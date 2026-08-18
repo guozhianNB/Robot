@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<!--
+  大模型端演示前端（单文件 SPA，5 个页签）
+  ========================================
+  对话    —— 多轮对话（流式 SSE）+ 思考路由展示 + 工具调用过程 + RAG 记忆注入
+  记忆    —— 老人档案（身份注册 + 用药）+ 记忆查看/审核（已确认/待处理）+ 人工录入
+  提醒    —— 护士建议录入 + 定时提醒列表/确认/删除（广播实时刷新）
+  工具日志 —— 联网搜索/新闻调用记录（审计可追溯）
+  设置    —— 一键功能开关（持久化）
+
+  依赖（CDN）：marked.js / highlight.js
+  后端：LLM/server.py（uvicorn, 端口 8000）
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>陪护机器人 · 大模型端控制台</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #171722; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column;
+    }
+    /* ---------- 顶部 ---------- */
+    header {
+      display: flex; align-items: center; gap: 16px; padding: 10px 18px;
+      background: #21212f; border-bottom: 1px solid #32324a; flex-wrap: wrap;
+    }
+    header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+    .uid-box { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #aaaac4; }
+    .uid-box select, .uid-box input {
+      background: #171722; color: #e0e0e0; border: 1px solid #3a3a52;
+      border-radius: 6px; padding: 5px 8px; font-size: 13px; outline: none;
+    }
+    .tabs { display: flex; gap: 4px; margin-left: auto; }
+    .tab {
+      background: none; border: none; color: #9a9ab4; cursor: pointer;
+      padding: 7px 14px; border-radius: 8px; font-size: 13px;
+    }
+    .tab:hover { background: #2a2a3e; }
+    .tab.active { background: #3b82f6; color: #fff; }
+    .health { font-size: 12px; color: #6ee7a0; }
+    .health.off { color: #f87171; }
+
+    /* ---------- 主体 ---------- */
+    main { flex: 1; overflow: hidden; position: relative; }
+    .page { display: none; height: 100%; }
+    .page.active { display: flex; }
+
+    /* ---------- 对话页 ---------- */
+    #page-chat { flex-direction: column; }
+    #messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 82%; }
+    .msg.user { align-self: flex-end; }
+    .msg.user .bubble { background: #3b82f6; color: #fff; padding: 9px 13px; border-radius: 14px 14px 4px 14px; white-space: pre-wrap; word-break: break-word; }
+    .msg.assistant { align-self: flex-start; width: 100%; }
+    .router-chip { display: inline-block; font-size: 11px; color: #f0a35e; background: #2a2333; border: 1px solid #5a4a33; border-radius: 10px; padding: 2px 8px; margin-bottom: 6px; }
+    .reasoning { background: #232335; border: 1px solid #3a3a4c; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
+    .reasoning summary { cursor: pointer; color: #f0a35e; font-size: 13px; user-select: none; }
+    .reasoning-text { margin-top: 6px; font-size: 13px; color: #9a9ab0; white-space: pre-wrap; }
+    .answer { background: #2a2a3c; border-radius: 14px 14px 14px 4px; padding: 10px 14px; line-height: 1.6; word-break: break-word; }
+    .answer pre { background: #111122; border-radius: 8px; padding: 10px; overflow-x: auto; margin: 8px 0; }
+    .answer code { background: #111122; padding: 2px 5px; border-radius: 4px; }
+    .answer pre code { background: none; padding: 0; }
+    .answer ul, .answer ol { padding-left: 20px; margin: 6px 0; }
+    .answer table { border-collapse: collapse; margin: 8px 0; }
+    .answer th, .answer td { border: 1px solid #4a4a5c; padding: 6px 10px; }
+    .answer a { color: #7dd3fc; }
+    .tool-chip {
+      display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+      background: #1e2b3c; border: 1px solid #2f5a8a; color: #93c5fd;
+      border-radius: 10px; padding: 3px 10px; margin: 4px 6px 4px 0;
+    }
+    .tool-chip.ok { border-color: #2f8a5a; color: #86efac; }
+    .tool-chip.err { border-color: #8a2f2f; color: #fca5a5; }
+    .chat-footer { padding: 10px 18px; background: #21212f; border-top: 1px solid #32324a; display: flex; flex-direction: column; gap: 8px; }
+    .option-row { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #aaaac4; flex-wrap: wrap; }
+    .option-row select { background: #171722; color: #e0e0e0; border: 1px solid #3a3a52; border-radius: 6px; padding: 4px 8px; font-size: 13px; }
+    .input-row { display: flex; gap: 10px; }
+    #input { flex: 1; resize: none; background: #171722; color: #e0e0e0; border: 1px solid #3a3a52; border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none; }
+    #input:focus { border-color: #3b82f6; }
+    #send-btn { background: #3b82f6; color: #fff; border: none; border-radius: 10px; padding: 0 24px; cursor: pointer; font-size: 14px; }
+    #send-btn:hover { background: #2f6fe0; }
+    #send-btn:disabled { background: #555; cursor: not-allowed; }
+
+    /* ---------- 通用面板 ---------- */
+    .panel { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+    .card { background: #21212f; border: 1px solid #32324a; border-radius: 12px; padding: 14px 16px; }
+    .card h3 { font-size: 14px; margin-bottom: 10px; color: #c9c9e2; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+    .field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #9a9ab4; }
+    .field input, .field select, .field textarea {
+      background: #171722; color: #e0e0e0; border: 1px solid #3a3a52; border-radius: 7px;
+      padding: 7px 9px; font-size: 13px; outline: none; font-family: inherit;
+    }
+    .field textarea { resize: vertical; min-height: 52px; }
+    .btn { background: #3b82f6; color: #fff; border: none; border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: 13px; }
+    .btn:hover { background: #2f6fe0; }
+    .btn.gray { background: #3a3a52; } .btn.gray:hover { background: #4a4a66; }
+    .btn.green { background: #16a34a; } .btn.green:hover { background: #15803d; }
+    .btn.red { background: #dc2626; } .btn.red:hover { background: #b91c1c; }
+    .btn.sm { padding: 4px 10px; font-size: 12px; }
+    .btn:disabled { background: #555; cursor: not-allowed; }
+
+    /* ---------- 列表 ---------- */
+    .list-item { display: flex; align-items: flex-start; gap: 10px; padding: 9px 4px; border-bottom: 1px solid #2a2a3e; font-size: 13px; }
+    .list-item:last-child { border-bottom: none; }
+    .badge { flex: none; font-size: 11px; border-radius: 8px; padding: 2px 8px; }
+    .badge.preference { background: #3b2f6e; color: #c4b5fd; }
+    .badge.event { background: #0f4c3a; color: #6ee7b7; }
+    .badge.fact { background: #312e2e; color: #d6d3d1; }
+    .badge.medical { background: #4c1d1d; color: #fca5a5; }
+    .badge.confirmed { background: #14532d; color: #86efac; }
+    .badge.pending { background: #713f12; color: #fcd34d; }
+    .badge.t-待触发 { background: #1e3a5f; color: #93c5fd; }
+    .badge.t-已触发 { background: #713f12; color: #fcd34d; }
+    .badge.t-已确认 { background: #14532d; color: #86efac; }
+    .badge.t-未确认 { background: #7f1d1d; color: #fca5a5; }
+    .badge.t-错过补报 { background: #4c1d95; color: #ddd6fe; }
+    .item-main { flex: 1; min-width: 0; }
+    .item-title { font-weight: 600; }
+    .item-sub { color: #9a9ab4; font-size: 12px; margin-top: 3px; word-break: break-all; }
+    .item-actions { display: flex; gap: 6px; flex: none; flex-wrap: wrap; }
+    .hint { font-size: 12px; color: #6b6b84; }
+    .row-flex { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+    /* ---------- 表格 ---------- */
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { border: 1px solid #32324a; padding: 7px 9px; text-align: left; vertical-align: top; }
+    th { background: #262638; color: #c9c9e2; }
+    td.snippet { color: #9a9ab4; }
+
+    /* ---------- 开关 ---------- */
+    .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 2px; border-bottom: 1px solid #2a2a3e; font-size: 13px; }
+    .switch-row:last-child { border-bottom: none; }
+    .switch { position: relative; width: 40px; height: 22px; flex: none; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: #3a3a52; border-radius: 22px; transition: .2s; cursor: pointer; }
+    .slider::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+    .switch input:checked + .slider { background: #3b82f6; }
+    .switch input:checked + .slider::before { transform: translateX(18px); }
+
+    /* ---------- Toast 通知 ---------- */
+    #toasts { position: fixed; top: 14px; right: 14px; z-index: 999; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
+    .toast { background: #1e293b; border: 1px solid #3b82f6; border-left: 4px solid #3b82f6; color: #e2e8f0; border-radius: 10px; padding: 10px 14px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.4); animation: slidein .25s ease; }
+    .toast.warn { border-color: #f59e0b; border-left-color: #f59e0b; }
+    .toast.err { border-color: #ef4444; border-left-color: #ef4444; }
+    @keyframes slidein { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>🤖 陪护机器人 · 大模型端</h1>
+    <div class="uid-box">
+      当前老人
+      <select id="uid-select"></select>
+      <span id="uid-name" class="hint"></span>
+    </div>
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-page="chat">💬 对话</button>
+      <button class="tab" data-page="memory">🧠 记忆</button>
+      <button class="tab" data-page="reminder">⏰ 提醒</button>
+      <button class="tab" data-page="tools">🔧 工具日志</button>
+      <button class="tab" data-page="settings">⚙️ 设置</button>
+    </div>
+    <span id="health" class="health">…</span>
+  </header>
+
+  <main>
+    <!-- ================= 对话 ================= -->
+    <section id="page-chat" class="page active">
+      <div id="messages"></div>
+      <div class="chat-footer">
+        <div class="option-row">
+          <span>思考模式：</span>
+          <select id="thinking-select">
+            <option value="auto">自动（日常秒回，敏感问题深思考）</option>
+            <option value="on">始终开启</option>
+            <option value="off">始终关闭</option>
+          </select>
+          <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+        </div>
+        <div class="input-row">
+          <textarea id="input" rows="2" placeholder="对老人说话，例如：我有点想孙子了 / 今天有什么新闻 / 我血压高药能减半吗"></textarea>
+          <button id="send-btn" onclick="send()">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 记忆 ================= -->
+    <section id="page-memory" class="page">
+      <div class="panel">
+        <div class="card">
+          <h3>📋 老人档案（身份注册 + 护士录入医疗信息；医疗字段只读来源）</h3>
+          <div class="form-grid">
+            <div class="field"><label>UID</label><input id="p-uid"></div>
+            <div class="field"><label>姓名</label><input id="p-name"></div>
+            <div class="field"><label>称呼</label><input id="p-nickname"></div>
+            <div class="field"><label>床位</label><input id="p-bed"></div>
+            <div class="field"><label>年龄</label><input id="p-age" type="number"></div>
+            <div class="field"><label>偏好称呼（如：闺女）</label><input id="p-call"></div>
+          </div>
+          <div class="form-grid" style="margin-top:10px">
+            <div class="field"><label>病史（每行一条）</label><textarea id="p-history"></textarea></div>
+            <div class="field"><label>用药（每行：药名 剂量 时间，如：降压药 1片 08:00）</label><textarea id="p-meds"></textarea></div>
+            <div class="field"><label>喜欢话题（逗号分隔）</label><input id="p-topics"></div>
+            <div class="field"><label>说话风格画像</label><input id="p-style"></div>
+            <div class="field"><label>备注</label><input id="p-notes"></div>
+          </div>
+          <div style="margin-top:12px"><button class="btn" onclick="saveProfile()">💾 保存档案（用药自动同步为每日服药提醒）</button></div>
+        </div>
+
+        <div class="card">
+          <h3>🪪 老人画像（对话整理所得，自动精简更新）</h3>
+          <div id="portrait-box" class="hint">加载中…</div>
+        </div>
+
+        <div class="card">
+          <h3>✅ 已确认记忆（对话时注入 RAG）</h3>
+          <div id="mem-confirmed"><div class="hint">加载中…</div></div>
+        </div>
+
+        <div class="card">
+          <h3>🕐 待处理记忆（大模型沉淀，需人工确认；医疗信息模型一律不写）</h3>
+          <div id="mem-pending"><div class="hint">加载中…</div></div>
+        </div>
+
+        <div class="card">
+          <h3>✍️ 人工录入记忆（护工用；医疗信息必须走这里）</h3>
+          <div class="row-flex">
+            <div class="field" style="min-width:130px">
+              <select id="m-type">
+                <option value="fact">一般事实</option>
+                <option value="preference">偏好/习惯</option>
+                <option value="event">事件经历</option>
+                <option value="medical">医疗信息（人工）</option>
+              </select>
+            </div>
+            <div class="field" style="flex:1; min-width:220px"><input id="m-content" placeholder="记忆内容，如：对青霉素过敏"></div>
+            <div class="field" style="min-width:120px">
+              <select id="m-status"><option value="confirmed">直接确认</option><option value="pending">进待处理</option></select>
+            </div>
+            <button class="btn" onclick="addMemory()">添加</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 提醒 ================= -->
+    <section id="page-reminder" class="page">
+      <div class="panel">
+        <div class="card">
+          <h3>📢 护士建议录入（定时转达给老人）</h3>
+          <div class="form-grid">
+            <div class="field"><label>标题</label><input id="r-title" placeholder="如：护士嘱咐"></div>
+            <div class="field"><label>内容</label><input id="r-content" placeholder="如：张爷爷，今天记得多喝水"></div>
+            <div class="field"><label>类型</label>
+              <select id="r-type"><option value="once">一次性</option><option value="daily">每日重复</option></select>
+            </div>
+            <div class="field"><label>时间 (HH:MM)</label><input id="r-time" placeholder="08:00"></div>
+            <div class="field"><label>日期（一次性时填写）</label><input id="r-date" type="date"></div>
+          </div>
+          <div style="margin-top:12px"><button class="btn" onclick="addReminder()">添加提醒</button>
+            <span class="hint"> 到点自动广播给前端；未确认超时会升级告警；错过触发点会补报。</span></div>
+        </div>
+        <div class="card">
+          <h3>⏰ 提醒列表（含档案用药自动同步的服药提醒）</h3>
+          <div id="reminder-list"><div class="hint">加载中…</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 工具日志 ================= -->
+    <section id="page-tools" class="page">
+      <div class="panel">
+        <div class="card">
+          <h3>🔧 工具调用日志（联网搜索 / 新闻，审计可追溯）</h3>
+          <table>
+            <thead><tr><th>时间</th><th>工具</th><th>参数</th><th>结果摘要</th><th>状态</th><th>耗时</th></tr></thead>
+            <tbody id="tool-log-body"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 设置 ================= -->
+    <section id="page-settings" class="page">
+      <div class="panel">
+        <div class="card">
+          <h3>⚙️ 功能开关（持久化，重启不丢）</h3>
+          <div id="settings-list"></div>
+          <div style="margin-top:12px"><button class="btn" onclick="saveSettings()">💾 保存设置</button></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toasts"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+
+  <script>
+    // ================================================================
+    const API = "http://127.0.0.1:8000";
+    let currentUid = localStorage.getItem("uid") || "elder_001";
+    let chatMessages = [];          // 前端展示用的本轮会话（后端自己管理长期历史）
+
+    // ================================================================
+    // 通用工具
+    // ================================================================
+    async function api(path, opts = {}) {
+      const res = await fetch(API + path, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    }
+
+    function toast(title, detail = "", kind = "") {
+      const el = document.createElement("div");
+      el.className = "toast " + kind;
+      el.innerHTML = `<b>${title}</b>${detail ? "<br>" + detail : ""}`;
+      document.getElementById("toasts").appendChild(el);
+      setTimeout(() => el.remove(), 9000);
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+
+    // ================================================================
+    // 页签切换
+    // ================================================================
+    document.getElementById("tabs").addEventListener("click", (e) => {
+      const btn = e.target.closest(".tab");
+      if (!btn) return;
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("page-" + btn.dataset.page).classList.add("active");
+      if (btn.dataset.page === "memory") loadMemory();
+      if (btn.dataset.page === "reminder") loadReminders();
+      if (btn.dataset.page === "tools") loadToolLog();
+      if (btn.dataset.page === "settings") loadSettings();
+    });
+
+    // ================================================================
+    // 档案选择
+    // ================================================================
+    async function loadProfiles() {
+      const { profiles } = await api("/api/profiles");
+      const sel = document.getElementById("uid-select");
+      sel.innerHTML = "";
+      for (const p of profiles) {
+        const opt = document.createElement("option");
+        opt.value = p.uid;
+        opt.textContent = `${p.name || p.uid}（${p.bed || "无床位"}）`;
+        sel.appendChild(opt);
+      }
+      if (!profiles.find(p => p.uid === currentUid)) currentUid = profiles[0]?.uid || "elder_001";
+      sel.value = currentUid;
+      updateUid();
+    }
+    function updateUid() {
+      currentUid = document.getElementById("uid-select").value || currentUid;
+      localStorage.setItem("uid", currentUid);
+      api("/api/profiles").then(({ profiles }) => {
+        const p = profiles.find(x => x.uid === currentUid);
+        document.getElementById("uid-name").textContent = p ? `${p.name || ""} ${p.nickname || ""}`.trim() : "";
+      }).catch(() => {});
+    }
+    document.getElementById("uid-select").addEventListener("change", updateUid);
+
+    // ================================================================
+    // 对话
+    // ================================================================
+    function scrollBottom() {
+      const m = document.getElementById("messages");
+      m.scrollTop = m.scrollHeight;
+    }
+
+    function appendUser(text) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg user";
+      const b = document.createElement("div");
+      b.className = "bubble";
+      b.textContent = text;
+      wrap.appendChild(b);
+      document.getElementById("messages").appendChild(wrap);
+      scrollBottom();
+    }
+
+    function appendAssistant() {
+      const wrap = document.createElement("div");
+      wrap.className = "msg assistant";
+
+      const router = document.createElement("div");   // 思考路由 chip
+      router.className = "router-chip";
+
+      const details = document.createElement("details");
+      details.className = "reasoning";
+      details.open = true;
+      const summary = document.createElement("summary");
+      summary.textContent = "🧠 思考过程";
+      const reasoningText = document.createElement("div");
+      reasoningText.className = "reasoning-text";
+      details.appendChild(summary);
+      details.appendChild(reasoningText);
+
+      const tools = document.createElement("div");    // 工具调用 chips
+      tools.className = "tool-row";
+
+      const answer = document.createElement("div");
+      answer.className = "answer";
+
+      wrap.append(router, details, tools, answer);
+      document.getElementById("messages").appendChild(wrap);
+      scrollBottom();
+      return { router, reasoningText, tools, answer };
+    }
+
+    function renderMarkdown(el) {
+      const raw = el.textContent;
+      el.innerHTML = marked.parse(raw);
+      el.querySelectorAll("pre code").forEach(b => hljs.highlightElement(b));
+    }
+
+    async function send() {
+      const input = document.getElementById("input");
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      appendUser(text);
+
+      const { router, reasoningText, tools, answer } = appendAssistant();
+      const btn = document.getElementById("send-btn");
+      btn.disabled = true;
+      let fullAnswer = "", fullReasoning = "";
+
+      try {
+        const response = await fetch(API + "/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            uid: currentUid,
+            message: text,
+            thinking: document.getElementById("thinking-select").value,
+          }),
+        });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop();
+          for (const event of events) {
+            for (const line of event.split("\n")) {
+              if (!line.startsWith("data: ")) continue;
+              const data = JSON.parse(line.slice(6));
+              switch (data.type) {
+                case "meta": {
+                  const r = data.router || {};
+                  const m = r.method || "off";
+                  let label;
+                  if (!r.on) label = "⚡ 快速回答（" + (r.reason || "日常闲聊") + "）";
+                  else if (m === "manual") label = "🧠 深思考（手动开启）";
+                  else if (m === "llm") label = `🧠 深思考（${r.reason || "LLM预判"}）`;
+                  else label = `🧠 深思考（${r.reason || ""}）`;
+                  router.textContent = label;
+                  break;
+                }
+                case "reasoning":
+                  fullReasoning += data.content || "";
+                  reasoningText.textContent = fullReasoning;
+                  break;
+                case "content":
+                  fullAnswer += data.content || "";
+                  answer.textContent = fullAnswer;
+                  break;
+                case "tool_start": {
+                  const chip = document.createElement("span");
+                  chip.className = "tool-chip";
+                  chip.textContent = `🔧 ${data.tool}(${JSON.stringify(data.args || {})})…`;
+                  chip.dataset.tool = data.tool;
+                  tools.appendChild(chip);
+                  break;
+                }
+                case "tool_result": {
+                  const chips = tools.querySelectorAll(".tool-chip");
+                  const chip = chips[chips.length - 1];
+                  if (chip) {
+                    chip.classList.add(data.ok ? "ok" : "err");
+                    chip.textContent = `${data.ok ? "✅" : "❌"} ${data.tool} · ${(data.snippet || "").slice(0, 60)}`;
+                  }
+                  break;
+                }
+                case "done":
+                  if (fullAnswer) renderMarkdown(answer);
+                  break;
+                case "error":
+                  answer.innerHTML = `<span style="color:#f87171">⚠️ ${escapeHtml(data.content || "未知错误")}</span>`;
+                  break;
+              }
+              scrollBottom();
+            }
+          }
+        }
+        if (fullAnswer) chatMessages.push({ role: "assistant", content: fullAnswer });
+      } catch (err) {
+        answer.innerHTML = `<span style="color:#f87171">请求失败：${escapeHtml(err.message)}。请确认后端已启动。</span>`;
+      } finally {
+        btn.disabled = false;
+        input.focus();
+      }
+    }
+
+    document.getElementById("input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    // ================================================================
+    // 记忆页
+    // ================================================================
+    function badge(type) {
+      const map = { preference: "偏好", event: "事件", fact: "事实", medical: "医疗" };
+      return `<span class="badge ${escapeHtml(type)}">${map[type] || escapeHtml(type)}</span>`;
+    }
+
+    async function loadMemory() {
+      const uid = currentUid;
+      const [confirmed, pending, ctx] = await Promise.all([
+        api(`/api/memories?uid=${uid}&status=confirmed`),
+        api(`/api/memories?uid=${uid}&status=pending`),
+        api(`/api/context?uid=${uid}`),
+      ]);
+      // 老人画像
+      document.getElementById("portrait-box").innerHTML = ctx.portrait
+        ? `<div class="item-title">${escapeHtml(ctx.portrait)}</div>`
+        : '<div class="hint">还没有画像——和老人聊完一段话题（空闲 30 秒）后自动生成</div>';
+      // 档案表单回填
+      const profiles = (await api("/api/profiles")).profiles;
+      const p = profiles.find(x => x.uid === uid);
+      if (p) {
+        document.getElementById("p-uid").value = p.uid;
+        document.getElementById("p-name").value = p.name || "";
+        document.getElementById("p-nickname").value = p.nickname || "";
+        document.getElementById("p-bed").value = p.bed || "";
+        document.getElementById("p-age").value = p.age || "";
+        document.getElementById("p-call").value = (p.preferences || {}).称呼 || "";
+        document.getElementById("p-history").value = ((p.profile || {}).病史 || []).join("\n");
+        document.getElementById("p-meds").value = ((p.profile || {}).用药 || [])
+          .map(m => `${m.name} ${m.dose || ""} ${m.time || ""}`.trim()).join("\n");
+        document.getElementById("p-topics").value = ((p.preferences || {}).话题 || []).join("，");
+        document.getElementById("p-style").value = p.style || "";
+        document.getElementById("p-notes").value = p.notes || "";
+      }
+
+      const cbox = document.getElementById("mem-confirmed");
+      cbox.innerHTML = confirmed.memories.length
+        ? confirmed.memories.map(m => `
+            <div class="list-item">
+              ${badge(m.type)}
+              <div class="item-main">
+                <div class="item-title">${escapeHtml(m.content)}</div>
+                <div class="item-sub">${m.ts} · 来源:${escapeHtml(m.source || "manual")}${m.expires_at ? " · 时效至 " + m.expires_at : ""}</div>
+              </div>
+              <div class="item-actions"><button class="btn red sm" onclick="delMemory(${m.id})">删除</button></div>
+            </div>`).join("")
+        : '<div class="hint">暂无已确认记忆</div>';
+
+      const pbox = document.getElementById("mem-pending");
+      pbox.innerHTML = pending.memories.length
+        ? pending.memories.map(m => `
+            <div class="list-item">
+              ${badge(m.type)}
+              <span class="badge pending">待处理</span>
+              <div class="item-main">
+                <div class="item-title">${escapeHtml(m.content)}</div>
+                <div class="item-sub">${m.ts} · 来源:${escapeHtml(m.source || "manual")}</div>
+              </div>
+              <div class="item-actions">
+                <button class="btn green sm" onclick="confirmMemory(${m.id})">确认</button>
+                <button class="btn red sm" onclick="rejectMemory(${m.id})">丢弃</button>
+              </div>
+            </div>`).join("")
+        : '<div class="hint">暂无待处理记忆</div>';
+    }
+
+    async function saveProfile() {
+      const meds = document.getElementById("p-meds").value.split("\n").map(l => l.trim()).filter(Boolean)
+        .map(l => { const [name, dose, time] = l.split(/\s+/); return { name: name || "", dose: dose || "", time: time || "" }; });
+      const profile = {
+        病史: document.getElementById("p-history").value.split("\n").map(s => s.trim()).filter(Boolean),
+        用药: meds.filter(m => m.name),
+      };
+      const preferences = {
+        称呼: document.getElementById("p-call").value.trim(),
+        话题: document.getElementById("p-topics").value.split(/[，,]/).map(s => s.trim()).filter(Boolean),
+      };
+      await api("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({
+          uid: document.getElementById("p-uid").value || currentUid,
+          name: document.getElementById("p-name").value.trim(),
+          nickname: document.getElementById("p-nickname").value.trim(),
+          bed: document.getElementById("p-bed").value.trim(),
+          age: Number(document.getElementById("p-age").value) || 0,
+          profile, preferences,
+          style: document.getElementById("p-style").value.trim(),
+          notes: document.getElementById("p-notes").value.trim(),
+        }),
+      });
+      toast("✅ 档案已保存", "用药已自动同步为每日服药提醒");
+      loadProfiles(); loadMemory();
+    }
+
+    async function addMemory() {
+      const content = document.getElementById("m-content").value.trim();
+      if (!content) return;
+      await api("/api/memories", {
+        method: "POST",
+        body: JSON.stringify({
+          uid: currentUid,
+          type: document.getElementById("m-type").value,
+          content,
+          status: document.getElementById("m-status").value,
+        }),
+      });
+      document.getElementById("m-content").value = "";
+      toast("✅ 已录入");
+      loadMemory();
+    }
+
+    async function confirmMemory(id) { await api(`/api/memories/${id}/confirm`, { method: "POST" }); loadMemory(); }
+    async function rejectMemory(id) { await api(`/api/memories/${id}/reject`, { method: "POST" }); loadMemory(); }
+    async function delMemory(id) { await api(`/api/memories/${id}`, { method: "DELETE" }); loadMemory(); }
+
+    // ================================================================
+    // 提醒页
+    // ================================================================
+    async function loadReminders() {
+      const { reminders } = await api(`/api/reminders?uid=${currentUid}`);
+      const box = document.getElementById("reminder-list");
+      if (!reminders.length) { box.innerHTML = '<div class="hint">暂无提醒</div>'; return; }
+      box.innerHTML = reminders.map(r => `
+        <div class="list-item">
+          <span class="badge t-${escapeHtml(r.status_label)}">${escapeHtml(r.status_label)}</span>
+          <span class="badge ${r.kind === "medication" ? "medical" : "fact"}">${r.kind === "medication" ? "💊 用药" : "📢 护士"}</span>
+          <div class="item-main">
+            <div class="item-title">${escapeHtml(r.title)}</div>
+            <div class="item-sub">${escapeHtml(r.content)}<br>
+              ${r.trigger_type === "daily" ? "每日 " : "一次性 "}${r.trigger_time}${r.trigger_date ? "（" + r.trigger_date + "）" : ""}
+              ${r.missed_count > 0 ? ` · 错过补报 ${r.missed_count} 次` : ""}
+              ${r.triggered_at ? " · 触发于 " + r.triggered_at : ""}${r.confirmed_at ? " · 确认于 " + r.confirmed_at : ""}</div>
+          </div>
+          <div class="item-actions">
+            ${["triggered", "unconfirmed", "missed"].includes(r.status) ? `<button class="btn green sm" onclick="confirmReminder(${r.id})">已执行/确认</button>` : ""}
+            <button class="btn red sm" onclick="delReminder(${r.id})">删除</button>
+          </div>
+        </div>`).join("");
+    }
+
+    async function addReminder() {
+      const content = document.getElementById("r-content").value.trim();
+      if (!content) { toast("请填写内容", "", "err"); return; }
+      await api("/api/reminders", {
+        method: "POST",
+        body: JSON.stringify({
+          uid: currentUid,
+          kind: "nurse",
+          title: document.getElementById("r-title").value.trim() || "护士建议",
+          content,
+          trigger_type: document.getElementById("r-type").value,
+          trigger_time: document.getElementById("r-time").value || "08:00",
+          trigger_date: document.getElementById("r-date").value || "",
+        }),
+      });
+      document.getElementById("r-content").value = "";
+      toast("✅ 提醒已创建，到点自动广播");
+      loadReminders();
+    }
+
+    async function confirmReminder(id) {
+      const r = await api(`/api/reminders/${id}/confirm`, { method: "POST", body: JSON.stringify({ uid: currentUid }) });
+      toast(r.ok ? "✅ 已确认" : "⚠️ " + r.message);
+      loadReminders();
+    }
+    async function delReminder(id) { await api(`/api/reminders/${id}`, { method: "DELETE" }); loadReminders(); }
+
+    // ================================================================
+    // 工具日志页
+    // ================================================================
+    async function loadToolLog() {
+      const { logs } = await api(`/api/tools/log?limit=60`);
+      const body = document.getElementById("tool-log-body");
+      if (!logs.length) { body.innerHTML = '<tr><td colspan="6" class="hint">暂无工具调用记录</td></tr>'; return; }
+      body.innerHTML = logs.map(l => `
+        <tr>
+          <td>${l.ts}</td>
+          <td>${escapeHtml(l.tool)}</td>
+          <td>${escapeHtml(JSON.stringify(l.args))}</td>
+          <td class="snippet">${escapeHtml((l.result_snippet || "").slice(0, 120))}</td>
+          <td>${l.status === "ok" ? '<span style="color:#86efac">ok</span>' : '<span style="color:#fca5a5">error</span>'}</td>
+          <td>${l.latency_ms}ms</td>
+        </tr>`).join("");
+    }
+
+    // ================================================================
+    // 设置页
+    // ================================================================
+    const SETTING_META = [
+      ["web_search_enabled", "联网搜索 / 新闻工具", "允许对话中调用 web_search / get_news（模块 9）"],
+      ["thinking_router_enabled", "思考路由层", "敏感/健康/复杂问题自动深思考，日常快速回答（模块 1）"],
+      ["router_llm_enabled", "路由 LLM 预判（兜底）", "关键词未命中时，用模型快速判断是否需要深思考"],
+      ["memory_consolidation_enabled", "记忆整理（话题结束后沉淀）", "空闲一段时间或上下文满时，批量整理记忆（去重/合并/画像）"],
+      ["reminder_enabled", "定时提醒", "提醒调度总开关（模块 6）"],
+      ["proactive_enabled", "主动交互", "空闲时主动找话题（模块 10，占位）"],
+      ["auto_switch_user", "自动切换老人", "人脸/声纹识别自动切换 uid（模块 4，占位）"],
+      ["asr_enabled", "ASR 语音识别", "语音链路后置（模块 7，占位）"],
+      ["tts_enabled", "TTS 语音播报", "语音链路后置（模块 7，占位）"],
+      ["alarm_enabled", "报警上报", "提醒未确认/紧急情况升级写审计日志（模块 11）"],
+    ];
+
+    async function loadSettings() {
+      const { settings } = await api("/api/settings");
+      const box = document.getElementById("settings-list");
+      let html = "";
+      for (const [key, label, desc] of SETTING_META) {
+        html += `
+          <div class="switch-row">
+            <div><b>${label}</b><br><span class="hint">${desc}</span></div>
+            <label class="switch"><input type="checkbox" data-key="${key}" ${settings[key] ? "checked" : ""}><span class="slider"></span></label>
+          </div>`;
+      }
+      html += `
+        <div class="form-grid" style="margin-top:12px">
+          <div class="field"><label>静默时段开始（不主动播报）</label><input id="s-silent-start" value="${settings.silent_start}"></div>
+          <div class="field"><label>静默时段结束</label><input id="s-silent-end" value="${settings.silent_end}"></div>
+          <div class="field"><label>确认超时（分钟，未确认升级告警）</label><input id="s-timeout" type="number" value="${settings.confirm_timeout_min}"></div>
+          <div class="field"><label>记忆整理空闲秒数（话题结束判定）</label><input id="s-idle" type="number" value="${settings.consolidate_idle_sec}"></div>
+        </div>`;
+      box.innerHTML = html;
+    }
+
+    async function saveSettings() {
+      const settings = {
+        confirm_timeout_min: Number(document.getElementById("s-timeout").value) || 30,
+        consolidate_idle_sec: Number(document.getElementById("s-idle").value) || 30,
+      };
+      document.querySelectorAll("#settings-list input[data-key]").forEach(i => {
+        settings[i.dataset.key] = i.checked;
+      });
+      settings.silent_start = document.getElementById("s-silent-start").value || "22:00";
+      settings.silent_end = document.getElementById("s-silent-end").value || "07:00";
+      await api("/api/settings", { method: "POST", body: JSON.stringify(settings) });
+      toast("✅ 设置已保存");
+    }
+
+    // ================================================================
+    // 全局广播监听（提醒触发 / 告警 / 确认）
+    // ================================================================
+    function connectEvents() {
+      const es = new EventSource(API + "/api/events");
+      es.addEventListener("reminder", (ev) => {
+        const d = JSON.parse(ev.data);
+        const when = d.missed ? "（错过补报）" : "";
+        toast(`⏰ ${d.title}${when}`, `${d.content}${d.silent ? "<br><span style='color:#fbbf24'>静默时段内，仅记录</span>" : ""}`, d.missed ? "warn" : "");
+        if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
+      });
+      es.addEventListener("reminder_confirmed", (ev) => {
+        const d = JSON.parse(ev.data);
+        toast("✅ 已确认", d.title);
+        if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
+      });
+      es.addEventListener("alarm", (ev) => {
+        const d = JSON.parse(ev.data);
+        toast("🚨 告警升级", d.message, "err");
+      });
+      es.onerror = () => { /* EventSource 自动重连 */ };
+    }
+
+    // ================================================================
+    // 健康检查
+    // ================================================================
+    async function ping() {
+      const el = document.getElementById("health");
+      try {
+        const h = await api("/api/health");
+        el.className = "health";
+        el.textContent = `● 后端在线 · ${h.time}`;
+      } catch {
+        el.className = "health off";
+        el.textContent = "● 后端离线";
+      }
+    }
+
+    // ================================================================
+    // 启动
+    // ================================================================
+    (async function init() {
+      try {
+        await loadProfiles();
+      } catch (e) {
+        toast("⚠️ 后端连不上", "请先在 LLM 目录启动：python -m uvicorn LLM.server:app --port 8000", "err");
+      }
+      loadMemory(); loadReminders(); loadToolLog(); loadSettings(); ping();
+      connectEvents();
+      setInterval(ping, 30000);
+    })();
+  </script>
+</body>
+</html>

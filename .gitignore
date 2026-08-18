@@ -6,3 +6,9 @@ stm32/led_test/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# LLM 运行时数据（SQLite 库 / 审计日志，不入库）
+LLM/data/*.db
+LLM/data/*.db-wal
+LLM/data/*.db-shm
+LLM/data/audit.jsonl

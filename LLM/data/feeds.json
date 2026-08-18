@@ -1,0 +1,26 @@
+{
+  "国内": [
+    "http://www.people.com.cn/rss/politics.xml",
+    "https://www.chinanews.com.cn/rss/scroll-news.xml",
+    "https://www.chinanews.com.cn/rss/society.xml",
+    "http://www.people.com.cn/rss/society.xml"
+  ],
+  "国际": [
+    "http://www.people.com.cn/rss/world.xml",
+    "https://www.chinanews.com.cn/rss/world.xml"
+  ],
+  "健康": [
+    "http://www.people.com.cn/rss/health.xml",
+    "https://www.chinanews.com.cn/rss/health.xml"
+  ],
+  "财经": [
+    "http://www.people.com.cn/rss/finance.xml",
+    "https://www.chinanews.com.cn/rss/finance.xml",
+    "https://news.baidu.com/n?cmd=1&class=finannews&tn=rss"
+  ],
+  "科技": [
+    "https://www.ithome.com/rss/",
+    "https://sspai.com/feed",
+    "https://www.solidot.org/index.rss"
+  ]
+}

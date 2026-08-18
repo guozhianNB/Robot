@@ -1,142 +1,331 @@
 # -*- coding: utf-8 -*-
 r"""
-AI 对话后端（方案 A：FastAPI + 流式转发）
-========================================
-职责：
-  1. 接收前端发来的对话消息（messages + thinking 开关）
-  2. 调用 DeepSeek 的流式接口（stream=True）
-  3. 把返回的每个"小纸条"(chunk) 转成 SSE 事件，实时推回给前端
+AI 对话后端（FastAPI + SSE 流式）—— 大模型端"大脑与嘴"的 HTTP 出口。
 
-数据流：
-  前端 --POST /api/chat--> 本文件 --stream=True--> DeepSeek API
-  前端 <--SSE 逐条推送--- 本文件 <--增量 chunk------ DeepSeek API
+能力（对应 docs/2.pre/大模型端开发目标.md）：
+  - /api/chat      多轮对话（流式 SSE）：护工角色 + 安全红线 + RAG 记忆注入 + 思考路由 + 工具调用（联网）
+  - /api/profiles  老人档案 CRUD（含用药 → 自动同步每日服药提醒）
+  - /api/memories  RAG 记忆查看 / 审核（已确认 / 待处理）/ 人工录入 / 沉淀触发
+  - /api/reminders 定时提醒（护士建议录入 / 确认 / 状态机）
+  - /api/tools/log 工具调用日志（审计可追溯）
+  - /api/settings  功能开关（一键开关，持久化）
+  - /api/events    提醒/告警广播（SSE，前端实时 toast）
+  - /api/context   查看某位老人当前记住了什么（演示/调试用）
 
-运行方式（在 LLM 目录下执行）：
-  ..\.venv\Scripts\python.exe -m uvicorn server:app --reload --port 8000
+运行方式（在项目根目录执行，包方式导入）：
+  .venv\Scripts\python.exe -m uvicorn LLM.server:app --host 0.0.0.0 --port 8000
 """
-
-import os
+import asyncio
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
-# ---------------------------------------------------------------------------
-# 1. 加载环境变量（.env 里的 DEEPSEEK_API_KEY）
-# ---------------------------------------------------------------------------
-# server.py 在 LLM/ 目录下，项目根是它的上一级。用绝对路径定位 .env，
-# 这样无论从哪个目录启动 uvicorn，都能找到 key。
-BASE_DIR = Path(__file__).resolve().parent.parent
+from . import db, bus, chat, memory as rag, reminder, tools as tool_mod
+from .conf import MODEL, BASE_DIR
+
 load_dotenv(BASE_DIR / ".env")
 
-# 创建 DeepSeek 客户端（OpenAI 兼容接口，所以用 openai SDK + 自定义 base_url）
 client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
 )
 
-# ---------------------------------------------------------------------------
-# 2. 创建 FastAPI 应用 + 跨域配置
-# ---------------------------------------------------------------------------
-app = FastAPI(title="AI Chat Backend")
+_bg = ThreadPoolExecutor(max_workers=4)   # 后台任务池：记忆沉淀 / 历史摘要，不占请求链路
 
-# CORS（跨域）：前端可能是 file:// 直接打开的（Origin 为 null），
-# 也可能是 localhost:8000 起的静态页，统一放行，方便本地开发。
+
+# ---------------------------------------------------------------------------
+# 应用生命周期
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db()
+    _seed_demo()
+    reminder.start()          # 独立线程的定时提醒调度器
+    drain_task = bus.start_drain()   # 广播扇出任务
+    yield
+    drain_task.cancel()
+
+
+app = FastAPI(title="AI 陪护机器人后端", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # 本地开发：允许所有来源
-    allow_methods=["*"],        # 允许所有方法（GET/POST...）
-    allow_headers=["*"],        # 允许所有请求头
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 
+def _seed_demo():
+    """首次启动：种一个示例老人档案（文档里的张建国示例）+ 示例护士建议。"""
+    if db.list_profiles():
+        return
+    profile = {
+        "病史": ["高血压"],
+        "用药": [{"name": "降压药", "dose": "1片", "time": "08:00"}],
+    }
+    prefs = {"称呼": "闺女", "话题": ["京剧", "孙子"]}
+    db.upsert_profile(
+        uid="elder_001", name="张建国", nickname="张爷爷", bed="3-12", age=78,
+        profile=profile, style="亲切北方口吻，爱用'闺女''老伴儿'称呼，话简短",
+        preferences=prefs, notes="演示示例档案，可修改/删除后重建",
+    )
+    for med in profile["用药"]:
+        db.upsert_medication_reminder("elder_001", med["name"], med["dose"], med["time"])
+    db.add_reminder("elder_001", "nurse", "护士建议", "今天记得多喝水，天气转凉注意保暖",
+                    "once", "18:00", db.now_iso()[:10], created_by="nurse")
+    from . import log as audit
+    audit.log("memory_change", action="seed", uid="elder_001", note="示例数据")
+
+
+def _sse(event: dict) -> str:
+    return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+
+def _post_chat_jobs(uid: str, user_text: str, assistant: str):
+    """对话结束后的后台任务（线程池，不阻塞请求）：
+    1. 本轮对话记入记忆整理缓冲，并安排"空闲 30s → 话题结束 → 批量整理记忆"定时器
+    2. 上下文窗口已满时立即整理（不等到空闲）
+    3. 滚动窗口历史摘要"""
+    settings = db.get_settings()
+    try:
+        rag.note_turn(uid, user_text, assistant, client, MODEL, settings)
+    except Exception as e:
+        from . import log as audit
+        audit.log("memory_change", action="note_error", uid=uid, error=str(e))
+    try:
+        if db.history_count(uid) >= chat.SUMMARY_THRESHOLD:
+            rag.consolidate(uid, client, MODEL)   # 上下文满了，话题基本结束，立即整理
+    except Exception:
+        pass
+    try:
+        chat.summarize_old(uid, client, MODEL)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
-# 3. 定义请求体的数据结构（Pydantic 会自动校验 + 转成 Python 对象）
+# 数据模型
 # ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    messages: list[dict]      # 多轮对话历史：[{"role": "user", "content": "..."}, ...]
-    thinking: bool = False    # 是否开启"思考模式"（显示模型的内心戏）
+    uid: str = "elder_001"
+    message: str
+    thinking: str = "auto"          # auto / on / off
+
+
+class ProfileIn(BaseModel):
+    uid: str
+    name: str = ""
+    nickname: str = ""
+    bed: str = ""
+    age: int = 0
+    profile: dict = {}              # {"病史": [...], "用药": [{"name","dose","time"}]}
+    style: str = ""
+    preferences: dict = {}          # {"称呼": "...", "话题": [...]}
+    notes: str = ""
+
+
+class MemoryIn(BaseModel):
+    uid: str
+    type: str = "fact"
+    content: str
+    status: str = "pending"
+
+
+class SuggestIn(BaseModel):
+    uid: str
+    user_text: str = ""
+    assistant_text: str = ""
+
+
+class ReminderIn(BaseModel):
+    uid: str
+    kind: str = "nurse"
+    title: str = ""
+    content: str
+    trigger_type: str = "once"      # daily / once
+    trigger_time: str = "08:00"
+    trigger_date: str = ""
+    confirm_timeout_min: int = 30
 
 
 # ---------------------------------------------------------------------------
-# 4. 核心：把 DeepSeek 的流式 chunk 逐个转成 SSE 事件
+# 路由
 # ---------------------------------------------------------------------------
-def stream_chat(req: ChatRequest):
-    """
-    这是一个"生成器"函数（用了 yield），FastAPI 会把它包装成
-    StreamingResponse，边生成边推给浏览器。
-
-    SSE 事件格式：以 "data: " 开头，以空行 \n\n 结尾
-      data: {"type":"reasoning","content":"..."}   ← 思考过程增量
-      data: {"type":"content","content":"..."}     ← 正式回答增量
-      data: {"type":"done"}                        ← 结束标记
-    """
-    # 根据 thinking 开关，决定传给 DeepSeek 的参数
-    if req.thinking:
-        # 开启思考：多传一个 reasoning_effort（low/high/max），让模型"想"得多一点
-        extra_body = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
-    else:
-        # 关闭思考：模型直接出答案，更快
-        extra_body = {"thinking": {"type": "disabled"}}
-
-    try:
-        # stream=True：让 DeepSeek 变成"边说边传"模式，返回迭代器
-        stream = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=req.messages,   # 把完整历史一起发过去 → 多轮记忆
-            stream=True,
-            extra_body=extra_body,
-        )
-
-        # 逐条接收"小纸条"(chunk)
-        for chunk in stream:
-            choice = chunk.choices[0]
-            delta = choice.delta
-
-            # 关键技巧：getattr(对象, 属性, 兜底值)
-            # thinking 关闭时，delta 上根本没有 reasoning_content 属性，
-            # 直接访问会抛 AttributeError，用 getattr 拿不到就返回 None。
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                yield _sse("reasoning", reasoning)
-
-            # content 是正式回答的增量（thinking 阶段它可能是 None）
-            if delta.content:
-                yield _sse("content", delta.content)
-
-            # finish_reason == "stop" 表示模型说完了，收尾
-            if choice.finish_reason:
-                yield _sse("done")
-                break
-
-    except Exception as e:
-        # 任何异常都推给前端一个 error 事件，方便前端提示用户
-        yield _sse("error", str(e))
+@app.get("/api/health")
+async def health():
+    return {"ok": True, "service": "llm-brain", "model": MODEL,
+            "time": db.now_iso(), "profiles": len(db.list_profiles())}
 
 
-def _sse(type_: str, content: str = ""):
-    """把事件拼成 SSE 文本：data: {...}\n\n"""
-    # ensure_ascii=False：保留中文原文，前端不用转码
-    payload = json.dumps({"type": type_, "content": content}, ensure_ascii=False)
-    return f"data: {payload}\n\n"
-
-
-# ---------------------------------------------------------------------------
-# 5. 路由：POST /api/chat
-# ---------------------------------------------------------------------------
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """
-    接收前端请求，返回一个"流式响应"。
-    media_type="text/event-stream" 告诉浏览器：这是 SSE 流，请边收边显示。
-    """
+async def chat_route(req: ChatRequest):
+    settings = db.get_settings()
+
+    def gen():
+        assistant = ""
+        for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking, settings):
+            if ev["type"] == "done":
+                assistant = ev.get("assistant", "")
+            yield _sse(ev)
+        if assistant.strip():
+            _bg.submit(_post_chat_jobs, req.uid, req.message, assistant)
+
     return StreamingResponse(
-        stream_chat(req),
-        media_type="text/event-stream",
+        gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------- 老人档案
+@app.get("/api/profiles")
+async def profiles_list():
+    return {"ok": True, "profiles": db.list_profiles()}
+
+
+@app.post("/api/profiles")
+async def profiles_upsert(p: ProfileIn):
+    prof = db.upsert_profile(
+        p.uid, p.name, p.nickname, p.bed, p.age, p.profile, p.style, p.preferences, p.notes)
+    # 用药 → 自动同步每日服药提醒
+    meds = (p.profile or {}).get("用药") or []
+    for m in meds:
+        if isinstance(m, dict) and m.get("name") and m.get("time"):
+            db.upsert_medication_reminder(p.uid, m["name"], m.get("dose", ""), m["time"])
+    from . import log as audit
+    audit.log("memory_change", action="profile_upsert", uid=p.uid, name=p.name, by="nurse")
+    return {"ok": True, "profile": prof}
+
+
+# ---------------------------------------------------------------- 记忆
+@app.get("/api/memories")
+async def memories_list(uid: str = Query(""), status: str = Query("")):
+    return {"ok": True, "memories": db.list_memories(uid=uid or None, status=status or None)}
+
+
+@app.post("/api/memories")
+async def memories_add(m: MemoryIn):
+    mid = db.add_memory(m.uid, m.type, m.content, status=m.status, source="manual")
+    from . import log as audit
+    audit.log("memory_change", action="manual_add", uid=m.uid, mid=mid, type=m.type,
+              content=m.content, by="nurse")
+    return {"ok": True, "id": mid}
+
+
+@app.post("/api/memories/{mid}/confirm")
+async def memories_confirm(mid: int):
+    m = db.get_memory(mid)
+    db.set_memory_status(mid, "confirmed")
+    from . import log as audit
+    audit.log("memory_change", action="confirm", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/{mid}/reject")
+async def memories_reject(mid: int):
+    m = db.get_memory(mid)
+    db.delete_memory(mid)
+    from . import log as audit
+    audit.log("memory_change", action="reject", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True}
+
+
+@app.delete("/api/memories/{mid}")
+async def memories_delete(mid: int):
+    db.delete_memory(mid)
+    return {"ok": True}
+
+
+@app.post("/api/memories/suggest")
+async def memories_suggest(s: SuggestIn):
+    result = await asyncio.to_thread(rag.suggest_from_chat,
+                                     s.uid, s.user_text, s.assistant_text, client, MODEL)
+    return {"ok": True, **result}
+
+
+@app.get("/api/context")
+async def context_view(uid: str = Query("elder_001")):
+    """演示/调试：看某位老人当前记住了什么。"""
+    profile = db.get_profile(uid)
+    confirmed = db.list_memories(uid=uid, status="confirmed")
+    pending = db.list_memories(uid=uid, status="pending")
+    return {
+        "ok": True, "uid": uid, "profile": profile,
+        "portrait": db.get_portrait(uid),
+        "summary": db.get_summary(uid),
+        "memories": {"confirmed": confirmed, "pending": pending},
+    }
+
+
+# ---------------------------------------------------------------- 提醒
+@app.get("/api/reminders")
+async def reminders_list(uid: str = Query("")):
+    rows = db.list_reminders(uid=uid or None)
+    for r in rows:
+        r["status_label"] = reminder.status_label(r["status"])
+    return {"ok": True, "reminders": rows}
+
+
+@app.post("/api/reminders")
+async def reminders_add(r: ReminderIn):
+    rid = db.add_reminder(
+        r.uid, r.kind, r.title or (r.content[:12]), r.content,
+        r.trigger_type, r.trigger_time, r.trigger_date,
+        confirm_timeout_min=r.confirm_timeout_min, created_by="nurse")
+    from . import log as audit
+    audit.log("reminder", action="create", rid=rid, uid=r.uid, kind=r.kind,
+              content=r.content[:200], by="nurse")
+    return {"ok": True, "id": rid}
+
+
+@app.post("/api/reminders/{rid}/confirm")
+async def reminders_confirm(rid: int, body: dict = None):
+    return reminder.confirm(rid, uid=(body or {}).get("uid", ""))
+
+
+@app.delete("/api/reminders/{rid}")
+async def reminders_delete(rid: int):
+    return reminder.dismiss(rid)
+
+
+# ---------------------------------------------------------------- 工具日志
+@app.get("/api/tools/log")
+async def tools_log(uid: str = Query(""), limit: int = Query(100)):
+    return {"ok": True, "logs": db.list_tool_log(uid=uid or None, limit=limit)}
+
+
+# ---------------------------------------------------------------- 设置
+@app.get("/api/settings")
+async def settings_get():
+    return {"ok": True, "settings": db.get_settings()}
+
+
+@app.post("/api/settings")
+async def settings_set(body: dict):
+    patch = body.get("settings") or body
+    cur = db.set_settings(patch)
+    from . import log as audit
+    audit.log("settings", change=json.dumps(patch, ensure_ascii=False), by="nurse")
+    return {"ok": True, "settings": cur}
+
+
+# ---------------------------------------------------------------- 广播（提醒/告警 SSE）
+@app.get("/api/events")
+async def events_stream():
+    return StreamingResponse(
+        bus.stream_events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------- 工具
+@app.get("/api/tools")
+async def tools_list():
+    """返回当前可用工具清单（前端展示用）。"""
+    return {"ok": True, "tools": tool_mod.TOOLS}

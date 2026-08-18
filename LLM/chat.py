@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+r"""
+对话编排引擎（模块 1）：
+  - 角色设定：温柔护工 System Prompt + 安全红线 + 老人风格注入 + RAG 记忆注入 + 历史摘要
+  - 思考路由层：关键词预分类，棘手/敏感/健康类问题自动 thinking on，日常秒回
+  - 上下文管理：滚动窗口 + 历史摘要
+  - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成，最多 2 轮
+"""
+import json
+import time
+
+from . import db
+from . import log as audit
+from . import memory as rag
+from . import tools as tool_mod
+from .conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
+                   ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
+                   LLM_TIMEOUT)
+
+PERSONA = (
+    "你是'小护'，一位温柔、耐心、专业的 AI 陪护机器人，正在照顾一位老人。"
+    "说话要像护工又像家人：语气亲切温和、句子简短口语化、多用'您'、适当关心起居饮食。"
+    "不要自称'AI'，自称'我'即可。不要输出与老人无关的长篇大论。"
+)
+
+SAFETY = (
+    "【安全红线，必须遵守】\n"
+    "1. 医疗信息只读：用药、剂量、诊断只能引用档案里的内容，绝不自行建议改药、停药、加药；"
+    "老人问'这药能减半吗'之类 → 回答'这个我不懂，我帮您问护士'。\n"
+    "2. 敏感话题：若老人提到想死、不想活、胸口剧痛、摔倒、很不舒服等危险信号 → 立即停止闲聊，"
+    "先安抚（'您别急，我陪着您'），并明确说出'我这就去通知护士'。\n"
+    "3. 不确定的事不要编造；不知道就直说，然后提出帮老人查/问护士。\n"
+    "4. 健康类信息要注明'仅供参考，具体问医生'。"
+)
+
+ROUTER_HIT = (
+    "【思考说明】这个问题涉及健康/药物/敏感或需要慎重的话题，请先仔细思考再回答，"
+    "语气要格外谨慎，不确定就建议问护士。"
+)
+
+
+def llm_json(client, model: str, prompt: str, timeout: int = LLM_TIMEOUT) -> dict | list:
+    """非流式 JSON 输出（用于记忆提取/历史摘要）。失败返回 {}。"""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            extra_body={"thinking": {"type": "disabled"}},
+            response_format={"type": "json_object"},
+            timeout=timeout,
+        )
+        text = resp.choices[0].message.content or ""
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("json").strip()
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+def route_thinking(text: str, settings: dict, llm_client=None, model: str = MODEL) -> dict:
+    """
+    思考路由层（v2）：
+      1. 主题/敏感/健康关键词 → thinking on
+      2. 情绪/负面词（语气强烈）→ thinking on
+      3. 规则未命中且消息够长 → LLM 快速预判兜底（不覆盖日常短问候，省延迟）
+    返回 {"on": bool, "reason": str, "method": "keyword|emotion|llm|manual|off"}
+    """
+    if not settings.get("thinking_router_enabled", True):
+        return {"on": False, "reason": "路由关闭", "method": "off"}
+    for kw in THINKING_KEYWORDS:
+        if kw in text:
+            return {"on": True, "reason": f"主题「{kw}」", "method": "keyword"}
+    for w in THINKING_EMOTION_WORDS:
+        if w in text:
+            return {"on": True, "reason": f"情绪「{w}」", "method": "emotion"}
+    if (settings.get("router_llm_enabled", True) and len(text) >= ROUTER_LLM_MIN_LEN
+            and llm_client is not None):
+        try:
+            judge = llm_json(llm_client, model, (
+                "判断下面这句话是否需要模型'深思考'后再回答。需要深思考的情况：涉及健康/药物/安全/敏感话题、"
+                "复杂推理或重要决策、强烈情绪、需要慎重措辞的场合。日常闲聊、简单问候、天气时间等不需要。\n"
+                '只输出 JSON：{"deep": true 或 false, "reason": "≤10字原因"}\n话：' + text))
+            if isinstance(judge, dict) and judge.get("deep"):
+                return {"on": True, "reason": f"LLM预判：{judge.get('reason', '')}", "method": "llm"}
+        except Exception:
+            pass
+    return {"on": False, "reason": "日常闲聊", "method": "off"}
+
+
+def build_system(uid: str, settings: dict) -> str:
+    """组装 System Prompt：角色 + 安全红线 + 风格 + 画像 + 记忆 + 摘要。"""
+    profile = db.get_profile(uid)
+    recall = rag.recall(uid, "")
+    style = ""
+    if profile and profile.get("style"):
+        style = f"\n【该老人的说话风格画像】{profile['style']}（用老人熟悉的方式说话，但保持自己是陪护机器人）"
+    portrait = db.get_portrait(uid)
+    portrait_part = f"\n【老人画像（对话整理所得，供参考）】{portrait}" if portrait else ""
+    parts = [
+        PERSONA,
+        SAFETY,
+        style,
+        portrait_part,
+        f"\n【我了解到的关于这位老人的信息（可能不全，仅供参考）】\n{recall['context']}",
+    ]
+    summary = db.get_summary(uid)
+    if summary:
+        parts.append(f"\n【更早对话的历史摘要】\n{summary}")
+    parts.append(
+        "\n【当前时间】" + time.strftime("%Y-%m-%d %H:%M (%A)") +
+        "\n如果老人问'现在几点/今天星期几'，按上面的时间回答。"
+    )
+    return "\n".join(parts)
+
+
+def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict) -> list[dict]:
+    """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。"""
+    system = build_system(uid, settings)
+    if thinking_on:
+        system += "\n" + ROUTER_HIT
+    history = db.load_history(uid, limit=HISTORY_WINDOW)
+    return [{"role": "system", "content": system}, *history,
+            {"role": "user", "content": user_text}]
+
+
+def summarize_old(uid: str, client, model: str):
+    """历史超过阈值时，对最早的对话生成摘要（后台任务，不占请求链路）。"""
+    count = db.history_count(uid)
+    if count <= SUMMARY_THRESHOLD:
+        return
+    old = db.oldest_history(uid, count - HISTORY_WINDOW)
+    if not old:
+        return
+    text = "\n".join(f"{m['role']}: {m['content']}" for m in old)
+    prompt = (
+        "把下面这段陪护机器人对话压缩成 200 字以内的中文摘要，"
+        "保留：老人说过的重要事实、喜好、事件、情绪状态。只输出 JSON：{\"summary\": \"...\"}\n\n" + text
+    )
+    data = llm_json(client, model, prompt)
+    summary = data.get("summary", "") if isinstance(data, dict) else ""
+    if summary:
+        prev = db.get_summary(uid)
+        db.set_summary(uid, (prev + "\n" + summary).strip())
+        db.trim_history(uid, keep=HISTORY_WINDOW)
+        audit.log("chat", action="summarize", uid=uid, summary=summary)
+
+
+def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict):
+    """
+    核心生成器：逐条 yield SSE 事件 dict。
+      {"type":"reasoning"|"content"|"tool_start"|"tool_result"|"done"|"error", ...}
+    工具循环最多 2 轮，防止模型无限调工具。
+    """
+    # 思考路由（规则 + 情绪词 + LLM 预判兜底）
+    routed = route_thinking(user_text, settings, llm_client=client, model=model)
+    thinking_on, reason, method = routed["on"], routed["reason"], routed["method"]
+    if thinking == "on":
+        thinking_on, reason, method = True, "用户手动开启", "manual"
+    elif thinking == "off":
+        thinking_on, reason, method = False, "用户手动关闭", "manual"
+
+    yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method, "uid": uid}}
+
+    messages = build_messages(uid, user_text, thinking_on, settings)
+    tools = tool_mod.TOOLS if settings.get("web_search_enabled", True) else []
+
+    full_assistant = ""
+    try:
+        for round_i in range(2):
+            extra = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"} if thinking_on \
+                else {"thinking": {"type": "disabled"}}
+            try:
+                stream = client.chat.completions.create(
+                    model=model, messages=messages, stream=True,
+                    tools=tools or None, tool_choice="auto" if tools else None,
+                    extra_body=extra,
+                )
+            except Exception as e:
+                # thinking+工具冲突等：降级重试一次（去掉 thinking 或去掉工具）
+                if thinking_on:
+                    thinking_on = False
+                    yield {"type": "meta", "router": {"on": False, "reason": f"重试降级：{e}", "uid": uid}}
+                    extra = {"thinking": {"type": "disabled"}}
+                    stream = client.chat.completions.create(
+                        model=model, messages=messages, stream=True,
+                        tools=tools or None, tool_choice="auto" if tools else None,
+                        extra_body=extra,
+                    )
+                else:
+                    raise
+
+            tool_calls = {}
+            finish = None
+            for chunk in stream:
+                choice = chunk.choices[0]
+                delta = choice.delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield {"type": "reasoning", "content": reasoning}
+                if delta.content:
+                    full_assistant += delta.content
+                    yield {"type": "content", "content": delta.content}
+                for tc in (delta.tool_calls or []):
+                    slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                    if tc.id:
+                        slot["id"] += tc.id
+                    if tc.function and tc.function.name:
+                        slot["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["args"] += tc.function.arguments
+                if choice.finish_reason:
+                    finish = choice.finish_reason
+                    break
+
+            if finish == "tool_calls" and tool_calls:
+                # 把工具调用补进上下文，再执行
+                assistant_msg = {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": slot["id"] or f"call_{round_i}_{i}", "type": "function",
+                     "function": {"name": slot["name"], "arguments": slot["args"] or "{}"}}
+                    for i, slot in sorted(tool_calls.items())
+                ]}
+                messages.append(assistant_msg)
+                for i, slot in sorted(tool_calls.items()):
+                    try:
+                        args = json.loads(slot["args"] or "{}")
+                    except Exception:
+                        args = {}
+                    name = slot["name"]
+                    yield {"type": "tool_start", "tool": name, "args": args}
+                    t0 = time.time()
+                    result = tool_mod.run_tool(name, args)
+                    latency = int((time.time() - t0) * 1000)
+                    snippet = result.get("result", result.get("message", ""))[:500]
+                    db.log_tool(uid, name, args, snippet,
+                                status="ok" if result.get("ok") else "error", latency_ms=latency)
+                    audit.log("tool", uid=uid, tool=name, args=args,
+                              ok=result.get("ok"), latency_ms=latency)
+                    yield {"type": "tool_result", "tool": name, "ok": result.get("ok"),
+                           "snippet": snippet}
+                    messages.append({"role": "tool", "tool_call_id": slot["id"] or f"call_{round_i}_{i}",
+                                     "content": json.dumps(result, ensure_ascii=False)})
+                continue  # 下一轮：把工具结果交给模型
+
+            break  # 正常结束
+    except Exception as e:
+        audit.log("chat", action="error", uid=uid, error=str(e))
+        yield {"type": "error", "content": f"对话服务出错：{e}"}
+        return
+
+    # 落库：对话历史 + 审计
+    db.append_history(uid, "user", user_text)
+    if full_assistant.strip():
+        db.append_history(uid, "assistant", full_assistant)
+    audit.log("chat", action="turn", uid=uid, user=user_text[:200], assistant=full_assistant[:200])
+    yield {"type": "done", "assistant": full_assistant}
