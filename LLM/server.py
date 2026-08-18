@@ -183,6 +183,21 @@ async def chat_route(req: ChatRequest):
     )
 
 
+@app.get("/api/chat/history")
+async def chat_history(uid: str = Query("elder_001"), limit: int = Query(200)):
+    """回读某位老人的历史对话（前端刷新后恢复显示）。"""
+    return {"ok": True, "history": db.load_history_full(uid=uid, limit=limit)}
+
+
+@app.delete("/api/chat/history")
+async def chat_history_clear(uid: str = Query("elder_001")):
+    """清空某位老人的对话历史。"""
+    n = db.clear_history(uid)
+    from . import log as audit
+    audit.log("chat", action="clear_history", uid=uid, count=n, by="nurse")
+    return {"ok": True, "cleared": n}
+
+
 # ---------------------------------------------------------------- 老人档案
 @app.get("/api/profiles")
 async def profiles_list():

@@ -355,6 +355,29 @@ def load_history(uid, limit=HISTORY_WINDOW) -> list[dict]:
         conn.close()
 
 
+def load_history_full(uid, limit=200) -> list[dict]:
+    """带时间戳的完整历史（前端回读渲染用）。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT role, content, ts FROM chat_history WHERE uid=? ORDER BY id ASC LIMIT ?",
+            (uid, limit)).fetchall()
+        return [{"role": r["role"], "content": r["content"], "ts": r["ts"]} for r in rows]
+    finally:
+        conn.close()
+
+
+def clear_history(uid) -> int:
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("DELETE FROM chat_history WHERE uid=?", (uid,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
 def history_count(uid) -> int:
     conn = _conn()
     try:
