@@ -34,7 +34,7 @@ flowchart TB
     end
 
     subgraph Edge["🖥️ 边缘侧 (Edge)"]
-        MainCtrl[机器人主控<br/>Jetson Orin Nano / 树莓派]
+        MainCtrl[机器人主控<br/>地瓜派 RDK X5]
         Algo[运行核心算法<br/>视觉·语音·传感器融合]
     end
 
@@ -66,7 +66,7 @@ flowchart TB
 | 维度 | 推荐技术/工具 | 作用与说明 |
 |------|--------------|-----------|
 | 硬件与底盘 | ROS/ROS2 机器人底盘、激光雷达（LiDAR） | 负责机器人的移动、建图与导航基础 |
-| 计算平台 | NVIDIA Jetson Orin Nano / 高性能笔记本 | 作为机器人的"本地大脑"，运行视觉与传感器算法 |
+| 计算平台 | 地瓜派 RDK X5 / 高性能笔记本 | 作为机器人的"本地大脑"，运行视觉与传感器算法 |
 | 软件开发 | Python（主流）、C++（底盘控制） | 核心开发语言。Vibe coding |
 | AI 交互 | DeepSeek / Qwen API + 提示词工程（Prompt） | 驱动情感对话，利用 RAG 赋予机器人长记忆 |
 | 语音语义 | 百度语音 / 科大讯飞 ASR & TTS SDK | 实现"听得准（语音识别）"与"说得好（语音合成）" |

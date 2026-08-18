@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<!--
+  AI 对话前端（单文件，方案 A）
+  ===========================
+  功能：
+    1. 多轮对话记忆 —— 前端维护 messages 数组，每次请求带上全部历史
+    2. 流式打字机输出 —— fetch 读取后端返回的 SSE 流，逐段显示
+    3. thinking 开关 —— 开启后显示可折叠的"思考过程"，与回答分开
+    4. Markdown 渲染 —— 用 marked.js 渲染回答（代码/列表/表格）
+    5. 代码高亮 —— 用 highlight.js
+    6. 清空对话按钮
+
+  依赖（CDN，需联网加载）：
+    - marked.js      Markdown 解析
+    - highlight.js   代码高亮
+
+  使用前提：后端 server.py 已启动（uvicorn, 端口 8000）
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 对话</title>
+
+  <!-- 代码高亮主题样式（深色） -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
+
+  <style>
+    /* ============ 基础布局：上消息区 / 下输入区 ============ */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #1e1e2e;           /* 深色背景 */
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;        /* 上下排列：头部 + 消息区 + 输入区 */
+    }
+
+    /* ============ 顶部栏 ============ */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 20px;
+      background: #2a2a3c;
+      border-bottom: 1px solid #3a3a4c;
+    }
+    header h1 { font-size: 18px; font-weight: 600; }
+    .clear-btn {
+      background: #e5484d;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 14px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .clear-btn:hover { background: #c93c41; }
+
+    /* ============ 消息区（可滚动） ============ */
+    #messages {
+      flex: 1;                       /* 占满剩余高度 */
+      overflow-y: auto;              /* 超出滚动 */
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    /* 用户消息：靠右、蓝底 */
+    .msg.user { align-self: flex-end; max-width: 75%; }
+    .msg.user .bubble {
+      background: #3b82f6;
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 14px 14px 4px 14px;
+      white-space: pre-wrap;         /* 保留用户换行 */
+      word-break: break-word;
+    }
+
+    /* AI 消息：靠左、整块 */
+    .msg.assistant { align-self: flex-start; max-width: 85%; width: 100%; }
+
+    /* 思考过程块：可折叠（<details> 自带折叠功能） */
+    .reasoning {
+      background: #232335;
+      border: 1px solid #3a3a4c;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 8px;
+    }
+    .reasoning summary {
+      cursor: pointer;
+      color: #f0a35e;                /* 橙色，和回答区分 */
+      font-size: 13px;
+      user-select: none;
+    }
+    .reasoning-text {
+      margin-top: 6px;
+      font-size: 13px;
+      color: #9a9ab0;
+      white-space: pre-wrap;
+    }
+
+    /* AI 正式回答 */
+    .answer {
+      background: #2a2a3c;
+      border-radius: 14px 14px 14px 4px;
+      padding: 10px 14px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+    /* Markdown 渲染后的元素间距 */
+    .answer pre {
+      background: #111122;
+      border-radius: 8px;
+      padding: 10px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .answer code { background: #111122; padding: 2px 5px; border-radius: 4px; }
+    .answer pre code { background: none; padding: 0; }
+    .answer ul, .answer ol { padding-left: 20px; margin: 6px 0; }
+    .answer table { border-collapse: collapse; margin: 8px 0; }
+    .answer th, .answer td { border: 1px solid #4a4a5c; padding: 6px 10px; }
+    .answer a { color: #7dd3fc; }
+
+    /* ============ 底部输入区 ============ */
+    footer {
+      padding: 12px 20px;
+      background: #2a2a3c;
+      border-top: 1px solid #3a3a4c;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    /* thinking 开关那一行 */
+    .option-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #aaaac0;
+    }
+    .option-row input[type="checkbox"] { accent-color: #3b82f6; }
+
+    .input-row { display: flex; gap: 10px; }
+    #input {
+      flex: 1;
+      resize: none;                  /* 禁止手动拉伸 */
+      background: #1e1e2e;
+      color: #e0e0e0;
+      border: 1px solid #3a3a4c;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+    }
+    #input:focus { border-color: #3b82f6; }
+    #send-btn {
+      background: #3b82f6;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 0 22px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #send-btn:hover { background: #2f6fe0; }
+    #send-btn:disabled { background: #555; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+  <!-- ============ 顶部：标题 + 清空 ============ -->
+  <header>
+    <h1>🤖 AI 对话（DeepSeek 流式）</h1>
+    <button class="clear-btn" onclick="clearChat()">🧹 清空对话</button>
+  </header>
+
+  <!-- ============ 消息区 ============ -->
+  <div id="messages"></div>
+
+  <!-- ============ 底部：开关 + 输入框 + 发送 ============ -->
+  <footer>
+    <div class="option-row">
+      <input type="checkbox" id="thinking-toggle">
+      <label for="thinking-toggle">🧠 思考模式（显示模型内心戏）</label>
+    </div>
+    <div class="input-row">
+      <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+      <button id="send-btn" onclick="send()">发送</button>
+    </div>
+  </footer>
+
+  <!-- ============ 第三方库（CDN） ============ -->
+  <!-- marked：把 Markdown 文本转成 HTML -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- highlight.js：给代码块上色 -->
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+
+  <script>
+    // ================================================================
+    // 全局配置
+    // ================================================================
+    const API_URL = "http://127.0.0.1:8000/api/chat";  // 后端地址
+    const MODEL = "deepseek-v4-flash";                  // 模型名（发给后端用）
+
+    // messages 数组 = 多轮对话记忆的核心！
+    // 每次请求都会把整个数组发给后端，DeepSeek 就能"记得"之前的对话。
+    // 注意：只存正式回答，不存思考过程（思考过程只是展示用，不进历史）
+    let messages = [];
+
+    // ================================================================
+    // 渲染：往页面上加一条消息气泡
+    // ================================================================
+    function appendUserMessage(text) {
+      // 用户消息：一个蓝色气泡
+      const wrap = document.createElement("div");
+      wrap.className = "msg user";
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;     // 用 textContent，防止用户输入被当成 HTML
+      wrap.appendChild(bubble);
+
+      document.getElementById("messages").appendChild(wrap);
+      scrollToBottom();
+    }
+
+    function appendAssistantMessage() {
+      // AI 消息：一个可折叠的思考块 + 一个回答块
+      const wrap = document.createElement("div");
+      wrap.className = "msg assistant";
+
+      // —— 思考过程块（用 <details>，自带"点击折叠"功能）——
+      const details = document.createElement("details");
+      details.className = "reasoning";
+      details.open = true;                       // 默认展开，方便实时看
+      const summary = document.createElement("summary");
+      summary.textContent = "🧠 思考过程";
+      const reasoningText = document.createElement("div");
+      reasoningText.className = "reasoning-text";
+      details.appendChild(summary);
+      details.appendChild(reasoningText);
+
+      // —— 正式回答块 ——
+      const answer = document.createElement("div");
+      answer.className = "answer";
+
+      wrap.appendChild(details);
+      wrap.appendChild(answer);
+
+      document.getElementById("messages").appendChild(wrap);
+      scrollToBottom();
+      return { reasoningText, answer };
+    }
+
+    // 让消息区自动滚到底部（实时看到最新内容）
+    function scrollToBottom() {
+      const box = document.getElementById("messages");
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // ================================================================
+    // 清空对话
+    // ================================================================
+    function clearChat() {
+      messages = [];                              // 清空记忆
+      document.getElementById("messages").innerHTML = "";  // 清空页面
+    }
+
+    // ================================================================
+    // 发送消息（核心流程）
+    // ================================================================
+    async function send() {
+      const input = document.getElementById("input");
+      const text = input.value.trim();
+      if (!text) return;                          // 空消息不发送
+
+      input.value = "";                           // 清空输入框
+      appendUserMessage(text);                    // 把用户消息画上页面
+
+      // 多轮记忆：把这次用户输入也加进历史数组
+      messages.push({ role: "user", content: text });
+
+      // 创建 AI 气泡，拿到思考块和回答块的 DOM 引用，准备往里填字
+      const { reasoningText, answer } = appendAssistantMessage();
+
+      // 发送中禁用按钮，防止重复点击
+      const btn = document.getElementById("send-btn");
+      btn.disabled = true;
+
+      try {
+        // —— 请求后端（POST），拿到"流式响应"对象 ——
+        // 注意：fetch 默认会等响应头回来就返回，不会等全部内容。
+        // 真正的数据通过 response.body 这个"流"一点点到达。
+        const response = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: MODEL,
+            messages: messages,                  // 整个历史（多轮记忆的关键）
+            thinking: document.getElementById("thinking-toggle").checked,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+
+        // —— 读流：把 SSE 文本一段段读出来 ——
+        const reader = response.body.getReader();       // 流读取器
+        const decoder = new TextDecoder("utf-8");       // 字节 → 字符串
+        let buffer = "";                                // 缓冲：处理半截数据
+
+        let fullAnswer = "";          // 完整回答（最后加进 messages）
+        let fullReasoning = "";       // 完整思考（只展示，不进历史）
+
+        while (true) {
+          // read() 返回 { done, value }：done=true 表示流结束了
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          // 把新到的字节解码成文本，追加到缓冲
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE 用"空行 \n\n"分隔每条事件。
+          // 但网络是一截一截来的，可能一次只来半个事件，
+          // 所以按 \n\n 切分，最后一段"半截"先留回缓冲等下次。
+          const events = buffer.split("\n\n");
+          buffer = events.pop();                       // 最后一段不完整，留待下轮
+
+          // 逐条解析完整事件（每条形如 "data: {...}"）
+          for (const event of events) {
+            const lines = event.split("\n");
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;   // 只处理 data: 开头的行
+              const data = JSON.parse(line.slice(6));       // 去掉 "data: " 前缀再转 JSON
+
+              switch (data.type) {
+                case "reasoning":
+                  // 思考过程增量：累计后整段显示（textContent 安全，不会当成 HTML）
+                  fullReasoning += data.content || "";
+                  reasoningText.textContent = fullReasoning;
+                  break;
+
+                case "content":
+                  // 正式回答增量：累计后整段显示 → 打字机效果
+                  fullAnswer += data.content || "";
+                  answer.textContent = fullAnswer;
+                  break;
+
+                case "done":
+                  // 流结束：把完整纯文本一次性渲染成 Markdown + 代码高亮
+                  renderMarkdown(answer);
+                  break;
+
+                case "error":
+                  // 后端报错：显示红字提示
+                  answer.innerHTML = `<span style="color:#f87171">⚠️ ${data.content || "未知错误"}</span>`;
+                  break;
+              }
+              scrollToBottom();                            // 每次更新都滚到底部
+            }
+          }
+        }
+
+        // 流结束后，把 AI 的完整回答存进历史 → 下一轮它就能"记得"这次回答
+        // （思考过程只是展示用，不进历史，避免把"内心戏"也发给模型）
+        if (fullAnswer) {
+          messages.push({ role: "assistant", content: fullAnswer });
+        }
+      } catch (err) {
+        answer.innerHTML = `<span style="color:#f87171">请求失败：${err.message}。请确认后端已启动。</span>`;
+      } finally {
+        btn.disabled = false;                          // 恢复按钮
+        input.focus();
+      }
+    }
+
+    // ================================================================
+    // Markdown 渲染 + 代码高亮
+    // ================================================================
+    function renderMarkdown(el) {
+      // marked.parse：把 Markdown 文本转成 HTML
+      const raw = el.textContent;                       // 取当前纯文本
+      el.innerHTML = marked.parse(raw);                 // 渲染成 HTML
+
+      // 给所有 <code> 代码块做高亮
+      el.querySelectorAll("pre code").forEach((block) => {
+        hljs.highlightElement(block);
+      });
+    }
+
+    // ================================================================
+    // 键盘：Enter 发送，Shift+Enter 换行
+    // ================================================================
+    document.getElementById("input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();          // 阻止默认的换行
+        send();
+      }
+    });
+  </script>
+</body>
+</html>

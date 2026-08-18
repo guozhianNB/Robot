@@ -68,7 +68,7 @@
 <body>
 <div class="container">
   <h1>🔋 智能养老陪护巡逻机器人 · 系统硬件结构图</h1>
-  <p class="subtitle">自造 ROS 底盘 + Jetson Orin Nano Super 本地化部署 | 2026-07-23</p>
+  <p class="subtitle">自造 ROS 底盘 + 地瓜派 RDK X5 本地化部署 | 2026-08-18</p>
 
   <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg" style="background:#fafafa;border-radius:10px;">
     <defs>
@@ -114,7 +114,7 @@
 
     <!-- 右上：Jetson 传感器 -->
     <rect x="580" y="50" width="600" height="260" rx="12" fill="url(#bg-sensor)" stroke="#b7eb8f" stroke-width="1.5" stroke-dasharray="6,3"/>
-    <text x="880" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#389e0d">📡 Jetson Orin Nano Super 连接的传感器</text>
+    <text x="880" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#389e0d">📡 地瓜派 RDK X5 连接的传感器</text>
 
     <!-- 右中：STM32 连接设备 -->
     <rect x="580" y="325" width="600" height="270" rx="12" fill="url(#bg-ctrl)" stroke="#adc6ff" stroke-width="1.5" stroke-dasharray="6,3"/>
@@ -137,7 +137,7 @@
     <!-- 12V→12V 稳压 -->
     <rect x="55" y="230" width="140" height="46" rx="8" fill="#fff7e6" stroke="#faad14" stroke-width="1.5" filter="url(#shadow)"/>
     <text x="125" y="250" text-anchor="middle" font-size="13" font-weight="600" fill="#d48806">12V→12V 稳压</text>
-    <text x="125" y="267" text-anchor="middle" font-size="10" fill="#999">给 Jetson 供电 · 21 元</text>
+    <text x="125" y="267" text-anchor="middle" font-size="10" fill="#999">给 RDK X5 供电 · 21 元</text>
 
     <!-- 12V→5V 稳压 -->
     <rect x="55" y="330" width="140" height="46" rx="8" fill="#fff7e6" stroke="#faad14" stroke-width="1.5" filter="url(#shadow)"/>
@@ -154,16 +154,16 @@
     <text x="128" y="555" text-anchor="middle" font-size="12" font-weight="600" fill="#cf1322">⚡ 电源架构</text>
     <text x="128" y="575" text-anchor="middle" font-size="11" fill="#666">电池 → 直连驱动板</text>
     <text x="128" y="592" text-anchor="middle" font-size="11" fill="#666">(驱动板自带稳压)</text>
-    <text x="128" y="610" text-anchor="middle" font-size="11" fill="#666">电池 → 12-12V → Jetson</text>
+    <text x="128" y="610" text-anchor="middle" font-size="11" fill="#666">电池 → 12-12V → RDK X5</text>
     <text x="128" y="625" text-anchor="middle" font-size="11" fill="#666">电池 → 12-5V → STM32</text>
 
     <!-- === 中列：控制链路节点 === -->
 
-    <!-- Jetson -->
+    <!-- RDK X5 -->
     <rect x="305" y="120" width="200" height="70" rx="12" fill="#e6f7ff" stroke="#1890ff" stroke-width="2.5" filter="url(#shadow-lg)"/>
     <text x="405" y="148" text-anchor="middle" font-size="20">🧠</text>
-    <text x="405" y="168" text-anchor="middle" font-size="14" font-weight="700" fill="#0050b3">Jetson Orin Nano Super</text>
-    <text x="405" y="183" text-anchor="middle" font-size="10" fill="#666">8GB | 本地大脑 · 3,869 元</text>
+    <text x="405" y="168" text-anchor="middle" font-size="14" font-weight="700" fill="#0050b3">地瓜派 RDK X5</text>
+    <text x="405" y="183" text-anchor="middle" font-size="10" fill="#666">本地大脑 · 价格待确认</text>
 
     <!-- STM32 -->
     <rect x="305" y="260" width="200" height="70" rx="12" fill="#f0f5ff" stroke="#2f54eb" stroke-width="2.5" filter="url(#shadow-lg)"/>
@@ -177,7 +177,7 @@
     <text x="405" y="448" text-anchor="middle" font-size="14" font-weight="700" fill="#c41d7f">TB6612 FNG 电机驱动</text>
     <text x="405" y="463" text-anchor="middle" font-size="10" fill="#666">双路驱动 · 自带稳压 · 69 元</text>
 
-    <!-- === 右上：Jetson 传感器 === -->
+    <!-- === 右上：RDK X5 传感器 === -->
 
     <!-- IMX219 -->
     <rect x="610" y="105" width="160" height="55" rx="8" fill="#e6fffb" stroke="#13c2c2" stroke-width="1.8" filter="url(#shadow)"/>
