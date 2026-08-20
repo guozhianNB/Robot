@@ -37,4 +37,9 @@ void mc_pid_tune(float kp, float ki, float kd);
  * 读编码器 → 换算 RPM → PID → 输出 PWM 的完整闭环 */
 void mc_update_all(void);
 
+/* 整车速度控制（麦克纳姆 X 型）：vx 前进 / vy 左移（单位 mm/s），
+ * w 旋转（单位 0.1°/s，正值左转）。内部逆运动学解算为四轮 RPM，
+ * 再交给 mc_set_target 进入各自闭环。三通道全 0 = 整车制动 */
+void mc_car_set(int vx, int vy, int w);
+
 #endif /* __MOTOR_CONTROL_H__ */

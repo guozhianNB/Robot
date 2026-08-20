@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/motor_driver.c
     Core/Src/motor_control.c
+    Core/Src/usb_proto.c
 )
 
 # Add include paths

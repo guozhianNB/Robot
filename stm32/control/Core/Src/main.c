@@ -19,7 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "tim.h"
-#include "usb.h"
+#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -27,6 +27,7 @@
 
 #include "motor_driver.h"
 #include "motor_control.h"
+#include "usb_proto.h"
 
 /* USER CODE END Includes */
 
@@ -97,43 +98,27 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM5_Init();
   MX_TIM8_Init();
-  MX_USB_PCD_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   md_init();               /* 启动 PWM + 编码器，清零方向引脚 */
   md_enc_sign_autocal();   /* 编码器方向自动标定（四轮依次短转，约 2.8s） */
   mc_init();               /* 清零 PID 闭环状态 */
+  up_init();               /* 清零 USB 车控协议状态 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  /* ===== 电机闭环控制测试 =====
-   * 每 10ms 调一次 mc_update_all() 做四电机闭环；
+  /* ===== USB 车控主循环 =====
    * 上电先自动标定编码器方向（四轮依次短转约 2.8s），
-   * 然后 1 号轮进入：正转 3s → 停 3s → 反转 3s → 循环。
-   * 需要改速度/电机：改 mc_set_target 的参数（way=1~4）。 */
-  uint32_t test_tick = HAL_GetTick();
-  int test_phase = 0;                          /* 0=正转 1=停止 2=反转 */
-  mc_set_target(1, 200);                       /* 初始：1 号电机正转 200 RPM */
-
+   * 之后每 10ms：up_poll()（解析 USB 命令 + 心跳状态上报）
+   *           + mc_update_all()（四电机闭环）。
+   * 底盘运动由地瓜派通过 USB 下发，见 docs/2.pre/USB车控接口.md。 */
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 每 3s 切换到下一测试阶段 */
-    if (HAL_GetTick() - test_tick >= 3000U)
-    {
-      test_tick = HAL_GetTick();
-      test_phase = (test_phase + 1) % 3;
-      switch (test_phase)
-      {
-        case 0: mc_set_target(1,  200); break; /* 正转 200 RPM */
-        case 1: mc_set_target(1,  0);   break; /* 停止（制动）   */
-        case 2: mc_set_target(1, -200); break; /* 反转 200 RPM   */
-        default: break;
-      }
-    }
-
+    up_poll();                                 /* USB 协议：命令分发 + 心跳 */
     mc_update_all();                           /* 10ms 周期闭环  */
     HAL_Delay(10);                             /* 10ms 周期      */
   }

@@ -191,3 +191,37 @@ void mc_update_all(void)
         md_set_motor(way, (int)output);
     }
 }
+
+/* ====================================================================
+ * 整车速度控制（麦克纳姆 X 型）
+ * vx：前进速度 (mm/s)   vy：左移速度 (mm/s)   w：旋转 (0.1°/s)
+ * 三通道全 0 = 整车制动。内部逆运动学 → 四轮 RPM → mc_set_target。
+ * ==================================================================== */
+#define MC_WHEEL_DIAMETER_MM   80.0f  /* 麦克纳姆轮直径，按实际轮子修改 */
+#define MC_ROTATE_RADIUS_MM   150.0f  /* 旋转半径（半对角线），按车架标定 */
+#define MC_PI                  3.14159265f
+
+void mc_car_set(int vx, int vy, int w)
+{
+    /* 旋转角速度 (0.1°/s → rad/s) → 切向线速度 (mm/s) */
+    float w_rad = (float)w * 0.1f * MC_PI / 180.0f;
+    float rot   = w_rad * MC_ROTATE_RADIUS_MM;
+
+    float f = (float)vx;
+    float l = (float)vy;
+
+    /* 麦克纳姆 X 型逆运动学（线速度叠加，mm/s）：
+     *   LF = f + l + rot    RF = f - l - rot
+     *   LR = f - l + rot    RR = f + l - rot   */
+    float w1 = f + l + rot;
+    float w2 = f - l - rot;
+    float w3 = f - l + rot;
+    float w4 = f + l - rot;
+
+    /* mm/s → RPM：RPM = v · 60 / (π · D) */
+    float k = 60.0f / (MC_WHEEL_DIAMETER_MM * MC_PI);
+    mc_set_target(1, (int)(w1 * k));   /* 左前 */
+    mc_set_target(2, (int)(w2 * k));   /* 右前 */
+    mc_set_target(3, (int)(w3 * k));   /* 左后 */
+    mc_set_target(4, (int)(w4 * k));   /* 右后 */
+}
