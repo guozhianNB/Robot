@@ -141,3 +141,18 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 麦轮底盘暂按差速模式导航（nav2 `max_vel_y: 0.0`），横移导航后置。
 - `nav2_params.yaml` 中 `map_server.yaml_filename`、`bt_navigator` 的 bt_xml 路径按 humble 默认写，装完需与板卡实际版本核对。
 - EKF（robot_localization）参数已备好但默认关闭，需底盘 + rf2o 双里程计才生效。
+
+### 2026-08-20 追加：launch 条件写法 bug 修复 + git 产物清理
+
+- **Bug**：`bringup.launch.py` / `odom.launch.py` 用 `PythonExpression(['odom_source == "chassis"'])` 写条件，启动报
+  `NameError: name 'odom_source' is not defined`。根因：Humble `launch.substitutions.PythonExpression` 的
+  `perform()` 是 `eval(perform_substitutions(expr), {}, math.__dict__)`，**locals 为空、globals 只有 math，
+  不解析裸标识符**为 launch 参数。
+- **修复**：改为把 `LaunchConfiguration` 对象嵌进表达式并加引号：
+  `PythonExpression(["'", odom_source, "' == 'chassis'"])`（替换后为 `'chassis' == 'chassis'` 再 eval）。
+  共 4 处：odom.launch.py 2 处（chassis/rf2o）、bringup.launch.py 2 处（mapping/navigation）。
+  本地模拟 eval 验证通过；旧写法可精确复现原报错。
+- **git 清理**：误把板卡 `colcon build` 产物（`ros2_car/build/ install/ log/`，197 个文件）提交进仓库；
+  已 `git rm -r --cached` 移出跟踪（磁盘保留），根 `.gitignore` 追加 `ros2_car/build|install|log/`、
+  `__pycache__/`、`maps/*.pgm|*.yaml` 忽略规则。**后续板卡同步后必须重新 `colcon build`**
+  （install/share 里还是旧 launch），建议用 `--symlink-install` 便于调试期改 launch 即改即用。

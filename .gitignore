@@ -12,3 +12,16 @@ LLM/data/*.db
 LLM/data/*.db-wal
 LLM/data/*.db-shm
 LLM/data/audit.jsonl
+
+# ROS2 工作区构建产物（不入库，板卡上保留即可）
+ros2_car/build/
+ros2_car/install/
+ros2_car/log/
+
+# Python
+ros2_car/**/__pycache__/
+ros2_car/**/*.py[cod]
+
+# SLAM 地图产物（运行时生成，用 map_saver_cli 保存，不入库）
+ros2_car/src/robot_bringup/maps/*.pgm
+ros2_car/src/robot_bringup/maps/*.yaml

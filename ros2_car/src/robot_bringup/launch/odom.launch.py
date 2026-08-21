@@ -41,7 +41,8 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[os.path.join(chassis_share, 'config', 'chassis_params.yaml')],
-        condition=IfCondition(PythonExpression(['odom_source == "chassis"'])),
+        condition=IfCondition(
+            PythonExpression(["'", odom_source, "' == 'chassis'"])),
     )
 
     rf2o_node = Node(
@@ -58,7 +59,8 @@ def generate_launch_description():
             'init_pose_from_topic': '',
             'freq': 10.0,
         }],
-        condition=IfCondition(PythonExpression(['odom_source == "rf2o"'])),
+        condition=IfCondition(
+            PythonExpression(["'", odom_source, "' == 'rf2o'"])),
     )
 
     return LaunchDescription([
