@@ -78,7 +78,8 @@ def generate_launch_description():
             'rviz': rviz,
             'use_sim_time': use_sim_time,
         }.items(),
-        condition=IfCondition(PythonExpression(['mode == "mapping"'])),
+        condition=IfCondition(
+            PythonExpression(["'", mode, "' == 'mapping'"])),
     )
 
     navigation = IncludeLaunchDescription(
@@ -88,7 +89,8 @@ def generate_launch_description():
             'rviz': rviz,
             'use_sim_time': use_sim_time,
         }.items(),
-        condition=IfCondition(PythonExpression(['mode == "navigation"'])),
+        condition=IfCondition(
+            PythonExpression(["'", mode, "' == 'navigation'"])),
     )
 
     return LaunchDescription(

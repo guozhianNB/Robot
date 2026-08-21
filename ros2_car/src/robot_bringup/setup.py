@@ -25,6 +25,8 @@ setup(
     description='小车一键启动：雷达 / 里程计 / SLAM 建图 / Nav2 导航',
     license='MIT',
     entry_points={
-        'console_scripts': [],
+        'console_scripts': [
+            'odom_to_tf = robot_bringup.odom_to_tf:main',
+        ],
     },
 )

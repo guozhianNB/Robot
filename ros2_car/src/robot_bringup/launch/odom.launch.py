@@ -53,11 +53,29 @@ def generate_launch_description():
         parameters=[{
             'laser_scan_topic': '/scan',
             'odom_topic': '/odom',
-            'publish_tf': True,
+            # rf2o 用激光扫描时间戳广播 odom→base_link，导致 slam_toolbox
+            # 查不到（Failed to compute odom pose）。这里关闭它自己的 TF，
+            # 改由下面 odom_to_tf 用 ROS 墙钟时间重新广播。
+            'publish_tf': False,
             'base_frame_id': 'base_link',
             'odom_frame_id': 'odom',
             'init_pose_from_topic': '',
             'freq': 10.0,
+        }],
+        condition=IfCondition(
+            PythonExpression(["'", odom_source, "' == 'rf2o'"])),
+    )
+
+    # 订阅 rf2o 的 /odom，用当前 ROS 时间广播 odom→base_link TF
+    odom_to_tf_node = Node(
+        package='robot_bringup',
+        executable='odom_to_tf',
+        name='odom_to_tf',
+        output='screen',
+        parameters=[{
+            'odom_frame': 'odom',
+            'base_frame': 'base_link',
+            'odom_topic': '/odom',
         }],
         condition=IfCondition(
             PythonExpression(["'", odom_source, "' == 'rf2o'"])),
@@ -68,4 +86,5 @@ def generate_launch_description():
         ekf_declare,
         chassis_node,
         rf2o_node,
+        odom_to_tf_node,
     ])

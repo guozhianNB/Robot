@@ -4,6 +4,7 @@ setup.py
 ../../build/robot_bringup/robot_bringup.egg-info/PKG-INFO
 ../../build/robot_bringup/robot_bringup.egg-info/SOURCES.txt
 ../../build/robot_bringup/robot_bringup.egg-info/dependency_links.txt
+../../build/robot_bringup/robot_bringup.egg-info/entry_points.txt
 ../../build/robot_bringup/robot_bringup.egg-info/requires.txt
 ../../build/robot_bringup/robot_bringup.egg-info/top_level.txt
 ../../build/robot_bringup/robot_bringup.egg-info/zip-safe
@@ -19,6 +20,7 @@ launch/slam.launch.py
 maps/README.md
 resource/robot_bringup
 robot_bringup/__init__.py
+robot_bringup/odom_to_tf.py
 rviz/mapping.rviz
 rviz/navigation.rviz
 urdf/car.urdf
