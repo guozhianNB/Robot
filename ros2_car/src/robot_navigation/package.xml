@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robot_navigation</name>
+  <version>0.1.0</version>
+  <description>导航辅助节点：命令行发 Nav2 目标、robot/cmd_stop 急停（对接大模型端契约）</description>
+  <maintainer email="sunrise@localhost">sunrise</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>action_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

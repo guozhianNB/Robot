@@ -9,6 +9,11 @@ stm32/   底盘下位机固件（STM32F103ZETX，C/CMake/HAL）→ 见 stm32/con
 docs/    需求/教程/接口契约/开发日志
 ```
 
+## 板卡连接
+- 通过ssh连接 `ssh sunrise@100.65.82.93`（Tailscale，异地可用）
+- sudo 免密可用，但禁止使用 sudo 安装/改系统，除非用户明确批准。
+- sunrise账户密码：`sunrise`
+
 ## 快速上手
 
 - **后端启动**（项目根目录）：

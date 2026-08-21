@@ -104,3 +104,40 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 后端新增：`GET /api/chat/history?uid=`（回读某老人历史对话）、`DELETE /api/chat/history?uid=`（清空历史）。
 - 前端：启动和切换老人时自动回读历史渲染成气泡；对话页新增"清空对话"按钮（只清对话，不影响记忆）。
 - 实测：连聊多轮 → 重启后端 → 历史 10 条、已确认/待处理记忆、画像、摘要全部还在。
+
+---
+
+## 2026-08-20 · 小车端：ROS2 SLAM 建图 + Nav2 导航代码（方向二·核心任务1）
+
+**依据：** `docs/目标文档及说明/ROS2小车端开发目标.md`（模块 1/3/4）、`docs/1.pre/教程_ROS2_SLAM小车实战.md`、板卡 `.hermes/skills/robotics` 与 `SLAM_Car` 项目方案。
+**运行载体：** RDK X5（Ubuntu 22.04 / ROS2 Humble）+ YDLidar Tmini Plus + STM32 麦轮底盘（USB CDC）。
+
+### 板卡环境实测（2026-08-20，SSH 100.65.82.93）
+
+- 官方示例工作区 `~/ros2/yahboomcar_ws` 已编译：`ydlidar_ros2_driver`、`slam_gmapping`、`rf2o_laser_odometry`。
+- 雷达实测为 **YDLidar Tmini Plus**（TOF，/dev/ttyUSB0，230400 波特，10Hz，frame `laser_frame`）；官方默认 TminiPro.yaml 可直接跑通扫描（X4.yaml 配置会连不上扫描）。
+- 底盘（STM32，/dev/ttyACM0）当时未连接；已装 `pyserial`。
+- **未安装**：slam_toolbox / nav2 / robot-localization（apt 源有候选版本）。
+
+### 做了什么（代码在 `ros2_car/`，本地镜像 `D:\_project\Robot\ros2_car\`）
+
+| 包 | 内容 |
+|------|------|
+| `robot_chassis` | 底盘驱动：`cmd_vel`→STM32 USB CDC 帧（`docs/USB车控接口.md` v1.0：SET_CAR_VEL 0x03 / STOP 0x01 / GET_STATUS 0x05，xor 校验）；STATUS(0x82) 四轮 RPM → 麦轮逆运动学 → 积分 → `/odom` + `odom→base_link` tf；看门狗 0.5s 零速兜底、限速（vx≤0.5 / vy≤0.3 / wz≤0.8）+ 加速度斜坡、`/robot/cmd_stop` 急停、串口断线自动重连。`usb_protocol.py` 独立编解码模块，**单测已通过**（帧头/校验/增量解析/坏帧重同步/STATUS 解码） |
+| `robot_bringup` | 一键启动：5 个 launch（lidar / odom / slam / navigation / bringup）+ 参数（`lidar_tmini_plus.yaml`、`slam_toolbox_params.yaml`、`nav2_params.yaml`、`ekf_params.yaml`）+ `car.urdf`（TF：odom→base_link→laser_link）+ 建图/导航两套 rviz 配置。`odom_source:=chassis|rf2o` 二选一（无底盘用 rf2o 激光里程计兜底）；navigation 复用 nav2_bringup 的 localization + navigation 组合（AMCL 定位 + DWB 局部规划 + NavFn 全局规划 + 代价地图避障） |
+| `robot_navigation` | 辅助节点：`navigate_to_pose`（命令行发 Nav2 目标，免 rviz）、`cmd_stop`（订阅 `/robot/cmd_stop` → 取消 Nav2 目标 + 发零速，对接大模型端契约 `docs/ROS底盘接口需求.md`） |
+
+**说明文档：** `ros2_car/README.md`（环境/一键启动/分步调试/底盘标定/安全机制/常见问题/大模型端对接）。
+
+### 状态与待办（截至日志）
+
+- ⏸ 依赖安装 `sudo apt install ros-humble-navigation2 nav2-bringup slam-toolbox robot-localization` **未完成**（板卡网络慢，下载中途按用户要求停止，dpkg 无残留、无锁，缓存可复用）。
+- 📤 代码**未上传板卡**：用户改为手动操作（scp `D:\_project\Robot\ros2_car` → `~/ros2/car_ws` → `colcon build --symlink-install`）。
+- 📋 板卡手动步骤（验证顺序）：雷达 `/scan` 出数 → rf2o `/odom` → `bringup mode:=mapping` 键盘建图 → `map_saver_cli` 存图 → `bringup mode:=navigation` AMCL 定位 + 2D Goal 导航。
+- 🔧 待办：装完依赖后核对 nav2 参数（nav2_bringup 实际版本）、底盘接入后轴方向/轮径/旋转半径标定（`chassis_params.yaml`）、大模型端 `robot/move`/`turn`/`navigate_to` 服务扩展。
+
+### 已知限制
+
+- 麦轮底盘暂按差速模式导航（nav2 `max_vel_y: 0.0`），横移导航后置。
+- `nav2_params.yaml` 中 `map_server.yaml_filename`、`bt_navigator` 的 bt_xml 路径按 humble 默认写，装完需与板卡实际版本核对。
+- EKF（robot_localization）参数已备好但默认关闭，需底盘 + rf2o 双里程计才生效。

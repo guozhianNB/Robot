@@ -1,0 +1,28 @@
+# YDLidar Tmini Plus 激光雷达驱动参数（实测：230400 波特，10Hz，TOF）
+# 板卡 2026-08-20 实测：Model: Tmini Plus，Fixed Size: 404，Sample Rate: 4K
+# 若换雷达型号，请用 ~/ros2/yahboomcar_ws/src/ydlidar_ros2_driver-humble/params/ 下对应 yaml
+
+ydlidar_ros2_driver_node:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    frame_id: laser_frame
+    ignore_array: ""
+    baudrate: 230400
+    lidar_type: 1
+    device_type: 0
+    sample_rate: 4
+    intensity_bit: 8
+    abnormal_check_count: 4
+    fixed_resolution: true
+    reversion: true
+    inverted: true
+    auto_reconnect: true
+    isSingleChannel: false
+    intensity: true
+    support_motor_dtr: false
+    angle_max: 180.0
+    angle_min: -180.0
+    range_max: 12.0
+    range_min: 0.03
+    frequency: 10.0
+    invalid_range_is_inf: false
