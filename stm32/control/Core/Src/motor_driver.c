@@ -26,11 +26,15 @@ typedef struct {
     uint16_t      pin2;          /* IN2 引脚 */
 } MdDirPin;
 
+/* 电机安装方向：左前(way1)、右后(way4) 为对角反放（电机为安装摆放而反装，
+ * 同样的 IN1/IN2 电平会让这两台电机相对车架反向转动），故在映射表里交换其
+ * IN1/IN2 引脚，使 md_set_motor 的"正转"对四轮统一为车架前进方向。
+ * 编码器方向仍由上电 md_enc_sign_autocal() 自动标定。 */
 static const MdDirPin md_dir_pin[MD_MOTOR_NUM] = {
-    { AIN1_GPIO_Port, AIN1_Pin, AIN2_GPIO_Port, AIN2_Pin },  /* way 1 */
-    { BIN1_GPIO_Port, BIN1_Pin, BIN2_GPIO_Port, BIN2_Pin },  /* way 2 */
-    { CIN1_GPIO_Port, CIN1_Pin, CIN2_GPIO_Port, CIN2_Pin },  /* way 3 */
-    { DIN1_GPIO_Port, DIN1_Pin, DIN2_GPIO_Port, DIN2_Pin },  /* way 4 */
+    { AIN2_GPIO_Port, AIN2_Pin, AIN1_GPIO_Port, AIN1_Pin },  /* way 1 左前：反放，IN1/IN2 交换 */
+    { BIN1_GPIO_Port, BIN1_Pin, BIN2_GPIO_Port, BIN2_Pin },  /* way 2 右前 */
+    { CIN1_GPIO_Port, CIN1_Pin, CIN2_GPIO_Port, CIN2_Pin },  /* way 3 左后 */
+    { DIN2_GPIO_Port, DIN2_Pin, DIN1_GPIO_Port, DIN1_Pin },  /* way 4 右后：反放，IN1/IN2 交换 */
 };
 
 /* PWM 通道映射 */

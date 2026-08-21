@@ -73,7 +73,14 @@ class ChassisDriver(Node):
         self.declare_parameter("send_period", 0.05)      # 下发周期 s（20Hz）
         self.declare_parameter("watchdog_timeout", 0.5)  # cmd_vel 看门狗 s（键盘遥控需要放宽）
 
-        self._p = {k: self.get_parameter(k).value for k in self.get_parameter_names()}
+        # Humble rclpy Node 没有 get_parameter_names()，显式列出已声明参数
+        self._p = {p.name: p.value for p in self.get_parameters([
+            "serial_port", "baudrate", "cmd_vel_topic", "odom_topic", "cmd_stop_topic",
+            "odom_frame_id", "base_frame_id", "wheel_radius", "rotate_radius",
+            "wheel_signs", "sign_vx", "sign_vy", "sign_wz",
+            "max_vx", "max_vy", "max_wz", "accel_limit", "ang_accel_limit",
+            "send_period", "watchdog_timeout",
+        ])}
 
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先安装: pip3 install pyserial")
