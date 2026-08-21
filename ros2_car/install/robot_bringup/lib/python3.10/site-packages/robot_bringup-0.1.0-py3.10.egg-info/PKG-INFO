@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: robot_bringup
+Version: 0.1.0
+Summary: 小车一键启动：雷达 / 里程计 / SLAM 建图 / Nav2 导航
+Maintainer: sunrise
+Maintainer-email: sunrise@localhost
+License: MIT
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

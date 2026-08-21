@@ -1,0 +1,2 @@
+[console_scripts]
+chassis_driver = robot_chassis.chassis_driver:main

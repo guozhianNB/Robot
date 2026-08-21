@@ -293,6 +293,12 @@ ros2 pkg create my_robot_pkg \
 #     geometry_msgs        = 几何消息类型（位置、速度等）
 ```
 
+> ⚠️ **写 ROS2 代码必读（邮箱坑）**：`ros2 pkg create` 生成的 `package.xml` 里，`<maintainer>` 标签默认填的是 `ros2@localhost`，**`localhost` 不是邮箱**，`colcon build` 编译会报错。每次建包后都要把里面的邮箱改成真实邮箱，统一写 **`sunrise@example.com`**，**不要写 `sunrise@localhost`**：
+> ```xml
+> <!-- package.xml -->
+> <maintainer email="sunrise@example.com">sunrise</maintainer>
+> ```
+
 ### 4.4 编译与运行
 
 ```bash

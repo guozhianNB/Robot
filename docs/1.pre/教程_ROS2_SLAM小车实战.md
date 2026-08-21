@@ -596,6 +596,12 @@ ros2 pkg create my_robot --build-type ament_python \
 
 > 🧠 **"包"是什么？** 一个可复用、可安装、可 `ros2 run` 的功能单元。你以后每写一个功能模块就建一个包。
 
+> ⚠️ **写 ROS2 代码必读（邮箱坑）**：`ros2 pkg create` 生成的 `package.xml` 里，`<maintainer>` 标签默认填的是 `ros2@localhost`，**`localhost` 不是邮箱**，`colcon build` 编译会报错。每次建包后都要把邮箱改成真实邮箱，统一写 **`sunrise@example.com`**，**不要写 `sunrise@localhost`**：
+> ```xml
+> <!-- package.xml -->
+> <maintainer email="sunrise@example.com">sunrise</maintainer>
+> ```
+
 ## 6.3 写第一个节点（速度监视器）
 
 创建文件 `~/ros2_ws/src/my_robot/my_robot/velocity_monitor.py`：

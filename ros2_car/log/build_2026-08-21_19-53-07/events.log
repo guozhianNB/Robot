@@ -1,0 +1,329 @@
+[0.000000] (-) TimerEvent: {}
+[0.001648] (robot_chassis) JobQueued: {'identifier': 'robot_chassis', 'dependencies': OrderedDict()}
+[0.003409] (robot_navigation) JobQueued: {'identifier': 'robot_navigation', 'dependencies': OrderedDict()}
+[0.004640] (robot_bringup) JobQueued: {'identifier': 'robot_bringup', 'dependencies': OrderedDict([('robot_chassis', '/home/sunrise/Robot/ros2_car/install/robot_chassis'), ('robot_navigation', '/home/sunrise/Robot/ros2_car/install/robot_navigation')])}
+[0.005786] (robot_chassis) JobStarted: {'identifier': 'robot_chassis'}
+[0.060025] (robot_navigation) JobStarted: {'identifier': 'robot_navigation'}
+[0.098484] (-) TimerEvent: {}
+[0.199570] (-) TimerEvent: {}
+[0.300635] (-) TimerEvent: {}
+[0.401587] (-) TimerEvent: {}
+[0.502537] (-) TimerEvent: {}
+[0.603516] (-) TimerEvent: {}
+[0.704586] (-) TimerEvent: {}
+[0.805530] (-) TimerEvent: {}
+[0.906546] (-) TimerEvent: {}
+[1.007494] (-) TimerEvent: {}
+[1.108475] (-) TimerEvent: {}
+[1.209726] (-) TimerEvent: {}
+[1.310704] (-) TimerEvent: {}
+[1.411722] (-) TimerEvent: {}
+[1.512810] (-) TimerEvent: {}
+[1.613999] (-) TimerEvent: {}
+[1.715142] (-) TimerEvent: {}
+[1.816090] (-) TimerEvent: {}
+[1.917052] (-) TimerEvent: {}
+[2.018201] (-) TimerEvent: {}
+[2.119209] (-) TimerEvent: {}
+[2.220223] (-) TimerEvent: {}
+[2.321198] (-) TimerEvent: {}
+[2.422183] (-) TimerEvent: {}
+[2.523243] (-) TimerEvent: {}
+[2.624278] (-) TimerEvent: {}
+[2.725254] (-) TimerEvent: {}
+[2.826275] (-) TimerEvent: {}
+[2.927322] (-) TimerEvent: {}
+[3.028266] (-) TimerEvent: {}
+[3.129342] (-) TimerEvent: {}
+[3.230495] (-) TimerEvent: {}
+[3.331544] (-) TimerEvent: {}
+[3.432633] (-) TimerEvent: {}
+[3.534310] (-) TimerEvent: {}
+[3.635333] (-) TimerEvent: {}
+[3.736439] (-) TimerEvent: {}
+[3.837377] (-) TimerEvent: {}
+[3.938281] (-) TimerEvent: {}
+[4.039222] (-) TimerEvent: {}
+[4.140183] (-) TimerEvent: {}
+[4.241150] (-) TimerEvent: {}
+[4.342129] (-) TimerEvent: {}
+[4.443152] (-) TimerEvent: {}
+[4.544429] (-) TimerEvent: {}
+[4.645675] (-) TimerEvent: {}
+[4.746790] (-) TimerEvent: {}
+[4.855864] (-) TimerEvent: {}
+[4.956912] (-) TimerEvent: {}
+[5.057941] (-) TimerEvent: {}
+[5.158922] (-) TimerEvent: {}
+[5.260123] (-) TimerEvent: {}
+[5.361195] (-) TimerEvent: {}
+[5.462453] (-) TimerEvent: {}
+[5.563475] (-) TimerEvent: {}
+[5.664548] (-) TimerEvent: {}
+[5.765484] (-) TimerEvent: {}
+[5.866585] (-) TimerEvent: {}
+[5.967964] (-) TimerEvent: {}
+[6.069043] (-) TimerEvent: {}
+[6.170066] (-) TimerEvent: {}
+[6.271036] (-) TimerEvent: {}
+[6.372012] (-) TimerEvent: {}
+[6.473063] (-) TimerEvent: {}
+[6.574138] (-) TimerEvent: {}
+[6.675384] (-) TimerEvent: {}
+[6.776597] (-) TimerEvent: {}
+[6.877566] (-) TimerEvent: {}
+[6.978489] (-) TimerEvent: {}
+[7.079333] (-) TimerEvent: {}
+[7.180187] (-) TimerEvent: {}
+[7.281017] (-) TimerEvent: {}
+[7.382467] (-) TimerEvent: {}
+[7.483395] (-) TimerEvent: {}
+[7.584264] (-) TimerEvent: {}
+[7.685188] (-) TimerEvent: {}
+[7.786186] (-) TimerEvent: {}
+[7.887306] (-) TimerEvent: {}
+[7.988168] (-) TimerEvent: {}
+[8.089019] (-) TimerEvent: {}
+[8.189926] (-) TimerEvent: {}
+[8.290936] (-) TimerEvent: {}
+[8.300797] (robot_chassis) Command: {'cmd': ['/usr/bin/python3', '-W', 'ignore:setup.py install is deprecated', '-W', 'ignore:easy_install command is deprecated', 'setup.py', 'egg_info', '--egg-base', '../../build/robot_chassis', 'build', '--build-base', '/home/sunrise/Robot/ros2_car/build/robot_chassis/build', 'install', '--record', '/home/sunrise/Robot/ros2_car/build/robot_chassis/install.log', '--install-scripts', '$base/lib/robot_chassis', '--single-version-externally-managed', 'install_data'], 'cwd': '/home/sunrise/Robot/ros2_car/src/robot_chassis', 'env': {'LANGUAGE': 'en_US.UTF-8', 'USER': 'sunrise', 'SSH_CLIENT': 'fe80::f095:8da:6ce8:c230%eth0 65468 22', 'XDG_SESSION_TYPE': 'tty', 'SHLVL': '1', 'LD_LIBRARY_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping/lib:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/aarch64-linux-gnu:/opt/ros/humble/lib:/usr/hobot/lib:/app/lib:/app/pub/lib:/middleware/lib:/middleware/pub/lib:/usr/hobot/lib/sensor:/system/lib:/system/usr/lib:/lib:', 'MOTD_SHOWN': 'pam', 'HOME': '/home/sunrise', 'OLDPWD': '/home/sunrise/Robot/ros2_car', 'SSH_TTY': '/dev/pts/6', 'ROS_PYTHON_VERSION': '3', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'COLCON_PREFIX_PATH': '/home/sunrise/Robot/ros2_car/install:/home/sunrise/ros2/yahboomcar_ws/install', 'ROS_DISTRO': 'humble', 'LOGNAME': 'sunrise', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'XDG_SESSION_CLASS': 'user', 'TERM': 'xterm-256color', 'XDG_SESSION_ID': '10', 'ROS_LOCALHOST_ONLY': '0', 'PATH': '/home/sunrise/.local/bin:/home/sunrise/bin:/home/sunrise/.local/node/bin:/home/sunrise/.local/bin:/opt/ros/humble/bin:/usr/hobot/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin', 'XDG_RUNTIME_DIR': '/run/user/1000', 'LANG': 'en_US.UTF-8', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:', 'AMENT_PREFIX_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping:/opt/ros/humble', 'SHELL': '/bin/bash', 'PWD': '/home/sunrise/Robot/ros2_car/build/robot_chassis', 'LC_ALL': 'en_US.UTF-8', 'SSH_CONNECTION': 'fe80::f095:8da:6ce8:c230%eth0 65468 fe80::c028:8cff:fe98:57f2%eth0 22', 'PYTHONPATH': '/home/sunrise/Robot/ros2_car/build/robot_chassis/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages', 'COLCON': '1', 'CMAKE_PREFIX_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping'}, 'shell': False}
+[8.378168] (robot_navigation) Command: {'cmd': ['/usr/bin/python3', '-W', 'ignore:setup.py install is deprecated', '-W', 'ignore:easy_install command is deprecated', 'setup.py', 'egg_info', '--egg-base', '../../build/robot_navigation', 'build', '--build-base', '/home/sunrise/Robot/ros2_car/build/robot_navigation/build', 'install', '--record', '/home/sunrise/Robot/ros2_car/build/robot_navigation/install.log', '--install-scripts', '$base/lib/robot_navigation', '--single-version-externally-managed', 'install_data'], 'cwd': '/home/sunrise/Robot/ros2_car/src/robot_navigation', 'env': {'LANGUAGE': 'en_US.UTF-8', 'USER': 'sunrise', 'SSH_CLIENT': 'fe80::f095:8da:6ce8:c230%eth0 65468 22', 'XDG_SESSION_TYPE': 'tty', 'SHLVL': '1', 'LD_LIBRARY_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping/lib:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/aarch64-linux-gnu:/opt/ros/humble/lib:/usr/hobot/lib:/app/lib:/app/pub/lib:/middleware/lib:/middleware/pub/lib:/usr/hobot/lib/sensor:/system/lib:/system/usr/lib:/lib:', 'MOTD_SHOWN': 'pam', 'HOME': '/home/sunrise', 'OLDPWD': '/home/sunrise/Robot/ros2_car', 'SSH_TTY': '/dev/pts/6', 'ROS_PYTHON_VERSION': '3', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'COLCON_PREFIX_PATH': '/home/sunrise/Robot/ros2_car/install:/home/sunrise/ros2/yahboomcar_ws/install', 'ROS_DISTRO': 'humble', 'LOGNAME': 'sunrise', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'XDG_SESSION_CLASS': 'user', 'TERM': 'xterm-256color', 'XDG_SESSION_ID': '10', 'ROS_LOCALHOST_ONLY': '0', 'PATH': '/home/sunrise/.local/bin:/home/sunrise/bin:/home/sunrise/.local/node/bin:/home/sunrise/.local/bin:/opt/ros/humble/bin:/usr/hobot/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin', 'XDG_RUNTIME_DIR': '/run/user/1000', 'LANG': 'en_US.UTF-8', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:', 'AMENT_PREFIX_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping:/opt/ros/humble', 'SHELL': '/bin/bash', 'PWD': '/home/sunrise/Robot/ros2_car/build/robot_navigation', 'LC_ALL': 'en_US.UTF-8', 'SSH_CONNECTION': 'fe80::f095:8da:6ce8:c230%eth0 65468 fe80::c028:8cff:fe98:57f2%eth0 22', 'PYTHONPATH': '/home/sunrise/Robot/ros2_car/build/robot_navigation/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages', 'COLCON': '1', 'CMAKE_PREFIX_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping'}, 'shell': False}
+[8.391076] (-) TimerEvent: {}
+[8.491955] (-) TimerEvent: {}
+[8.592811] (-) TimerEvent: {}
+[8.693692] (-) TimerEvent: {}
+[8.794545] (-) TimerEvent: {}
+[8.895492] (-) TimerEvent: {}
+[8.996493] (-) TimerEvent: {}
+[9.097439] (-) TimerEvent: {}
+[9.198305] (-) TimerEvent: {}
+[9.299156] (-) TimerEvent: {}
+[9.400006] (-) TimerEvent: {}
+[9.500885] (-) TimerEvent: {}
+[9.601753] (-) TimerEvent: {}
+[9.702626] (-) TimerEvent: {}
+[9.803482] (-) TimerEvent: {}
+[9.904335] (-) TimerEvent: {}
+[9.965941] (robot_chassis) StdoutLine: {'line': b'running egg_info\n'}
+[10.004536] (-) TimerEvent: {}
+[10.035132] (robot_navigation) StdoutLine: {'line': b'running egg_info\n'}
+[10.065804] (robot_chassis) StdoutLine: {'line': b'creating ../../build/robot_chassis/robot_chassis.egg-info\n'}
+[10.066741] (robot_chassis) StdoutLine: {'line': b'writing ../../build/robot_chassis/robot_chassis.egg-info/PKG-INFO\n'}
+[10.069258] (robot_chassis) StdoutLine: {'line': b'writing dependency_links to ../../build/robot_chassis/robot_chassis.egg-info/dependency_links.txt\n'}
+[10.070359] (robot_chassis) StdoutLine: {'line': b'writing entry points to ../../build/robot_chassis/robot_chassis.egg-info/entry_points.txt\n'}
+[10.071403] (robot_chassis) StdoutLine: {'line': b'writing requirements to ../../build/robot_chassis/robot_chassis.egg-info/requires.txt\n'}
+[10.072110] (robot_chassis) StdoutLine: {'line': b'writing top-level names to ../../build/robot_chassis/robot_chassis.egg-info/top_level.txt\n'}
+[10.072807] (robot_chassis) StdoutLine: {'line': b"writing manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'\n"}
+[10.104674] (-) TimerEvent: {}
+[10.133948] (robot_navigation) StdoutLine: {'line': b'creating ../../build/robot_navigation/robot_navigation.egg-info\n'}
+[10.134867] (robot_navigation) StdoutLine: {'line': b'writing ../../build/robot_navigation/robot_navigation.egg-info/PKG-INFO\n'}
+[10.137510] (robot_navigation) StdoutLine: {'line': b'writing dependency_links to ../../build/robot_navigation/robot_navigation.egg-info/dependency_links.txt\n'}
+[10.138797] (robot_navigation) StdoutLine: {'line': b'writing entry points to ../../build/robot_navigation/robot_navigation.egg-info/entry_points.txt\n'}
+[10.139941] (robot_navigation) StdoutLine: {'line': b'writing requirements to ../../build/robot_navigation/robot_navigation.egg-info/requires.txt\n'}
+[10.140642] (robot_navigation) StdoutLine: {'line': b'writing top-level names to ../../build/robot_navigation/robot_navigation.egg-info/top_level.txt\n'}
+[10.141514] (robot_navigation) StdoutLine: {'line': b"writing manifest file '../../build/robot_navigation/robot_navigation.egg-info/SOURCES.txt'\n"}
+[10.204813] (-) TimerEvent: {}
+[10.276070] (robot_chassis) StdoutLine: {'line': b"reading manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'\n"}
+[10.282638] (robot_chassis) StdoutLine: {'line': b"writing manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'\n"}
+[10.283505] (robot_chassis) StdoutLine: {'line': b'running build\n'}
+[10.284139] (robot_chassis) StdoutLine: {'line': b'running build_py\n'}
+[10.284950] (robot_chassis) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis\n'}
+[10.286124] (robot_chassis) StdoutLine: {'line': b'copying robot_chassis/__init__.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis\n'}
+[10.287680] (robot_chassis) StdoutLine: {'line': b'copying robot_chassis/chassis_driver.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis\n'}
+[10.288782] (robot_chassis) StdoutLine: {'line': b'copying robot_chassis/usb_protocol.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis\n'}
+[10.290719] (robot_chassis) StdoutLine: {'line': b'running install\n'}
+[10.304964] (-) TimerEvent: {}
+[10.319946] (robot_chassis) StdoutLine: {'line': b'running install_lib\n'}
+[10.346890] (robot_navigation) StdoutLine: {'line': b"reading manifest file '../../build/robot_navigation/robot_navigation.egg-info/SOURCES.txt'\n"}
+[10.353507] (robot_navigation) StdoutLine: {'line': b"writing manifest file '../../build/robot_navigation/robot_navigation.egg-info/SOURCES.txt'\n"}
+[10.354374] (robot_navigation) StdoutLine: {'line': b'running build\n'}
+[10.355071] (robot_navigation) StdoutLine: {'line': b'running build_py\n'}
+[10.355786] (robot_navigation) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation\n'}
+[10.356989] (robot_navigation) StdoutLine: {'line': b'copying robot_navigation/navigate_to_pose.py -> /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation\n'}
+[10.358059] (robot_navigation) StdoutLine: {'line': b'copying robot_navigation/__init__.py -> /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation\n'}
+[10.359051] (robot_navigation) StdoutLine: {'line': b'copying robot_navigation/cmd_stop.py -> /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation\n'}
+[10.360990] (robot_navigation) StdoutLine: {'line': b'running install\n'}
+[10.391845] (robot_navigation) StdoutLine: {'line': b'running install_lib\n'}
+[10.405122] (-) TimerEvent: {}
+[10.421684] (robot_chassis) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis\n'}
+[10.422607] (robot_chassis) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/__init__.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis\n'}
+[10.423477] (robot_chassis) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/chassis_driver.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis\n'}
+[10.424322] (robot_chassis) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/usb_protocol.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis\n'}
+[10.427576] (robot_chassis) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/__init__.py to __init__.cpython-310.pyc\n'}
+[10.429076] (robot_chassis) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/chassis_driver.py to chassis_driver.cpython-310.pyc\n'}
+[10.442146] (robot_chassis) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/usb_protocol.py to usb_protocol.cpython-310.pyc\n'}
+[10.446782] (robot_chassis) StdoutLine: {'line': b'running install_data\n'}
+[10.448085] (robot_chassis) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_chassis/share/ament_index/resource_index/packages\n'}
+[10.449182] (robot_chassis) StdoutLine: {'line': b'copying resource/robot_chassis -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/ament_index/resource_index/packages\n'}
+[10.450353] (robot_chassis) StdoutLine: {'line': b'copying package.xml -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis\n'}
+[10.451305] (robot_chassis) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis/config\n'}
+[10.452021] (robot_chassis) StdoutLine: {'line': b'copying config/chassis_params.yaml -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis/config\n'}
+[10.452705] (robot_chassis) StdoutLine: {'line': b'running install_egg_info\n'}
+[10.494292] (robot_navigation) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation\n'}
+[10.495117] (robot_navigation) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation/navigate_to_pose.py -> /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation\n'}
+[10.495865] (robot_navigation) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation/__init__.py -> /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation\n'}
+[10.512769] (-) TimerEvent: {}
+[10.513689] (robot_navigation) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_navigation/build/lib/robot_navigation/cmd_stop.py -> /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation\n'}
+[10.514530] (robot_navigation) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation/navigate_to_pose.py to navigate_to_pose.cpython-310.pyc\n'}
+[10.515180] (robot_navigation) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation/__init__.py to __init__.cpython-310.pyc\n'}
+[10.515788] (robot_navigation) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation/cmd_stop.py to cmd_stop.cpython-310.pyc\n'}
+[10.516491] (robot_navigation) StdoutLine: {'line': b'running install_data\n'}
+[10.517131] (robot_navigation) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_navigation/share/ament_index/resource_index/packages\n'}
+[10.517726] (robot_navigation) StdoutLine: {'line': b'copying resource/robot_navigation -> /home/sunrise/Robot/ros2_car/install/robot_navigation/share/ament_index/resource_index/packages\n'}
+[10.518234] (robot_navigation) StdoutLine: {'line': b'copying package.xml -> /home/sunrise/Robot/ros2_car/install/robot_navigation/share/robot_navigation\n'}
+[10.518706] (robot_navigation) StdoutLine: {'line': b'running install_egg_info\n'}
+[10.563257] (robot_chassis) StdoutLine: {'line': b'Copying ../../build/robot_chassis/robot_chassis.egg-info to /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis-0.1.0-py3.10.egg-info\n'}
+[10.569314] (robot_chassis) StdoutLine: {'line': b'running install_scripts\n'}
+[10.612972] (-) TimerEvent: {}
+[10.632475] (robot_navigation) StdoutLine: {'line': b'Copying ../../build/robot_navigation/robot_navigation.egg-info to /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages/robot_navigation-0.1.0-py3.10.egg-info\n'}
+[10.638061] (robot_navigation) StdoutLine: {'line': b'running install_scripts\n'}
+[10.713170] (-) TimerEvent: {}
+[10.794869] (robot_chassis) StdoutLine: {'line': b'Installing chassis_driver script to /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/robot_chassis\n'}
+[10.797792] (robot_chassis) StdoutLine: {'line': b"writing list of installed files to '/home/sunrise/Robot/ros2_car/build/robot_chassis/install.log'\n"}
+[10.813370] (-) TimerEvent: {}
+[10.863678] (robot_navigation) StdoutLine: {'line': b'Installing cmd_stop script to /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/robot_navigation\n'}
+[10.864815] (robot_navigation) StdoutLine: {'line': b'Installing navigate_to_pose script to /home/sunrise/Robot/ros2_car/install/robot_navigation/lib/robot_navigation\n'}
+[10.867909] (robot_navigation) StdoutLine: {'line': b"writing list of installed files to '/home/sunrise/Robot/ros2_car/build/robot_navigation/install.log'\n"}
+[10.913630] (-) TimerEvent: {}
+[11.014686] (-) TimerEvent: {}
+[11.032129] (robot_chassis) CommandEnded: {'returncode': 0}
+[11.116853] (-) TimerEvent: {}
+[11.127477] (robot_chassis) JobEnded: {'identifier': 'robot_chassis', 'rc': 0}
+[11.137410] (robot_navigation) CommandEnded: {'returncode': 0}
+[11.183372] (robot_navigation) JobEnded: {'identifier': 'robot_navigation', 'rc': 0}
+[11.193658] (robot_bringup) JobStarted: {'identifier': 'robot_bringup'}
+[11.218011] (-) TimerEvent: {}
+[11.319128] (-) TimerEvent: {}
+[11.420117] (-) TimerEvent: {}
+[11.521179] (-) TimerEvent: {}
+[11.622295] (-) TimerEvent: {}
+[11.723977] (-) TimerEvent: {}
+[11.824868] (-) TimerEvent: {}
+[11.925665] (-) TimerEvent: {}
+[12.026471] (-) TimerEvent: {}
+[12.127280] (-) TimerEvent: {}
+[12.228082] (-) TimerEvent: {}
+[12.328929] (-) TimerEvent: {}
+[12.429905] (-) TimerEvent: {}
+[12.533400] (-) TimerEvent: {}
+[12.634286] (-) TimerEvent: {}
+[12.735285] (-) TimerEvent: {}
+[12.836196] (-) TimerEvent: {}
+[12.937089] (-) TimerEvent: {}
+[13.038118] (-) TimerEvent: {}
+[13.139600] (-) TimerEvent: {}
+[13.242110] (-) TimerEvent: {}
+[13.342948] (-) TimerEvent: {}
+[13.443774] (-) TimerEvent: {}
+[13.544566] (-) TimerEvent: {}
+[13.645354] (-) TimerEvent: {}
+[13.746154] (-) TimerEvent: {}
+[13.847027] (-) TimerEvent: {}
+[13.947778] (-) TimerEvent: {}
+[14.048530] (-) TimerEvent: {}
+[14.149362] (-) TimerEvent: {}
+[14.250674] (-) TimerEvent: {}
+[14.351551] (-) TimerEvent: {}
+[14.452395] (-) TimerEvent: {}
+[14.553319] (-) TimerEvent: {}
+[14.654245] (-) TimerEvent: {}
+[14.755179] (-) TimerEvent: {}
+[14.855962] (-) TimerEvent: {}
+[14.956802] (-) TimerEvent: {}
+[15.057691] (-) TimerEvent: {}
+[15.158476] (-) TimerEvent: {}
+[15.259248] (-) TimerEvent: {}
+[15.360031] (-) TimerEvent: {}
+[15.460830] (-) TimerEvent: {}
+[15.561629] (-) TimerEvent: {}
+[15.662430] (-) TimerEvent: {}
+[15.763269] (-) TimerEvent: {}
+[15.864282] (-) TimerEvent: {}
+[15.965202] (-) TimerEvent: {}
+[16.066093] (-) TimerEvent: {}
+[16.166975] (-) TimerEvent: {}
+[16.267784] (-) TimerEvent: {}
+[16.368575] (-) TimerEvent: {}
+[16.469356] (-) TimerEvent: {}
+[16.570107] (-) TimerEvent: {}
+[16.670897] (-) TimerEvent: {}
+[16.771692] (-) TimerEvent: {}
+[16.872468] (-) TimerEvent: {}
+[16.973260] (-) TimerEvent: {}
+[17.074070] (-) TimerEvent: {}
+[17.174889] (-) TimerEvent: {}
+[17.275747] (-) TimerEvent: {}
+[17.376730] (-) TimerEvent: {}
+[17.418661] (robot_bringup) Command: {'cmd': ['/usr/bin/python3', '-W', 'ignore:setup.py install is deprecated', '-W', 'ignore:easy_install command is deprecated', 'setup.py', 'egg_info', '--egg-base', '../../build/robot_bringup', 'build', '--build-base', '/home/sunrise/Robot/ros2_car/build/robot_bringup/build', 'install', '--record', '/home/sunrise/Robot/ros2_car/build/robot_bringup/install.log', '--install-scripts', '$base/lib/robot_bringup', '--single-version-externally-managed', 'install_data'], 'cwd': '/home/sunrise/Robot/ros2_car/src/robot_bringup', 'env': {'LANGUAGE': 'en_US.UTF-8', 'USER': 'sunrise', 'SSH_CLIENT': 'fe80::f095:8da:6ce8:c230%eth0 65468 22', 'XDG_SESSION_TYPE': 'tty', 'SHLVL': '1', 'LD_LIBRARY_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping/lib:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/aarch64-linux-gnu:/opt/ros/humble/lib:/usr/hobot/lib:/app/lib:/app/pub/lib:/middleware/lib:/middleware/pub/lib:/usr/hobot/lib/sensor:/system/lib:/system/usr/lib:/lib:', 'MOTD_SHOWN': 'pam', 'HOME': '/home/sunrise', 'OLDPWD': '/home/sunrise/Robot/ros2_car', 'SSH_TTY': '/dev/pts/6', 'ROS_PYTHON_VERSION': '3', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'COLCON_PREFIX_PATH': '/home/sunrise/Robot/ros2_car/install:/home/sunrise/ros2/yahboomcar_ws/install', 'ROS_DISTRO': 'humble', 'LOGNAME': 'sunrise', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'XDG_SESSION_CLASS': 'user', 'TERM': 'xterm-256color', 'XDG_SESSION_ID': '10', 'ROS_LOCALHOST_ONLY': '0', 'PATH': '/home/sunrise/.local/bin:/home/sunrise/bin:/home/sunrise/.local/node/bin:/home/sunrise/.local/bin:/opt/ros/humble/bin:/usr/hobot/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin', 'XDG_RUNTIME_DIR': '/run/user/1000', 'LANG': 'en_US.UTF-8', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:', 'AMENT_PREFIX_PATH': '/home/sunrise/Robot/ros2_car/install/robot_navigation:/home/sunrise/Robot/ros2_car/install/robot_chassis:/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping:/opt/ros/humble', 'SHELL': '/bin/bash', 'PWD': '/home/sunrise/Robot/ros2_car/build/robot_bringup', 'LC_ALL': 'en_US.UTF-8', 'SSH_CONNECTION': 'fe80::f095:8da:6ce8:c230%eth0 65468 fe80::c028:8cff:fe98:57f2%eth0 22', 'PYTHONPATH': '/home/sunrise/Robot/ros2_car/build/robot_bringup/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_navigation/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:/home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages', 'COLCON': '1', 'CMAKE_PREFIX_PATH': '/home/sunrise/ros2/yahboomcar_ws/install/ydlidar_ros2_driver:/home/sunrise/ros2/yahboomcar_ws/install/slam_gmapping:/home/sunrise/ros2/yahboomcar_ws/install/rf2o_laser_odometry:/home/sunrise/ros2/yahboomcar_ws/install/openslam_gmapping'}, 'shell': False}
+[17.476866] (-) TimerEvent: {}
+[17.577702] (-) TimerEvent: {}
+[17.678515] (-) TimerEvent: {}
+[17.779287] (-) TimerEvent: {}
+[17.880019] (-) TimerEvent: {}
+[17.980751] (-) TimerEvent: {}
+[18.081483] (-) TimerEvent: {}
+[18.182198] (-) TimerEvent: {}
+[18.282961] (-) TimerEvent: {}
+[18.383698] (-) TimerEvent: {}
+[18.484457] (-) TimerEvent: {}
+[18.585238] (-) TimerEvent: {}
+[18.686019] (-) TimerEvent: {}
+[18.786852] (-) TimerEvent: {}
+[18.887605] (-) TimerEvent: {}
+[18.925800] (robot_bringup) StdoutLine: {'line': b'running egg_info\n'}
+[18.987742] (-) TimerEvent: {}
+[19.020175] (robot_bringup) StdoutLine: {'line': b'creating ../../build/robot_bringup/robot_bringup.egg-info\n'}
+[19.021051] (robot_bringup) StdoutLine: {'line': b'writing ../../build/robot_bringup/robot_bringup.egg-info/PKG-INFO\n'}
+[19.023315] (robot_bringup) StdoutLine: {'line': b'writing dependency_links to ../../build/robot_bringup/robot_bringup.egg-info/dependency_links.txt\n'}
+[19.024686] (robot_bringup) StdoutLine: {'line': b'writing requirements to ../../build/robot_bringup/robot_bringup.egg-info/requires.txt\n'}
+[19.025323] (robot_bringup) StdoutLine: {'line': b'writing top-level names to ../../build/robot_bringup/robot_bringup.egg-info/top_level.txt\n'}
+[19.025918] (robot_bringup) StdoutLine: {'line': b"writing manifest file '../../build/robot_bringup/robot_bringup.egg-info/SOURCES.txt'\n"}
+[19.087927] (-) TimerEvent: {}
+[19.188739] (-) TimerEvent: {}
+[19.224987] (robot_bringup) StdoutLine: {'line': b"reading manifest file '../../build/robot_bringup/robot_bringup.egg-info/SOURCES.txt'\n"}
+[19.231670] (robot_bringup) StdoutLine: {'line': b"writing manifest file '../../build/robot_bringup/robot_bringup.egg-info/SOURCES.txt'\n"}
+[19.232604] (robot_bringup) StdoutLine: {'line': b'running build\n'}
+[19.233206] (robot_bringup) StdoutLine: {'line': b'running build_py\n'}
+[19.233831] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/build/robot_bringup/build/lib/robot_bringup\n'}
+[19.234883] (robot_bringup) StdoutLine: {'line': b'copying robot_bringup/__init__.py -> /home/sunrise/Robot/ros2_car/build/robot_bringup/build/lib/robot_bringup\n'}
+[19.236574] (robot_bringup) StdoutLine: {'line': b'running install\n'}
+[19.265338] (robot_bringup) StdoutLine: {'line': b'running install_lib\n'}
+[19.288903] (-) TimerEvent: {}
+[19.361286] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages/robot_bringup\n'}
+[19.362138] (robot_bringup) StdoutLine: {'line': b'copying /home/sunrise/Robot/ros2_car/build/robot_bringup/build/lib/robot_bringup/__init__.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages/robot_bringup\n'}
+[19.365057] (robot_bringup) StdoutLine: {'line': b'byte-compiling /home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages/robot_bringup/__init__.py to __init__.cpython-310.pyc\n'}
+[19.366389] (robot_bringup) StdoutLine: {'line': b'running install_data\n'}
+[19.367734] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/ament_index/resource_index/packages\n'}
+[19.368685] (robot_bringup) StdoutLine: {'line': b'copying resource/robot_bringup -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/ament_index/resource_index/packages\n'}
+[19.369728] (robot_bringup) StdoutLine: {'line': b'copying package.xml -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup\n'}
+[19.370560] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.371139] (robot_bringup) StdoutLine: {'line': b'copying launch/navigation.launch.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.371808] (robot_bringup) StdoutLine: {'line': b'copying launch/lidar.launch.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.372491] (robot_bringup) StdoutLine: {'line': b'copying launch/bringup.launch.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.373154] (robot_bringup) StdoutLine: {'line': b'copying launch/odom.launch.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.373803] (robot_bringup) StdoutLine: {'line': b'copying launch/slam.launch.py -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch\n'}
+[19.374630] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/config\n'}
+[19.375205] (robot_bringup) StdoutLine: {'line': b'copying config/nav2_params.yaml -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/config\n'}
+[19.375912] (robot_bringup) StdoutLine: {'line': b'copying config/lidar_tmini_plus.yaml -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/config\n'}
+[19.376647] (robot_bringup) StdoutLine: {'line': b'copying config/ekf_params.yaml -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/config\n'}
+[19.377340] (robot_bringup) StdoutLine: {'line': b'copying config/slam_toolbox_params.yaml -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/config\n'}
+[19.378212] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/urdf\n'}
+[19.378835] (robot_bringup) StdoutLine: {'line': b'copying urdf/car.urdf -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/urdf\n'}
+[19.379658] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/rviz\n'}
+[19.380221] (robot_bringup) StdoutLine: {'line': b'copying rviz/mapping.rviz -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/rviz\n'}
+[19.380935] (robot_bringup) StdoutLine: {'line': b'copying rviz/navigation.rviz -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/rviz\n'}
+[19.381766] (robot_bringup) StdoutLine: {'line': b'creating /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/maps\n'}
+[19.382327] (robot_bringup) StdoutLine: {'line': b'copying maps/README.md -> /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/maps\n'}
+[19.382881] (robot_bringup) StdoutLine: {'line': b'running install_egg_info\n'}
+[19.389016] (-) TimerEvent: {}
+[19.486190] (robot_bringup) StdoutLine: {'line': b'Copying ../../build/robot_bringup/robot_bringup.egg-info to /home/sunrise/Robot/ros2_car/install/robot_bringup/lib/python3.10/site-packages/robot_bringup-0.1.0-py3.10.egg-info\n'}
+[19.489135] (-) TimerEvent: {}
+[19.490374] (robot_bringup) StdoutLine: {'line': b'running install_scripts\n'}
+[19.589314] (-) TimerEvent: {}
+[19.688324] (robot_bringup) StdoutLine: {'line': b"writing list of installed files to '/home/sunrise/Robot/ros2_car/build/robot_bringup/install.log'\n"}
+[19.689415] (-) TimerEvent: {}
+[19.790103] (-) TimerEvent: {}
+[19.891445] (-) TimerEvent: {}
+[19.900850] (robot_bringup) CommandEnded: {'returncode': 0}
+[19.984876] (robot_bringup) JobEnded: {'identifier': 'robot_bringup', 'rc': 0}
+[19.989226] (-) EventReactorShutdown: {}

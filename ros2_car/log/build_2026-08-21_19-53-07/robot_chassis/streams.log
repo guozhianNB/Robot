@@ -1,0 +1,38 @@
+[8.303s] Invoking command in '/home/sunrise/Robot/ros2_car/src/robot_chassis': PYTHONPATH=/home/sunrise/Robot/ros2_car/build/robot_chassis/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/robot_chassis build --build-base /home/sunrise/Robot/ros2_car/build/robot_chassis/build install --record /home/sunrise/Robot/ros2_car/build/robot_chassis/install.log --install-scripts $base/lib/robot_chassis --single-version-externally-managed install_data
+[9.961s] running egg_info
+[10.060s] creating ../../build/robot_chassis/robot_chassis.egg-info
+[10.061s] writing ../../build/robot_chassis/robot_chassis.egg-info/PKG-INFO
+[10.064s] writing dependency_links to ../../build/robot_chassis/robot_chassis.egg-info/dependency_links.txt
+[10.065s] writing entry points to ../../build/robot_chassis/robot_chassis.egg-info/entry_points.txt
+[10.066s] writing requirements to ../../build/robot_chassis/robot_chassis.egg-info/requires.txt
+[10.066s] writing top-level names to ../../build/robot_chassis/robot_chassis.egg-info/top_level.txt
+[10.067s] writing manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'
+[10.271s] reading manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'
+[10.277s] writing manifest file '../../build/robot_chassis/robot_chassis.egg-info/SOURCES.txt'
+[10.278s] running build
+[10.278s] running build_py
+[10.279s] creating /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis
+[10.281s] copying robot_chassis/__init__.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis
+[10.282s] copying robot_chassis/chassis_driver.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis
+[10.283s] copying robot_chassis/usb_protocol.py -> /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis
+[10.285s] running install
+[10.314s] running install_lib
+[10.416s] creating /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis
+[10.417s] copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/__init__.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis
+[10.418s] copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/chassis_driver.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis
+[10.419s] copying /home/sunrise/Robot/ros2_car/build/robot_chassis/build/lib/robot_chassis/usb_protocol.py -> /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis
+[10.422s] byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/__init__.py to __init__.cpython-310.pyc
+[10.424s] byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/chassis_driver.py to chassis_driver.cpython-310.pyc
+[10.437s] byte-compiling /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis/usb_protocol.py to usb_protocol.cpython-310.pyc
+[10.441s] running install_data
+[10.443s] creating /home/sunrise/Robot/ros2_car/install/robot_chassis/share/ament_index/resource_index/packages
+[10.444s] copying resource/robot_chassis -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/ament_index/resource_index/packages
+[10.445s] copying package.xml -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis
+[10.446s] creating /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis/config
+[10.446s] copying config/chassis_params.yaml -> /home/sunrise/Robot/ros2_car/install/robot_chassis/share/robot_chassis/config
+[10.447s] running install_egg_info
+[10.558s] Copying ../../build/robot_chassis/robot_chassis.egg-info to /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages/robot_chassis-0.1.0-py3.10.egg-info
+[10.564s] running install_scripts
+[10.789s] Installing chassis_driver script to /home/sunrise/Robot/ros2_car/install/robot_chassis/lib/robot_chassis
+[10.792s] writing list of installed files to '/home/sunrise/Robot/ros2_car/build/robot_chassis/install.log'
+[11.027s] Invoked command in '/home/sunrise/Robot/ros2_car/src/robot_chassis' returned '0': PYTHONPATH=/home/sunrise/Robot/ros2_car/build/robot_chassis/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunrise/Robot/ros2_car/install/robot_chassis/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/robot_chassis build --build-base /home/sunrise/Robot/ros2_car/build/robot_chassis/build install --record /home/sunrise/Robot/ros2_car/build/robot_chassis/install.log --install-scripts $base/lib/robot_chassis --single-version-externally-managed install_data

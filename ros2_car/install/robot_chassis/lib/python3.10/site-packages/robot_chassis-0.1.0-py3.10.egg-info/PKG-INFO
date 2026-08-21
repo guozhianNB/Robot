@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: robot_chassis
+Version: 0.1.0
+Summary: STM32 麦轮底盘 ROS2 驱动
+Maintainer: sunrise
+Maintainer-email: sunrise@localhost
+License: MIT
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

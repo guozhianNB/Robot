@@ -1,0 +1,34 @@
+# STM32 麦轮底盘驱动参数（robot_chassis/chassis_driver）
+# 说明见 README.md「标定」节；真机联调时按实测值修改。
+
+chassis_driver:
+  ros__parameters:
+    # ---- 串口（USB CDC，见 docs/USB车控接口.md）----
+    serial_port: /dev/ttyACM0
+    baudrate: 115200
+
+    # ---- 话题/坐标系 ----
+    cmd_vel_topic: /cmd_vel
+    odom_topic: /odom
+    cmd_stop_topic: /robot/cmd_stop
+    odom_frame_id: odom
+    base_frame_id: base_link
+
+    # ---- 麦轮运动学几何（单位 m）----
+    wheel_radius: 0.04        # 轮半径；固件默认轮径 80mm → 0.04
+    rotate_radius: 0.15       # L+W（旋转半径）；固件默认 150mm
+    wheel_signs: [1, 1, 1, 1] # 四轮方向修正 (LF,RF,LR,RR)，方向反了改 -1
+    sign_vx: 1.0              # 前进轴方向修正（±1）
+    sign_vy: 1.0              # 横移轴方向修正（±1）
+    sign_wz: 1.0              # 自转轴方向修正（±1）
+
+    # ---- 速度限制（养老院场景，安全优先）----
+    max_vx: 0.5               # m/s
+    max_vy: 0.3               # m/s（麦轮横移）
+    max_wz: 0.8               # rad/s
+    accel_limit: 0.5          # m/s^2
+    ang_accel_limit: 0.8      # rad/s^2
+
+    # ---- 时序 ----
+    send_period: 0.05         # 下发周期 s（20Hz，兼作链路保活）
+    watchdog_timeout: 0.5     # cmd_vel 看门狗 s（键盘遥控需放宽；nav2 高频下发不受影响）
