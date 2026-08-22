@@ -31,3 +31,7 @@ ros2_car/**/*.py[cod]
 # SLAM 地图产物（运行时生成，用 map_saver_cli 保存，不入库）
 ros2_car/src/robot_bringup/maps/*.pgm
 ros2_car/src/robot_bringup/maps/*.yaml
+
+# 语音：运行时模型与调研残留不入库
+LLM/models/
+.research_sherpa/
