@@ -8,7 +8,7 @@ r"""下载并解压语音模型到 LLM/models/voice/。
   - KWS / silero_vad：modelscope（pkufool 镜像仓库）
   - ASR / TTS：hf-mirror.com（HuggingFace 镜像，csukuangfj 仓库）
 """
-import sys, tarfile, urllib.request, shutil
+import sys, tarfile, urllib.request, shutil, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,23 +27,32 @@ ASR_DIR = DEST / "sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
 TTS_DIR = DEST / "sherpa-onnx-vits-zh-ll"
 
 
-def _download(url: str, out: Path, timeout: int = 600) -> None:
+def _download(url: str, out: Path, timeout: int = 600, total_cap_s: float | None = None) -> None:
+    """下载 url 到 out。timeout 为单次 socket 操作超时；total_cap_s 为总时长硬上限
+    （urllib 的 timeout 只限单次 read，数据缓慢滴答时总时长可能失控，需手动截止）。"""
     print(f"[download] {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r, open(out, "wb") as f:
-        shutil.copyfileobj(r, f)
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            f.write(b)
+            if total_cap_s is not None and (time.time() - t0) > total_cap_s:
+                raise TimeoutError(f"下载超过 {total_cap_s:.0f}s 总时长上限，放弃（源过慢）")
 
 
 def _try_tarball(key: str, url: str, dest_dir: Path) -> bool:
     """尝试从 GitHub 拉 tar.bz2 并解压；慢/失败（网络/超时）返回 False 走镜像。
-    GitHub 海外源在本机可能极慢（~24KB/s），限时 45s，超时即回退。"""
+    GitHub 海外源在本机可能极慢（~24KB/s），总时长限 40s，超时即回退。"""
     marker = DEST / f".{key}.done"
     if marker.exists():
         print(f"[skip] {key}")
         return True
     out = DEST / f"{key}.tar.bz2"
     try:
-        _download(url, out, timeout=45)
+        _download(url, out, timeout=45, total_cap_s=40)
     except Exception as e:
         print(f"[warn] {key} GitHub 源失败（{e}），改用镜像逐文件下载")
         out.unlink(missing_ok=True)
