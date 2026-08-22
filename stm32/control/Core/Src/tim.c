@@ -50,7 +50,7 @@ void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 72-1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 1000;   /* ~1kHz PWM：65535 时仅 15Hz，电机只会发抖不转 */
+  htim1.Init.Period = 1000;   /* ~1kHz PWM：65535 时仅 15Hz，电机只发抖不转（AGENTS.md 约束 5） */
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -260,7 +260,7 @@ void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 2-1;
+  htim5.Init.Prescaler = 0;     /* 与 TIM2/3/4 保持一致：预分频非 0 会让编码器计数减半 → RPM 测值减半 → PID 输出加倍（WIRING.md P1） */
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 65535;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -378,12 +378,12 @@ void HAL_TIM_Encoder_MspInit(TIM_HandleTypeDef* tim_encoderHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_15;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* 编码器多开漏输出，必须上拉否则无信号 */
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     GPIO_InitStruct.Pin = GPIO_PIN_3;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* 编码器多开漏输出，必须上拉否则无信号 */
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     __HAL_AFIO_REMAP_TIM2_PARTIAL_1();
@@ -407,7 +407,7 @@ void HAL_TIM_Encoder_MspInit(TIM_HandleTypeDef* tim_encoderHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* 编码器多开漏输出，必须上拉否则无信号 */
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN TIM3_MspInit 1 */
@@ -429,7 +429,7 @@ void HAL_TIM_Encoder_MspInit(TIM_HandleTypeDef* tim_encoderHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_13;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* 编码器多开漏输出，必须上拉否则无信号 */
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
     __HAL_AFIO_REMAP_TIM4_ENABLE();
@@ -453,7 +453,7 @@ void HAL_TIM_Encoder_MspInit(TIM_HandleTypeDef* tim_encoderHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* 编码器多开漏输出，必须上拉否则无信号 */
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN TIM5_MspInit 1 */

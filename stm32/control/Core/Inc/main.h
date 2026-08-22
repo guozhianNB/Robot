@@ -75,6 +75,9 @@ void Error_Handler(void);
 #define DIN2_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
+/* KEY1：PE3，按下拉低 → 进入电机1闭环测试模式 */
+#define KEY1_Pin GPIO_PIN_3
+#define KEY1_GPIO_Port GPIOE
 
 /* USER CODE END Private defines */
 
