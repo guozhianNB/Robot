@@ -771,9 +771,10 @@
       ["memory_consolidation_enabled", "记忆整理（话题结束后沉淀）", "空闲一段时间或上下文满时，批量整理记忆（去重/合并/画像）"],
       ["reminder_enabled", "定时提醒", "提醒调度总开关（模块 6）"],
       ["proactive_enabled", "主动交互", "空闲时主动找话题（模块 10，占位）"],
-      ["auto_switch_user", "自动切换老人", "人脸/声纹识别自动切换 uid（模块 4，占位）"],
-      ["asr_enabled", "ASR 语音识别", "语音链路后置（模块 7，占位）"],
-      ["tts_enabled", "TTS 语音播报", "语音链路后置（模块 7，占位）"],
+      ["auto_switch_user", "自动切换老人", "人脸/声纹识别自动切换 uid（模块 4）"],
+      ["voice_enabled", "语音链路总开关", "启动时拉起语音服务（唤醒词/识别/播报/声纹，模块 7）"],
+      ["asr_enabled", "ASR 语音识别", "唤醒后语音→文字（模块 7）"],
+      ["tts_enabled", "TTS 语音播报", "回复文本用语音播报（模块 7）"],
       ["alarm_enabled", "报警上报", "提醒未确认/紧急情况升级写审计日志（模块 11）"],
     ];
 
@@ -790,6 +791,9 @@
       }
       html += `
         <div class="form-grid" style="margin-top:12px">
+          <div class="field"><label>唤醒词（显示用，实际检测用 kws_keywords.txt）</label><input id="s-wakeword" value="${settings.wakeword || "小机器人"}"></div>
+          <div class="field"><label>免唤醒连续对话窗口（秒）</label><input id="s-handsfree" type="number" value="${settings.handsfree_seconds}"></div>
+          <div class="field"><label>声纹阈值（余弦 0~1，越高越严）</label><input id="s-spk-threshold" type="number" step="0.01" value="${settings.spk_threshold}"></div>
           <div class="field"><label>静默时段开始（不主动播报）</label><input id="s-silent-start" value="${settings.silent_start}"></div>
           <div class="field"><label>静默时段结束</label><input id="s-silent-end" value="${settings.silent_end}"></div>
           <div class="field"><label>确认超时（分钟，未确认升级告警）</label><input id="s-timeout" type="number" value="${settings.confirm_timeout_min}"></div>
@@ -808,6 +812,9 @@
       });
       settings.silent_start = document.getElementById("s-silent-start").value || "22:00";
       settings.silent_end = document.getElementById("s-silent-end").value || "07:00";
+      settings.wakeword = document.getElementById("s-wakeword").value || "小机器人";
+      settings.handsfree_seconds = Number(document.getElementById("s-handsfree").value) || 30;
+      settings.spk_threshold = Number(document.getElementById("s-spk-threshold").value) || 0.55;
       await api("/api/settings", { method: "POST", body: JSON.stringify(settings) });
       toast("✅ 设置已保存");
     }
