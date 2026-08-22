@@ -17,22 +17,33 @@
 #define MC_MOTOR_NUM          4        /* 电机数量                         */
 
 /* 编码器每圈计数（TIM 编码器 TI1 模式，仅统计 CH1 上升沿）
- * 标定方法：让电机空转 N 圈，看编码器累计计数 → CPR = 总计数 / N    */
-#define MC_ENCODER_CPR        330.0f
+ * ⚠️ 实测标定值：手动转轮子 10 圈测得 PPR ≈ 28202（两次复核 28219/28202）。
+ *    这是"轮子每圈脉冲数"（已含减速比放大），所以 rpm 语义 = 轮子转速，
+ *    与 mc_car_set 的 mm/s→RPM 换算（轮子 RPM）统一。标定方法：
+ *    手动转轮子 N 圈，看累计计数 → PPR = 总计数 / N                     */
+#define MC_ENCODER_CPR        28202.0f
 
 /* 默认控制周期 (ms)：mc_update_all 内部用 HAL_GetTick 实测 dt，
  * 调用间隔异常（<1ms 或 >200ms）时回退到该值                        */
 #define MC_CONTROL_PERIOD_MS  10U
 
 /* ---------------- PID 默认参数（全局共享一组） ----------------
+ * 实测整定（2026-08，CPR=28202 轮子每圈脉冲）：
+ *   KP=6.5  快速响应：err=100 时起步 650 PWM，速度立即冲上去
+ *   KI=2.0  积分快速消除稳态误差
+ *   KD=0    低速量化噪声大，微分会放大噪声
  * 调参方向：
  *   KP 太小 → 速度跟不上目标（稳态误差大）；KP 太大 → 振荡/啸叫
  *   KI 消除稳态误差，太大 → 超调/震荡
  *   KD 抑制超调，但会放大编码器量化噪声（低速时建议保持 0）        */
-#define MC_PID_KP             0.8f
+#define MC_PID_KP             6.5f
 #define MC_PID_KI             2.0f
 #define MC_PID_KD             0.0f
-#define MC_PID_INTEGRAL_LIMIT 150.0f  /* 积分项上限：防积分饱和           */
+#define MC_PID_INTEGRAL_LIMIT 1000.0f /* 积分项上限：放宽到与输出限幅一致（等效不限幅）。
+                                          防饱和由"条件积分+输出限幅"双保险兜底：
+                                          输出饱和时积分冻结，输出顶死在 ±1000。
+                                          ⚠️ 原 150/600 会把输出封顶 → 速度升不上去
+                                          （实测 150→pwm卡42，600→pwm卡214）*/
 #define MC_PID_OUTPUT_LIMIT   1000.0f /* 输出限幅（±1000 = 满量程）       */
 
 /* 每电机闭环状态（按 way 索引，互不串扰） */

@@ -48,6 +48,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motor_driver.c
     Core/Src/motor_control.c
     Core/Src/usb_proto.c
+    Core/Src/oled.c
+    Core/Src/font.c
 )
 
 # Add include paths
