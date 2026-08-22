@@ -35,3 +35,4 @@ ros2_car/src/robot_bringup/maps/*.yaml
 # 语音：运行时模型与调研残留不入库
 LLM/models/
 .research_sherpa/
+.pip-cache/
