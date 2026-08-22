@@ -92,7 +92,7 @@ IDLE ──唤醒词命中──▶ LISTENING ──一句话结束──▶ SPE
 - **模型**：3D-Speaker **ERes2NetV2**（ModelScope `damo/speech_eres2netV2_sv_zh-cn_16k-common`，34.3M 参数，192 维 embedding，短语音验证友好，中文评测 SOTA 级）
 - **推理**：torch（Windows 开发机）；上板时导出 ONNX 用 onnxruntime（3D-Speaker 官方支持 ONNX Runtime 部署，免装 torch，见 §9）
 - **注册（enroll）**：录 10~30s → VAD 切成若干句 → 每句提取 embedding → **平均合并**为档案 embedding，存 `LLM/data/speakers/<uid>.npz`（含元信息：注册时间、句子数、uid）
-- **验证（verify，1:1）**：`cosine(当前句, 档案) ≥ spk_threshold`（默认 **0.55**，可调）→ 确认是登记过的老人
+- **验证（verify，1:1）**：`cosine(当前句, 档案) ≥ spk_threshold`（默认 **0.55**，可调）→ 确认是登记过的老人；官方模型基线阈值 0.360，因"精准优先"（宁可拒识不误识）默认上调，开发期实测校准
 - **识别（identify，1:N）**：对全部档案算 cosine → 最高分 ≥ 阈值 → 判为某人；否则"未知说话人"（不切 uid、按陌生人处理）
 - **阈值校准**：开发期用"同人自比 / 异人对比"实测校准默认阈值，写入配置
 - **性能**：192 维 embedding 对比开销可忽略；模型推理在 8 核 A55 上 CPU 实时（单句 <100ms 量级）

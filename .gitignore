@@ -1,8 +1,14 @@
-stm32/led_test/
+
 .kagent/
 .venv/
 
+# env隐私数据
 .env
+
+# 临时测试文件
+/stm32/control_test/
+/stm32/led_test/
+
 __pycache__/
 *.py[cod]
 .pytest_cache/
