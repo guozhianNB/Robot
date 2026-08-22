@@ -38,10 +38,11 @@
 - `LLM/voice/tts.py` — 合成封装
 - `LLM/voice/speaker.py` — 声纹（注册/验证/识别，含纯函数 `cosine`/`classify`）
 - `LLM/voice/identity.py` — 身份融合层（`IdentityVote`/`VoiceprintSource`/`VoiceprintOnlyFusion`/`effective_uid`）
+- `LLM/voice/backend.py` — 推理后端抽象（BPU 优先 / CPU 兜底 / 自动检测，RDK X5 预留，见 `docs/superpowers/specs/2026-08-22-voice-bpu-acceleration-goal.md`）
 - `LLM/voice/worker.py` — 编排线程 + 心跳 + 崩溃兜底
 - `LLM/voice/kws_keywords.txt` — 唤醒词拼音映射
 - `LLM/voice_api.py` — 语音服务挂载逻辑（start_voice/status/enroll/list）
-- `LLM/tests/test_session.py`、`LLM/tests/test_speaker_math.py`、`LLM/tests/test_identity.py`
+- `LLM/tests/test_session.py`、`LLM/tests/test_speaker_math.py`、`LLM/tests/test_identity.py`、`LLM/tests/test_backend.py`
 - `scripts/fetch_voice_models.py` — 下载/解压模型
 - `scripts/voice_selftest.py` — 离线自检（无麦克风）
 
@@ -374,6 +375,139 @@ class Session:
 ```bash
 git add LLM/voice/session.py LLM/tests/test_session.py
 git commit -m "feat(voice): 会话状态机（唤醒/免唤醒窗口/打断/超时）"
+```
+
+---
+
+## 任务 2B：推理后端抽象（BPU 预留，RDK X5）
+
+> 目标文档：`docs/superpowers/specs/2026-08-22-voice-bpu-acceleration-goal.md`。本期只落骨架（Windows 恒 cpu）；板卡阶段由板卡 agent 实现 BPU runner 并回填 `BPU_SUPPORTED`。
+
+**文件：**
+- 创建：`LLM/voice/backend.py`
+- 测试：`LLM/tests/test_backend.py`
+
+- [ ] **步骤 1：写失败测试**
+
+创建 `LLM/tests/test_backend.py`：
+```python
+# -*- coding: utf-8 -*-
+import LLM.voice.backend as b
+
+def test_forced_cpu(monkeypatch):
+    b.reset_backend()
+    monkeypatch.setenv("VOICE_BACKEND", "cpu")
+    assert b.detect_backend() == "cpu"
+
+def test_forced_bpu(monkeypatch):
+    b.reset_backend()
+    monkeypatch.setenv("VOICE_BACKEND", "bpu")
+    assert b.detect_backend() == "bpu"
+
+def test_resolve_supported_bpu_when_forced(monkeypatch):
+    b.reset_backend()
+    monkeypatch.setenv("VOICE_BACKEND", "bpu")
+    assert b.resolve_backend("speaker_eres2netv2", "auto") == "bpu"
+
+def test_resolve_unsupported_falls_to_cpu(monkeypatch):
+    b.reset_backend()
+    monkeypatch.setenv("VOICE_BACKEND", "bpu")
+    assert b.resolve_backend("asr_zipformer", "auto") == "cpu"
+
+def test_resolve_bpu_denied_when_forced_cpu(monkeypatch):
+    b.reset_backend()
+    monkeypatch.setenv("VOICE_BACKEND", "cpu")
+    assert b.resolve_backend("speaker_eres2netv2", "auto") == "cpu"
+```
+
+- [ ] **步骤 2：运行测试验证失败**
+
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_backend.py -v`
+预期：FAIL，`ModuleNotFoundError`。
+
+- [ ] **步骤 3：实现 backend.py**
+
+创建 `LLM/voice/backend.py`：
+```python
+# -*- coding: utf-8 -*-
+r"""推理后端抽象：BPU 优先、CPU 兜底、自动检测（RDK X5 征程6E）。
+
+Windows 开发机恒为 cpu；板卡上探测 hobot_dnn 可用则 bpu。
+检测优先级：env VOICE_BACKEND(bpu|cpu|auto) > 探测 hobot_dnn > 默认 cpu。
+板卡阶段：实现 BPU runner 遵守 InferenceBackend/ModelRunner 契约，见
+docs/superpowers/specs/2026-08-22-voice-bpu-acceleration-goal.md。"""
+import os
+import threading
+
+# 当前认定可上 BPU 的模型键（板卡实测后可增删）
+BPU_SUPPORTED = {"speaker_eres2netv2"}
+
+_available = None
+_lock = threading.Lock()
+
+
+def reset_backend():
+    """清缓存（测试用；也用于运行时重新探测）。"""
+    global _available
+    _available = None
+
+
+def detect_backend() -> str:
+    """返回 'bpu' 或 'cpu'，结果缓存。"""
+    global _available
+    if _available is not None:
+        return _available
+    with _lock:
+        if _available is not None:
+            return _available
+        forced = os.environ.get("VOICE_BACKEND", "").strip().lower()
+        if forced in ("bpu", "cpu"):
+            _available = forced
+        else:
+            _available = "bpu" if _probe_bpu() else "cpu"
+        return _available
+
+
+def _probe_bpu() -> bool:
+    try:
+        import hobot_dnn  # noqa: F401  板卡工具链；本机无则抛 ImportError
+        return True
+    except Exception:
+        return False
+
+
+def resolve_backend(model_key: str, requested: str = "auto") -> str:
+    """按模型解析实际后端：'bpu' 仅当模型在支持表、探测到 BPU、且未被强制 cpu。"""
+    if requested == "cpu":
+        return "cpu"
+    if model_key in BPU_SUPPORTED and detect_backend() == "bpu":
+        return "bpu"
+    return "cpu"
+
+
+# ---- 板卡阶段需实现的后端契约（本期仅为文档化占位，不实例化）----
+class InferenceBackend:
+    name = "cpu"
+
+    def load(self, model_key, model_spec):
+        raise NotImplementedError
+
+
+class ModelRunner:
+    def run(self, **inputs):
+        raise NotImplementedError
+```
+
+- [ ] **步骤 4：运行测试验证通过**
+
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_backend.py -v`
+预期：5 个用例全部 PASS。
+
+- [ ] **步骤 5：Commit**
+
+```bash
+git add LLM/voice/backend.py LLM/tests/test_backend.py
+git commit -m "feat(voice): 推理后端抽象（BPU 优先/CPU 兜底/自动检测，板卡预留）"
 ```
 
 ---
@@ -1454,7 +1588,7 @@ git commit -m "test(voice): 离线自检脚本（模型加载 + TTS/ASR 往返 +
 
 ## 完成标准
 
-- [ ] `python -m pytest LLM/tests -v` 全绿（session / speaker_math / identity 共 15 用例）
+- [ ] `python -m pytest LLM/tests -v` 全绿（session / speaker_math / identity / backend 共 20 用例）
 - [ ] `scripts/voice_selftest.py` 输出 `ALL OK`
 - [ ] 真实链路验收 6 项 + 掉线不崩 3 项 + 声纹双档案 3 项全部通过
 - [ ] 规格 §1–§11 全部有对应实现（§9 移植要点属 M5，不在本期）
