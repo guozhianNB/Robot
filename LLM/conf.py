@@ -23,8 +23,12 @@ DEFAULT_SETTINGS = {
     "router_llm_enabled": True,     # 思考路由：规则未命中时用 LLM 快速预判兜底
     "memory_consolidation_enabled": True,  # 记忆整理（话题结束后批量沉淀）
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
-    "asr_enabled": False,           # ASR 占位（语音链路后置）
-    "tts_enabled": False,           # TTS 占位
+    "asr_enabled": True,            # 语音识别（真实开关）
+    "tts_enabled": True,            # 语音合成（真实开关）
+    "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）
+    "wakeword": "小机器人",          # 唤醒词（显示用；实际检测用 kws_keywords.txt）
+    "handsfree_seconds": 30,        # 免唤醒连续对话窗口
+    "spk_threshold": 0.55,          # 声纹余弦阈值（官方基线 0.360，精准优先上调）
     "alarm_enabled": True,          # 报警上报开关（未确认提醒升级时写审计日志）
     "silent_start": "22:00",        # 静默时段开始（主动播报不发）
     "silent_end": "07:00",          # 静默时段结束

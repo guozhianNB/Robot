@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
-from . import db, bus, chat, memory as rag, reminder, tools as tool_mod
+from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
 from .conf import MODEL, BASE_DIR
 
 load_dotenv(BASE_DIR / ".env")
@@ -51,7 +51,9 @@ async def lifespan(app: FastAPI):
     _seed_demo()
     reminder.start()          # 独立线程的定时提醒调度器
     drain_task = bus.start_drain()   # 广播扇出任务
+    voice_api.start_voice(client, MODEL, _post_chat_jobs)
     yield
+    voice_api.stop_voice()
     drain_task.cancel()
 
 
@@ -328,6 +330,24 @@ async def settings_set(body: dict):
     from . import log as audit
     audit.log("settings", change=json.dumps(patch, ensure_ascii=False), by="nurse")
     return {"ok": True, "settings": cur}
+
+
+# ---------------------------------------------------------------- 语音
+@app.post("/api/voice/enroll")
+async def voice_enroll(body: dict):
+    uid = (body or {}).get("uid", "elder_001")
+    seconds = int((body or {}).get("seconds", 15))
+    return await asyncio.to_thread(voice_api.enroll_speaker, uid, seconds)
+
+
+@app.get("/api/voice/status")
+async def voice_status():
+    return voice_api.get_status()
+
+
+@app.get("/api/voice/speakers")
+async def voice_speakers():
+    return {"ok": True, "speakers": voice_api.list_speakers()}
 
 
 # ---------------------------------------------------------------- 广播（提醒/告警 SSE）
