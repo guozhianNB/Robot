@@ -84,6 +84,9 @@ def enroll_speaker(uid: str, seconds: int = 15) -> dict:
         _recognizer.enroll(uid, segs)
         audit.log("voice_spk", action="enroll", uid=uid, segments=len(segs))
         return {"ok": True, "uid": uid, "segments": len(segs)}
+    except Exception as e:
+        audit.log("voice_error", action="enroll", uid=uid, error=str(e))
+        return {"ok": False, "uid": uid, "error": str(e)}
     finally:
         if _worker is not None:
             try:

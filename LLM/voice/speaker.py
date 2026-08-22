@@ -37,6 +37,13 @@ class SpeakerRecognizer:
 
     def _ensure_model(self):
         if self._pipeline is None:
+            import os
+            # 模型缓存/配置统一放 LLM/models/voice/modelscope（已被 .gitignore 排除），
+            # 避免散落到用户 HOME；已有环境变量时尊重外部设置。
+            os.environ.setdefault(
+                "MODELSCOPE_CACHE", str(config.MODEL_DIR / "modelscope" / "cache"))
+            os.environ.setdefault(
+                "MODELSCOPE_HOME", str(config.MODEL_DIR / "modelscope" / "home"))
             from modelscope.pipelines import pipeline  # 懒加载，避免拖慢启动
             self._pipeline = pipeline(
                 task="speaker-verification", model=self.model_id, device="cpu")

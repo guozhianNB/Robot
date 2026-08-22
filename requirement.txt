@@ -3,4 +3,11 @@ sounddevice
 numpy
 modelscope
 pytest
+# modelscope 运行期依赖（部分镜像源不自动拉全，显式固化）
+addict
+datasets
+pillow
+simplejson
+sortedcontainers
+soundfile
 # torch/torchaudio: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
