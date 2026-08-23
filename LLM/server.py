@@ -199,6 +199,13 @@ async def modules_status():
     }}
 
 
+@app.get("/api/logs/warnings")
+async def logs_warnings(limit: int = Query(50)):
+    """最近警告/错误审计日志（服务端过滤，供前端排查用）。"""
+    from . import log as audit
+    return {"ok": True, "logs": audit.read_warnings(limit=limit)}
+
+
 @app.post("/api/chat")
 async def chat_route(req: ChatRequest):
     settings = db.get_settings()
