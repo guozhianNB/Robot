@@ -227,3 +227,20 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 新增 `tests/test_log_warnings.py`（3 个用例）：过滤规则（正常事件剔除、error/alarm/voice_degraded 保留，按写入顺序）、`limit` 截断 + 文件缺失返回空、坏行跳过（解析失败行 + 合法 JSON 非对象行）。
 - 全量回归：`pytest tests -q` → **38 passed**（9 个测试文件，无回归）。
 - 手动端到端验证（uvicorn 启动 + curl `/api/logs/warnings` + 注入错误审计 + 浏览器弹窗操作）由控制者执行。
+
+---
+
+## 2026-08-24 · 语音前端实时联动（SSE 事件推送）
+
+**做了什么：**
+- 后端 `LLM/voice/worker.py`：新增 `_publish()` 兜底助手，在唤醒命中 / ASR 出文本 / TTS 开始 / 播报结束 / 对话落库后推送 `voice_state`（wake/recognized/speaking/idle）与 `chat_new`（uid/user/assistant）事件，全部 try/except 兜底，不影响语音主循环。
+- 前端 `UI/index.html`：对话页顶部新增语音状态指示条；`connectEvents()` 监听 `voice_state`（状态条）与 `chat_new`（同老人且对话页激活 → 原位追加对话轮并防重复；uid 不一致 → 自动切换到对应老人对话页；其他页签 → toast 提示）；抽 `switchTab()` 公共函数。
+- 测试 `LLM/tests/test_worker_events.py`：5 个事件广播单元测试。
+
+**有什么用：** 语音对话（唤醒→识别→回复→播报）全程在前端实时可见，护士不再需要刷新页面才能看到老人和机器人的对话；另一位老人说话时页面自动切过去。
+
+### 测试
+
+- 新增 `tests/test_worker_events.py`（5 个用例）：`bus.publish` 后 SSE 扇出 `voice_state` / `chat_new` 事件广播（事件类型、uid 字段、任意线程触发）。
+- 全量回归：`pytest LLM/tests -q` → **28 passed**（5 个测试文件，无回归；含声纹批次后续新增的 3 个用例，本批次基线 25）。
+- 后端启动 + `curl -N /api/events` 事件流集成验证（health、SSE keep-alive、`bus.publish` 注入 `voice_state`/`chat_new` 实时出现在流中）由控制者执行。
