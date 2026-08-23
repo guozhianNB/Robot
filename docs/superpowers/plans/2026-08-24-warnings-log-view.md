@@ -84,6 +84,7 @@ def test_bad_json_skipped(tmp_path, monkeypatch):
         f.write('{"ts": "t1", "event": "alarm", "level": "warn"}\n')
         f.write("not-json\n")                                     # 坏行 → 跳过
         f.write('{"ts": "t2", "event": "voice_error"}\n')
+        f.write('123\n')                                          # 合法 JSON 但非对象 → 跳过
     monkeypatch.setattr(log, "AUDIT_LOG", str(p))
     out = log.read_warnings(limit=50)
     assert [r["ts"] for r in out] == ["t1", "t2"]
@@ -115,6 +116,8 @@ def read_warnings(limit: int = 50) -> list[dict]:
                     continue
                 try:
                     rec = json.loads(line)
+                    if not isinstance(rec, dict):
+                        continue   # 合法 JSON 但非对象（数组/数字/字符串/null）→ 跳过
                 except Exception:
                     continue   # 坏行跳过
                 if _is_warning(rec):
