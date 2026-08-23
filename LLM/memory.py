@@ -24,7 +24,10 @@ import re
 from . import db
 from . import log as audit
 from . import vectors
-from .conf import MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS
+from . import graph
+from . import ragstore
+from .conf import (MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS,
+                   CORE_IMPORTANCE_THRESHOLD, IDENTITY_KEYWORDS)
 
 # 医疗字段关键词：命中即判定为医疗信息，禁止模型写入
 MEDICAL_KEYWORDS = ["药", "剂量", "病史", "诊断", "血压", "血糖", "手术", "住院", "过敏",
@@ -201,6 +204,34 @@ def _dedup_check(uid: str, content: str, mtype: str | None = None) -> int | None
     if hits and hits[0]["score"] >= DEDUP_SIM_THRESHOLD:
         return hits[0]["doc"]["id"]
     return None
+
+
+def _apply_v3(uid: str, e: dict) -> dict:
+    """记忆 v3 分流：episodic/semantic → RAG；核心层 type 按 importance 分流；
+    医疗/身份红线一律 reject。"""
+    mtype = (e.get("type") or "semantic").lower()
+    content = (e.get("content") or "").strip()
+    importance = int(e.get("importance") or 0)
+    if not content:
+        return {"route": "skip"}
+    if mtype == "medical" or any(k in content for k in MEDICAL_KEYWORDS):
+        audit.log("memory_change", action="reject", uid=uid, type=mtype,
+                  content=content, reason="医疗只读红线")
+        return {"route": "reject", "reason": "医疗信息只允许人工录入"}
+    if any(k in content for k in IDENTITY_KEYWORDS):
+        audit.log("memory_change", action="reject", uid=uid, type=mtype,
+                  content=content, reason="身份只读红线")
+        return {"route": "reject", "reason": "身份信息只允许护士录入"}
+
+    core_types = {"preference", "relation", "persona", "style", "fact"}
+    if mtype in core_types and importance >= CORE_IMPORTANCE_THRESHOLD:
+        db.add_core_memory(uid, mtype, content, importance=importance, source="llm:consolidate")
+        audit.log("memory_change", action="core_add", uid=uid, type=mtype, content=content)
+        return {"route": "core"}
+    # 其余（episodic/semantic 或低 importance 核心层）→ RAG
+    ragstore.add(uid, mtype, content, importance=importance, source="llm:consolidate")
+    audit.log("memory_change", action="rag_add", uid=uid, type=mtype, content=content)
+    return {"route": "rag"}
 
 
 def _apply_entry(uid: str, e: dict) -> dict:
