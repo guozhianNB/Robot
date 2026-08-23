@@ -110,3 +110,81 @@ async def modules_status():
 
 - 不做：自动弹出、设置页入口、模块详情二级页、定时轮询（仅手动刷新 + 打开时拉取）。
 - 不改：现有 `/api/health`、`/api/memories/health` 接口（新增聚合接口与其并存）。
+
+---
+
+# 补充设计：模块状态弹窗内「警告/错误日志」（2026-08-24 追加，用户已确认）
+
+## 目标
+
+在模块状态弹窗内加一个「📋 警告/错误日志」按钮，按下后在**同一弹窗内**展示后端运行中遇到的所有
+警告/错误类审计日志（如语音降级/报错、提醒 tick 异常、记忆整理失败、告警升级等），便于排查"到底出过什么事"。
+
+## 背景：现有审计日志
+
+后端 `LLM/log.py` 把全部事件 JSONL 落盘 `LLM/data/audit.jsonl`（`log(event, **fields)`，含
+`ts` 时间戳）。事件类型：`chat` / `memory_change` / `reminder` / `tool` / `settings` / `alarm` /
+`voice_degraded` / `voice_error` / `voice_state` / `system` / `memory_correct` / `graph` 等。
+错误/警告类条目分散在多种事件中（`*_error` 动作、`alarm`、`voice_degraded`、`tick_error`、
+`consolidate_error` 等），前端目前**没有任何接口能查这些日志**（`/api/tools/log` 只查工具调用记录，来自另一张表）。
+
+## 方案（用户已确认）
+
+- **数据接口**：后端新增 `GET /api/logs/warnings`（只读 `audit.jsonl` 末尾 N 条，**服务端过滤**警告/错误类，
+  返回结构化列表），前端只管展示。
+- **展示**：模块状态弹窗 footer 加「📋 警告/错误日志」按钮，点击后在弹窗 body 内展开日志列表区
+  （模块状态 ⇄ 日志列表两个视图切换，一键切回）；日志为空显示「✅ 暂无警告/错误记录」。
+- **范围**：只显示警告/错误类，不显示正常事件。
+
+## 后端改动
+
+### `LLM/log.py` — 新增读取函数
+
+```python
+def read_warnings(limit: int = 50) -> list[dict]:
+    """读 audit.jsonl 末尾 limit 条，过滤警告/错误类事件（*_error / alarm / voice_degraded / *warn* / level 含 warn / 含 error 字段）。"""
+    # 读文件 → 逐行解析 JSON（解析失败跳过）→ 匹配警告/错误规则 → 取末尾 limit 条
+```
+
+### `LLM/server.py` — 新增路由
+
+```python
+@app.get("/api/logs/warnings")
+async def logs_warnings(limit: int = Query(50)):
+    from . import log as audit
+    return {"ok": True, "logs": audit.read_warnings(limit=limit)}
+```
+
+## 过滤规则（服务端，命中任一条即视为警告/错误）
+
+- `action` 或 `event` 字段值含 `error`（如 `tick_error` / `consolidate_error` / `voice_error` / `ragstore_add_error`）
+- `event == "alarm"` 或 `level` 字段值含 `warn`
+- `event == "voice_degraded"`
+- 存在 `error` 字段
+
+## 前端改动（UI/index.html）
+
+- `openModulesModal()` 的 modal footer 追加按钮「📋 警告/错误日志」。
+- 点击后调用 `loadWarningsLog()`：`GET /api/logs/warnings` → 渲染日志列表到弹窗 body（替换模块列表视图），
+  每条显示 `时间 · 事件 · 动作/说明`，错误（`error` 字段存在 / 事件含 error）红色，告警（alarm/warn）橙色。
+- 视图切换：弹窗内一个"返回模块状态"链接/按钮切回模块列表；重新打开弹窗默认回到模块状态视图。
+- 日志为空 → 「✅ 暂无警告/错误记录」。
+- 无新弹窗；复用现有 `.mod-row` 样式或新增 `.log-row` 样式。
+
+## 错误处理
+
+- 后端离线/接口失败 → 日志区显示「无法获取日志（后端离线）」。
+- 单条 JSON 解析失败 → 服务端跳过，不崩。
+- 日志文件不存在（首次运行）→ 返回空列表，前端显示"暂无记录"。
+
+## 测试
+
+- 后端：`curl http://127.0.0.1:8000/api/logs/warnings` → 返回 `{"ok":true,"logs":[...]}`；
+  造一条 `audit.log("voice_error", ...)` 后能查到；`limit` 参数生效。
+- 前端：点「警告/错误日志」→ 列表展示；空日志 → 暂无记录；切回模块状态正常；后端离线 → 提示。
+
+## 范围（YAGNI）
+
+- 不做：日志详情二级页、按事件类型筛选、时间范围选择、日志持久化查询接口（直接读 JSONL）。
+- 不改：现有 `/api/tools/log`；审计日志写入逻辑不动。
+
