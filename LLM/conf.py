@@ -36,6 +36,10 @@ DEFAULT_SETTINGS = {
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
 }
 
+# 声纹录制
+VOICE_ENROLL_SECONDS = 15        # 注册/追加默认录制秒数
+VOICE_PENDING_TTL_S = 600        # 录制暂存（特征+音频）内存保留时长
+
 # 思考路由 · 第一层：主题/敏感/健康关键词（命中即深思考）
 THINKING_KEYWORDS = [
     # 健康/药物
