@@ -557,8 +557,10 @@ window._es = _es = new EventSource(API + "/api/events");
 将 `init()` 中的 `setInterval(ping, 30000);` 改为：
 
 ```js
-      _pingTimer = setInterval(ping, 30000);
+      window._pingTimer = _pingTimer = setInterval(ping, 30000);
 ```
+
+（脚本顶层 `let` 声明**不会**成为 `window` 属性，所以必须显式写 `window._pingTimer =`，`showExitOverlay` 才能读到并 clear 它；同理 `connectEvents` 里已用 `window._es = _es = new EventSource(...)` 显式挂载。）
 
 （`showExitOverlay` 已通过 `window._es` / `window._pingTimer` 访问，确保两处引用一致。）
 
