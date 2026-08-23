@@ -169,3 +169,32 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - **前端（`UI/index.html`）**：工具日志页顶部新增「工具开关」卡片（名称+描述+switch，保存走 `/api/settings`）；设置页移除原 `web_search_enabled` 总开关（统一在工具页管理）。
 - **新增工具现在只需写一处**（见 tools.py docstring「三步走」）：装饰器 + 实现函数，分发/清单/开关/前端展示全部自动生效。
 - **验证**：`py_compile` 4 文件通过；模块级冒烟（注册表/分发/未知工具/开关过滤）通过；后端 8011 端口启动后 `/api/tools`、`/api/settings` 读写、未知 key 丢弃、开关保存恢复均通过（测试后已恢复默认全开）。
+
+---
+
+## 2026-08-24 · 模块状态弹窗 + 系统退出按钮
+
+**背景：** 护士/家属需要一眼看清后端可选能力（语音 / Embedding / RAG / 知识图谱）是否可用、缺了什么依赖；同时给出一键安全退出——停提醒、释放语音设备、关广播，而不是直接杀进程。
+
+### 后端（`LLM/server.py`）
+
+- 新增 `GET /api/modules/status` 聚合接口：一次返回 `voice`（`voice_api.get_status()`）、`embed`（`embed.status()`）、`ragstore`（`ragstore.status()`）、`graph`（`graph.status()`）四模块状态；各模块缺依赖时自行降级（`available=False` / `status=unavailable`），接口照常 `{"ok": True}` 返回，不因单模块故障而报错。
+- 新增 `POST /api/system/shutdown` 优雅退出，按序执行：
+  1. 落审计（`log("system", action="shutdown")`）；
+  2. `reminder.stop()` 停提醒调度线程（不再触发新提醒）；
+  3. `voice_api.stop_voice()` 停语音 worker（释放麦克风/扬声器）；
+  4. `bus.stop()` 停 SSE 广播扇出；
+  5. `_bg.shutdown(wait=False)` 停后台任务线程池；
+  6. `_delayed_exit()` 延迟 1 秒 `os._exit(0)`——给 uvicorn 留出时间把 200 响应发回前端再杀进程。
+
+### 前端（`UI/index.html`）
+
+- 顶栏新增「🔍 模块状态」「⏻ 退出」按钮 + modal 基础样式（3 个提交：modal 样式与按钮 → 弹窗与警示色 → 退出确认与遮罩）。
+- 「模块状态」弹窗：拉取 `/api/modules/status` 逐模块展示——✅ 可用 / ⚠️ 未启动或设置中关闭（非故障）/ ❌ 缺失依赖（列出缺失项）；**任一模块异常时顶栏按钮变警示色（warn）**；「🔄 重新检测」按钮刷新列表；后端离线时弹窗显示离线提示。
+- 「退出」按钮：确认弹窗（取消无副作用）→ 确认后 `POST /api/system/shutdown` → 全屏「系统已退出」遮罩（按钮禁用、SSE 断开）；后端约 1 秒后自行退出，刷新页面显示「后端离线」。
+
+### 测试
+
+- 新增 `tests/test_modules_status.py`（`/api/modules/status` 响应结构：4 个模块键齐全）、`tests/test_shutdown_hooks.py`（reminder 停止钩子：start 先 clear 再 stop 置事件；bus 停止置标志）。
+- 全量回归：`pytest tests -q` → **35 passed**（8 个测试文件，无回归）。
+- 手动端到端验证（启动 uvicorn + 浏览器操作 + 退出）由控制者执行，结果见任务 7 报告。
