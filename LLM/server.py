@@ -407,10 +407,43 @@ async def settings_set(body: dict):
 
 
 # ---------------------------------------------------------------- 语音
-@app.post("/api/voice/enroll")
-async def voice_enroll(body: dict):
-    uid = (body or {}).get("uid", "elder_001")
+@app.post("/api/voice/record")
+async def voice_record(body: dict = None):
+    """两步式声纹第 1 步：录制并暂存（不落档），返回 recording_id。"""
     seconds = int((body or {}).get("seconds", 15))
+    return await asyncio.to_thread(voice_api.record_speaker, seconds)
+
+
+@app.get("/api/voice/record/{recording_id}/audio")
+async def voice_record_audio(recording_id: str):
+    """试听：返回暂存录音的 wav。"""
+    got = await asyncio.to_thread(voice_api.get_recording_audio, recording_id)
+    if got is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": "录音已过期或不存在"})
+    data, ctype = got
+    from fastapi.responses import Response
+    return Response(content=data, media_type=ctype)
+
+
+@app.delete("/api/voice/record/{recording_id}")
+async def voice_record_discard(recording_id: str):
+    """丢弃暂存录音（重录/放弃时用）。"""
+    return await asyncio.to_thread(voice_api.discard_recording, recording_id)
+
+
+@app.post("/api/voice/enroll")
+async def voice_enroll(body: dict = None):
+    body = body or {}
+    uid = body.get("uid", "elder_001")
+    if body.get("recording_id"):
+        # 两步式第 2 步：提交暂存入档（append 默认 True = 合并平均）
+        append = bool(body.get("append", True))
+        return await asyncio.to_thread(voice_api.commit_speaker,
+                                       body["recording_id"], uid, append)
+    # 旧行为兼容：无 recording_id 直接录 seconds 秒覆盖建档
+    seconds = int(body.get("seconds", 15))
     return await asyncio.to_thread(voice_api.enroll_speaker, uid, seconds)
 
 
@@ -421,7 +454,21 @@ async def voice_status():
 
 @app.get("/api/voice/speakers")
 async def voice_speakers():
-    return {"ok": True, "speakers": voice_api.list_speakers()}
+    return {"ok": True, "speakers": voice_api.list_speakers(),
+            "details": voice_api.list_speaker_details()}
+
+
+@app.delete("/api/voice/speakers/{uid}")
+async def voice_speaker_delete(uid: str):
+    """删除老人声纹（注销/重录时用）。"""
+    return await asyncio.to_thread(voice_api.delete_speaker, uid)
+
+
+@app.get("/api/face/status")
+async def face_status():
+    """人脸录入占位：本期未实现，返回 unavailable（前端据此置灰按钮）。"""
+    return {"ok": True, "status": "unavailable",
+            "reason": "人脸录入尚未接入（占位接口，见 docs/temp/face-recognition-notes.md）"}
 
 
 # ---------------------------------------------------------------- 广播（提醒/告警 SSE）
