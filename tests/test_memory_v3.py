@@ -157,3 +157,15 @@ def test_apply_v3_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatc
     r = memory._apply_v3("elder_002", {"action": "correct", "correct_id": mid, "content": "老人姓王"})
     assert r["route"] == "skip"
     assert db.get_core_memory(mid)["content"] == "老人姓张"
+
+
+def test_portrait_medical_rejected(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    monkeypatch.setattr(memory.db, "set_portrait", lambda uid, p: None)
+    called = []
+    monkeypatch.setattr(memory.db, "add_core_memory",
+                        lambda uid, t, c, **kw: called.append(c) or 1)
+    monkeypatch.setattr(memory.db, "list_core_memories", lambda uid: [])
+    memory._upsert_portrait("elder_001", "老人有高血压，需按时吃药")
+    assert called == []  # 未写入任何核心记忆

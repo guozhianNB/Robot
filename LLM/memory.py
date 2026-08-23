@@ -207,7 +207,7 @@ CONSOLIDATE_PROMPT = """你是陪护机器人的记忆管家。下面是刚结�
 {{
   "entries": [...],
   "digest": "这段对话的一句话摘要（≤80字）",
-  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/健康注意事项/说话风格）"
+  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/说话风格（不得包含任何医疗/用药/病史信息））"
 }}
 
 entries 规则：
@@ -246,7 +246,10 @@ def _apply_v3(uid: str, e: dict) -> dict:
     医疗/身份红线一律 reject。"""
     mtype = (e.get("type") or "semantic").lower()
     content = (e.get("content") or "").strip()
-    importance = int(e.get("importance") or 0)
+    try:
+        importance = int(e.get("importance") or 0)
+    except (ValueError, TypeError):
+        importance = 0
     if not content:
         return {"route": "skip"}
     # 整理纠错：本条是在修正旧核心记忆
@@ -299,6 +302,10 @@ def _upsert_relation(uid: str, rel: dict) -> None:
 
 
 def _append_summary_and_episode(uid: str, digest: str) -> None:
+    if any(k in digest for k in MEDICAL_KEYWORDS):
+        audit.log("memory_change", action="reject", uid=uid, type="digest",
+                  content=digest, reason="医疗只读红线")
+        return
     prev = db.get_summary(uid)
     new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
     db.set_summary(uid, new_sum[-900:])
@@ -308,6 +315,10 @@ def _append_summary_and_episode(uid: str, digest: str) -> None:
 
 
 def _upsert_portrait(uid: str, portrait: str) -> None:
+    if any(k in portrait for k in MEDICAL_KEYWORDS):
+        audit.log("memory_change", action="reject", uid=uid, type="persona",
+                  content=portrait, reason="医疗只读红线")
+        return
     # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
     for m in db.list_core_memories(uid):
         if m["type"] == "persona":
@@ -425,9 +436,13 @@ def consolidate(uid: str, client, model: str) -> dict:
     stats = {"skip": 0, "reject": 0, "core": 0, "rag": 0, "correct": 0}
     if isinstance(data, dict):
         for e in data.get("entries", []) or []:
-            r = _apply_v3(uid, e)
-            key = r["route"]
-            stats[key] = stats.get(key, 0) + 1
+            try:
+                r = _apply_v3(uid, e)
+                key = r["route"]
+                stats[key] = stats.get(key, 0) + 1
+            except Exception as exc:  # noqa: BLE001
+                audit.log("memory_change", action="entry_error", uid=uid, error=str(exc))
+                stats["skip"] = stats.get("skip", 0) + 1
 
         for rel in data.get("relations", []) or []:
             _upsert_relation(uid, rel)

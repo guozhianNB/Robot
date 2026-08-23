@@ -304,7 +304,11 @@ async def core_memories_list(uid: str = Query("elder_001")):
 
 @app.delete("/api/memories/core/{mid}")
 async def core_memories_delete(mid: int):
+    m = db.get_core_memory(mid)
     db.delete_core_memory(mid)
+    from . import log as audit
+    audit.log("memory_change", action="core_delete", mid=mid,
+              uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True}
 
 
