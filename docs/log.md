@@ -198,3 +198,32 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 新增 `tests/test_modules_status.py`（`/api/modules/status` 响应结构：4 个模块键齐全）、`tests/test_shutdown_hooks.py`（reminder 停止钩子：start 先 clear 再 stop 置事件；bus 停止置标志）。
 - 全量回归：`pytest tests -q` → **35 passed**（8 个测试文件，无回归）。
 - 手动端到端验证（启动 uvicorn + 浏览器操作 + 退出）由控制者执行，结果见任务 7 报告。
+
+---
+
+## 2026-08-24 · 模块状态弹窗警告/错误日志视图
+
+**背景：** 模块状态弹窗只告诉护士/家属"哪个模块不可用"，但看不出**为什么**——缺依赖、语音出错、提醒告警等都在审计日志里，前端却无处可查。本功能在弹窗内直接提供"警告/错误日志"视图，服务端过滤、前端红/橙分色展示，排查问题不用再登服务器翻 `audit.jsonl`。
+
+### 后端（`LLM/log.py` + `LLM/server.py`）
+
+- `log.py` 新增 `read_warnings(limit=50)`：顺序读 `audit.jsonl` 全文，逐行过滤出警告/错误类条目，返回末尾 `limit` 条。命中任一条规则即保留：
+  - `action` 或 `event` 含 `error`（覆盖 `*_error` 事件与 `tick_error` 等 action）；
+  - `event == "alarm"`（提醒升级告警）；
+  - `level` 含 `warn`（`warning`/`warn` 等级）；
+  - `event == "voice_degraded"`（语音降级，可选依赖缺失）；
+  - 记录自带 `error` 字段。
+  - 健壮性：文件不存在 → 空列表；单行 JSON 解析失败 → 跳过（坏行不影响其余）；合法 JSON 但非对象（数组/数字/字符串）→ 跳过（审查发现修复）。
+- `server.py` 新增 `GET /api/logs/warnings?limit=`：调 `read_warnings` 返回 `{"ok": True, "logs": [...]}`，服务端过滤，前端拿到的就是纯警告/错误列表。
+
+### 前端（`UI/index.html`）
+
+- 模块状态弹窗 footer 新增「📋 警告/错误日志」按钮；点击后同一弹窗内切换到日志列表视图（无记录时显示"✅ 暂无警告/错误记录"）。
+- 日志行分色：`❌` 红色 = error 事件/action 或带 `error` 字段；`⚠️` 橙色 = alarm 或 level 含 warn；每行显示时间 + 事件名 + action + error 详情。
+- 「← 返回模块状态」切回模块列表；**视图快照一致性**（审查发现，两轮修复）：打开弹窗时重置快照、每次检测后同步快照，避免切回时回滚到过期数据。
+
+### 测试
+
+- 新增 `tests/test_log_warnings.py`（3 个用例）：过滤规则（正常事件剔除、error/alarm/voice_degraded 保留，按写入顺序）、`limit` 截断 + 文件缺失返回空、坏行跳过（解析失败行 + 合法 JSON 非对象行）。
+- 全量回归：`pytest tests -q` → **38 passed**（9 个测试文件，无回归）。
+- 手动端到端验证（uvicorn 启动 + curl `/api/logs/warnings` + 注入错误审计 + 浏览器弹窗操作）由控制者执行。
