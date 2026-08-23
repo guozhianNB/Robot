@@ -241,6 +241,21 @@ def _dedup_check(uid: str, content: str, mtype: str | None = None) -> int | None
     return None
 
 
+def _rag_dedup_check(uid: str, content: str, mtype: str | None = None) -> int | None:
+    """RAG 层去重：新条目与已有 rag_memories（可限定类型）向量相似度过高 → 返回命中 id。"""
+    all_mems = db.list_rag_memories(uid)
+    if mtype:
+        all_mems = [m for m in all_mems if m.get("type") == mtype]
+    docs = [{"id": m["id"], "text": m["content"]} for m in all_mems]
+    if not docs:
+        return None
+    index = vectors.build_index(docs)
+    hits = vectors.recall(index, content, top_k=1)
+    if hits and hits[0]["score"] >= DEDUP_SIM_THRESHOLD:
+        return hits[0]["doc"]["id"]
+    return None
+
+
 def _apply_v3(uid: str, e: dict) -> dict:
     """记忆 v3 分流：episodic/semantic → RAG；核心层 type 按 importance 分流；
     医疗/身份红线一律 reject。"""
@@ -285,6 +300,8 @@ def _apply_v3(uid: str, e: dict) -> dict:
         audit.log("memory_change", action="core_add", uid=uid, type=mtype, content=content)
         return {"route": "core"}
     # 其余（episodic/semantic 或低 importance 核心层）→ RAG
+    if _rag_dedup_check(uid, content, mtype=mtype):
+        return {"route": "duplicate"}
     ragstore.add(uid, mtype, content, importance=importance, source="llm:consolidate")
     audit.log("memory_change", action="rag_add", uid=uid, type=mtype, content=content)
     return {"route": "rag"}
@@ -309,7 +326,7 @@ def _append_summary_and_episode(uid: str, digest: str) -> None:
     prev = db.get_summary(uid)
     new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
     db.set_summary(uid, new_sum[-900:])
-    if not _dedup_check(uid, digest, mtype="episode"):
+    if not _rag_dedup_check(uid, digest, mtype="episodic"):
         ragstore.add(uid, "episodic", digest, source="llm:consolidate")
         audit.log("memory_change", action="episode_add", uid=uid, content=digest)
 
@@ -433,7 +450,7 @@ def consolidate(uid: str, client, model: str) -> dict:
     prompt = CONSOLIDATE_PROMPT.format(conversation=conversation, existing=_existing_context(uid))
     data = llm_json(client, model, prompt)
 
-    stats = {"skip": 0, "reject": 0, "core": 0, "rag": 0, "correct": 0}
+    stats = {"skip": 0, "reject": 0, "core": 0, "rag": 0, "correct": 0, "duplicate": 0}
     if isinstance(data, dict):
         for e in data.get("entries", []) or []:
             try:
