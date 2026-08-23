@@ -8,7 +8,6 @@ r"""
   - 静默时段（默认 22:00–07:00）内不主动播报（紧急告警除外，这里只做记录）。
 """
 import threading
-import time
 from datetime import datetime, timedelta
 
 from . import db
@@ -18,6 +17,7 @@ from .conf import REMINDER_STATUS
 
 _tick = 15          # 扫描间隔（秒）
 _miss_window = 300  # 错过判定窗口：超过触发点 5 分钟后才触发 → 视为错过补报
+_stop_evt = threading.Event()   # 停止信号：stop() 置位后调度线程退出
 
 _status_labels = {
     "pending": "待触发", "triggered": "已触发", "unconfirmed": "未确认",
@@ -112,7 +112,7 @@ def _tick_once(settings: dict):
 
 
 def _run():
-    while True:
+    while not _stop_evt.is_set():
         try:
             settings = db.get_settings()
             if settings.get("reminder_enabled", True):
@@ -123,14 +123,20 @@ def _run():
                 audit.log("memory_change", action="expire", count=expired, note="TTL 到期自动清除")
         except Exception as e:
             audit.log("reminder", action="tick_error", error=str(e))
-        time.sleep(_tick)
+        _stop_evt.wait(_tick)      # 置位后立即醒来退出，无需等整轮 tick
 
 
 def start():
     """启动调度线程（幂等）。"""
+    _stop_evt.clear()
     t = threading.Thread(target=_run, name="reminder-scheduler", daemon=True)
     t.start()
     return t
+
+
+def stop():
+    """请求停止：置位事件，_run 循环内检查后退出（不阻塞等待线程）。"""
+    _stop_evt.set()
 
 
 # ---------------------------------------------------------------- 对外操作

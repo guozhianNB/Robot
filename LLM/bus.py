@@ -12,6 +12,7 @@ import threading
 
 _q = queue.Queue()          # 线程安全：任意线程 publish()
 _subscribers = set()        # 事件循环侧：asyncio.Queue 集合
+_stop = False                   # 停止标志：stop() 置 True 后 drain 循环退出
 
 
 def publish(event_type: str, **payload):
@@ -22,7 +23,7 @@ def publish(event_type: str, **payload):
 async def _drain():
     """把队列里的广播扇出到每个订阅连接。"""
     loop = asyncio.get_running_loop()
-    while True:
+    while not _stop:
         try:
             item = await loop.run_in_executor(None, _q.get)  # 阻塞取（线程安全）
         except Exception:
@@ -58,3 +59,9 @@ def start_drain():
     """在应用启动时创建后台任务。"""
     task = asyncio.create_task(_drain())
     return task
+
+
+def stop():
+    """停止扇出任务（置位标志，drain 循环退出）。"""
+    global _stop
+    _stop = True
