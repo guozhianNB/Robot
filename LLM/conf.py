@@ -33,6 +33,7 @@ DEFAULT_SETTINGS = {
     "silent_start": "22:00",        # 静默时段开始（主动播报不发）
     "silent_end": "07:00",          # 静默时段结束
     "confirm_timeout_min": 30,      # 提醒送达后多少分钟未确认 → 升级"未确认"
+    "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
 }
 
 # 思考路由 · 第一层：主题/敏感/健康关键词（命中即深思考）
