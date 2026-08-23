@@ -719,9 +719,11 @@
 
     function appendVoiceTurn(userText, assistantText) {
       const box = document.getElementById("messages");
-      // 防重复：最后一条助手气泡内容相同（如切换重绘后同轮事件二次到达）则跳过
+      // 防重复：先渲染一次再比较"渲染后文本"，避免 Markdown 语法导致误判
+      const tmp = document.createElement("div");
+      tmp.innerHTML = marked.parse(assistantText || "");
       const last = box.querySelector(".msg.assistant:last-of-type .answer");
-      if (last && last.textContent === assistantText) return;
+      if (last && last.textContent === tmp.textContent) return;
       appendUser(userText);
       const { answer } = appendAssistant(false);
       answer.textContent = assistantText;
