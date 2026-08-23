@@ -40,6 +40,7 @@ client = OpenAI(
 )
 
 _bg = ThreadPoolExecutor(max_workers=4)   # 后台任务池：记忆沉淀 / 历史摘要，不占请求链路
+_shutting_down = False                    # 退出中标志：幂等防重入（放在 _bg 定义附近）
 
 
 # ---------------------------------------------------------------------------
@@ -429,14 +430,21 @@ async def events_stream():
 @app.post("/api/system/shutdown")
 async def system_shutdown():
     """系统退出：停提醒线程 → 停语音（释放音频设备）→ 停广播 → 停线程池，
-    返回响应后延迟 1 秒 os._exit(0)，保证前端先收到 200 再杀进程。"""
+    返回响应后延迟 1 秒 os._exit(0)，保证前端先收到 200 再杀进程。
+    幂等：重复调用直接返回；任何 stop 步骤抛异常也保证退出任务被调度。"""
+    global _shutting_down
+    if _shutting_down:
+        return {"ok": True, "message": "系统正在退出…"}
+    _shutting_down = True
     from . import log as audit
     audit.log("system", action="shutdown", by="nurse")
-    reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
-    voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
-    bus.stop()                           # 3. 事件总线扇出
-    _bg.shutdown(wait=False)             # 4. 后台任务线程池（不等待，进程将退出）
-    asyncio.create_task(_delayed_exit()) # 5. 1 秒后真正退出
+    try:
+        reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
+        voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
+        bus.stop()                           # 3. 事件总线扇出
+        _bg.shutdown(wait=False)             # 4. 后台任务线程池（不等待，进程将退出）
+    finally:
+        asyncio.create_task(_delayed_exit()) # 5. 无论上述步骤是否抛异常，1 秒后真正退出
     return {"ok": True, "message": "系统正在退出…"}
 
 
