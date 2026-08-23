@@ -88,10 +88,21 @@ def route_thinking(text: str, settings: dict, llm_client=None, model: str = MODE
     return {"on": False, "reason": "日常闲聊", "method": "off"}
 
 
-def build_system(uid: str, settings: dict) -> str:
-    """组装 System Prompt：角色 + 安全红线 + 风格 + 画像 + 记忆 + 摘要。"""
+def _build_query(user_text: str, history: list[dict]) -> str:
+    """构造记忆检索 query：本次用户消息 + 最近几轮对话，提高向量召回相关度。"""
+    parts = [user_text]
+    for m in history[-4:]:
+        c = (m.get("content") or "").strip()
+        if c:
+            parts.append(c)
+    return " ".join(parts).strip()
+
+
+def build_system(uid: str, settings: dict, query: str = "") -> str:
+    """组装 System Prompt：角色 + 安全红线 + 风格 + 画像 + 记忆 + 摘要。
+    query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。"""
     profile = db.get_profile(uid)
-    recall = rag.recall(uid, "")
+    recall = rag.recall(uid, query)
     style = ""
     if profile and profile.get("style"):
         style = f"\n【该老人的说话风格画像】{profile['style']}（用老人熟悉的方式说话，但保持自己是陪护机器人）"
@@ -116,10 +127,10 @@ def build_system(uid: str, settings: dict) -> str:
 
 def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict) -> list[dict]:
     """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。"""
-    system = build_system(uid, settings)
+    history = db.load_history(uid, limit=HISTORY_WINDOW)
+    system = build_system(uid, settings, query=_build_query(user_text, history))
     if thinking_on:
         system += "\n" + ROUTER_HIT
-    history = db.load_history(uid, limit=HISTORY_WINDOW)
     return [{"role": "system", "content": system}, *history,
             {"role": "user", "content": user_text}]
 

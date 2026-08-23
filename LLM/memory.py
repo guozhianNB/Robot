@@ -24,7 +24,7 @@ import re
 from . import db
 from . import log as audit
 from . import vectors
-from .conf import MEMORY_RULES, EVENT_TTL_DAYS
+from .conf import MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS
 
 # 医疗字段关键词：命中即判定为医疗信息，禁止模型写入
 MEDICAL_KEYWORDS = ["药", "剂量", "病史", "诊断", "血压", "血糖", "手术", "住院", "过敏",
@@ -188,9 +188,11 @@ entries 规则：
 """
 
 
-def _dedup_check(uid: str, content: str) -> int | None:
-    """服务端兜底：新条目与已有记忆（已确认+待处理）向量相似度过高 → 视为重复，返回已有 id。"""
+def _dedup_check(uid: str, content: str, mtype: str | None = None) -> int | None:
+    """服务端兜底：新条目与已有记忆（已确认+待处理，可限定类型）向量相似度过高 → 视为重复，返回已有 id。"""
     all_mems = db.list_memories(uid=uid, status="confirmed") + db.list_memories(uid=uid, status="pending")
+    if mtype:
+        all_mems = [m for m in all_mems if m.get("type") == mtype]
     docs = [{"id": m["id"], "text": m["content"]} for m in all_mems]
     if not docs:
         return None
@@ -270,6 +272,11 @@ def consolidate(uid: str, client, model: str) -> dict:
             prev = db.get_summary(uid)
             new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
             db.set_summary(uid, new_sum[-900:])
+            # 摘要同时作为 Episode 记忆入库，供后续按话题检索（修"摘要不进检索"）
+            if not _dedup_check(uid, digest, mtype="episode"):
+                db.add_memory(uid, "episode", digest, status="confirmed",
+                              ttl_days=EPISODE_TTL_DAYS, source="llm:consolidate")
+                audit.log("memory_change", action="episode_add", uid=uid, content=digest)
         portrait = (data.get("portrait") or "").strip()
         if portrait:
             db.set_portrait(uid, portrait)

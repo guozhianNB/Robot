@@ -72,6 +72,7 @@ MEMORY_RULES = {
     "fact": "pending",             # 一般事实 → 待处理
 }
 EVENT_TTL_DAYS = 30                # 事件记忆默认时效
+EPISODE_TTL_DAYS = 90              # 经历片段（Episode）记忆时效：一段对话摘要，比单条事件更久
 
 # 提醒状态机
 REMINDER_STATUS = ["pending", "triggered", "unconfirmed", "confirmed", "missed"]
