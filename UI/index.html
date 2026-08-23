@@ -220,6 +220,21 @@
         </div>
 
         <div class="card">
+          <h3>🧠 核心记忆（性格/偏好/关系，模型自动沉淀）</h3>
+          <div id="core-box" class="hint">加载中…</div>
+        </div>
+
+        <div class="card">
+          <h3>🗂️ RAG 记忆（事件/经历/一般事实，语义检索用）</h3>
+          <div id="rag-box" class="hint">加载中…</div>
+        </div>
+
+        <div class="card">
+          <h3>🕸️ 知识图谱（实体-关系，可查看）</h3>
+          <div id="graph-box" class="hint">加载中…</div>
+        </div>
+
+        <div class="card">
           <h3>✅ 已确认记忆（对话时注入 RAG）</h3>
           <div id="mem-confirmed"><div class="hint">加载中…</div></div>
         </div>
@@ -578,7 +593,7 @@
     // 记忆页
     // ================================================================
     function badge(type) {
-      const map = { preference: "偏好", event: "事件", fact: "事实", medical: "医疗" };
+      const map = { preference: "偏好", event: "事件", fact: "事实", medical: "医疗", relation: "关系", persona: "画像", style: "说话风格" };
       return `<span class="badge ${escapeHtml(type)}">${map[type] || escapeHtml(type)}</span>`;
     }
 
@@ -640,6 +655,55 @@
               </div>
             </div>`).join("")
         : '<div class="hint">暂无待处理记忆</div>';
+
+      // 核心记忆 / RAG 记忆 / 知识图谱：三块并行 fetch，各自容错（失败仅影响本块）
+      const [coreRes, ragRes, graphRes] = await Promise.all([
+        api(`/api/memories/core?uid=${uid}`).catch(() => null),
+        api(`/api/memories/rag?uid=${uid}`).catch(() => null),
+        api(`/api/memories/graph?uid=${uid}`).catch(() => null),
+      ]);
+
+      const coreBox = document.getElementById("core-box");
+      if (!coreRes) {
+        coreBox.innerHTML = '<div class="hint">核心记忆加载失败</div>';
+      } else if (!coreRes.memories.length) {
+        coreBox.innerHTML = '<div class="hint">暂无核心记忆——和老人聊天后由模型自动沉淀</div>';
+      } else {
+        coreBox.innerHTML = coreRes.memories.map(m => `
+            <div class="list-item">
+              ${badge(m.type)}
+              <div class="item-main">
+                <div class="item-title">${escapeHtml(m.content)}</div>
+                <div class="item-sub">${m.ts} · 重要性 ${m.importance ?? 0} · 置信 ${m.confidence ?? 0}${m.source ? " · 来源:" + escapeHtml(m.source) : ""}</div>
+              </div>
+            </div>`).join("");
+      }
+
+      const ragBox = document.getElementById("rag-box");
+      if (!ragRes) {
+        ragBox.innerHTML = '<div class="hint">RAG 记忆加载失败</div>';
+      } else if (!ragRes.memories.length) {
+        ragBox.innerHTML = '<div class="hint">暂无 RAG 记忆（事件/经历/一般事实）</div>';
+      } else {
+        ragBox.innerHTML = ragRes.memories.map(m => `
+            <div class="list-item">
+              ${badge(m.type)}
+              <div class="item-main">
+                <div class="item-title">${escapeHtml(m.content)}</div>
+                <div class="item-sub">${m.ts}${m.source ? " · 来源:" + escapeHtml(m.source) : ""}</div>
+              </div>
+            </div>`).join("");
+      }
+
+      const graphBox = document.getElementById("graph-box");
+      if (!graphRes) {
+        graphBox.innerHTML = '<div class="hint">知识图谱加载失败</div>';
+      } else {
+        const st = graphRes.status || {};
+        graphBox.innerHTML = st.available
+          ? '<div class="hint">✅ 知识图谱可用（kuzu）</div>'
+          : '<div class="hint">⚠️ 知识图谱不可用' + (st.missing && st.missing.length ? "（缺少依赖：" + escapeHtml(st.missing.join("；")) + "）" : "") + '</div>';
+      }
     }
 
     async function saveProfile() {
