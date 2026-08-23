@@ -258,6 +258,15 @@ def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source=""
             conn.close()
 
 
+def get_core_memory(mid: int) -> dict | None:
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM core_memories WHERE id=?", (mid,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
 def list_core_memories(uid, limit=None) -> list[dict]:
     sql = "SELECT * FROM core_memories WHERE uid=? ORDER BY importance DESC, id DESC"
     args = [uid]

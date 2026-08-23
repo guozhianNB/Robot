@@ -234,6 +234,40 @@ def _apply_v3(uid: str, e: dict) -> dict:
     return {"route": "rag"}
 
 
+CORRECT_PROMPT = """下面是一句老人新说的话。判断它是否在纠正/更新机器人之前的某条记忆。
+若是，输出要纠正的记忆目标与新内容；否则 correct=false。
+只输出 JSON：{{"correct": true或false, "mid": <记忆id，无则 null>, "new_content": "纠正后的内容"}}
+
+【新说的话】
+{text}
+"""
+
+
+def correct_instant(uid: str, user_text: str, client, model: str) -> dict:
+    """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。"""
+    from .chat import llm_json
+    try:
+        data = llm_json(client, model, CORRECT_PROMPT.format(text=user_text))
+    except Exception as e:  # noqa: BLE001
+        audit.log("memory_correct", action="instant_error", uid=uid, error=str(e))
+        return {"corrected": False, "reason": "llm_error"}
+    if not isinstance(data, dict) or not data.get("correct") or not data.get("mid"):
+        return {"corrected": False, "reason": "no_correction"}
+    mid = int(data["mid"])
+    old = db.get_core_memory(mid)
+    new_content = (data.get("new_content") or "").strip()
+    if not old or not new_content:
+        return {"corrected": False, "reason": "no_target"}
+    if any(k in new_content for k in MEDICAL_KEYWORDS) or any(k in new_content for k in IDENTITY_KEYWORDS):
+        audit.log("memory_correct", action="blocked", uid=uid, mid=mid,
+                  old=old["content"], new=new_content, reason="医疗/身份红线")
+        return {"corrected": False, "reason": "redline"}
+    db.update_core_memory(mid, content=new_content)
+    audit.log("memory_correct", action="instant", uid=uid, mid=mid,
+              old=old["content"], new=new_content)
+    return {"corrected": True, "mid": mid}
+
+
 def _apply_entry(uid: str, e: dict) -> dict:
     """按分级规则写入一条整理结果。返回处理摘要。"""
     action = e.get("action", "add")
