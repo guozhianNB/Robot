@@ -771,7 +771,7 @@
     function ensureChatFor(uid) {
       const sel = document.getElementById("uid-select");
       if (!sel || ![...sel.options].some(o => o.value === uid)) {
-        toast("🎤 新的语音对话", `${uid} 不在当前档案列表中`, "warn");
+        toast("🎤 新的语音对话", `${escapeHtml(uid)} 不在当前档案列表中`, "warn");
         return;
       }
       sel.value = uid;
@@ -1074,7 +1074,7 @@
       }, 1000);
       try {
         const res = await api("/api/voice/record", {
-          method: "POST", body: JSON.stringify({ seconds: 15 }),
+          method: "POST", body: JSON.stringify({ seconds: 15, uid: reg.uid }),
         });
         if (!res.ok) throw new Error(res.error || "录制失败");
         reg.recordingId = res.recording_id;
@@ -1211,7 +1211,7 @@
       }, 1000);
       try {
         const res = await api("/api/voice/record", {
-          method: "POST", body: JSON.stringify({ seconds: 15 }),
+          method: "POST", body: JSON.stringify({ seconds: 15, uid: currentUid }),
         });
         if (!res.ok) throw new Error(res.error || "录制失败");
         if (seq !== appendSeq) return;

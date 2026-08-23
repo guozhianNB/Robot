@@ -247,13 +247,18 @@ def list_speaker_details() -> dict:
             _recognizer = spk_mod.SpeakerRecognizer()
         except Exception:
             return {}
-    return {uid: {"samples": _recognizer.sample_count(uid)}
-            for uid in _recognizer.list_profiles()}
+    out = {}
+    for uid in _recognizer.list_profiles():
+        try:
+            out[uid] = {"samples": _recognizer.sample_count(uid)}
+        except ValueError:
+            continue   # 跳过非白名单遗留档案（如修复前的中文 uid）
+    return out
 
 
 def enroll_speaker(uid: str, seconds: int = 15) -> dict:
     """旧行为兼容：录 seconds 秒并覆盖建档（等效 record + commit append=False）。"""
-    res = record_speaker(seconds)
+    res = record_speaker(seconds, uid=uid)
     if not res.get("ok"):
         return {"ok": False, "uid": uid, "error": res.get("error", "录制失败")}
     return commit_speaker(res["recording_id"], uid, append=False)
