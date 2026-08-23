@@ -415,5 +415,5 @@ async def events_stream():
 # ---------------------------------------------------------------- 工具
 @app.get("/api/tools")
 async def tools_list():
-    """返回当前可用工具清单（前端展示用）。"""
-    return {"ok": True, "tools": tool_mod.TOOLS}
+    """返回当前可用工具清单 + 每工具开关状态（前端展示/切换用）。"""
+    return {"ok": True, "tools": tool_mod.tools_with_state(db.get_settings())}

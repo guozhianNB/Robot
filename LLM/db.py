@@ -591,7 +591,9 @@ def update_memory_content(mid: int, content: str) -> None:
 # ---------------------------------------------------------------- settings
 def get_settings() -> dict:
     from .conf import DEFAULT_SETTINGS
+    from .tools import TOOL_DEFAULTS
     out = dict(DEFAULT_SETTINGS)
+    out.update(TOOL_DEFAULTS)   # per-tool 开关默认值（已保存的随后覆盖）
     conn = _conn()
     try:
         for r in conn.execute("SELECT key,value FROM settings").fetchall():
@@ -611,8 +613,10 @@ def get_settings() -> dict:
 
 def set_settings(patch: dict) -> dict:
     from .conf import DEFAULT_SETTINGS
+    from .tools import TOOL_DEFAULTS
     cur = get_settings()
-    cur.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
+    allowed = set(DEFAULT_SETTINGS) | set(TOOL_DEFAULTS)
+    cur.update({k: v for k, v in patch.items() if k in allowed})
     with _lock:
         conn = _conn()
         try:

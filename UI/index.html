@@ -295,6 +295,11 @@
     <section id="page-tools" class="page">
       <div class="panel">
         <div class="card">
+          <h3>🔧 工具开关（按工具独立开关，保存后对话中按此过滤）</h3>
+          <div id="tool-switches"><div class="hint">加载中…</div></div>
+          <div style="margin-top:12px"><button class="btn" onclick="saveToolSwitches()">💾 保存工具开关</button></div>
+        </div>
+        <div class="card">
           <h3>🔧 工具调用日志（联网搜索 / 新闻，审计可追溯）</h3>
           <table>
             <thead><tr><th>时间</th><th>工具</th><th>参数</th><th>结果摘要</th><th>状态</th><th>耗时</th></tr></thead>
@@ -365,7 +370,7 @@
       document.getElementById("page-" + btn.dataset.page).classList.add("active");
       if (btn.dataset.page === "memory") loadMemory();
       if (btn.dataset.page === "reminder") loadReminders();
-      if (btn.dataset.page === "tools") loadToolLog();
+      if (btn.dataset.page === "tools") { loadToolSwitches(); loadToolLog(); }
       if (btn.dataset.page === "settings") loadSettings();
     });
 
@@ -828,8 +833,32 @@
     async function delReminder(id) { await api(`/api/reminders/${id}`, { method: "DELETE" }); loadReminders(); }
 
     // ================================================================
-    // 工具日志页
+    // 工具页（开关 + 调用日志）
     // ================================================================
+    async function loadToolSwitches() {
+      const { tools } = await api("/api/tools");
+      const box = document.getElementById("tool-switches");
+      if (!tools || !tools.length) { box.innerHTML = '<div class="hint">暂无工具</div>'; return; }
+      box.innerHTML = tools.map(t => {
+        const f = t.function || {};
+        const desc = (f.description || "").slice(0, 80);
+        return `
+          <div class="switch-row">
+            <div><b>${escapeHtml(f.name)}</b>${desc ? `<br><span class="hint">${escapeHtml(desc)}</span>` : ""}</div>
+            <label class="switch"><input type="checkbox" data-switch-key="${escapeHtml(t.switch_key || "")}" ${t.enabled ? "checked" : ""}><span class="slider"></span></label>
+          </div>`;
+      }).join("");
+    }
+
+    async function saveToolSwitches() {
+      const settings = {};
+      document.querySelectorAll("#tool-switches input[data-switch-key]").forEach(i => {
+        settings[i.dataset.switchKey] = i.checked;
+      });
+      await api("/api/settings", { method: "POST", body: JSON.stringify(settings) });
+      toast("✅ 工具开关已保存");
+    }
+
     async function loadToolLog() {
       const { logs } = await api(`/api/tools/log?limit=60`);
       const body = document.getElementById("tool-log-body");
@@ -849,7 +878,6 @@
     // 设置页
     // ================================================================
     const SETTING_META = [
-      ["web_search_enabled", "联网搜索 / 新闻工具", "允许对话中调用 web_search / get_news（模块 9）"],
       ["thinking_router_enabled", "思考路由层", "敏感/健康/复杂问题自动深思考，日常快速回答（模块 1）"],
       ["router_llm_enabled", "路由 LLM 预判（兜底）", "关键词未命中时，用模型快速判断是否需要深思考"],
       ["memory_consolidation_enabled", "记忆整理（话题结束后沉淀）", "空闲一段时间或上下文满时，批量整理记忆（去重/合并/画像）"],

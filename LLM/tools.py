@@ -7,7 +7,16 @@ r"""
 安全约束：结果只做摘要；健康类信息在返回里注明"仅供参考"；过滤惊悚关键词。
 
 工具以 OpenAI Function Calling 格式暴露给大模型，由 chat 引擎调用。
+
+【新增工具三步走】schema 与实现写在一起，装饰器自动注册：
+    @tool("工具名", "何时用/怎么用的描述（模型靠它决定调用）", {参数 JSON Schema}, enabled=True)
+    def 工具名(参数: str = "默认值") -> dict:
+        ...
+        return {"ok": True, "result": "..."}   # 或 {"ok": False, "message": "..."}
+注册后 run_tool 自动分发、TOOLS 自动收录、per-tool 开关 <工具名>_enabled 自动生效，
+前端工具页自动显示开关，无需再改 chat.py / server.py / db.py / conf.py。
 """
+import inspect
 import json
 import re
 import time
@@ -23,40 +32,35 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RobotCompanion/1.
 # 惊悚/暴力等不适合老人的内容关键词（命中即过滤）
 BANNED = ["死亡", "尸体", "凶杀", "杀人", "爆炸伤亡", "强奸", "惨案", "遗体"]
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "联网搜索最新信息（新闻、天气、常识、时事等）。老人问不知道的新鲜事时使用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "要搜索的关键词或问题"},
-                },
-                "required": ["query"],
+# ---------------------------------------------------------------- 注册表
+# name -> {"schema": OpenAI function-calling 声明, "fn": 实现函数, "enabled": 默认开关}
+_TOOL_REGISTRY: dict[str, dict] = {}
+
+
+def tool(name: str, description: str, parameters: dict, enabled: bool = True):
+    """注册一个工具：OpenAI function-calling schema 与实现写在一起，run_tool 自动分发。"""
+    def deco(fn):
+        _TOOL_REGISTRY[name] = {
+            "schema": {
+                "type": "function",
+                "function": {"name": name, "description": description, "parameters": parameters},
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_news",
-            "description": "获取结构化新闻摘要（国内/国际/健康/科技/全部）。老人问'今天有什么新闻'时使用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": ["国内", "国际", "健康", "财经", "科技", "全部"],
-                        "description": "新闻分类",
-                    },
-                },
-                "required": ["category"],
-            },
-        },
-    },
-]
+            "fn": fn,
+            "enabled": enabled,
+        }
+        return fn
+    return deco
+
+
+def _run_fn(fn, args: dict):
+    """调用工具实现：按函数签名过滤模型传来的参数，缺省交给函数默认值兜底。"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):   # 拿不到签名（如 C 函数）→ 直接展开
+        return fn(**args)
+    allowed = {p for p in sig.parameters if p not in ("self", "cls")}
+    kwargs = {k: v for k, v in args.items() if k in allowed}
+    return fn(**kwargs)
 
 
 # ---------------------------------------------------------------- RSS 源
@@ -203,6 +207,15 @@ def _search_corpus(query: str, limit: int = 6) -> list[dict]:
     return [it for _, it in scored[:limit]]
 
 
+@tool(
+    "web_search",
+    "联网搜索最新信息（新闻、天气、常识、时事等）。老人问不知道的新鲜事时使用。",
+    {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "要搜索的关键词或问题"}},
+        "required": ["query"],
+    },
+)
 def web_search(query: str) -> dict:
     query = (query or "").strip()
     if not query:
@@ -253,6 +266,21 @@ HEALTH_KEYWORDS = ["健康", "医院", "医生", "药", "疫苗", "睡眠", "血
                    "运动", "养生", "疾病", "治疗", "体检", "老年", "阿尔茨海默", "痴呆", "感冒"]
 
 
+@tool(
+    "get_news",
+    "获取结构化新闻摘要（国内/国际/健康/科技/全部）。老人问'今天有什么新闻'时使用。",
+    {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": ["国内", "国际", "健康", "财经", "科技", "全部"],
+                "description": "新闻分类",
+            },
+        },
+        "required": ["category"],
+    },
+)
 def get_news(category: str = "全部") -> dict:
     category = category or "全部"
     cats = NEWS_CATEGORY.get(category, None)
@@ -271,13 +299,36 @@ def get_news(category: str = "全部") -> dict:
     return {"ok": True, "result": "\n".join(lines)}
 
 
+# ---------------------------------------------------------------- 注册表导出
+# 注意：必须在全部 @tool 注册之后生成（模块 import 时按顺序执行）
+TOOLS = [reg["schema"] for reg in _TOOL_REGISTRY.values()]
+TOOL_ENABLED_KEYS = [f"{n}_enabled" for n in _TOOL_REGISTRY]
+TOOL_DEFAULTS = {f"{n}_enabled": reg["enabled"] for n, reg in _TOOL_REGISTRY.items()}
+
+
+def effective_tools(settings: dict) -> list[dict]:
+    """按 per-tool 开关（`<工具名>_enabled`）过滤，返回要传给模型的 schema 列表。"""
+    return [reg["schema"] for name, reg in _TOOL_REGISTRY.items()
+            if settings.get(f"{name}_enabled", reg["enabled"])]
+
+
+def tools_with_state(settings: dict) -> list[dict]:
+    """给前端用：schema + enabled（当前开关状态）+ switch_key（设置项 key）。"""
+    out = []
+    for name, reg in _TOOL_REGISTRY.items():
+        item = dict(reg["schema"])
+        item["enabled"] = bool(settings.get(f"{name}_enabled", reg["enabled"]))
+        item["switch_key"] = f"{name}_enabled"
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------- 调度入口
 def run_tool(name: str, args: dict) -> dict:
-    try:
-        if name == "web_search":
-            return web_search(args.get("query", ""))
-        if name == "get_news":
-            return get_news(args.get("category", "全部"))
+    reg = _TOOL_REGISTRY.get(name)
+    if not reg:
         return {"ok": False, "message": f"未知工具 {name}"}
+    try:
+        return _run_fn(reg["fn"], args or {})
     except Exception as e:
         return {"ok": False, "message": f"工具执行失败: {e}"}

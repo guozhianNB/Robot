@@ -21,12 +21,12 @@ docs/    需求/教程/接口契约/开发日志
   .venv\Scripts\python.exe -m uvicorn LLM.server:app --host 0.0.0.0 --port 8000
   ```
 - **前端**：浏览器直接打开 `UI/index.html`（纯原生 JS 单文件，零构建，后端 CORS 全开）。
-- **虚拟环境**：`.venv/`（Windows 用 `Scripts/python.exe`）。`requirement.txt` 为空，实际依赖 openai / fastapi / uvicorn / pydantic / python-dotenv，其余用 stdlib。
+- **虚拟环境**：`.venv/`（Windows 用 `Scripts/python.exe`）。核心依赖 openai / fastapi / uvicorn / pydantic / python-dotenv；语音链路额外依赖 numpy / sherpa-onnx / sounddevice / modelscope / torch（见 `requirement.txt`）。**注意：`requirement.txt` 声明 ≠ 环境已装齐，后端必须容忍可选依赖缺失、降级运行（见「系统稳健性」）。**
 - **配置**：API key 在根 `.env`（`DEEPSEEK_API_KEY`），`LLM/conf.py` 用 `load_dotenv(BASE_DIR/".env")` 加载。
 
 ## 架构与模块（LLM/ 后端）
 
-- `server.py` — FastAPI 入口：CORS 全开，`lifespan` 启动 `db.init_db()` → `_seed_demo()` → `reminder.start()` → `bus.start_drain()`；全局 OpenAI 客户端（DeepSeek），`_bg` 线程池跑后台任务。
+- `server.py` — FastAPI 入口：CORS 全开，`lifespan` 启动 `db.init_db()` → `_seed_demo()` → `reminder.start()` → `bus.start_drain()` → `voice_api.start_voice()`；全局 OpenAI 客户端（DeepSeek），`_bg` 线程池跑后台任务。
 - `chat.py` — 对话编排：`chat_stream()`（SSE 生成器，工具循环最多 2 轮）、`route_thinking()`（思考路由）、`build_system()/build_messages()`（System Prompt + RAG + 滚动窗口）、`llm_json()`。
 - `conf.py` — **集中配置**。路径、`DEFAULT_SETTINGS`、`THINKING_KEYWORDS`、`HISTORY_WINDOW`、`MEMORY_RULES`、`MODEL`、超时等。**改参数先来这里**。
 - `db.py` — SQLite 数据层（`LLM/data/brain.db`，WAL + 线程锁）。函数命名 `get_*`/`add_*`/`set_*`/`update_*`/`delete_*`/`upsert_*`，协程侧用 `asyncio.to_thread`。
@@ -36,10 +36,11 @@ docs/    需求/教程/接口契约/开发日志
 - `tools.py` — 联网工具（OpenAI function-calling 格式）：`web_search` / `get_news`，`run_tool()` 分发，过滤 `BANNED` 惊悚词。
 - `log.py` — 审计日志（JSONL 落 `LLM/data/audit.jsonl`，线程锁追加）：`log(event, **fields)`。
 - `vectors.py` — 零依赖轻量向量检索（字符 n-gram 哈希 + TF + L2 + 余弦）。
+- `voice/` + `voice_api.py` — 语音链路（唤醒/识别/播报/声纹，**可选能力**）：外部依赖缺失时整体降级，后端照常启动，见「系统稳健性」。
 
 ## API 端点（server.py）
 
-`GET /api/health` ｜ `POST /api/chat`（SSE 流式，体 `{uid, message, thinking:"auto|on|off"}`）｜ `GET|DELETE /api/chat/history` ｜ `GET|POST /api/profiles` ｜ `GET|POST /api/memories` + `/confirm` `/reject` `/delete` `/suggest` ｜ `GET /api/context` ｜ `GET|POST /api/reminders` + `/confirm` `/delete` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings` ｜ `GET /api/events`（SSE 广播）｜ `GET /api/tools`
+`GET /api/health` ｜ `POST /api/chat`（SSE 流式，体 `{uid, message, thinking:"auto|on|off"}`）｜ `GET|DELETE /api/chat/history` ｜ `GET|POST /api/profiles` ｜ `GET|POST /api/memories` + `/confirm` `/reject` `/delete` `/suggest` ｜ `GET /api/context` ｜ `GET|POST /api/reminders` + `/confirm` `/delete` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings` ｜ `GET /api/events`（SSE 广播）｜ `GET /api/tools` ｜ `GET /api/voice/status` ｜ `POST /api/voice/enroll` ｜ `GET /api/voice/speakers`（语音依赖缺失时降级返回，见「系统稳健性」）
 
 ## 关键约定（改动前必读）
 
@@ -49,6 +50,18 @@ docs/    需求/教程/接口契约/开发日志
 4. **SSE 事件协议两端强耦合**：事件类型（`meta`/`reasoning`/`content`/`tool_start`/`tool_result`/`done`/`error`）在 `chat.py::chat_stream` 与 `UI/index.html::send` 同时维护，改类型要同步。
 5. **DeepSeek 流式陷阱**：thinking disabled 时 `delta` 无 `reasoning_content` 属性，必须用 `getattr(delta, "reasoning_content", None)` 安全取值（见 `llm_request.py` 示例）。
 6. 包内模块用 `from . import xxx` 相对导入；文件头 `# -*- coding: utf-8 -*-` + r-string docstring。
+
+## 系统稳健性（降级运行，重点）
+
+**原则：可选能力的外部依赖缺失时，系统必须降级运行，而不是拒绝启动。** 部署环境不一（板卡 / 无模型 / 依赖未装齐），`requirement.txt` 只声明依赖、不代表运行环境已装齐，后端必须容忍缺失。
+
+- **红线**：可选依赖（numpy / sherpa-onnx / sounddevice / modelscope / torch 等）绝不允许出现在 `server.py` 及后端导入链的顶层硬 import 中——`LLM.server` 必须能无条件 import、`lifespan` 必须能无条件启动。
+- **降级模式（范例 `LLM/voice_api.py`）**：可选依赖在模块顶层逐个 `try/except` 引入，失败时置模块级标志 `_VOICE_AVAILABLE = False`，并把缺失项逐个收集进 `_MISSING_DEPS`（缺多个时别只报第一个）。
+- **不可用时的行为**：
+  - `start_*` 型启动钩子：`audit.log("voice_degraded", ...)` 记录 + `print("[WARN] ...")` 提示 + 返回 `None` 静默跳过，不影响 lifespan 其余步骤；
+  - 查询类 API：返回 `{"ok": True, "status": "unavailable", ..., "reason": "缺少依赖：..."}`（`ok` 保持 True——服务健康 ≠ 功能可用，前端不会误判为后端故障）；
+  - 写操作 API：返回 `{"ok": False, "error": "语音模块不可用（缺少依赖：...）"}`。
+- **新功能引入可选依赖时遵循此模式**；能用 stdlib 就绝不引入外部依赖（如 `vectors.py` 零依赖向量检索）。
 
 ## 前端（UI/）
 
@@ -73,5 +86,5 @@ docs/    需求/教程/接口契约/开发日志
 ## 已知坑
 
 - `.gitignore` 排除了 `.venv/`、`.env`、`LLM/data/*.db*`、`LLM/data/audit.jsonl`（运行时数据不入库）。
-- `requirement.txt` 为空：新依赖记得固化进去。
+- `requirement.txt` 声明的语音依赖（numpy / sherpa-onnx / sounddevice / modelscope 等）在目标环境可能未装齐：新依赖记得固化进去，且后端必须容忍缺失、降级运行（见「系统稳健性」）。
 - 后端 run 用包方式 `LLM.server:app`（`server.py` 里路径基于 `Path(__file__).parent.parent` 定位 `.env`）。

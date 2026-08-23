@@ -166,7 +166,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method, "uid": uid}}
 
     messages = build_messages(uid, user_text, thinking_on, settings)
-    tools = tool_mod.TOOLS if settings.get("web_search_enabled", True) else []
+    tools = tool_mod.effective_tools(settings)
 
     full_assistant = ""
     try:

@@ -156,3 +156,16 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
   已 `git rm -r --cached` 移出跟踪（磁盘保留），根 `.gitignore` 追加 `ros2_car/build|install|log/`、
   `__pycache__/`、`maps/*.pgm|*.yaml` 忽略规则。**后续板卡同步后必须重新 `colcon build`**
   （install/share 里还是旧 launch），建议用 `--symlink-install` 便于调试期改 launch 即改即用。
+
+### 2026-08-24 追加：LLM 工具系统改造 —— 装饰器注册表 + per-tool 开关 + 前端工具页开关
+
+- **背景**：原 `tools.py` 中 schema 声明、实现函数、`run_tool` 手写 if 分发三处分离，新增工具要改多处且易不同步；`web_search_enabled` 一把梭管所有工具，无法单独开关。
+- **改造（`LLM/tools.py`）**：
+  - 新增装饰器 `@tool(name, description, parameters, enabled=True)`：schema 与实现写在一起，import 时自动注册进 `_TOOL_REGISTRY`。
+  - `TOOLS` / `TOOL_ENABLED_KEYS` / `TOOL_DEFAULTS` 由注册表自动生成（`TOOLS` 对外接口不变，chat/server 旧引用兼容）。
+  - `run_tool` 改为注册表分发；新增 `_run_fn` 用 `inspect.signature` 过滤模型传来的参数，缺省交给函数默认值兜底（避免内部 TypeError 被误判重试）。
+  - 新增 `effective_tools(settings)`（按 `<工具名>_enabled` 过滤传给模型的 schema）、`tools_with_state(settings)`（给前端带 enabled/switch_key）。
+- **联动改动**：`chat.py` 改用 `effective_tools(settings)` 过滤；`db.py` 的 `get_settings/set_settings` 合并 `TOOL_DEFAULTS`（新工具开关 key 自动可读写持久化，无需改 db/conf）；`server.py` `/api/tools` 返回每工具开关状态。
+- **前端（`UI/index.html`）**：工具日志页顶部新增「工具开关」卡片（名称+描述+switch，保存走 `/api/settings`）；设置页移除原 `web_search_enabled` 总开关（统一在工具页管理）。
+- **新增工具现在只需写一处**（见 tools.py docstring「三步走」）：装饰器 + 实现函数，分发/清单/开关/前端展示全部自动生效。
+- **验证**：`py_compile` 4 文件通过；模块级冒烟（注册表/分发/未知工具/开关过滤）通过；后端 8011 端口启动后 `/api/tools`、`/api/settings` 读写、未知 key 丢弃、开关保存恢复均通过（测试后已恢复默认全开）。

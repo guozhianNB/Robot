@@ -1,20 +1,43 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# 养老陪护巡逻机器人（云-边-端）Python 依赖清单
+# 整理原则：只列项目代码实际直接 import 到的第三方包，按「必需/可选」分节。
+#   可选依赖刻意缺失时必须能降级运行（见 AGENTS.md「系统稳健性」），
+#   需要对应能力时取消对应注释行再安装即可。
+# ============================================================
+
+# ------------------------- 核心必需（LLM/ 后端硬依赖） -------------------------
+# 这些包在 server.py 及后端导入链顶层 import，缺一个都无法启动。
 fastapi
 uvicorn
 openai
 pydantic
 python-dotenv
+
+# ------------------------- RAG / 知识图谱 -------------------------
+缺省时向量检索/知识图谱降级为空操作，不阻断对话。
 chromadb
 kuzu
+
+# ------------------------- 语音链路 -------------------------
+# 缺省时语音模块整体降级，后端照常启动（见 LLM/voice_api.py）。
+numpy
 sherpa-onnx
 sounddevice
-numpy
 modelscope
+torch
+# torchaudio：声纹（3D-Speaker ERes2NetV2）必经依赖，版本须与 torch 匹配
+# （PyPI 最新为 2.11.0，与 torch 2.11.0 配套；torch 2.13.0 下装 2.11.0 亦可导入）。
+# 缺它则声纹懒加载时报错、每次语音回合在声纹步失败（worker 重连音频、话到不了大模型）。
+torchaudio
+
+# 声纹模型走 modelscope 拉取，部分镜像源不自动拉全依赖，按需再显式加装：
+#   addict / datasets / pillow / simplejson / sortedcontainers / soundfile
+# torch/torchaudio（CPU 版，单独装）：
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# ------------------------- 可选：板卡工具链 -------------------------
+# 仅地瓜派（RDK）上需要，本机不装（hobot_dnn 工具链需在板卡环境安装）。
+
+# ------------------------- 开发 / 测试 -------------------------
 pytest
-# modelscope 运行期依赖（部分镜像源不自动拉全，显式固化）
-addict
-datasets
-pillow
-simplejson
-sortedcontainers
-soundfile
-# torch/torchaudio: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
