@@ -213,6 +213,22 @@
       position: fixed; inset: 0; background: #101018; z-index: 2000;
       display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px;
     }
+    /* ---------- 注册向导 ---------- */
+    .wizard-steps { display: flex; gap: 6px; align-items: center; font-size: 12px; color: #9a9ab4; margin-bottom: 14px; }
+    .wizard-steps .step { display: inline-flex; align-items: center; gap: 4px; }
+    .wizard-steps .num { background: #2a2a3e; border-radius: 50%; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
+    .wizard-steps .step.done .num { background: #1f9d55; }
+    .wizard-steps .step.active .num { background: #3b82f6; color: #fff; }
+    .wizard-steps .sep { color: #444; }
+    .option-card { background: #101018; border: 1px solid #333; border-radius: 10px; padding: 12px 14px; cursor: pointer; margin-bottom: 10px; }
+    .option-card:hover { border-color: #3b82f6; }
+    .option-card .oc-title { font-weight: 600; }
+    .option-card .oc-sub { color: #9a9ab4; font-size: 11.5px; margin-top: 2px; }
+    .rec-panel { background: #101018; border: 1px solid #333; border-radius: 10px; padding: 16px; text-align: center; }
+    .rec-panel .rec-countdown { font-size: 22px; font-weight: 700; color: #f87171; margin: 6px 0; }
+    .identity-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .identity-chips .chip { background: #2a2a3e; border-radius: 6px; padding: 3px 8px; font-size: 12px; }
+    .identity-chips .chip.off { color: #888; }
     .exit-card { text-align: center; color: #e0e0e0; }
     .exit-card h2 { font-size: 22px; margin-bottom: 10px; }
     .exit-card p { color: #9a9ab4; font-size: 13px; }
@@ -235,6 +251,7 @@
       <button class="tab" data-page="settings">⚙️ 设置</button>
     </div>
     <span id="health" class="health">…</span>
+    <button id="reg-btn" class="btn gray sm" style="background:#1f9d55" onclick="openRegisterWizard()">➕ 注册老人</button>
     <button id="mod-btn" class="btn gray sm" onclick="openModulesModal()">🔍 模块状态</button>
     <button id="exit-btn" onclick="askExit()">⏻ 退出</button>
   </header>
@@ -285,6 +302,14 @@
             <div class="field"><label>备注</label><input id="p-notes"></div>
           </div>
           <div style="margin-top:12px"><button class="btn" onclick="saveProfile()">💾 保存档案（用药自动同步为每日服药提醒）</button></div>
+        <div style="margin-top:12px">
+          <div class="hint">身份样本（当前老人）</div>
+          <div class="identity-chips" id="identity-chips"><span class="chip">加载中…</span></div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="btn" onclick="openVoiceAppendPanel()">🎙️ 追加声纹样本</button>
+            <button class="btn" disabled style="background:#333;color:#888;cursor:not-allowed" onclick="toast('人脸录入尚未接入','','err')">📷 追加人脸照片（未开放）</button>
+          </div>
+        </div>
         </div>
 
         <div class="card">
@@ -793,6 +818,17 @@
         document.getElementById("p-notes").value = p.notes || "";
       }
 
+      // 身份样本状态（声纹档案数 / 人脸占位）
+      try {
+        const vres = await api("/api/voice/speakers");
+        const det = (vres.details || {})[uid];
+        const spk = det ? `🎙️ 声纹已建档（${det.samples} 次样本）` : "🎙️ 声纹未建档";
+        document.getElementById("identity-chips").innerHTML =
+          `<span class="chip">${spk}</span><span class="chip off">📷 人脸未接入</span>`;
+      } catch (e) {
+        document.getElementById("identity-chips").innerHTML = '<span class="chip off">身份样本状态未知</span>';
+      }
+
       const cbox = document.getElementById("mem-confirmed");
       cbox.innerHTML = confirmed.memories.length
         ? confirmed.memories.map(m => `
@@ -915,6 +951,309 @@
       });
       toast("✅ 档案已保存", "用药已自动同步为每日服药提醒");
       loadProfiles(); loadMemory();
+    }
+
+    // ================================================================
+    // 老人注册向导（4 步：基本信息 → 声纹 → 人脸占位 → 完成）
+    // ================================================================
+    let reg = { step: 0, uid: "", recordingId: null };
+
+    async function nextElderUid() {
+      const { profiles } = await api("/api/profiles");
+      let max = 0;
+      for (const p of profiles) {
+        const m = /^elder_(\d+)$/.exec(p.uid || "");
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+      }
+      return "elder_" + String(max + 1).padStart(3, "0");
+    }
+
+    async function openRegisterWizard() {
+      reg = { step: 0, uid: "", recordingId: null };
+      reg.uid = await nextElderUid();
+      regStep(1);
+    }
+
+    // regStep 最终版：n===3（人脸占位）需异步拉取 /api/face/status，其余步骤同步渲染
+    function regStep(n) {
+      reg.step = n;
+      const steps = ["基本信息", "声纹", "人脸", "完成"];
+      const html = steps.map((s, i) => {
+        const idx = i + 1;
+        const cls = idx < n ? "step done" : idx === n ? "step active" : "step";
+        return `<span class="${cls}"><span class="num">${idx < n ? "✓" : idx}</span>${s}</span>`;
+      }).join('<span class="sep">──</span>');
+      document.getElementById("modal-title").textContent = "➕ 注册老人";
+      const body = document.getElementById("modal-body");
+      body.innerHTML = `<div class="wizard-steps">${html}</div>`;
+      if (n === 3) {
+        regStep3Html().then(h => { body.innerHTML = `<div class="wizard-steps">${html}</div>` + h; });
+      } else {
+        body.innerHTML += n === 1 ? regStep1Html() : n === 2 ? regStep2Html() : regStep4Html();
+      }
+      document.getElementById("modal-foot").innerHTML = "";
+      document.getElementById("modal-mask").style.display = "flex";
+    }
+
+    function regStep1Html() {
+      return `<div class="form-grid">
+        <div class="field"><label>UID（自动生成，可改）</label><input id="reg-uid" value="${escapeHtml(reg.uid)}"></div>
+        <div class="field"><label>姓名 *</label><input id="reg-name" placeholder="张桂芳"></div>
+        <div class="field"><label>称呼</label><input id="reg-nickname" placeholder="张奶奶"></div>
+        <div class="field"><label>床位</label><input id="reg-bed" placeholder="3-15"></div>
+        <div class="field"><label>年龄</label><input id="reg-age" type="number"></div>
+        <div class="field"><label>性别</label><input id="reg-gender" placeholder="女"></div>
+        <div class="field"><label>生日</label><input id="reg-birthday" type="date"></div>
+        <div class="field"><label>偏好称呼（如：闺女）</label><input id="reg-call" placeholder="闺女"></div>
+        <div class="field" style="grid-column:1/3"><label>喜欢话题（逗号分隔）</label><input id="reg-topics" placeholder="京剧、孙子、养生"></div>
+        <div class="field" style="grid-column:1/3"><label>说话风格画像</label><input id="reg-style" placeholder="轻声细语，爱用'囡囡'称呼"></div>
+        <div class="field" style="grid-column:1/3"><label>备注</label><input id="reg-notes" placeholder="喜欢听评书，晚饭后散步"></div>
+      </div>
+      <div class="hint" style="margin-top:8px">病史 / 用药可在注册完成后于记忆页档案表单补录</div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+        <button class="btn gray" onclick="closeModal()">取消</button>
+        <button class="btn" onclick="regSaveProfile()">保存档案 → 下一步</button>
+      </div>`;
+    }
+
+    async function regSaveProfile() {
+      const name = document.getElementById("reg-name").value.trim();
+      if (!name) { toast("请填写姓名", "", "err"); return; }
+      const preferences = {
+        称呼: document.getElementById("reg-call").value.trim(),
+        话题: document.getElementById("reg-topics").value.split(/[，,]/).map(s => s.trim()).filter(Boolean),
+      };
+      await api("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({
+          uid: document.getElementById("reg-uid").value.trim() || reg.uid,
+          name,
+          nickname: document.getElementById("reg-nickname").value.trim(),
+          bed: document.getElementById("reg-bed").value.trim(),
+          age: Number(document.getElementById("reg-age").value) || 0,
+          gender: document.getElementById("reg-gender").value.trim(),
+          birthday: document.getElementById("reg-birthday").value.trim(),
+          profile: { 病史: [], 用药: [] }, preferences,
+          style: document.getElementById("reg-style").value.trim(),
+          notes: document.getElementById("reg-notes").value.trim(),
+        }),
+      });
+      reg.uid = document.getElementById("reg-uid").value.trim() || reg.uid;
+      toast("✅ 档案已保存");
+      regStep(2);
+    }
+
+    function regStep2Html() {
+      return `<div class="rec-panel" id="reg-rec-panel">
+        <div style="font-size:26px">🎙️</div>
+        <div>请老人对着机器人说一段话（15 秒）</div>
+        <div class="hint" style="margin:6px 0">录制完成后可试听、重录或保存</div>
+        <button class="btn" onclick="regStartRecord()">▶ 开始录制</button>
+        <div class="hint" style="margin-top:8px">语音模块不可用时可跳过，稍后在记忆页追加</div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+        <button class="btn gray" onclick="regStep(3)">跳过（稍后追加）</button>
+      </div>`;
+    }
+
+    let regTimer = null;
+    async function regStartRecord() {
+      const panel = document.getElementById("reg-rec-panel");
+      panel.innerHTML = '<div style="font-size:26px">🔴 录音中…</div><div class="rec-countdown" id="reg-count">15</div><div class="hint">请老人对着机器人说话</div>';
+      regTimer = setInterval(() => {
+        const el = document.getElementById("reg-count");
+        if (!el) return;
+        const n = parseInt(el.textContent, 10) - 1;
+        el.textContent = Math.max(n, 0);
+      }, 1000);
+      try {
+        const res = await api("/api/voice/record", {
+          method: "POST", body: JSON.stringify({ seconds: 15 }),
+        });
+        if (!res.ok) throw new Error(res.error || "录制失败");
+        reg.recordingId = res.recording_id;
+        regShowRecordResult(res.segments);
+      } catch (e) {
+        if (regTimer) clearInterval(regTimer);
+        panel.innerHTML = `<div class="hint" style="color:#f87171">⚠️ ${escapeHtml(e.message)}</div>
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:10px">
+            <button class="btn gray" onclick="regStep(3)">跳过（稍后追加）</button>
+            <button class="btn" onclick="regStartRecord()">重试</button>
+          </div>`;
+      }
+    }
+
+    function regShowRecordResult(segments) {
+      if (regTimer) { clearInterval(regTimer); regTimer = null; }
+      const panel = document.getElementById("reg-rec-panel");
+      panel.innerHTML = `<div style="font-size:26px">✅</div>
+        <div>录音完成，检测到 <b>${segments}</b> 段有效语音</div>
+        <div style="display:flex;gap:8px;justify-content:center;margin-top:12px">
+          <button class="btn gray" onclick="regListen()">🔊 试听</button>
+          <button class="btn gray" onclick="regStartRecord()">🔁 重录</button>
+          <button class="btn" onclick="regCommitRecord(false)">💾 保存</button>
+        </div>
+        <div class="hint" style="margin-top:8px">「重录」丢弃本次录音重新录；「保存」建档（首次）</div>`;
+    }
+
+    async function regListen() {
+      try {
+        const r = await fetch(API + "/api/voice/record/" + reg.recordingId + "/audio");
+        if (!r.ok) { toast("录音已过期，请重新录制", "", "err"); return; }
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = new Audio(url);
+        a.play();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      } catch (e) { toast("试听失败：" + e.message, "", "err"); }
+    }
+
+    async function regCommitRecord(append) {
+      const res = await api("/api/voice/enroll", {
+        method: "POST",
+        body: JSON.stringify({ uid: reg.uid, recording_id: reg.recordingId, append }),
+      });
+      if (!res.ok) { toast("保存失败：" + res.error, "", "err"); return; }
+      reg.recordingId = null;
+      reg.voiceDone = true;            // 声纹建档完成（完成页据此显示"已建档"）
+      toast("✅ 声纹已建档", "样本数 " + res.samples);
+      regStep(3);
+    }
+
+    async function regStep3Html() {
+      let face = "";
+      try {
+        const st = await api("/api/face/status");
+        face = st.status === "unavailable"
+          ? `<div class="hint">${escapeHtml(st.reason || "人脸录入尚未接入")}</div>`
+          : '<div class="hint">人脸模块可用</div>';
+      } catch (e) { face = '<div class="hint">人脸模块状态未知</div>'; }
+      return `<div style="background:#101018;border:1px dashed #444;border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:26px">📷</div>
+        <div>摄像头录入人脸 — 功能尚未接入</div>
+        ${face}
+        <button class="btn" disabled style="background:#333;color:#888;cursor:not-allowed;margin-top:10px">📷 拍照录入（未开放）</button>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+        <button class="btn" onclick="regFinish()">完成注册</button>
+      </div>`;
+    }
+
+    function regStep4Html() {
+      return `<div style="background:#101018;border:1px solid #1f9d55;border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:28px">🎉</div>
+        <div style="font-size:15px;margin-top:4px">老人注册成功！</div>
+        <div class="hint" style="margin-top:6px">${escapeHtml(reg.name || "")}（${escapeHtml(reg.uid)}）· 声纹${reg.voiceDone ? "已建档" : "未建档（可在记忆页追加）"} · 人脸待接入</div>
+        <button class="btn" style="margin-top:12px" onclick="regDone()">完成，切换到该老人</button>
+      </div>`;
+    }
+
+    function regFinish() {
+      regStep(4);   // reg.voiceDone 由 regCommitRecord 成功时置位；跳过则保持 false
+    }
+
+    async function regDone() {
+      closeModal();
+      currentUid = reg.uid;
+      localStorage.setItem("uid", currentUid);
+      document.getElementById("uid-select").value = currentUid;
+      toast("✅ 已切换到 " + reg.uid);
+      loadProfiles(); loadMemory(); loadChatHistory();
+    }
+
+    // ================================================================
+    // 追加声纹面板（追加样本 / 清除档案；录制后试听/重录/保存）
+    // ================================================================
+    let appendRec = null;
+    let appendTimer = null;
+
+    async function openVoiceAppendPanel() {
+      appendRec = null;
+      const det = ((await api("/api/voice/speakers")).details || {})[currentUid];
+      const status = det ? `已建档 · ${det.samples} 次样本（追加会合并平均，越录越准）` : "未建档（追加即首次建档）";
+      document.getElementById("modal-title").textContent = "🎙️ 声纹样本管理（" + currentUid + "）";
+      document.getElementById("modal-body").innerHTML = `
+        <div class="hint" style="margin-bottom:10px">当前：${escapeHtml(status)}</div>
+        <div class="option-card" onclick="appendStart()">
+          <div class="oc-title">➕ 追加样本</div>
+          <div class="oc-sub">重新录一段（15 秒），与已有档案合并平均</div>
+        </div>
+        <div class="option-card" style="border-color:#dc2626" onclick="appendClear()">
+          <div class="oc-title">🗑️ 清除档案</div>
+          <div class="oc-sub">删除该老人的全部声纹样本（需确认；不影响老人基本信息档案）</div>
+        </div>`;
+      document.getElementById("modal-foot").innerHTML = '<button class="btn gray" onclick="closeModal()">关闭</button>';
+      document.getElementById("modal-mask").style.display = "flex";
+    }
+
+    async function appendStart() {
+      const body = document.getElementById("modal-body");
+      body.innerHTML = '<div class="rec-panel"><div style="font-size:26px">🔴 录音中…</div><div class="rec-countdown" id="append-count">15</div><div class="hint">请老人对着机器人说话</div></div>';
+      appendTimer = setInterval(() => {
+        const el = document.getElementById("append-count");
+        if (el) el.textContent = Math.max(parseInt(el.textContent, 10) - 1, 0);
+      }, 1000);
+      try {
+        const res = await api("/api/voice/record", {
+          method: "POST", body: JSON.stringify({ seconds: 15 }),
+        });
+        if (!res.ok) throw new Error(res.error || "录制失败");
+        appendRec = res.recording_id;
+        appendResult(res.segments);
+      } catch (e) {
+        if (appendTimer) { clearInterval(appendTimer); appendTimer = null; }
+        body.innerHTML = `<div class="hint" style="color:#f87171">⚠️ ${escapeHtml(e.message)}</div>
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:10px">
+            <button class="btn" onclick="appendStart()">重试</button>
+            <button class="btn gray" onclick="openVoiceAppendPanel()">返回</button>
+          </div>`;
+      }
+    }
+
+    function appendResult(segments) {
+      if (appendTimer) { clearInterval(appendTimer); appendTimer = null; }
+      const body = document.getElementById("modal-body");
+      body.innerHTML = `<div class="rec-panel">
+        <div style="font-size:26px">✅</div>
+        <div>录音完成，检测到 <b>${segments}</b> 段有效语音</div>
+        <div style="display:flex;gap:8px;justify-content:center;margin-top:12px">
+          <button class="btn gray" onclick="appendListen()">🔊 试听</button>
+          <button class="btn gray" onclick="appendStart()">🔁 重录</button>
+          <button class="btn" onclick="appendCommit()">💾 保存</button>
+        </div>
+        <div class="hint" style="margin-top:8px">「重录」丢弃本次录音重新录；「保存」合并入档</div>
+      </div>`;
+    }
+
+    async function appendListen() {
+      try {
+        const r = await fetch(API + "/api/voice/record/" + appendRec + "/audio");
+        if (!r.ok) { toast("录音已过期，请重新录制", "", "err"); return; }
+        const url = URL.createObjectURL(await r.blob());
+        new Audio(url).play();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      } catch (e) { toast("试听失败：" + e.message, "", "err"); }
+    }
+
+    async function appendCommit() {
+      const res = await api("/api/voice/enroll", {
+        method: "POST",
+        body: JSON.stringify({ uid: currentUid, recording_id: appendRec, append: true }),
+      });
+      if (!res.ok) { toast("保存失败：" + res.error, "", "err"); return; }
+      appendRec = null;
+      toast("✅ 已合并入档", "样本数 " + res.samples);
+      closeModal();
+      loadMemory();
+    }
+
+    async function appendClear() {
+      if (!confirm("确认清除 " + currentUid + " 的全部声纹样本？老人基本信息档案不受影响。")) return;
+      const res = await api("/api/voice/speakers/" + currentUid, { method: "DELETE" });
+      if (!res.ok) { toast("清除失败：" + res.error, "", "err"); return; }
+      toast("🗑️ 声纹档案已清除", "可重新录制建档");
+      closeModal();
+      loadMemory();
     }
 
     async function addMemory() {
