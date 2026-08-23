@@ -31,6 +31,14 @@ def test_relation_dedup(g):
     assert len(likes) == 1
 
 
+def test_list_relations(g):
+    g.upsert_entity("elder_001", "elder_001:张建国", "张建国", "person")
+    g.upsert_entity("elder_001", "elder_001:京剧", "京剧", "topic")
+    g.upsert_relation("elder_001", "elder_001:张建国", "elder_001:京剧", "likes")
+    rels = g.list_relations("elder_001")
+    assert any(r["src"] == "张建国" and r["type"] == "likes" and r["dst"] == "京剧" for r in rels)
+
+
 def test_status_degraded_when_unavailable(monkeypatch):
     monkeypatch.setattr(graph, "_AVAILABLE", False)
     assert graph.status()["available"] is False

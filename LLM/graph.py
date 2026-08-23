@@ -108,6 +108,23 @@ def list_entities(uid: str) -> list[dict]:
         return []
 
 
+def list_relations(uid: str) -> list[dict]:
+    if not _AVAILABLE:
+        return []
+    try:
+        rows = _conn.execute(
+            "MATCH (a:Entity)-[r:Relation]->(b:Entity) WHERE r.uid=$uid "
+            "RETURN a.name AS src, r.type AS type, b.name AS dst",
+            {"uid": uid})
+        out = []
+        while rows.has_next():
+            rec = rows.get_next()
+            out.append({"src": rec[0], "type": rec[1], "dst": rec[2]})
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def status() -> dict:
     return {"available": _AVAILABLE, "missing": _MISSING}
 

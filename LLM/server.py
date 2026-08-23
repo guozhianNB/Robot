@@ -316,7 +316,8 @@ async def rag_memories_list(uid: str = Query("elder_001")):
 @app.get("/api/memories/graph")
 async def graph_view(uid: str = Query("elder_001")):
     from . import graph as g
-    return {"ok": True, "status": g.status()}
+    return {"ok": True, "status": g.status(),
+            "entities": g.list_entities(uid), "relations": g.list_relations(uid)}
 
 
 @app.get("/api/memories/health")

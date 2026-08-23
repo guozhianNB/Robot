@@ -700,9 +700,23 @@
         graphBox.innerHTML = '<div class="hint">知识图谱加载失败</div>';
       } else {
         const st = graphRes.status || {};
-        graphBox.innerHTML = st.available
+        let html = st.available
           ? '<div class="hint">✅ 知识图谱可用（kuzu）</div>'
           : '<div class="hint">⚠️ 知识图谱不可用' + (st.missing && st.missing.length ? "（缺少依赖：" + escapeHtml(st.missing.join("；")) + "）" : "") + '</div>';
+        const entities = graphRes.entities || [];
+        const relations = graphRes.relations || [];
+        if (!entities.length && !relations.length) {
+          html += '<div class="hint">暂无实体关系</div>';
+        } else {
+          if (entities.length) {
+            html += '<div class="graph-section">实体：' + entities.map(e => escapeHtml(e.name) + '(' + escapeHtml(e.type) + ')').join("、") + '</div>';
+          }
+          if (relations.length) {
+            html += '<div class="graph-section">关系：</div>' + relations.map(r =>
+              '<div class="graph-rel">' + escapeHtml(r.src) + ' —' + escapeHtml(r.type) + '→ ' + escapeHtml(r.dst) + '</div>').join("");
+          }
+        }
+        graphBox.innerHTML = html;
       }
     }
 
