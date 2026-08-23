@@ -83,6 +83,16 @@ EMBED_MODEL = "text-embedding-v3"
 EMBED_DIM = 1024          # 阿里 text-embedding-v3 默认维度；n-gram 回退也映射到此维度
 EMBED_TIMEOUT = 10
 
+# ---- 记忆系统 v3：检索与分流 ----
+MEMORY_TOP_K = 3                # RAG 检索 Top-K
+CORE_MEMORY_CAP = 30            # 核心记忆全量注入条数上限
+CORE_MEMORY_CHAR_CAP = 2000     # 核心记忆注入字符上限
+CORE_IMPORTANCE_THRESHOLD = 3   # importance >= 3 且核心层 type 才进 core_memories
+GRAPH_REL_TYPES = ["likes", "dislikes", "family", "related_to", "happened_at"]
+
+# 身份字段红线：模型永不写、永不改（护士只读档案）
+IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号"]
+
 # LLM 参数
 MODEL = "deepseek-v4-flash"
 LLM_TIMEOUT = 60

@@ -20,6 +20,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
   uid TEXT PRIMARY KEY,
   name TEXT DEFAULT '', nickname TEXT DEFAULT '', bed TEXT DEFAULT '', age INTEGER DEFAULT 0,
+  gender TEXT DEFAULT '', birthday TEXT DEFAULT '',
   profile_json TEXT DEFAULT '{}',      -- {"病史": [...], "用药": [{"name","dose","time"}]}
   style TEXT DEFAULT '',
   preferences_json TEXT DEFAULT '{}',  -- {"称呼": "...", "话题": [...]}
@@ -54,6 +55,17 @@ CREATE TABLE IF NOT EXISTS chat_history (
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS summaries (uid TEXT PRIMARY KEY, summary TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS portraits (uid TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS core_memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT, type TEXT, content TEXT,
+  confidence REAL DEFAULT 0.5, importance INTEGER DEFAULT 0,
+  source TEXT DEFAULT '', ts TEXT, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS rag_memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT, chroma_id TEXT, type TEXT, content TEXT,
+  importance INTEGER DEFAULT 0, source TEXT DEFAULT '', ts TEXT
+);
 """
 
 
@@ -109,6 +121,7 @@ def list_profiles() -> list[dict]:
 
 
 def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
+                   gender="", birthday="",
                    profile=None, style="", preferences=None, notes="") -> dict:
     profile = profile or {}
     preferences = preferences or {}
@@ -117,13 +130,14 @@ def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
         conn = _conn()
         try:
             conn.execute(
-                """INSERT INTO profiles (uid,name,nickname,bed,age,profile_json,style,preferences_json,notes,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO profiles (uid,name,nickname,bed,age,gender,birthday,profile_json,style,preferences_json,notes,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(uid) DO UPDATE SET
                      name=excluded.name, nickname=excluded.nickname, bed=excluded.bed, age=excluded.age,
+                     gender=excluded.gender, birthday=excluded.birthday,
                      profile_json=excluded.profile_json, style=excluded.style,
                      preferences_json=excluded.preferences_json, notes=excluded.notes, updated_at=excluded.updated_at""",
-                (uid, name, nickname, bed, age,
+                (uid, name, nickname, bed, age, gender, birthday,
                  json.dumps(profile, ensure_ascii=False),
                  style,
                  json.dumps(preferences, ensure_ascii=False),
@@ -215,6 +229,91 @@ def cleanup_expired_memories() -> int:
             return cur.rowcount
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------- core_memories
+def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source="", ts=None) -> int:
+    ts = ts or now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO core_memories (uid,type,content,confidence,importance,source,ts,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (uid, mtype, content, confidence, importance, source, ts, ts))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def list_core_memories(uid, limit=None) -> list[dict]:
+    sql = "SELECT * FROM core_memories WHERE uid=? ORDER BY importance DESC, id DESC"
+    args = [uid]
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def update_core_memory(mid, content=None, importance=None, confidence=None) -> None:
+    fields = {"updated_at": now_iso()}
+    if content is not None:
+        fields["content"] = content
+    if importance is not None:
+        fields["importance"] = importance
+    if confidence is not None:
+        fields["confidence"] = confidence
+    keys = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [mid]
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(f"UPDATE core_memories SET {keys} WHERE id=?", vals)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def delete_core_memory(mid) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("DELETE FROM core_memories WHERE id=?", (mid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- rag_memories（镜像表）
+def add_rag_memory(uid, mtype, content, chroma_id, importance=0, source="", ts=None) -> int:
+    ts = ts or now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO rag_memories (uid,chroma_id,type,content,importance,source,ts) VALUES (?,?,?,?,?,?,?)",
+                (uid, chroma_id, mtype, content, importance, source, ts))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def list_rag_memories(uid, limit=None) -> list[dict]:
+    sql = "SELECT * FROM rag_memories WHERE uid=? ORDER BY id DESC"
+    args = [uid]
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------- reminders
