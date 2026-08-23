@@ -41,17 +41,19 @@
 - 修改：`requirement.txt`
 - 创建：`tests/conftest.py`
 
-- [ ] **步骤 1：安装核心依赖与新依赖**
+- [ ] **步骤 1：（用户手动 pip，执行者不安装）确认依赖清单**
 
-```powershell
-.venv\Scripts\python.exe -m pip install fastapi uvicorn openai pydantic python-dotenv
-.venv\Scripts\python.exe -m pip install chromadb kuzu pytest
+以下包由用户手动 pip 安装，执行者**不要运行 pip install**：
+
+```
+fastapi uvicorn openai pydantic python-dotenv
+chromadb kuzu pytest
 ```
 
-- [ ] **步骤 2：验证导入**
+- [ ] **步骤 2：验证依赖已就绪**
 
 运行：`.venv\Scripts\python.exe -c "import fastapi, openai, chromadb, kuzu, pytest; print('ok')"`
-预期：输出 `ok`
+预期：输出 `ok`；若报 `ModuleNotFoundError`，提示用户补装对应包后再继续，不要自行 pip。
 
 - [ ] **步骤 3：更新 requirement.txt 补齐核心依赖与新依赖**
 
