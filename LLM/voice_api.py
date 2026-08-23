@@ -120,14 +120,17 @@ def list_speakers():
     return sorted(p.stem for p in voice_config.SPEAKER_DIR.glob("*.npz"))
 
 
-def record_speaker(seconds: int = 15) -> dict:
+def record_speaker(seconds: int = 15, uid: str = None) -> dict:
     """录 seconds 秒 → VAD 切段 → 提特征，暂存内存（特征+音频），返回 recording_id。
     不落档；由 commit_speaker 提交入档，discard_recording 丢弃。"""
     if not _VOICE_AVAILABLE:
         return {"ok": False, "error": _degraded_msg()}
     global _recognizer
     if _worker is not None:
-        _worker.src.stop()
+        try:
+            _worker.src.stop()
+        except Exception:
+            pass  # worker 存在但音频源异常时不应拖垮录制
     try:
         src = audio_mod.AudioSource()
         src.start()
@@ -158,7 +161,7 @@ def record_speaker(seconds: int = 15) -> dict:
         _cleanup_pending()
         _pending[rid] = {"emb": emb, "segments": len(segs),
                          "wav": _wav_bytes(samples), "ts": time.time()}
-        audit.log("voice_spk", action="record", rid=rid, segments=len(segs))
+        audit.log("voice_spk", action="record", rid=rid, segments=len(segs), uid=uid)
         return {"ok": True, "recording_id": rid, "segments": len(segs)}
     except Exception as e:
         audit.log("voice_error", action="record", error=str(e))
@@ -185,6 +188,7 @@ def commit_speaker(recording_id: str, uid: str, append: bool = True) -> dict:
         _recognizer.enroll_embedding(uid, item["emb"], append=append)
         audit.log("voice_spk", action="commit", uid=uid, append=append,
                   segments=item["segments"])
+        _sync_worker_profiles()
         return {"ok": True, "uid": uid, "samples": _recognizer.sample_count(uid)}
     except Exception as e:
         audit.log("voice_error", action="commit", uid=uid, error=str(e))
@@ -205,6 +209,17 @@ def get_recording_audio(recording_id: str):
     return item["wav"], "audio/wav"
 
 
+def _sync_worker_profiles():
+    """档案变更后同步语音 worker 的内存档案（worker 存在时），否则静默跳过。"""
+    try:
+        if _worker is not None:
+            spk = getattr(_worker, "spk", None)
+            if spk is not None and hasattr(spk, "reload"):
+                spk.reload()
+    except Exception:
+        pass
+
+
 def delete_speaker(uid: str) -> dict:
     """清除该 uid 的声纹档案（不影响老人基本信息档案）。"""
     if not _VOICE_AVAILABLE:
@@ -215,6 +230,7 @@ def delete_speaker(uid: str) -> dict:
             _recognizer = spk_mod.SpeakerRecognizer()
         _recognizer.delete(uid)
         audit.log("voice_spk", action="delete", uid=uid, by="nurse")
+        _sync_worker_profiles()
         return {"ok": True, "uid": uid}
     except Exception as e:
         audit.log("voice_error", action="delete", uid=uid, error=str(e))

@@ -410,8 +410,10 @@ async def settings_set(body: dict):
 @app.post("/api/voice/record")
 async def voice_record(body: dict = None):
     """两步式声纹第 1 步：录制并暂存（不落档），返回 recording_id。"""
-    seconds = int((body or {}).get("seconds", 15))
-    return await asyncio.to_thread(voice_api.record_speaker, seconds)
+    body = body or {}
+    seconds = int(body.get("seconds", 15))
+    uid = body.get("uid")
+    return await asyncio.to_thread(voice_api.record_speaker, seconds, uid)
 
 
 @app.get("/api/voice/record/{recording_id}/audio")
@@ -454,6 +456,9 @@ async def voice_status():
 
 @app.get("/api/voice/speakers")
 async def voice_speakers():
+    if not voice_api._VOICE_AVAILABLE:
+        return {"ok": True, "status": "unavailable", "reason": voice_api._degraded_msg(),
+                "speakers": [], "details": {}}
     return {"ok": True, "speakers": voice_api.list_speakers(),
             "details": voice_api.list_speaker_details()}
 

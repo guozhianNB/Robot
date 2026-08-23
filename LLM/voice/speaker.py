@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 r"""声纹：3D-Speaker ERes2NetV2（modelscope）。注册 / 验证(1:1) / 识别(1:N)。"""
+import re
 from pathlib import Path
 import numpy as np
 
 from . import config
+
+
+def _check_uid(uid: str) -> None:
+    """uid 白名单校验（防路径穿越）：只允许字母/数字/下划线/连字符，非法抛 ValueError。"""
+    if not isinstance(uid, str) or re.fullmatch(r"[A-Za-z0-9_-]+", uid) is None:
+        raise ValueError("非法 uid")
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -67,6 +74,7 @@ class SpeakerRecognizer:
     def enroll(self, uid: str, segments: list[np.ndarray], append: bool = False) -> np.ndarray:
         """segments: 若干段 16k 语音；逐段提特征取平均，落盘 npz。
         append=True 时与已有档案合并平均（档案样本计数 +1）。"""
+        _check_uid(uid)
         embs = [self.embed(s) for s in segments if len(s) >= config.SAMPLE_RATE]
         if not embs:
             raise ValueError("没有足够长（≥1s）的语音段用于注册")
@@ -75,6 +83,7 @@ class SpeakerRecognizer:
 
     def enroll_embedding(self, uid: str, emb: np.ndarray, append: bool = False) -> np.ndarray:
         """直接用特征向量入档（录制暂存路径用）；append=True 合并平均。"""
+        _check_uid(uid)
         old = self._profiles.get(uid)
         old_count = self.sample_count(uid)
         merged, count = merge_profile(old if append else None, old_count if append else 0, emb)
@@ -97,6 +106,7 @@ class SpeakerRecognizer:
 
     def delete(self, uid: str) -> None:
         """清除该 uid 的声纹档案（文件 + 内存）。"""
+        _check_uid(uid)
         self._profiles.pop(uid, None)
         f = self.profile_dir / f"{uid}.npz"
         if f.exists():
@@ -104,6 +114,7 @@ class SpeakerRecognizer:
 
     def sample_count(self, uid: str) -> int:
         """档案样本计数：新 npz 读 count；旧 npz（无 count）视为 1；无档案 0。"""
+        _check_uid(uid)
         f = self.profile_dir / f"{uid}.npz"
         if not f.exists():
             return 0
@@ -112,6 +123,11 @@ class SpeakerRecognizer:
             return int(d["count"]) if "count" in d else 1
         except Exception:
             return 1
+
+    def reload(self) -> None:
+        """清空内存档案并从磁盘重新加载（供外部实例同步用）。"""
+        self._profiles = {}
+        self._load()
 
     def _load(self):
         for f in self.profile_dir.glob("*.npz"):
