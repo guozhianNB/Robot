@@ -77,6 +77,12 @@ EPISODE_TTL_DAYS = 90              # 经历片段（Episode）记忆时效：一
 # 提醒状态机
 REMINDER_STATUS = ["pending", "triggered", "unconfirmed", "confirmed", "missed"]
 
+# ---- 记忆系统 v3：embedding ----
+EMBED_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+EMBED_MODEL = "text-embedding-v3"
+EMBED_DIM = 1024          # 阿里 text-embedding-v3 默认维度；n-gram 回退也映射到此维度
+EMBED_TIMEOUT = 10
+
 # LLM 参数
 MODEL = "deepseek-v4-flash"
 LLM_TIMEOUT = 60
