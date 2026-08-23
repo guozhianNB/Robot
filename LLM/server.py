@@ -185,6 +185,19 @@ async def health():
             "time": db.now_iso(), "profiles": len(db.list_profiles())}
 
 
+@app.get("/api/modules/status")
+async def modules_status():
+    """可选模块状态聚合：语音 / embedding / RAG 存储 / 知识图谱。
+    各模块缺失依赖时自行降级（available=False / status=unavailable），接口照常返回。"""
+    from . import embed as e, ragstore, graph as g
+    return {"ok": True, "modules": {
+        "voice":    voice_api.get_status(),
+        "embed":    e.status(),
+        "ragstore": ragstore.status(),
+        "graph":    g.status(),
+    }}
+
+
 @app.post("/api/chat")
 async def chat_route(req: ChatRequest):
     settings = db.get_settings()
