@@ -10,6 +10,17 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6))
 
 
+def merge_profile(old: np.ndarray | None, old_count: int, new: np.ndarray):
+    """声纹合并平均：new 并入旧档案。返回 (merged_emb, new_count)。
+    old 为 None 或 old_count<=0 时视为新建（count=1）。"""
+    if old is None or old_count <= 0:
+        emb = np.asarray(new, dtype=np.float32)
+        return emb / (np.linalg.norm(emb) + 1e-6), 1
+    merged = (old.astype(np.float32) * old_count + np.asarray(new, dtype=np.float32)) / (old_count + 1)
+    merged = merged / (np.linalg.norm(merged) + 1e-6)
+    return merged.astype(np.float32), old_count + 1
+
+
 def classify(emb: np.ndarray, profiles: dict, threshold: float):
     """profiles: {uid: emb}。返回 (uid|None, 最高分)。纯函数，便于测试。"""
     if not profiles:
