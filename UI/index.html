@@ -394,6 +394,8 @@
     const API = "http://127.0.0.1:8000";
     let currentUid = localStorage.getItem("uid") || "elder_001";
     let chatMessages = [];          // 前端展示用的本轮会话（后端自己管理长期历史）
+    let _es = null;            // EventSource 实例（退出时需 close）
+    let _pingTimer = null;     // 健康轮询定时器（退出时需 clear）
 
     // ================================================================
     // 通用工具
@@ -1014,23 +1016,23 @@
     // 全局广播监听（提醒触发 / 告警 / 确认）
     // ================================================================
     function connectEvents() {
-      const es = new EventSource(API + "/api/events");
-      es.addEventListener("reminder", (ev) => {
+      window._es = _es = new EventSource(API + "/api/events");
+      _es.addEventListener("reminder", (ev) => {
         const d = JSON.parse(ev.data);
         const when = d.missed ? "（错过补报）" : "";
         toast(`⏰ ${d.title}${when}`, `${d.content}${d.silent ? "<br><span style='color:#fbbf24'>静默时段内，仅记录</span>" : ""}`, d.missed ? "warn" : "");
         if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
       });
-      es.addEventListener("reminder_confirmed", (ev) => {
+      _es.addEventListener("reminder_confirmed", (ev) => {
         const d = JSON.parse(ev.data);
         toast("✅ 已确认", d.title);
         if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
       });
-      es.addEventListener("alarm", (ev) => {
+      _es.addEventListener("alarm", (ev) => {
         const d = JSON.parse(ev.data);
         toast("🚨 告警升级", d.message, "err");
       });
-      es.onerror = () => { /* EventSource 自动重连 */ };
+      _es.onerror = () => { /* EventSource 自动重连 */ };
     }
 
     // ================================================================
@@ -1106,6 +1108,37 @@
     }
 
     // ================================================================
+    // 系统退出
+    // ================================================================
+    function askExit() {
+      openModal("⏻ 确认退出系统",
+        '<p>确认退出系统？将停止提醒/语音服务并关闭后端。</p>',
+        '<button class="btn gray" onclick="closeModal()">取消</button><button class="btn red" onclick="doExit()">确认退出</button>');
+    }
+
+    async function doExit() {
+      const body = document.getElementById("modal-body");
+      body.innerHTML = '<div class="hint">正在退出…</div>';
+      try {
+        await api("/api/system/shutdown", { method: "POST" });
+      } catch (e) {
+        toast("⚠️ 后端已离线", "无需退出", "err");
+      }
+      showExitOverlay();
+    }
+
+    function showExitOverlay() {
+      closeModal();
+      document.getElementById("exit-overlay").style.display = "flex";
+      document.getElementById("exit-btn").disabled = true;
+      document.getElementById("mod-btn").disabled = true;
+      if (window._es) window._es.close();          // 断开 SSE，停止自动重连
+      if (window._pingTimer) clearInterval(window._pingTimer);   // 停止健康轮询
+      document.getElementById("health").textContent = "● 已退出";
+      document.getElementById("health").className = "health off";
+    }
+
+    // ================================================================
     // 启动
     // ================================================================
     (async function init() {
@@ -1118,7 +1151,7 @@
       loadMemory(); loadReminders(); loadToolLog(); loadSettings(); ping();
       loadModuleStatus();   // 预检模块状态：有异常时顶栏按钮变红
       connectEvents();
-      setInterval(ping, 30000);
+      window._pingTimer = _pingTimer = setInterval(ping, 30000);
     })();
   </script>
 </body>
