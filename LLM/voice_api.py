@@ -50,7 +50,7 @@ _recognizer = None   # 声纹实例（建档端点复用，避免重复加载）
 _pending = {}   # recording_id -> {"emb", "segments", "wav", "ts"}（录制暂存，TTL 后清理）
 
 
-def _wav_bytes(samples: np.ndarray) -> bytes:
+def _wav_bytes(samples) -> bytes:
     """float32 16k 单声道 → wav bytes（16bit PCM），供试听。"""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
