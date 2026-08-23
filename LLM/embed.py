@@ -7,27 +7,47 @@ import math
 import os
 
 from . import vectors
-from .conf import (BASE_DIR, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM, EMBED_TIMEOUT)
+from .conf import BASE_DIR, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM, EMBED_TIMEOUT
 
-_AVAILABLE = False
-_client = None
+_AVAILABLE = True
 _MISSING = []
+_client = None
+
+try:
+    from openai import OpenAI
+except ImportError as _exc:
+    OpenAI = None
+    _AVAILABLE = False
+    _MISSING.append("openai: " + str(_exc))
+
+try:
+    from dotenv import load_dotenv
+except ImportError as _exc:
+    load_dotenv = None
+    _AVAILABLE = False
+    _MISSING.append("python-dotenv: " + str(_exc))
 
 
-def _init():
-    global _AVAILABLE, _client
-    try:
-        from openai import OpenAI
-        from dotenv import load_dotenv
-        load_dotenv(BASE_DIR / ".env")
-        key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-        if not key:
+def _ensure_client():
+    """懒加载 OpenAI 客户端；key 缺失或构造失败 → _AVAILABLE=False 并返回 None。"""
+    global _client, _AVAILABLE
+    if _client is not None:
+        return _client
+    if OpenAI is None or load_dotenv is None:
+        return None
+    load_dotenv(BASE_DIR / ".env")
+    key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if not key:
+        _AVAILABLE = False
+        if "缺少 DASHSCOPE_API_KEY（.env）" not in _MISSING:
             _MISSING.append("缺少 DASHSCOPE_API_KEY（.env）")
-            return
+        return None
+    try:
         _client = OpenAI(api_key=key, base_url=EMBED_BASE_URL)
-        _AVAILABLE = True
-    except Exception as e:  # noqa: BLE001
-        _MISSING.append(str(e))
+    except Exception as _exc:
+        _AVAILABLE = False
+        _MISSING.append(str(_exc))
+    return _client
 
 
 def _fallback_embed(texts: list[str]) -> list[list[float]]:
@@ -45,15 +65,20 @@ def _fallback_embed(texts: list[str]) -> list[list[float]]:
     return out
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(texts):
     if not texts:
         return []
     if _AVAILABLE:
-        try:
-            resp = _client.embeddings.create(model=EMBED_MODEL, input=texts, timeout=EMBED_TIMEOUT)
-            return [d.embedding for d in resp.data]
-        except Exception:  # noqa: BLE001
-            pass
+        client = _ensure_client()
+        if client is not None:
+            try:
+                resp = client.embeddings.create(model=EMBED_MODEL, input=texts, timeout=EMBED_TIMEOUT)
+                vecs = [d.embedding for d in resp.data]
+                if all(len(v) == EMBED_DIM for v in vecs):
+                    return vecs
+                # 维度不符 → 视为异常，回退
+            except Exception:
+                pass
     return _fallback_embed(texts)
 
 
@@ -62,7 +87,6 @@ def embed_query(text: str) -> list[float]:
 
 
 def status() -> dict:
+    # 懒加载：无 key 时把 _AVAILABLE 置 False 并收集缺失提示，保证状态查询反映真实可用性。
+    _ensure_client()
     return {"available": _AVAILABLE, "missing": _MISSING}
-
-
-_init()
