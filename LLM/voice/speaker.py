@@ -64,16 +64,23 @@ class SpeakerRecognizer:
         ret = self._pipeline([wav_16k], output_emb=True)
         return np.asarray(ret["embs"][0], dtype=np.float32)
 
-    def enroll(self, uid: str, segments: list[np.ndarray]) -> np.ndarray:
-        """segments: 若干段 16k 语音；逐段提特征取平均，落盘 npz。"""
+    def enroll(self, uid: str, segments: list[np.ndarray], append: bool = False) -> np.ndarray:
+        """segments: 若干段 16k 语音；逐段提特征取平均，落盘 npz。
+        append=True 时与已有档案合并平均（档案样本计数 +1）。"""
         embs = [self.embed(s) for s in segments if len(s) >= config.SAMPLE_RATE]
         if not embs:
             raise ValueError("没有足够长（≥1s）的语音段用于注册")
-        profile = np.mean(embs, axis=0).astype(np.float32)
-        profile = profile / (np.linalg.norm(profile) + 1e-6)
-        self._profiles[uid] = profile
-        np.savez(self.profile_dir / f"{uid}.npz", emb=profile)
-        return profile
+        new = np.mean(embs, axis=0).astype(np.float32)
+        return self.enroll_embedding(uid, new, append=append)
+
+    def enroll_embedding(self, uid: str, emb: np.ndarray, append: bool = False) -> np.ndarray:
+        """直接用特征向量入档（录制暂存路径用）；append=True 合并平均。"""
+        old = self._profiles.get(uid)
+        old_count = self.sample_count(uid)
+        merged, count = merge_profile(old if append else None, old_count if append else 0, emb)
+        self._profiles[uid] = merged
+        np.savez(self.profile_dir / f"{uid}.npz", emb=merged, count=count)
+        return merged
 
     def verify(self, uid: str, wav_16k: np.ndarray) -> tuple[bool, float]:
         if uid not in self._profiles:
@@ -87,6 +94,24 @@ class SpeakerRecognizer:
 
     def list_profiles(self) -> list[str]:
         return sorted(self._profiles.keys())
+
+    def delete(self, uid: str) -> None:
+        """清除该 uid 的声纹档案（文件 + 内存）。"""
+        self._profiles.pop(uid, None)
+        f = self.profile_dir / f"{uid}.npz"
+        if f.exists():
+            f.unlink()
+
+    def sample_count(self, uid: str) -> int:
+        """档案样本计数：新 npz 读 count；旧 npz（无 count）视为 1；无档案 0。"""
+        f = self.profile_dir / f"{uid}.npz"
+        if not f.exists():
+            return 0
+        try:
+            d = np.load(f)
+            return int(d["count"]) if "count" in d else 1
+        except Exception:
+            return 1
 
     def _load(self):
         for f in self.profile_dir.glob("*.npz"):
