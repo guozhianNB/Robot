@@ -46,4 +46,19 @@ def test_migrate_idempotent(tmp_path, isolated_paths, monkeypatch):
     n_core_after_first = len(db.list_core_memories("elder_001"))
     r2 = migrate.run()
     assert r1["ok"] is True
+    assert r2["skipped"] is True
     assert n_core_after_first == len(db.list_core_memories("elder_001"))
+
+
+def test_migrate_dedup_core(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, migrate
+    db.init_db()
+    db.add_memory("elder_001", "preference", "喜欢京剧", status="confirmed", source="llm")
+    monkeypatch.setattr(migrate.ragstore, "add", lambda uid, t, c, **kw: None)
+    r1 = migrate.run()
+    # 手动再插一条同 type+content 的旧记忆，模拟重复源数据
+    db.add_memory("elder_001", "preference", "喜欢京剧", status="confirmed", source="llm")
+    monkeypatch.setattr(db, "get_settings", lambda: {"migrate_done": False})
+    migrate.run()
+    cores = [m for m in db.list_core_memories("elder_001") if m["content"] == "喜欢京剧"]
+    assert len(cores) == 1
