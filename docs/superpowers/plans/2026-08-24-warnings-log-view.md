@@ -210,6 +210,7 @@ async function openModulesModal() {
     '<button class="btn" onclick="loadModuleStatus()">🔄 重新检测</button>' +
     '<button class="btn gray" onclick="loadWarningsLog()">📋 警告/错误日志</button>' +
     '<button class="btn gray" onclick="closeModal()">关闭</button>');
+  _lastModuleHtml = "";   // 每次打开弹窗重置快照，避免视图切换回滚过期数据
   await loadModuleStatus();
 }
 ```
