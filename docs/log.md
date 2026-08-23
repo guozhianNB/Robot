@@ -244,3 +244,39 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 新增 `tests/test_worker_events.py`（5 个用例）：`bus.publish` 后 SSE 扇出 `voice_state` / `chat_new` 事件广播（事件类型、uid 字段、任意线程触发）。
 - 全量回归：`pytest LLM/tests -q` → **28 passed**（5 个测试文件，无回归；含声纹批次后续新增的 3 个用例，本批次基线 25）。
 - 后端启动 + 事件流集成验证由控制者执行：uvicorn 启动 + health + SSE keep-alive + `bus.publish` 注入 `voice_state`/`chat_new` 线上格式（纯 asyncio 直连事件总线，INTEGRATION OK）；真实链路验证（uvicorn + Node EventSource 直连 `/api/events`，触发真实提醒事件经 `onmessage` 按 `data.type` 收到，确认 `data` 行按 `message` 类型派发、onmessage 分发机制端到端成立）实测通过。
+
+---
+
+## 2026-08-24 · 老人注册流程：注册向导 + 两步式声纹 API + 声纹档案合并
+
+**依据：** `docs/superpowers/plans/2026-08-24-elder-registration-flow.md`（实现提交 `7f8fdcb` `2b30892` `86d142a` `90691e1` `78bfa53` `d180258` `8b947b8` `2465adc`）。
+
+### 前端（`UI/index.html`）：老人注册向导
+
+- 4 步向导：**基本信息 → 声纹录制 → 人脸占位 → 完成**（`8b947b8`）：UID 自动生成（`elder_NNN`，可改）+ 姓名/称呼/床位等表单 → `POST /api/profiles` 建档后进声纹步；人脸步异步拉 `/api/face/status` 置灰占位；完成后「完成，切换到该老人」自动切换对话/记忆页（`2465adc` 补成功页显示姓名 + 录制竞态防护）。
+- 声纹录制步：**试听 / 重录 / 保存 / 跳过**——录制 15s → 试听 wav → 不满意重录（丢弃暂存）→ 保存建档（`POST /api/voice/enroll`，首次 append）；语音模块不可用时提示可跳过，稍后在记忆页追加。
+- 记忆页新增「身份样本」区块（`8b947b8`）：展示声纹样本数、可**追加声纹**（录制→试听/重录/保存合并入档）与**清除声纹档案**（`DELETE /api/voice/speakers/{uid}`）；人脸占位卡片置灰（未接入）。
+
+### 后端（`LLM/server.py` + `LLM/voice_api.py`）：声纹两步式 API
+
+- `POST /api/voice/record`（`7f8fdcb` 新增录制常量：默认秒数/暂存 TTL）——录制并**暂存不落档**，返回 `recording_id`（`90691e1`）；
+- `GET /api/voice/record/{id}/audio` —— 试听暂存录音（wav）；`DELETE /api/voice/record/{id}` —— 丢弃暂存（幂等）；
+- `POST /api/voice/enroll` —— 第 2 步**合并入档**（带 `recording_id`，`append` 默认 True = 追加合并；旧行为兼容：无 `recording_id` 时录 N 秒覆盖建档）；
+- `DELETE /api/voice/speakers/{uid}` —— 清除该老人声纹档案（不影响基本信息档案）；
+- `GET /api/face/status` —— **人脸占位路由**（`78bfa53`），本期未接入，返回 `{"ok": True, "status": "unavailable"}`，前端据此置灰按钮。
+
+### 声纹档案合并平均（`LLM/voice/speaker.py`）
+
+- `merge_profile(old, old_count, new)` 纯函数（`2b30892`）：按样本数加权平均，返回合并 emb + 新 count；
+- `enroll_embedding(uid, emb, append)`（`86d142a`）：追加时与旧档案合并平均，`emb + count` 落盘 npz——**追加越录越准**；覆盖模式重置 count=1；
+- **兼容旧 npz**：老档案无 `count` 字段按 1 样本处理；支持删除档案文件。
+
+### 降级保障
+
+- `d180258`：`_wav_bytes` 去掉定义期 numpy 注解，**无 numpy 环境模块仍可导入**（守「可选依赖缺失必须降级运行」红线）。
+
+### 测试
+
+- 新增 3 个测试文件共 24 用例：`test_speaker_enroll.py`（7：追加合并/覆盖重置/删除/旧 npz 兼容）、`test_voice_api_enroll.py`（9：暂存/提交/试听/丢弃/清除/降级路径/TTL 清理）、`test_server_voice_routes.py`（8：record/enroll/audio/discard/delete speakers/face status 路由）；`test_speaker_math.py` 增补 merge_profile 用例（上批基线已含）。
+- 全量回归：`pytest LLM/tests -q` → **52 passed**（8 个测试文件，无回归；上批基线 28 → 本批 +24）。
+- 端到端手工验证（启动后端 + 浏览器走完注册向导 + 声纹试听/追加/清除）由控制者执行，结果见任务 7 报告。
