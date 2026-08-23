@@ -103,6 +103,45 @@ def recall(uid: str, query: str) -> dict:
     }
 
 
+def recall_v3(uid: str, query: str) -> dict:
+    """v3 检索组装：只读档案 + 核心记忆（cap）+ RAG Top-K + 图谱一跳关系。"""
+    from .conf import MEMORY_TOP_K, CORE_MEMORY_CAP, CORE_MEMORY_CHAR_CAP
+    parts = []
+    sources = []
+    profile = db.get_profile(uid)
+    parts += _profile_memory(profile, uid)
+    sources += [{"type": "profile"} for _ in parts]
+
+    cores = db.list_core_memories(uid, limit=CORE_MEMORY_CAP)
+    for m in cores:
+        parts.append(f"[核心] {m['content']}（{m['type']}）")
+    sources += [{"type": "core", "id": m["id"]} for m in cores]
+
+    for h in ragstore.query(uid, query, top_k=MEMORY_TOP_K):
+        parts.append(f"[记忆] {h['content']}")
+        sources.append({"type": "rag"})
+
+    for eid in _query_entities(uid, query):
+        for rel in graph.one_hop(eid):
+            parts.append(f"[关系] {eid.split(':')[-1]} {rel['type']} {rel['target']}")
+            sources.append({"type": "graph"})
+
+    context = "\n".join(parts)
+    if len(context) > CORE_MEMORY_CHAR_CAP + 3000:
+        context = context[:CORE_MEMORY_CHAR_CAP + 3000]
+    return {"context": context, "sources": sources}
+
+
+def _query_entities(uid: str, query: str) -> list[str]:
+    """从 query 匹配该 uid 已有实体名（名称出现在 query 中），返回命中实体 id。"""
+    ids = []
+    for ent in graph.list_entities(uid):
+        name = ent.get("name") or ""
+        if name and name in query:
+            ids.append(ent["id"])
+    return ids
+
+
 # ================================================================
 # 记忆沉淀 v2：话题结束批量整理
 # ================================================================

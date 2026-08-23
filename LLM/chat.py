@@ -102,7 +102,7 @@ def build_system(uid: str, settings: dict, query: str = "") -> str:
     """组装 System Prompt：角色 + 安全红线 + 风格 + 画像 + 记忆 + 摘要。
     query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。"""
     profile = db.get_profile(uid)
-    recall = rag.recall(uid, query)
+    recall = rag.recall_v3(uid, query)
     style = ""
     if profile and profile.get("style"):
         style = f"\n【该老人的说话风格画像】{profile['style']}（用老人熟悉的方式说话，但保持自己是陪护机器人）"

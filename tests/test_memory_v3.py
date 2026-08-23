@@ -84,3 +84,15 @@ def test_instant_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch
     r = memory.correct_instant("elder_002", "我其实姓王", None, "test-model")
     assert r["corrected"] is False
     assert db.get_core_memory(mid)["content"] == "老人姓张"
+
+
+def test_recall_v3_returns_core_and_rag(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    db.add_core_memory("elder_001", "preference", "喜欢听京剧", importance=5)
+    monkeypatch.setattr(memory.ragstore, "query",
+                        lambda uid, q, top_k: [{"content": "上周感冒已好转", "meta": {}}])
+    monkeypatch.setattr(memory.graph, "one_hop", lambda eid: [])
+    r = memory.recall_v3("elder_001", "想听戏")
+    assert "喜欢听京剧" in r["context"]
+    assert "感冒" in r["context"]
