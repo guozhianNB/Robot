@@ -1118,6 +1118,7 @@
         }
 
         body.innerHTML = rows.join("");
+        _lastModuleHtml = body.innerHTML;   // 每次检测后同步快照，视图切换不回滚过期数据
         if (hasBad) btn.classList.add("warn");   // 任一模块异常 → 按钮警示色
       } catch (e) {
         body.innerHTML = '<div class="hint">无法获取模块状态（后端离线）</div>';
