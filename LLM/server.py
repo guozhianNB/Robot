@@ -47,7 +47,20 @@ _bg = ThreadPoolExecutor(max_workers=4)   # 后台任务池：记忆沉淀 / 历
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from . import log as audit
     db.init_db()
+
+    # 记忆 v3 迁移（幂等）+ 依赖自检
+    try:
+        from . import migrate
+        migrate.run()
+    except Exception as e:
+        audit.log("memory_change", action="migrate_error", error=str(e))
+
+    from . import embed as embed_mod, ragstore, graph
+    audit.log("memory_degraded", embed=embed_mod.status(),
+              ragstore=ragstore.status(), graph=graph.status())
+
     _seed_demo()
     reminder.start()          # 独立线程的定时提醒调度器
     drain_task = bus.start_drain()   # 广播扇出任务
@@ -108,6 +121,10 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str):
         pass
     try:
         chat.summarize_old(uid, client, MODEL)
+    except Exception:
+        pass
+    try:
+        rag.correct_instant(uid, user_text, client, MODEL)
     except Exception:
         pass
 
@@ -278,6 +295,34 @@ async def context_view(uid: str = Query("elder_001")):
         "summary": db.get_summary(uid),
         "memories": {"confirmed": confirmed, "pending": pending},
     }
+
+
+@app.get("/api/memories/core")
+async def core_memories_list(uid: str = Query("elder_001")):
+    return {"ok": True, "memories": db.list_core_memories(uid)}
+
+
+@app.delete("/api/memories/core/{mid}")
+async def core_memories_delete(mid: int):
+    db.delete_core_memory(mid)
+    return {"ok": True}
+
+
+@app.get("/api/memories/rag")
+async def rag_memories_list(uid: str = Query("elder_001")):
+    return {"ok": True, "memories": db.list_rag_memories(uid)}
+
+
+@app.get("/api/memories/graph")
+async def graph_view(uid: str = Query("elder_001")):
+    from . import graph as g
+    return {"ok": True, "status": g.status()}
+
+
+@app.get("/api/memories/health")
+async def memories_health():
+    from . import embed as e, ragstore, graph as g
+    return {"ok": True, "embed": e.status(), "ragstore": ragstore.status(), "graph": g.status()}
 
 
 # ---------------------------------------------------------------- 提醒
