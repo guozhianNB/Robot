@@ -9,7 +9,7 @@ import uuid
 from . import db
 from . import embed
 from . import log as audit
-from .conf import DATA_DIR, EMBED_DIM
+from .conf import DATA_DIR
 
 _AVAILABLE = True
 _PATH = str(DATA_DIR / "chroma")
@@ -25,7 +25,7 @@ except ImportError as _exc:
 
 
 def _init():
-    global _client
+    global _client, _AVAILABLE
     if chromadb is None:
         return
     try:
@@ -33,7 +33,7 @@ def _init():
         _AVAILABLE = True
     except Exception as _exc:
         _AVAILABLE = False
-        _MISSING.append(str(_exc))
+        _MISSING.append("chromadb: " + str(_exc))
 
 
 def _coll(uid: str):

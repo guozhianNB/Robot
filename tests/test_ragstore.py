@@ -30,3 +30,19 @@ def test_mirror_row_created(rs, isolated_paths):
 def test_degraded_query_empty(monkeypatch):
     monkeypatch.setattr(ragstore, "_AVAILABLE", False)
     assert ragstore.query("elder_001", "任意", top_k=3) == []
+
+
+def test_init_failure_sets_unavailable(monkeypatch, tmp_path):
+    from LLM import ragstore
+    import chromadb
+
+    def boom(path):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chromadb, "PersistentClient", boom)
+    monkeypatch.setattr(ragstore, "_PATH", str(tmp_path / "chroma"))
+    monkeypatch.setattr(ragstore, "_client", None)
+    monkeypatch.setattr(ragstore, "_AVAILABLE", True)
+    ragstore._init()
+    assert ragstore._AVAILABLE is False
+    assert ragstore.status()["available"] is False
