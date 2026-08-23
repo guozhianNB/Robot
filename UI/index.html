@@ -415,6 +415,22 @@
       setTimeout(() => el.remove(), 9000);
     }
 
+    // ================================================================
+    // Modal 弹窗（模块状态 / 退出确认共用）
+    // ================================================================
+    function openModal(title, bodyHtml, footHtml = "") {
+      document.getElementById("modal-title").textContent = title;
+      document.getElementById("modal-body").innerHTML = bodyHtml;
+      document.getElementById("modal-foot").innerHTML = footHtml;
+      document.getElementById("modal-mask").style.display = "flex";
+    }
+    function closeModal() {
+      document.getElementById("modal-mask").style.display = "none";
+    }
+    document.getElementById("modal-mask").addEventListener("click", (e) => {
+      if (e.target === e.currentTarget) closeModal();   // 点遮罩空白处关闭
+    });
+
     function escapeHtml(s) {
       return String(s ?? "").replace(/[&<>"']/g, c => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -1033,6 +1049,63 @@
     }
 
     // ================================================================
+    // 模块状态弹窗
+    // ================================================================
+    async function openModulesModal() {
+      openModal("🔍 模块状态检测", '<div class="hint">检测中…</div>',
+        '<button class="btn" onclick="loadModuleStatus()">🔄 重新检测</button><button class="btn gray" onclick="closeModal()">关闭</button>');
+      await loadModuleStatus();
+    }
+
+    async function loadModuleStatus() {
+      const body = document.getElementById("modal-body");
+      const btn = document.getElementById("mod-btn");
+      btn.classList.remove("warn");
+      try {
+        const { modules } = await api("/api/modules/status");
+        const rows = [];
+        let hasBad = false;
+
+        // 语音链路：running / stopped(设置关闭=停用，非故障) / stopped / unavailable
+        const v = modules.voice || {};
+        if (v.status === "running") {
+          rows.push(`<div class="mod-row"><span class="st">✅</span><span class="name">语音链路</span><span class="desc">运行中</span></div>`);
+        } else if (v.status === "stopped" && v.voice_enabled === false) {
+          rows.push(`<div class="mod-row warn"><span class="st">⚪</span><span class="name">语音链路</span><span class="desc">已停用（设置中关闭，非故障）</span></div>`);
+        } else if (v.status === "stopped") {
+          rows.push(`<div class="mod-row warn"><span class="st">⚠️</span><span class="name">语音链路</span><span class="desc">未启动</span></div>`);
+          hasBad = true;
+        } else {
+          rows.push(`<div class="mod-row err"><span class="st">❌</span><span class="name">语音链路</span><span class="desc">${escapeHtml(v.reason || "不可用")}</span></div>`);
+          hasBad = true;
+        }
+
+        // embed / ragstore / graph：available 布尔
+        const simple = [
+          ["embed", "Embedding 向量"],
+          ["ragstore", "RAG 存储"],
+          ["graph", "知识图谱"],
+        ];
+        for (const [key, name] of simple) {
+          const m = modules[key] || {};
+          if (m.available) {
+            rows.push(`<div class="mod-row"><span class="st">✅</span><span class="name">${name}</span><span class="desc">可用</span></div>`);
+          } else {
+            const missing = (m.missing || []).join("；") || "未知原因";
+            rows.push(`<div class="mod-row err"><span class="st">❌</span><span class="name">${name}</span><span class="desc">缺失依赖：${escapeHtml(missing)}</span></div>`);
+            hasBad = true;
+          }
+        }
+
+        body.innerHTML = rows.join("");
+        if (hasBad) btn.classList.add("warn");   // 任一模块异常 → 按钮警示色
+      } catch (e) {
+        body.innerHTML = '<div class="hint">无法获取模块状态（后端离线）</div>';
+        btn.classList.remove("warn");
+      }
+    }
+
+    // ================================================================
     // 启动
     // ================================================================
     (async function init() {
@@ -1043,6 +1116,7 @@
       }
       loadChatHistory();
       loadMemory(); loadReminders(); loadToolLog(); loadSettings(); ping();
+      loadModuleStatus();   // 预检模块状态：有异常时顶栏按钮变红
       connectEvents();
       setInterval(ping, 30000);
     })();
