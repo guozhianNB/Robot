@@ -73,3 +73,14 @@ def test_instant_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch):
     r = memory.correct_instant("elder_001", "我其实姓李", _mk_client("{}"), "test-model")
     assert r["corrected"] is False
     assert db.get_core_memory(mid)["content"] == "老人喜欢戏曲"
+
+
+def test_instant_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
+    monkeypatch.setattr("LLM.chat.llm_json",
+                        lambda c, m, p: {"correct": True, "mid": mid, "new_content": "老人姓王"})
+    r = memory.correct_instant("elder_002", "我其实姓王", None, "test-model")
+    assert r["corrected"] is False
+    assert db.get_core_memory(mid)["content"] == "老人姓张"

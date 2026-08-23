@@ -234,9 +234,13 @@ def _apply_v3(uid: str, e: dict) -> dict:
     return {"route": "rag"}
 
 
-CORRECT_PROMPT = """下面是一句老人新说的话。判断它是否在纠正/更新机器人之前的某条记忆。
-若是，输出要纠正的记忆目标与新内容；否则 correct=false。
+CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句老人新说的话。
+判断这句话是否在纠正/更新某条已有记忆。
+若是，输出要纠正的记忆 id（从列表里选）与新内容；否则 correct=false。
 只输出 JSON：{{"correct": true或false, "mid": <记忆id，无则 null>, "new_content": "纠正后的内容"}}
+
+【已有核心记忆】
+{memories}
 
 【新说的话】
 {text}
@@ -246,17 +250,27 @@ CORRECT_PROMPT = """下面是一句老人新说的话。判断它是否在纠正
 def correct_instant(uid: str, user_text: str, client, model: str) -> dict:
     """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。"""
     from .chat import llm_json
-    try:
-        data = llm_json(client, model, CORRECT_PROMPT.format(text=user_text))
-    except Exception as e:  # noqa: BLE001
-        audit.log("memory_correct", action="instant_error", uid=uid, error=str(e))
+    cores = db.list_core_memories(uid, limit=30)
+    mem_text = "\n".join(f"[#{m['id']}] {m['content']}" for m in cores) or "（暂无）"
+    data = llm_json(client, model, CORRECT_PROMPT.format(memories=mem_text, text=user_text))
+    if not data:
+        # llm_json 失败/解析失败返回空 dict，区别于"无纠正"
+        audit.log("memory_correct", action="instant_error", uid=uid, error="LLM 返回空或解析失败")
         return {"corrected": False, "reason": "llm_error"}
-    if not isinstance(data, dict) or not data.get("correct") or not data.get("mid"):
+    if not isinstance(data, dict) or not data.get("correct") or data.get("mid") is None:
         return {"corrected": False, "reason": "no_correction"}
-    mid = int(data["mid"])
+    try:
+        mid = int(data["mid"])
+    except (ValueError, TypeError):
+        audit.log("memory_correct", action="instant_error", uid=uid, error="mid 非数值")
+        return {"corrected": False, "reason": "bad_mid"}
     old = db.get_core_memory(mid)
+    if not old or old.get("uid") != uid:
+        audit.log("memory_correct", action="instant_error", uid=uid, mid=mid,
+                  error="目标不存在或不属于该老人")
+        return {"corrected": False, "reason": "no_target"}
     new_content = (data.get("new_content") or "").strip()
-    if not old or not new_content:
+    if not new_content:
         return {"corrected": False, "reason": "no_target"}
     if any(k in new_content for k in MEDICAL_KEYWORDS) or any(k in new_content for k in IDENTITY_KEYWORDS):
         audit.log("memory_correct", action="blocked", uid=uid, mid=mid,
