@@ -76,11 +76,23 @@ def _conn():
     return conn
 
 
+def _ensure_columns(conn, table, columns):
+    """对已存在的表补缺失列（CREATE TABLE IF NOT EXISTS 不会改已有表）。"""
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col, ddl in columns.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db():
     with _lock:
         conn = _conn()
         try:
             conn.executescript(SCHEMA)
+            _ensure_columns(conn, "profiles", {
+                "gender": "gender TEXT DEFAULT ''",
+                "birthday": "birthday TEXT DEFAULT ''",
+            })
             conn.commit()
         finally:
             conn.close()
@@ -121,8 +133,8 @@ def list_profiles() -> list[dict]:
 
 
 def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
-                   gender="", birthday="",
-                   profile=None, style="", preferences=None, notes="") -> dict:
+                   profile=None, style="", preferences=None, notes="",
+                   gender="", birthday="") -> dict:
     profile = profile or {}
     preferences = preferences or {}
     ts = now_iso()

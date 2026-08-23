@@ -23,3 +23,13 @@ def test_profile_has_identity_columns(tmp_path, isolated_paths):
     p = db.get_profile("elder_001")
     assert p["gender"] == "男"
     assert p["birthday"] == "1948-03-02"
+
+
+def test_core_memory_update_delete(tmp_path, isolated_paths):
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "preference", "喜欢听京剧", importance=4)
+    db.update_core_memory(mid, content="改后内容", importance=5)
+    rows = db.list_core_memories("elder_001")
+    assert any(r["id"] == mid and r["content"] == "改后内容" and r["importance"] == 5 for r in rows)
+    db.delete_core_memory(mid)
+    assert all(r["id"] != mid for r in db.list_core_memories("elder_001"))
