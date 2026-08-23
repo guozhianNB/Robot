@@ -178,6 +178,21 @@
     .mod-row.warn .desc { color: #fcd34d; }
     .mod-row.err .desc { color: #fca5a5; }
 
+    /* ---------- 警告/错误日志行 ---------- */
+    .log-row {
+      display: flex; align-items: flex-start; gap: 10px; padding: 8px 4px;
+      border-bottom: 1px solid #2a2a3e; font-size: 12.5px;
+    }
+    .log-row:last-child { border-bottom: none; }
+    .log-row .lt { flex: none; font-size: 13px; }
+    .log-row .lb { flex: 1; min-width: 0; }
+    .log-row .ltime { color: #6b6b84; font-size: 11.5px; }
+    .log-row .ltext { color: #e0e0e0; word-break: break-all; margin-top: 2px; }
+    .log-row.err .ltext { color: #fca5a5; }
+    .log-row.warn .ltext { color: #fcd34d; }
+    .log-view-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
+    .log-view-head a { color: #7dd3fc; cursor: pointer; font-size: 12.5px; }
+
     /* ---------- 顶栏按钮 ---------- */
     #mod-btn { margin-left: 10px; }
     #mod-btn.warn { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
@@ -1055,7 +1070,9 @@
     // ================================================================
     async function openModulesModal() {
       openModal("🔍 模块状态检测", '<div class="hint">检测中…</div>',
-        '<button class="btn" onclick="loadModuleStatus()">🔄 重新检测</button><button class="btn gray" onclick="closeModal()">关闭</button>');
+        '<button class="btn" onclick="loadModuleStatus()">🔄 重新检测</button>' +
+        '<button class="btn gray" onclick="loadWarningsLog()">📋 警告/错误日志</button>' +
+        '<button class="btn gray" onclick="closeModal()">关闭</button>');
       await loadModuleStatus();
     }
 
@@ -1105,6 +1122,43 @@
         body.innerHTML = '<div class="hint">无法获取模块状态（后端离线）</div>';
         btn.classList.remove("warn");
       }
+    }
+
+    // ================================================================
+    // 警告/错误日志（同一弹窗内视图切换）
+    // ================================================================
+    let _lastModuleHtml = "";   // 记住模块列表 HTML，便于切回
+
+    async function loadWarningsLog() {
+      const body = document.getElementById("modal-body");
+      if (!_lastModuleHtml) _lastModuleHtml = body.innerHTML;   // 首次进入时记住模块视图
+      body.innerHTML = '<div class="hint">加载日志中…</div>';
+      try {
+        const { logs } = await api("/api/logs/warnings");
+        if (!logs || !logs.length) {
+          body.innerHTML = '<div class="hint">✅ 暂无警告/错误记录</div>';
+        } else {
+          const rows = logs.map(l => {
+            const isErr = !!(l.error) || /error/i.test(l.event || "") || /error/i.test(l.action || "");
+            const isWarn = !isErr && ((l.event === "alarm") || /warn/i.test(l.level || ""));
+            const cls = isErr ? "err" : isWarn ? "warn" : "";
+            const icon = isErr ? "❌" : isWarn ? "⚠️" : "ℹ️";
+            const ev = l.event || "unknown";
+            const act = l.action ? ` · ${l.action}` : "";
+            const detail = l.error ? `<br><span class="ltext">${escapeHtml(l.error)}</span>` : "";
+            return `<div class="log-row ${cls}"><span class="lt">${icon}</span><span class="lb">
+              <span class="ltime">${escapeHtml(l.ts || "")} · ${escapeHtml(ev)}${escapeHtml(act)}</span>${detail}</span></div>`;
+          }).join("");
+          body.innerHTML = `<div class="log-view-head"><span>最近 ${logs.length} 条警告/错误</span><a onclick="backToModules()">← 返回模块状态</a></div>${rows}`;
+        }
+      } catch (e) {
+        body.innerHTML = '<div class="hint">无法获取日志（后端离线）</div>';
+      }
+    }
+
+    function backToModules() {
+      const body = document.getElementById("modal-body");
+      body.innerHTML = _lastModuleHtml || '<div class="hint">检测中…</div>';
     }
 
     // ================================================================
