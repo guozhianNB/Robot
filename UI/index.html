@@ -1038,6 +1038,7 @@
           notes: document.getElementById("reg-notes").value.trim(),
         }),
       });
+      reg.name = name;
       reg.uid = document.getElementById("reg-uid").value.trim() || reg.uid;
       toast("✅ 档案已保存");
       regStep(2);
@@ -1166,9 +1167,12 @@
     // ================================================================
     let appendRec = null;
     let appendTimer = null;
+    let appendSeq = 0;
 
     async function openVoiceAppendPanel() {
       appendRec = null;
+      if (appendTimer) { clearInterval(appendTimer); appendTimer = null; }
+      appendSeq += 1;
       const det = ((await api("/api/voice/speakers")).details || {})[currentUid];
       const status = det ? `已建档 · ${det.samples} 次样本（追加会合并平均，越录越准）` : "未建档（追加即首次建档）";
       document.getElementById("modal-title").textContent = "🎙️ 声纹样本管理（" + currentUid + "）";
@@ -1187,6 +1191,7 @@
     }
 
     async function appendStart() {
+      const seq = ++appendSeq;
       const body = document.getElementById("modal-body");
       body.innerHTML = '<div class="rec-panel"><div style="font-size:26px">🔴 录音中…</div><div class="rec-countdown" id="append-count">15</div><div class="hint">请老人对着机器人说话</div></div>';
       appendTimer = setInterval(() => {
@@ -1198,9 +1203,11 @@
           method: "POST", body: JSON.stringify({ seconds: 15 }),
         });
         if (!res.ok) throw new Error(res.error || "录制失败");
+        if (seq !== appendSeq) return;
         appendRec = res.recording_id;
         appendResult(res.segments);
       } catch (e) {
+        if (seq !== appendSeq) return;
         if (appendTimer) { clearInterval(appendTimer); appendTimer = null; }
         body.innerHTML = `<div class="hint" style="color:#f87171">⚠️ ${escapeHtml(e.message)}</div>
           <div style="display:flex;gap:8px;justify-content:center;margin-top:10px">
