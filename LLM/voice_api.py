@@ -7,10 +7,14 @@ r"""语音服务的挂载逻辑：启动 worker、状态查询、声纹建档。
   置 _VOICE_AVAILABLE=False 并记录 _MISSING_DEPS，所有语音能力返回"不可用"，
   绝不让导入链崩掉主程序 —— 后端必须在无语音依赖时也能正常启动。
 """
+import io
 import time
+import uuid
+import wave
 from pathlib import Path
 
 from . import db, bus, chat, log as audit
+from .conf import VOICE_PENDING_TTL_S
 
 # ---------------------------------------------------------------------------
 # 可选能力降级：外部依赖逐个尝试引入，收集所有缺失项。
@@ -42,6 +46,25 @@ def _degraded_msg():
 
 _worker = None
 _recognizer = None   # 声纹实例（建档端点复用，避免重复加载）
+
+_pending = {}   # recording_id -> {"emb", "segments", "wav", "ts"}（录制暂存，TTL 后清理）
+
+
+def _wav_bytes(samples: np.ndarray) -> bytes:
+    """float32 16k 单声道 → wav bytes（16bit PCM），供试听。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(voice_config.SAMPLE_RATE)
+        w.writeframes((np.clip(samples, -1, 1) * 32767).astype(np.int16).tobytes())
+    return buf.getvalue()
+
+
+def _cleanup_pending():
+    now = time.time()
+    for k in [k for k, v in _pending.items() if now - v["ts"] > VOICE_PENDING_TTL_S]:
+        _pending.pop(k, None)
 
 
 def _chat_fn(client, model):
@@ -97,13 +120,14 @@ def list_speakers():
     return sorted(p.stem for p in voice_config.SPEAKER_DIR.glob("*.npz"))
 
 
-def enroll_speaker(uid: str, seconds: int = 15) -> dict:
-    """录 seconds 秒 → VAD 切段 → 提特征平均入档。"""
+def record_speaker(seconds: int = 15) -> dict:
+    """录 seconds 秒 → VAD 切段 → 提特征，暂存内存（特征+音频），返回 recording_id。
+    不落档；由 commit_speaker 提交入档，discard_recording 丢弃。"""
     if not _VOICE_AVAILABLE:
-        return {"ok": False, "uid": uid, "error": _degraded_msg()}
+        return {"ok": False, "error": _degraded_msg()}
     global _recognizer
     if _worker is not None:
-        _worker.src.stop()   # 暂停常驻采集，避免设备争用
+        _worker.src.stop()
     try:
         src = audio_mod.AudioSource()
         src.start()
@@ -126,15 +150,94 @@ def enroll_speaker(uid: str, seconds: int = 15) -> dict:
             if seg is None:
                 break
             segs.append(seg)
-        _recognizer.enroll(uid, segs)
-        audit.log("voice_spk", action="enroll", uid=uid, segments=len(segs))
-        return {"ok": True, "uid": uid, "segments": len(segs)}
+        embs = [_recognizer.embed(s) for s in segs if len(s) >= voice_config.SAMPLE_RATE]
+        if not embs:
+            return {"ok": False, "error": "没有检测到有效语音段，请靠近麦克风再说一遍"}
+        emb = np.mean(embs, axis=0).astype(np.float32)
+        rid = uuid.uuid4().hex
+        _cleanup_pending()
+        _pending[rid] = {"emb": emb, "segments": len(segs),
+                         "wav": _wav_bytes(samples), "ts": time.time()}
+        audit.log("voice_spk", action="record", rid=rid, segments=len(segs))
+        return {"ok": True, "recording_id": rid, "segments": len(segs)}
     except Exception as e:
-        audit.log("voice_error", action="enroll", uid=uid, error=str(e))
-        return {"ok": False, "uid": uid, "error": str(e)}
+        audit.log("voice_error", action="record", error=str(e))
+        return {"ok": False, "error": str(e)}
     finally:
         if _worker is not None:
             try:
                 _worker.src.start()
             except Exception:
                 pass
+
+
+def commit_speaker(recording_id: str, uid: str, append: bool = True) -> dict:
+    """把暂存特征入档（append=True 与已有档案合并平均），入档后清除暂存。"""
+    if not _VOICE_AVAILABLE:
+        return {"ok": False, "uid": uid, "error": _degraded_msg()}
+    item = _pending.pop(recording_id, None)
+    if item is None:
+        return {"ok": False, "uid": uid, "error": "录音已过期或不存在，请重新录制"}
+    try:
+        global _recognizer
+        if _recognizer is None:
+            _recognizer = spk_mod.SpeakerRecognizer()
+        _recognizer.enroll_embedding(uid, item["emb"], append=append)
+        audit.log("voice_spk", action="commit", uid=uid, append=append,
+                  segments=item["segments"])
+        return {"ok": True, "uid": uid, "samples": _recognizer.sample_count(uid)}
+    except Exception as e:
+        audit.log("voice_error", action="commit", uid=uid, error=str(e))
+        return {"ok": False, "uid": uid, "error": str(e)}
+
+
+def discard_recording(recording_id: str) -> dict:
+    """丢弃暂存（幂等）。"""
+    _pending.pop(recording_id, None)
+    return {"ok": True}
+
+
+def get_recording_audio(recording_id: str):
+    """返回 (wav_bytes, "audio/wav")；不存在返回 None（试听用）。"""
+    item = _pending.get(recording_id)
+    if item is None:
+        return None
+    return item["wav"], "audio/wav"
+
+
+def delete_speaker(uid: str) -> dict:
+    """清除该 uid 的声纹档案（不影响老人基本信息档案）。"""
+    if not _VOICE_AVAILABLE:
+        return {"ok": False, "uid": uid, "error": _degraded_msg()}
+    try:
+        global _recognizer
+        if _recognizer is None:
+            _recognizer = spk_mod.SpeakerRecognizer()
+        _recognizer.delete(uid)
+        audit.log("voice_spk", action="delete", uid=uid, by="nurse")
+        return {"ok": True, "uid": uid}
+    except Exception as e:
+        audit.log("voice_error", action="delete", uid=uid, error=str(e))
+        return {"ok": False, "uid": uid, "error": str(e)}
+
+
+def list_speaker_details() -> dict:
+    """{uid: {"samples": n}}，前端渲染样本数用。语音不可用时返回空。"""
+    if not _VOICE_AVAILABLE:
+        return {}
+    global _recognizer
+    if _recognizer is None:
+        try:
+            _recognizer = spk_mod.SpeakerRecognizer()
+        except Exception:
+            return {}
+    return {uid: {"samples": _recognizer.sample_count(uid)}
+            for uid in _recognizer.list_profiles()}
+
+
+def enroll_speaker(uid: str, seconds: int = 15) -> dict:
+    """旧行为兼容：录 seconds 秒并覆盖建档（等效 record + commit append=False）。"""
+    res = record_speaker(seconds)
+    if not res.get("ok"):
+        return {"ok": False, "uid": uid, "error": res.get("error", "录制失败")}
+    return commit_speaker(res["recording_id"], uid, append=False)
