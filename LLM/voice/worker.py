@@ -39,6 +39,14 @@ class VoiceWorker(threading.Thread):
             except Exception:
                 pass
 
+    def _publish(self, event_type: str, **kw):
+        """事件广播兜底：publish 失败不影响语音主循环。"""
+        if self.publish_fn:
+            try:
+                self.publish_fn(event_type, **kw)
+            except Exception:
+                pass
+
     # ---- 运行时构建（懒加载；失败即抛给 run 降级）----
     def _build_runtime(self):
         self.src = audio.AudioSource()
@@ -102,6 +110,7 @@ class VoiceWorker(threading.Thread):
             if hit:
                 self.session.wake()
                 audit.log("voice_wake", keyword=hit)
+                self._publish("voice_state", state="wake")
 
         elif self.session.state == session_mod.State.LISTENING:
             seg = self.vad.pop_speech()
@@ -119,6 +128,7 @@ class VoiceWorker(threading.Thread):
             if self.sink.is_done():
                 self.session.finish_speaking()
                 self._speak_started = None
+                self._publish("voice_state", state="idle")
 
     def _handle_speech(self, seg, settings):
         self.session.note_speech()
@@ -136,12 +146,14 @@ class VoiceWorker(threading.Thread):
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
         chat_uid = self.current_uid or "elder_001"
+        self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
         reply = self.chat_fn(chat_uid, text)
         if self.post_turn_fn:
             try:
                 self.post_turn_fn(chat_uid, text, reply)
             except Exception:
                 pass
+        self._publish("chat_new", uid=chat_uid, user=text, assistant=reply)
         if reply and settings.get("tts_enabled", True):
             self._speak(reply)
 
@@ -151,6 +163,7 @@ class VoiceWorker(threading.Thread):
         self.session.start_speaking()
         self.sink.play(samples, sr)
         audit.log("voice_tts", text=text[:100], ms=len(samples) * 1000 // sr)
+        self._publish("voice_state", state="speaking", text=text)
 
     def stop(self):
         self._stop.set()
