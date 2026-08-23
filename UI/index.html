@@ -705,6 +705,9 @@
     // ================================================================
     // 语音实时联动：状态指示条 / 实时对话轮 / 自动切换老人
     // ================================================================
+    // 语音状态指示条超时自动隐藏：chat_fn/TTS 抛异常时 worker 不会发 idle，
+    // 若不兜底指示条会永久停在"正在聆听/正在播报"
+    let _voiceStateTimer = null;
     function handleVoiceState(d) {
       const el = document.getElementById("voice-indicator");
       if (!el) return;
@@ -713,8 +716,16 @@
         recognized: "🎤 正在聆听：" + (d.text || ""),
         speaking: "🔊 正在播报…",
       }[d.state];
-      if (label) { el.textContent = label; el.classList.add("on"); }
-      else { el.classList.remove("on"); el.textContent = ""; }
+      if (label) {
+        clearTimeout(_voiceStateTimer);
+        el.textContent = label; el.classList.add("on");
+        _voiceStateTimer = setTimeout(() => {
+          el.classList.remove("on"); el.textContent = "";
+        }, 12000);
+      } else {
+        clearTimeout(_voiceStateTimer);
+        el.classList.remove("on"); el.textContent = "";
+      }
     }
 
     function appendVoiceTurn(userText, assistantText) {
@@ -1083,37 +1094,48 @@
     // ================================================================
     function connectEvents() {
       window._es = _es = new EventSource(API + "/api/events");
-      _es.addEventListener("reminder", (ev) => {
-        const d = JSON.parse(ev.data);
-        const when = d.missed ? "（错过补报）" : "";
-        toast(`⏰ ${d.title}${when}`, `${d.content}${d.silent ? "<br><span style='color:#fbbf24'>静默时段内，仅记录</span>" : ""}`, d.missed ? "warn" : "");
-        if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
-      });
-      _es.addEventListener("reminder_confirmed", (ev) => {
-        const d = JSON.parse(ev.data);
-        toast("✅ 已确认", d.title);
-        if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
-      });
-      _es.addEventListener("alarm", (ev) => {
-        const d = JSON.parse(ev.data);
-        toast("🚨 告警升级", d.message, "err");
-      });
-      _es.addEventListener("voice_state", (ev) => {
-        handleVoiceState(JSON.parse(ev.data));
-      });
-      _es.addEventListener("chat_new", (ev) => {
-        const d = JSON.parse(ev.data);
-        if (d.uid && d.uid !== currentUid) {
-          ensureChatFor(d.uid);          // 自动切换到对应老人对话页
-          return;
+      // 后端 stream_events() 只发 "data: <json>\n\n"、没有 `event:` 行，按 SSE 规范
+      // 这类消息一律以 "message" 类型派发 → 具名 addEventListener 永不触发。
+      // 统一走 onmessage，解析 JSON 后按 payload 的 type 字段分发（与 send() 一致）。
+      _es.onmessage = (ev) => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (e) { return; }   // 畸形行不炸页面
+        switch (d.type) {
+          case "reminder": {
+            const when = d.missed ? "（错过补报）" : "";
+            toast(`⏰ ${d.title}${when}`, `${d.content}${d.silent ? "<br><span style='color:#fbbf24'>静默时段内，仅记录</span>" : ""}`, d.missed ? "warn" : "");
+            if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
+            break;
+          }
+          case "reminder_confirmed": {
+            toast("✅ 已确认", d.title);
+            if (document.querySelector('[data-page="reminder"]').classList.contains("active")) loadReminders();
+            break;
+          }
+          case "alarm": {
+            toast("🚨 告警升级", d.message, "err");
+            break;
+          }
+          case "voice_state": {
+            handleVoiceState(d);
+            break;
+          }
+          case "chat_new": {
+            if (!d.uid) return;              // 无 uid 畸形事件直接丢弃，防空气泡
+            if (d.uid !== currentUid) {
+              ensureChatFor(d.uid);          // 自动切换到对应老人对话页
+              return;
+            }
+            const chatPage = document.querySelector('[data-page="chat"]');
+            if (chatPage && chatPage.classList.contains("active")) {
+              appendVoiceTurn(d.user || "", d.assistant || "");
+            } else {
+              toast("🎤 新的语音对话", escapeHtml((d.user || "").slice(0, 40)));
+            }
+            break;
+          }
         }
-        const chatPage = document.querySelector('[data-page="chat"]');
-        if (chatPage && chatPage.classList.contains("active")) {
-          appendVoiceTurn(d.user || "", d.assistant || "");
-        } else {
-          toast("🎤 新的语音对话", (d.user || "").slice(0, 40));
-        }
-      });
+      };
       _es.onerror = () => { /* EventSource 自动重连 */ };
     }
 
