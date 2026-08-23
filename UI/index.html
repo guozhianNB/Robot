@@ -148,6 +148,52 @@
     .toast.warn { border-color: #f59e0b; border-left-color: #f59e0b; }
     .toast.err { border-color: #ef4444; border-left-color: #ef4444; }
     @keyframes slidein { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+    /* ---------- Modal 弹窗（模块状态 / 退出确认共用） ---------- */
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(10, 10, 20, .65);
+      display: flex; align-items: center; justify-content: center; z-index: 1000;
+    }
+    .modal {
+      background: #21212f; border: 1px solid #3a3a52; border-radius: 14px;
+      width: min(480px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+      box-shadow: 0 10px 40px rgba(0,0,0,.5);
+    }
+    .modal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 13px 16px; border-bottom: 1px solid #32324a; font-size: 14px; font-weight: 600;
+    }
+    .modal-close { background: none; border: none; color: #9a9ab4; font-size: 18px; cursor: pointer; line-height: 1; }
+    .modal-close:hover { color: #fff; }
+    .modal-body { padding: 14px 16px; overflow-y: auto; font-size: 13px; }
+    .modal-foot { padding: 11px 16px; border-top: 1px solid #32324a; display: flex; gap: 8px; justify-content: flex-end; }
+    .mod-row {
+      display: flex; align-items: center; gap: 10px; padding: 9px 4px;
+      border-bottom: 1px solid #2a2a3e; font-size: 13px;
+    }
+    .mod-row:last-child { border-bottom: none; }
+    .mod-row .st { flex: none; font-size: 14px; }
+    .mod-row .name { flex: none; width: 110px; font-weight: 600; }
+    .mod-row .desc { flex: 1; color: #9a9ab4; word-break: break-all; }
+    .mod-row.warn .desc { color: #fcd34d; }
+    .mod-row.err .desc { color: #fca5a5; }
+
+    /* ---------- 顶栏按钮 ---------- */
+    #mod-btn { margin-left: 10px; }
+    #mod-btn.warn { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
+    #mod-btn.warn:hover { background: #991b1b; }
+    #exit-btn { background: #dc2626; color: #fff; border: none; border-radius: 8px; padding: 5px 12px; cursor: pointer; font-size: 12.5px; }
+    #exit-btn:hover { background: #b91c1c; }
+    #exit-btn:disabled { background: #555; cursor: not-allowed; }
+
+    /* ---------- 已退出全屏遮罩 ---------- */
+    #exit-overlay {
+      position: fixed; inset: 0; background: #101018; z-index: 2000;
+      display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    }
+    .exit-card { text-align: center; color: #e0e0e0; }
+    .exit-card h2 { font-size: 22px; margin-bottom: 10px; }
+    .exit-card p { color: #9a9ab4; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -167,6 +213,8 @@
       <button class="tab" data-page="settings">⚙️ 设置</button>
     </div>
     <span id="health" class="health">…</span>
+    <button id="mod-btn" class="btn gray sm" onclick="openModulesModal()">🔍 模块状态</button>
+    <button id="exit-btn" onclick="askExit()">⏻ 退出</button>
   </header>
 
   <main>
@@ -322,6 +370,21 @@
   </main>
 
   <div id="toasts"></div>
+
+  <div id="modal-mask" class="modal-mask" style="display:none">
+    <div class="modal">
+      <div class="modal-head"><span id="modal-title"></span><button class="modal-close" onclick="closeModal()">×</button></div>
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-foot" class="modal-foot"></div>
+    </div>
+  </div>
+
+  <div id="exit-overlay" style="display:none">
+    <div class="exit-card">
+      <h2>⏻ 系统已退出</h2>
+      <p>后端服务已停止，可刷新页面重新连接。</p>
+    </div>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
