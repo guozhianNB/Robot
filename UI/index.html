@@ -202,6 +202,8 @@
             <div class="field"><label>称呼</label><input id="p-nickname"></div>
             <div class="field"><label>床位</label><input id="p-bed"></div>
             <div class="field"><label>年龄</label><input id="p-age" type="number"></div>
+            <div class="field"><label>性别</label><input id="p-gender"></div>
+            <div class="field"><label>生日</label><input id="p-birthday"></div>
             <div class="field"><label>偏好称呼（如：闺女）</label><input id="p-call"></div>
           </div>
           <div class="form-grid" style="margin-top:10px">
@@ -617,6 +619,8 @@
         document.getElementById("p-nickname").value = p.nickname || "";
         document.getElementById("p-bed").value = p.bed || "";
         document.getElementById("p-age").value = p.age || "";
+        document.getElementById("p-gender").value = p.gender || "";
+        document.getElementById("p-birthday").value = p.birthday || "";
         document.getElementById("p-call").value = (p.preferences || {}).称呼 || "";
         document.getElementById("p-history").value = ((p.profile || {}).病史 || []).join("\n");
         document.getElementById("p-meds").value = ((p.profile || {}).用药 || [])
@@ -739,6 +743,8 @@
           nickname: document.getElementById("p-nickname").value.trim(),
           bed: document.getElementById("p-bed").value.trim(),
           age: Number(document.getElementById("p-age").value) || 0,
+          gender: document.getElementById("p-gender").value.trim(),
+          birthday: document.getElementById("p-birthday").value.trim(),
           profile, preferences,
           style: document.getElementById("p-style").value.trim(),
           notes: document.getElementById("p-notes").value.trim(),

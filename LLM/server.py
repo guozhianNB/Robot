@@ -144,6 +144,8 @@ class ProfileIn(BaseModel):
     nickname: str = ""
     bed: str = ""
     age: int = 0
+    gender: str = ""
+    birthday: str = ""
     profile: dict = {}              # {"病史": [...], "用药": [{"name","dose","time"}]}
     style: str = ""
     preferences: dict = {}          # {"称呼": "...", "话题": [...]}
@@ -226,7 +228,8 @@ async def profiles_list():
 @app.post("/api/profiles")
 async def profiles_upsert(p: ProfileIn):
     prof = db.upsert_profile(
-        p.uid, p.name, p.nickname, p.bed, p.age, p.profile, p.style, p.preferences, p.notes)
+        p.uid, p.name, p.nickname, p.bed, p.age, p.profile, p.style, p.preferences, p.notes,
+        gender=p.gender, birthday=p.birthday)
     # 用药 → 自动同步每日服药提醒
     meds = (p.profile or {}).get("用药") or []
     for m in meds:

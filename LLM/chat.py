@@ -99,20 +99,12 @@ def _build_query(user_text: str, history: list[dict]) -> str:
 
 
 def build_system(uid: str, settings: dict, query: str = "") -> str:
-    """组装 System Prompt：角色 + 安全红线 + 风格 + 画像 + 记忆 + 摘要。
+    """组装 System Prompt：角色 + 安全红线 + 记忆（recall_v3 已含档案 style/画像与核心记忆 persona）+ 摘要。
     query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。"""
-    profile = db.get_profile(uid)
     recall = rag.recall_v3(uid, query)
-    style = ""
-    if profile and profile.get("style"):
-        style = f"\n【该老人的说话风格画像】{profile['style']}（用老人熟悉的方式说话，但保持自己是陪护机器人）"
-    portrait = db.get_portrait(uid)
-    portrait_part = f"\n【老人画像（对话整理所得，供参考）】{portrait}" if portrait else ""
     parts = [
         PERSONA,
         SAFETY,
-        style,
-        portrait_part,
         f"\n【我了解到的关于这位老人的信息（可能不全，仅供参考）】\n{recall['context']}",
     ]
     summary = db.get_summary(uid)

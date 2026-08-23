@@ -92,7 +92,7 @@ CORE_IMPORTANCE_THRESHOLD = 3   # importance >= 3 且核心层 type 才进 core_
 GRAPH_REL_TYPES = ["likes", "dislikes", "family", "related_to", "happened_at"]
 
 # 身份字段红线：模型永不写、永不改（护士只读档案）
-IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号"]
+IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号", "昵称", "称呼"]
 
 # LLM 参数
 MODEL = "deepseek-v4-flash"
