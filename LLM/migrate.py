@@ -12,6 +12,10 @@ def _core_exists(uid: str, mtype: str, content: str) -> bool:
                for m in db.list_core_memories(uid))
 
 
+def _rag_exists(uid: str, content: str) -> bool:
+    return any(m["content"] == content for m in db.list_rag_memories(uid))
+
+
 def run() -> dict:
     settings = db.get_settings()
     if settings.get("migrate_done"):
@@ -31,15 +35,16 @@ def run() -> dict:
                 db.add_core_memory(m["uid"], mtype, content, importance=3, source="migrate")
                 migrated["core"] += 1
             else:  # event → episodic
-                ragstore.add(m["uid"], "episodic", content, source="migrate")
-                migrated["rag"] += 1
+                if not _rag_exists(m["uid"], content):
+                    ragstore.add(m["uid"], "episodic", content, source="migrate")
+                    migrated["rag"] += 1
         for uid in _all_uids():
             portrait = db.get_portrait(uid)
             if portrait and not _core_exists(uid, "persona", portrait):
                 db.add_core_memory(uid, "persona", portrait, importance=5, source="migrate")
                 migrated["core"] += 1
             summary = db.get_summary(uid)
-            if summary:
+            if summary and not _rag_exists(uid, summary):
                 ragstore.add(uid, "episodic", summary, source="migrate")
                 migrated["rag"] += 1
         db.set_settings({"migrate_done": True})

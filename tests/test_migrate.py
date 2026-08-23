@@ -62,3 +62,20 @@ def test_migrate_dedup_core(tmp_path, isolated_paths, monkeypatch):
     migrate.run()
     cores = [m for m in db.list_core_memories("elder_001") if m["content"] == "喜欢京剧"]
     assert len(cores) == 1
+
+
+def test_migrate_dedup_episodic(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, migrate
+    db.init_db()
+    db.add_memory("elder_001", "event", "上周感冒", status="confirmed", source="llm")
+
+    def fake_add(uid, mtype, content, **kw):
+        return db.add_rag_memory(uid, mtype, content, "fakeid", source=kw.get("source", ""))
+
+    monkeypatch.setattr(migrate.ragstore, "add", fake_add)
+    migrate.run()
+    # 模拟崩溃后重试：标记未落、但源数据还在
+    monkeypatch.setattr(db, "get_settings", lambda: {"migrate_done": False})
+    migrate.run()
+    rags = [m for m in db.list_rag_memories("elder_001") if m["content"] == "上周感冒"]
+    assert len(rags) == 1
