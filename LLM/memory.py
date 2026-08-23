@@ -191,7 +191,7 @@ def _existing_context(uid: str) -> str:
     """整理时给模型看的已有记忆（核心记忆含 id，用于去重/合并/纠错判断）。"""
     profile = db.get_profile(uid)
     parts = _profile_memory(profile, uid)
-    for m in db.list_core_memories(uid)[-20:]:
+    for m in db.list_core_memories(uid)[:20]:
         parts.append(f"[核心记忆#{m['id']}] {m['type']}: {m['content']}")
     return "\n".join(parts) if parts else "（暂无）"
 
@@ -216,12 +216,11 @@ entries 规则：
 3. 医疗信息（药、病史、剂量、诊断）一律不提取。
 4. 不确定的条目 confidence 标 low。
 5. 每条 entries 格式：
-   {{"action":"add|skip|merge|conflict", "type":"preference|event|fact",
-     "content":"记忆内容", "merge_id":<数字，merge 时填已有记忆编号>, "confidence":"high|low"}}
-   - add：新信息
-   - skip：不值得记（重复/玩笑/废话）
-   - merge：已有记忆的补充细节 → merge_id 填编号，content 写合并后的完整内容
-   - conflict：与已有记忆矛盾 → 照常写入 content，动作标 conflict（会进人工待处理）
+   {{"type":"episodic|semantic|preference|relation|persona|style|fact",
+    "content":"记忆内容", "importance":0到5的整数}}
+   - episodic/semantic 属普通记忆；preference/relation/persona/style/fact 属核心记忆
+   - importance 越重要分越高；核心记忆（性格/重要关系/画像/说话风格/基本事实）通常填 3 以上，
+     普通事件/一般事实填 0-2
 6. 若某条新信息是在【修正】已有记忆（已有记忆编号见上文《已有记忆》列表），
    用 {{"action":"correct", "correct_id":<已有记忆编号>, "content":"修正后的完整内容"}} 表示。
 """
@@ -252,16 +251,22 @@ def _apply_v3(uid: str, e: dict) -> dict:
         return {"route": "skip"}
     # 整理纠错：本条是在修正旧核心记忆
     if e.get("action") == "correct" and e.get("correct_id"):
-        mid = int(e["correct_id"])
+        try:
+            mid = int(e["correct_id"])
+        except (ValueError, TypeError):
+            return {"route": "skip"}
         old = db.get_core_memory(mid)
-        if old and content:
-            if any(k in content for k in MEDICAL_KEYWORDS) or any(k in content for k in IDENTITY_KEYWORDS):
-                audit.log("memory_correct", action="blocked", uid=uid, mid=mid, reason="红线")
-                return {"route": "reject"}
-            db.update_core_memory(mid, content=content)
-            audit.log("memory_correct", action="consolidate", uid=uid, mid=mid,
-                      old=old["content"], new=content)
-            return {"route": "correct"}
+        if not old or old.get("uid") != uid:
+            audit.log("memory_correct", action="blocked", uid=uid, mid=mid,
+                      reason="目标不存在或不属于该老人")
+            return {"route": "skip"}
+        if any(k in content for k in MEDICAL_KEYWORDS) or any(k in content for k in IDENTITY_KEYWORDS):
+            audit.log("memory_correct", action="blocked", uid=uid, mid=mid, reason="红线")
+            return {"route": "reject"}
+        db.update_core_memory(mid, content=content)
+        audit.log("memory_correct", action="consolidate", uid=uid, mid=mid,
+                  old=old["content"], new=content)
+        return {"route": "correct"}
     if mtype == "medical" or any(k in content for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type=mtype,
                   content=content, reason="医疗只读红线")
@@ -308,6 +313,7 @@ def _upsert_portrait(uid: str, portrait: str) -> None:
         if m["type"] == "persona":
             db.delete_core_memory(m["id"])
     db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
+    db.set_portrait(uid, portrait)  # 双写过渡，兼容 chat.py/server.py 旧读路径
     audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
 
 

@@ -139,3 +139,21 @@ def test_apply_v3_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch)
     r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "姓名是李四"})
     assert r["route"] == "reject"
     assert db.get_core_memory(mid)["content"] == "老人喜欢戏曲"
+
+
+def test_apply_v3_correct_blocks_medical(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "fact", "老人有高血压", importance=4)
+    r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "每天吃两片降压药"})
+    assert r["route"] == "reject"
+    assert db.get_core_memory(mid)["content"] == "老人有高血压"
+
+
+def test_apply_v3_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
+    r = memory._apply_v3("elder_002", {"action": "correct", "correct_id": mid, "content": "老人姓王"})
+    assert r["route"] == "skip"
+    assert db.get_core_memory(mid)["content"] == "老人姓张"
