@@ -42,8 +42,9 @@ def test_bad_json_skipped(tmp_path, monkeypatch):
     p = tmp_path / "audit.jsonl"
     with open(p, "w", encoding="utf-8") as f:
         f.write('{"ts": "t1", "event": "alarm", "level": "warn"}\n')
-        f.write("not-json\n")                                     # 坏行 → 跳过
+        f.write("not-json\n")                                     # 解析失败行 → 跳过
         f.write('{"ts": "t2", "event": "voice_error"}\n')
+        f.write('123\n')                                          # 合法 JSON 但非对象 → 跳过
     monkeypatch.setattr(log, "AUDIT_LOG", str(p))
     out = log.read_warnings(limit=50)
     assert [r["ts"] for r in out] == ["t1", "t2"]

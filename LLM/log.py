@@ -40,6 +40,8 @@ def read_warnings(limit: int = 50) -> list[dict]:
                     continue
                 try:
                     rec = json.loads(line)
+                    if not isinstance(rec, dict):
+                        continue   # 合法 JSON 但非对象（数组/数字/字符串/null）→ 跳过
                 except Exception:
                     continue   # 坏行跳过
                 if _is_warning(rec):
