@@ -425,6 +425,27 @@ async def events_stream():
     )
 
 
+# ---------------------------------------------------------------- 系统
+@app.post("/api/system/shutdown")
+async def system_shutdown():
+    """系统退出：停提醒线程 → 停语音（释放音频设备）→ 停广播 → 停线程池，
+    返回响应后延迟 1 秒 os._exit(0)，保证前端先收到 200 再杀进程。"""
+    from . import log as audit
+    audit.log("system", action="shutdown", by="nurse")
+    reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
+    voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
+    bus.stop()                           # 3. 事件总线扇出
+    _bg.shutdown(wait=False)             # 4. 后台任务线程池（不等待，进程将退出）
+    asyncio.create_task(_delayed_exit()) # 5. 1 秒后真正退出
+    return {"ok": True, "message": "系统正在退出…"}
+
+
+async def _delayed_exit():
+    """延迟退出：给 uvicorn 留出时间把上面这个响应发回前端。"""
+    await asyncio.sleep(1.0)
+    os._exit(0)
+
+
 # ---------------------------------------------------------------- 工具
 @app.get("/api/tools")
 async def tools_list():
