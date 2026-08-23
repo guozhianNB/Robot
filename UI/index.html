@@ -1023,21 +1023,26 @@
         称呼: document.getElementById("reg-call").value.trim(),
         话题: document.getElementById("reg-topics").value.split(/[，,]/).map(s => s.trim()).filter(Boolean),
       };
-      await api("/api/profiles", {
-        method: "POST",
-        body: JSON.stringify({
-          uid: document.getElementById("reg-uid").value.trim() || reg.uid,
-          name,
-          nickname: document.getElementById("reg-nickname").value.trim(),
-          bed: document.getElementById("reg-bed").value.trim(),
-          age: Number(document.getElementById("reg-age").value) || 0,
-          gender: document.getElementById("reg-gender").value.trim(),
-          birthday: document.getElementById("reg-birthday").value.trim(),
-          profile: { 病史: [], 用药: [] }, preferences,
-          style: document.getElementById("reg-style").value.trim(),
-          notes: document.getElementById("reg-notes").value.trim(),
-        }),
-      });
+      try {
+        await api("/api/profiles", {
+          method: "POST",
+          body: JSON.stringify({
+            uid: document.getElementById("reg-uid").value.trim() || reg.uid,
+            name,
+            nickname: document.getElementById("reg-nickname").value.trim(),
+            bed: document.getElementById("reg-bed").value.trim(),
+            age: Number(document.getElementById("reg-age").value) || 0,
+            gender: document.getElementById("reg-gender").value.trim(),
+            birthday: document.getElementById("reg-birthday").value.trim(),
+            profile: { 病史: [], 用药: [] }, preferences,
+            style: document.getElementById("reg-style").value.trim(),
+            notes: document.getElementById("reg-notes").value.trim(),
+          }),
+        });
+      } catch (e) {
+        toast("操作失败：" + escapeHtml(e.message), "", "err");
+        return;   // 网络异常不跳步骤，留在当前表单
+      }
       reg.name = name;
       reg.uid = document.getElementById("reg-uid").value.trim() || reg.uid;
       toast("✅ 档案已保存");
@@ -1106,15 +1111,21 @@
         const a = new Audio(url);
         a.play();
         setTimeout(() => URL.revokeObjectURL(url), 30000);
-      } catch (e) { toast("试听失败：" + e.message, "", "err"); }
+      } catch (e) { toast("试听失败：" + escapeHtml(e.message), "", "err"); }
     }
 
     async function regCommitRecord(append) {
-      const res = await api("/api/voice/enroll", {
-        method: "POST",
-        body: JSON.stringify({ uid: reg.uid, recording_id: reg.recordingId, append }),
-      });
-      if (!res.ok) { toast("保存失败：" + res.error, "", "err"); return; }
+      let res;
+      try {
+        res = await api("/api/voice/enroll", {
+          method: "POST",
+          body: JSON.stringify({ uid: reg.uid, recording_id: reg.recordingId, append }),
+        });
+      } catch (e) {
+        toast("操作失败：" + escapeHtml(e.message), "", "err");
+        return;
+      }
+      if (!res.ok) { toast("保存失败：" + escapeHtml(res.error), "", "err"); return; }
       reg.recordingId = null;
       reg.voiceDone = true;            // 声纹建档完成（完成页据此显示"已建档"）
       toast("✅ 声纹已建档", "样本数 " + res.samples);
@@ -1158,7 +1169,7 @@
       currentUid = reg.uid;
       localStorage.setItem("uid", currentUid);
       document.getElementById("uid-select").value = currentUid;
-      toast("✅ 已切换到 " + reg.uid);
+      toast("✅ 已切换到 " + escapeHtml(reg.uid));
       loadProfiles(); loadMemory(); loadChatHistory();
     }
 
@@ -1239,15 +1250,21 @@
         const url = URL.createObjectURL(await r.blob());
         new Audio(url).play();
         setTimeout(() => URL.revokeObjectURL(url), 30000);
-      } catch (e) { toast("试听失败：" + e.message, "", "err"); }
+      } catch (e) { toast("试听失败：" + escapeHtml(e.message), "", "err"); }
     }
 
     async function appendCommit() {
-      const res = await api("/api/voice/enroll", {
-        method: "POST",
-        body: JSON.stringify({ uid: currentUid, recording_id: appendRec, append: true }),
-      });
-      if (!res.ok) { toast("保存失败：" + res.error, "", "err"); return; }
+      let res;
+      try {
+        res = await api("/api/voice/enroll", {
+          method: "POST",
+          body: JSON.stringify({ uid: currentUid, recording_id: appendRec, append: true }),
+        });
+      } catch (e) {
+        toast("操作失败：" + escapeHtml(e.message), "", "err");
+        return;
+      }
+      if (!res.ok) { toast("保存失败：" + escapeHtml(res.error), "", "err"); return; }
       appendRec = null;
       toast("✅ 已合并入档", "样本数 " + res.samples);
       closeModal();
@@ -1256,8 +1273,14 @@
 
     async function appendClear() {
       if (!confirm("确认清除 " + currentUid + " 的全部声纹样本？老人基本信息档案不受影响。")) return;
-      const res = await api("/api/voice/speakers/" + currentUid, { method: "DELETE" });
-      if (!res.ok) { toast("清除失败：" + res.error, "", "err"); return; }
+      let res;
+      try {
+        res = await api("/api/voice/speakers/" + currentUid, { method: "DELETE" });
+      } catch (e) {
+        toast("操作失败：" + escapeHtml(e.message), "", "err");
+        return;
+      }
+      if (!res.ok) { toast("清除失败：" + escapeHtml(res.error), "", "err"); return; }
       toast("🗑️ 声纹档案已清除", "可重新录制建档");
       closeModal();
       loadMemory();
