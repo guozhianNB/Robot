@@ -149,9 +149,7 @@ static void single_motor_test_run(void)
   md_clear_encoder(0);
   HAL_Delay(300);
 
-  /* ② PID 闭环恒速：实测整定 Kp=6.5/Ki=2.0（快速响应）
-   *    Kp 决定起步推力（err=100 时 6.5×100=650 PWM，立即冲上去）
-   *    Ki 决定积分爬升速度（2.0/秒补足稳态误差）
+  /* ② PID 闭环恒速：实测整定 Kp=6.5/Ki=2.0（用户测试验证过的参数）
    *    积分限幅已放宽到 1000（与输出限幅一致，等效不限幅）
    *    ⚠️ 与 motor_control.c 的 MC_PID_KP/KI 默认值保持一致 */
   mc_init();

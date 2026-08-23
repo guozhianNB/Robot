@@ -251,12 +251,17 @@ class ChassisDriver(Node):
         now = self.get_clock().now().to_msg()
 
         # 麦轮逆运动学（X 型四轮，rpm 顺序 LF,RF,LR,RR）
+        # 对照固件 mc_car_set 正向解：
+        #   LF=f+l+rot  RF=f-l-rot  LR=f-l+rot  RR=f+l-rot
+        # 反解：vx=(LF+RF+LR+RR)/4
+        #       vy=(LF-RF-LR+RR)/4      （正=左移）
+        #       wz=(LF-RF+LR-RR)/(4·L)  （正=左转）
         w = [rpm[i] * RAD_PER_RPM * self._p["wheel_signs"][i] for i in range(4)]
         r = self._p["wheel_radius"]
         lw = self._p["rotate_radius"]
-        vx = self._p["sign_vx"] * r / 4.0 * (w[0] + w[1] + w[2] + w[3])
-        vy = self._p["sign_vy"] * r / 4.0 * (-w[0] + w[1] + w[2] - w[3])
-        wz = self._p["sign_wz"] * r / (4.0 * lw) * (-w[0] + w[1] - w[2] + w[3])
+        vx = self._p["sign_vx"] * r / 4.0 * ( w[0] + w[1] + w[2] + w[3])
+        vy = self._p["sign_vy"] * r / 4.0 * ( w[0] - w[1] - w[2] + w[3])
+        wz = self._p["sign_wz"] * r / (4.0 * lw) * ( w[0] - w[1] + w[2] - w[3])
 
         # 积分位姿（odom 世界系：x 前 y 左 z 上）
         dt = 0.1  # 心跳周期 100ms；若长期偏差可改由时间戳差分
