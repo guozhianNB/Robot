@@ -188,16 +188,11 @@ def _take_pending(uid: str) -> list[dict]:
 
 
 def _existing_context(uid: str) -> str:
-    """整理时给模型看的"已有记忆"，用于判断去重/冲突/合并。"""
+    """整理时给模型看的已有记忆（核心记忆含 id，用于去重/合并/纠错判断）。"""
     profile = db.get_profile(uid)
     parts = _profile_memory(profile, uid)
-    portrait = db.get_portrait(uid)
-    if portrait:
-        parts.append(f"【老人画像（此前整理）】{portrait}")
-    for m in db.list_memories(uid=uid, status="confirmed")[-15:]:
-        parts.append(f"[记忆#{m['id']}] {m['type']}: {m['content']}（{m['ts']}）")
-    for m in db.list_memories(uid=uid, status="pending")[-5:]:
-        parts.append(f"[待审核#{m['id']}] {m['type']}: {m['content']}")
+    for m in db.list_core_memories(uid)[-20:]:
+        parts.append(f"[核心记忆#{m['id']}] {m['type']}: {m['content']}")
     return "\n".join(parts) if parts else "（暂无）"
 
 
@@ -227,6 +222,8 @@ entries 规则：
    - skip：不值得记（重复/玩笑/废话）
    - merge：已有记忆的补充细节 → merge_id 填编号，content 写合并后的完整内容
    - conflict：与已有记忆矛盾 → 照常写入 content，动作标 conflict（会进人工待处理）
+6. 若某条新信息是在【修正】已有记忆（已有记忆编号见上文《已有记忆》列表），
+   用 {{"action":"correct", "correct_id":<已有记忆编号>, "content":"修正后的完整内容"}} 表示。
 """
 
 
@@ -253,6 +250,18 @@ def _apply_v3(uid: str, e: dict) -> dict:
     importance = int(e.get("importance") or 0)
     if not content:
         return {"route": "skip"}
+    # 整理纠错：本条是在修正旧核心记忆
+    if e.get("action") == "correct" and e.get("correct_id"):
+        mid = int(e["correct_id"])
+        old = db.get_core_memory(mid)
+        if old and content:
+            if any(k in content for k in MEDICAL_KEYWORDS) or any(k in content for k in IDENTITY_KEYWORDS):
+                audit.log("memory_correct", action="blocked", uid=uid, mid=mid, reason="红线")
+                return {"route": "reject"}
+            db.update_core_memory(mid, content=content)
+            audit.log("memory_correct", action="consolidate", uid=uid, mid=mid,
+                      old=old["content"], new=content)
+            return {"route": "correct"}
     if mtype == "medical" or any(k in content for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type=mtype,
                   content=content, reason="医疗只读红线")
@@ -271,6 +280,35 @@ def _apply_v3(uid: str, e: dict) -> dict:
     ragstore.add(uid, mtype, content, importance=importance, source="llm:consolidate")
     audit.log("memory_change", action="rag_add", uid=uid, type=mtype, content=content)
     return {"route": "rag"}
+
+
+def _upsert_relation(uid: str, rel: dict) -> None:
+    src, dst = (rel.get("src") or "").strip(), (rel.get("dst") or "").strip()
+    if not src or not dst:
+        return
+    sid = f"{uid}:{src}"
+    did = f"{uid}:{dst}"
+    graph.upsert_entity(uid, sid, src, rel.get("stype", "entity"))
+    graph.upsert_entity(uid, did, dst, rel.get("dtype", "entity"))
+    graph.upsert_relation(uid, sid, did, rel.get("rel", "related_to"))
+
+
+def _append_summary_and_episode(uid: str, digest: str) -> None:
+    prev = db.get_summary(uid)
+    new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
+    db.set_summary(uid, new_sum[-900:])
+    if not _dedup_check(uid, digest, mtype="episode"):
+        ragstore.add(uid, "episodic", digest, source="llm:consolidate")
+        audit.log("memory_change", action="episode_add", uid=uid, content=digest)
+
+
+def _upsert_portrait(uid: str, portrait: str) -> None:
+    # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
+    for m in db.list_core_memories(uid):
+        if m["type"] == "persona":
+            db.delete_core_memory(m["id"])
+    db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
+    audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
 
 
 CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句老人新说的话。
@@ -378,27 +416,23 @@ def consolidate(uid: str, client, model: str) -> dict:
     prompt = CONSOLIDATE_PROMPT.format(conversation=conversation, existing=_existing_context(uid))
     data = llm_json(client, model, prompt)
 
-    stats = {"add": 0, "add_pending": 0, "skip": 0, "duplicate": 0,
-             "merge": 0, "conflict": 0, "reject": 0}
+    stats = {"skip": 0, "reject": 0, "core": 0, "rag": 0, "correct": 0}
     if isinstance(data, dict):
         for e in data.get("entries", []) or []:
-            r = _apply_entry(uid, e)
-            key = r["action"] if r["action"] in stats else "skip"
+            r = _apply_v3(uid, e)
+            key = r["route"]
             stats[key] = stats.get(key, 0) + 1
+
+        for rel in data.get("relations", []) or []:
+            _upsert_relation(uid, rel)
+
         digest = (data.get("digest") or "").strip()
         if digest:
-            prev = db.get_summary(uid)
-            new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
-            db.set_summary(uid, new_sum[-900:])
-            # 摘要同时作为 Episode 记忆入库，供后续按话题检索（修"摘要不进检索"）
-            if not _dedup_check(uid, digest, mtype="episode"):
-                db.add_memory(uid, "episode", digest, status="confirmed",
-                              ttl_days=EPISODE_TTL_DAYS, source="llm:consolidate")
-                audit.log("memory_change", action="episode_add", uid=uid, content=digest)
+            _append_summary_and_episode(uid, digest)
+
         portrait = (data.get("portrait") or "").strip()
         if portrait:
-            db.set_portrait(uid, portrait)
-            audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
+            _upsert_portrait(uid, portrait)
     else:
         audit.log("memory_change", action="consolidate_error", uid=uid, error="解析失败")
 

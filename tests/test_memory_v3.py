@@ -96,3 +96,46 @@ def test_recall_v3_returns_core_and_rag(tmp_path, isolated_paths, monkeypatch):
     r = memory.recall_v3("elder_001", "想听戏")
     assert "喜欢听京剧" in r["context"]
     assert "感冒" in r["context"]
+
+
+CONSOLIDATE_JSON = '''
+{"entries": [
+  {"type":"episodic","content":"上周感冒已好转","importance":2},
+  {"type":"preference","content":"喜欢听京剧","importance":4}
+ ],
+ "relations": [{"src":"张建国","stype":"person","rel":"likes","dst":"京剧","dtype":"topic"}],
+ "digest":"聊了身体恢复和京剧爱好",
+ "portrait":"喜欢京剧，身体在恢复"}
+'''
+
+
+def test_consolidate_v3_routes_and_graph(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    monkeypatch.setattr("LLM.chat.llm_json", lambda c, m, p: __import__("json").loads(CONSOLIDATE_JSON))
+    monkeypatch.setattr(memory, "_take_pending", lambda uid: [{"role": "user", "content": "我好了，喜欢京剧"}])
+    monkeypatch.setattr(memory, "_dedup_check", lambda uid, c, **kw: None)
+    monkeypatch.setattr(memory.graph, "upsert_entity", lambda *a: None)
+    monkeypatch.setattr(memory.graph, "upsert_relation", lambda *a: None)
+    monkeypatch.setattr(memory.ragstore, "add", lambda uid, t, c, **kw: None)
+    r = memory.consolidate("elder_001", None, "test-model")
+    assert r["ok"] is True
+    assert any(m["content"] == "喜欢听京剧" for m in db.list_core_memories("elder_001"))
+
+
+def test_apply_v3_correct_updates_old(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
+    r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "老人姓王"})
+    assert r["route"] == "correct"
+    assert db.get_core_memory(mid)["content"] == "老人姓王"
+
+
+def test_apply_v3_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch):
+    from LLM import db, memory
+    db.init_db()
+    mid = db.add_core_memory("elder_001", "fact", "老人喜欢戏曲", importance=4)
+    r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "姓名是李四"})
+    assert r["route"] == "reject"
+    assert db.get_core_memory(mid)["content"] == "老人喜欢戏曲"
