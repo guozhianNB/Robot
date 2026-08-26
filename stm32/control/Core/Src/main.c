@@ -237,9 +237,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   md_init();               /* 启动 PWM + 编码器，清零方向引脚 */
   /* ⚠️ 已取消 md_enc_sign_autocal() 上电自动标定：
-   *   自动标定需四轮依次短转，且结果不可控；接线正反改为手动决定——
-   *   编码器 A/B 接反时，在 motor_driver.c 的 md_enc[].sign 或
-   *   初始化处手动 md_set_enc_sign(way, -1)。默认全 +1。 */
+   *   自动标定需四轮依次短转，且结果不可控；接线正反改为手动决定。
+   *   四轮编码器 A/B 相实测全反（2026-08 control_test 接线检测全 REV），
+   *   已软件补偿：motor_driver.c 的 md_init() 默认 sign=-1。 */
   mc_init();               /* 清零 PID 闭环状态 */
   up_init();               /* 清零 USB 车控协议状态 */
 

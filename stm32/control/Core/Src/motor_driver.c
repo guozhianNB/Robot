@@ -84,7 +84,9 @@ void md_init(void)
         __HAL_TIM_SET_COUNTER(md_enc_tim[i], 0);
         md_enc[i].prev_raw = 0;
         md_enc[i].count    = 0;
-        md_enc[i].sign     = 1;
+        /* 四轮编码器 A/B 相实测全反（2026-08 control_test 接线检测全 REV）：
+         * 不改线，软件统一 sign=-1 补偿；某轮改线恢复正常时把该轮改回 +1 */
+        md_enc[i].sign     = -1;
         md_enc[i].inited   = true;
     }
 
