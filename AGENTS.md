@@ -8,7 +8,7 @@ UI/      单文件 HTML 前端控制台
 stm32/   底盘下位机固件（STM32F103ZETX，C/CMake/HAL）→ 见 stm32/control/AGENTS.md
 docs/    需求/教程/接口契约/开发日志
 ```
-
+## 注意，先查看你当前的位置。如果你在ubuntu系统上，你就在开发板卡上，不用ssh连接！
 ## 板卡连接
 - 通过ssh连接 `ssh sunrise@100.65.82.93`（Tailscale，异地可用）
 - sudo 免密可用，但禁止使用 sudo 安装/改系统，除非用户明确批准。
