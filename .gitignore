@@ -8,6 +8,7 @@
 # 临时测试文件
 /stm32/control_test/
 /stm32/led_test/
+.real_frame.jpg
 
 __pycache__/
 *.py[cod]
