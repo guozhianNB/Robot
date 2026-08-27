@@ -1563,9 +1563,11 @@ const toasts = ref<{ id: number; text: string }[]>([]);
 let es: EventSource | null = null;
 
 function pushToast(text: string) {
-  toasts.value.push({ id: Date.now(), text });
+  const id = Date.now();
+  toasts.value.push({ id, text });
+  // 捕获 id 供过滤（不能用 Date.now()——6 秒后已推进，恒不相等导致 toast 永不消失）
   setTimeout(() => {
-    toasts.value = toasts.value.filter((t) => t.id !== Date.now());
+    toasts.value = toasts.value.filter((t) => t.id !== id);
   }, 6000);
 }
 
