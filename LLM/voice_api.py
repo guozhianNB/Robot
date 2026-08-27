@@ -47,6 +47,37 @@ def _degraded_msg():
 _worker = None
 _recognizer = None   # 声纹实例（建档端点复用，避免重复加载）
 
+# 会话状态（独立于语音可用性）：手动选择用户 + 锁定标志（规格 §8）
+_session_uid = None
+_session_locked = False
+
+
+def set_session_uid(uid: str, locked: bool) -> dict:
+    """手动切换当前会话用户（规格 D11）。
+    锁定时写 worker.locked_uid（声纹不再自动切换）；解锁时清空。
+    语音不可用时仍返回 ok —— 会话状态独立于语音能力。"""
+    global _session_uid, _session_locked
+    _session_uid = uid
+    _session_locked = bool(locked)
+    if _worker is not None:
+        try:
+            _worker.locked_uid = uid if locked else None
+        except Exception:
+            pass
+    audit.log("session", action="set_uid", uid=uid, locked=bool(locked), by="nurse")
+    return {"ok": True, "uid": uid, "locked": bool(locked)}
+
+
+def get_session_uid() -> dict:
+    """当前会话用户：手动选择优先；否则语音链路识别结果；否则 None。"""
+    uid = _session_uid
+    locked = _session_locked
+    source = "manual" if locked else "none"
+    if uid is None and _worker is not None:
+        uid = getattr(_worker, "current_uid", None)
+        source = "voiceprint" if uid else "none"
+    return {"ok": True, "uid": uid, "locked": locked, "source": source}
+
 _pending = {}   # recording_id -> {"emb", "segments", "wav", "ts"}（录制暂存，TTL 后清理）
 
 

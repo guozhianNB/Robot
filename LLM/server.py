@@ -177,6 +177,17 @@ class ReminderIn(BaseModel):
     confirm_timeout_min: int = 30
 
 
+class SessionUserIn(BaseModel):
+    uid: str
+    locked: bool = True
+
+
+class AlarmIn(BaseModel):
+    type: str = "sos"          # sos / fall / health / no_activity ...
+    uid: str = ""
+    message: str = ""
+
+
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
@@ -447,6 +458,32 @@ async def voice_enroll(body: dict = None):
     # 旧行为兼容：无 recording_id 直接录 seconds 秒覆盖建档
     seconds = int(body.get("seconds", 15))
     return await asyncio.to_thread(voice_api.enroll_speaker, uid, seconds)
+
+
+# ---------------------------------------------------------------- 会话状态
+@app.get("/api/session/user")
+async def session_user_get():
+    """当前会话用户（active_uid + 锁定标志），全端共享。"""
+    return voice_api.get_session_uid()
+
+
+@app.post("/api/session/user")
+async def session_user_set(s: SessionUserIn):
+    """手动切换当前会话用户并广播 user_changed（kiosk 切用户/admin 同步）。"""
+    res = voice_api.set_session_uid(s.uid, s.locked)
+    bus.publish("user_changed", uid=s.uid, locked=s.locked, source="manual")
+    return res
+
+
+# ---------------------------------------------------------------- 紧急呼叫
+@app.post("/api/alarm")
+async def alarm_report(a: AlarmIn):
+    """紧急呼叫上报（规格 D6）：审计 + 广播；微信推送留给模块 11。"""
+    from . import log as audit
+    audit.log("alarm", action="report", type=a.type, uid=a.uid,
+              message=a.message[:200], by="nurse")
+    bus.publish("alarm", level="critical", type=a.type, uid=a.uid, message=a.message)
+    return {"ok": True}
 
 
 @app.get("/api/voice/status")
