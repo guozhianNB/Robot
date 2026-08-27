@@ -800,8 +800,13 @@ const KNOWN_TYPES = new Set([
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */
 export function parseBusEvent(raw: string): BusEvent | null {
   if (!raw.startsWith("data:")) return null;       // 心跳注释行等
+  return parseBusPayload(raw.slice(5));
+}
+
+/** 解析已剥离 "data:" 前缀的 payload JSON（EventSource 的 msg.data 场景）→ BusEvent | null */
+export function parseBusPayload(raw: string): BusEvent | null {
   try {
-    const payload = JSON.parse(raw.slice(5).trim()) as Record<string, unknown>;
+    const payload = JSON.parse(raw.trim()) as Record<string, unknown>;
     const type = payload["type"];
     if (typeof type !== "string" || !KNOWN_TYPES.has(type)) return null;
     return payload as unknown as BusEvent;
@@ -810,7 +815,7 @@ export function parseBusEvent(raw: string): BusEvent | null {
   }
 }
 
-/** 将 SSE 流按 \n\n 切帧并解析（供 connectEvents 复用） */
+/** 将 SSE 流按 \n\n 切帧并解析（供 fetch 原始流场景复用） */
 export function parseSseChunk(chunk: string): BusEvent[] {
   const out: BusEvent[] = [];
   for (const frame of chunk.split("\n\n")) {
@@ -994,10 +999,9 @@ createApp(App).mount("#app");
 ```ts
 // SSE 事件订阅（EventSource 自动重连，规格 §5）
 import { onUnmounted, ref } from "vue";
-import type { BusEvent } from "shared";
-import { parseSseChunk } from "shared";
+import { parseBusPayload } from "shared";
 
-export function useBus(onEvent: (ev: BusEvent) => void) {
+export function useBus(onEvent: (ev: import("shared").BusEvent) => void) {
   const connected = ref(false);
   let es: EventSource | null = null;
   let closed = false;
@@ -1007,7 +1011,10 @@ export function useBus(onEvent: (ev: BusEvent) => void) {
     es = new EventSource("/api/events");
     es.onopen = () => (connected.value = true);
     es.onmessage = (msg: MessageEvent) => {
-      for (const ev of parseSseChunk(msg.data as string)) onEvent(ev);
+      // EventSource 的 msg.data 已剥离 "data:" 前缀（WHATWG 标准）——
+      // 直接 JSON.parse 按 payload.type 分发；不能用 parseSseChunk（它要求 data: 前缀，会全丢）
+      const ev = parseBusPayload(msg.data as string);
+      if (ev) onEvent(ev);
     };
     es.onerror = () => {
       connected.value = false;
@@ -1533,7 +1540,7 @@ createApp(App).mount("#app");
 <script setup lang="ts">
 // admin 壳：7 页签 + SSE toast（沿用旧前端单页风格，规格 §6）
 import { onUnmounted, ref } from "vue";
-import { type BusEvent, parseSseChunk } from "shared";
+import { type BusEvent, parseBusPayload } from "shared";
 import OverviewPage from "./pages/OverviewPage.vue";
 import ChatPage from "./pages/ChatPage.vue";
 import MemoriesPage from "./pages/MemoriesPage.vue";
@@ -1571,7 +1578,9 @@ function onEvent(ev: BusEvent) {
 function connect() {
   es = new EventSource("/api/events");
   es.onmessage = (msg: MessageEvent) => {
-    for (const ev of parseSseChunk(msg.data as string)) onEvent(ev);
+    // EventSource 的 msg.data 已剥离 "data:" 前缀——用 parseBusPayload（parseSseChunk 要求前缀会全丢）
+    const ev = parseBusPayload(msg.data as string);
+    if (ev) onEvent(ev);
   };
   es.onerror = () => { es?.close(); setTimeout(connect, 3000); };
 }

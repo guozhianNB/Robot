@@ -68,8 +68,13 @@ const KNOWN_TYPES = new Set([
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */
 export function parseBusEvent(raw: string): BusEvent | null {
   if (!raw.startsWith("data:")) return null;       // 心跳注释行等
+  return parseBusPayload(raw.slice(5));
+}
+
+/** 解析已剥离 "data:" 前缀的 payload JSON（EventSource 的 msg.data 场景）→ BusEvent | null */
+export function parseBusPayload(raw: string): BusEvent | null {
   try {
-    const payload = JSON.parse(raw.slice(5).trim()) as Record<string, unknown>;
+    const payload = JSON.parse(raw.trim()) as Record<string, unknown>;
     const type = payload["type"];
     if (typeof type !== "string" || !KNOWN_TYPES.has(type)) return null;
     return payload as unknown as BusEvent;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseBusEvent } from "../src/events";
+import { parseBusEvent, parseBusPayload } from "../src/events";
 
 describe("parseBusEvent", () => {
   it("解析 reminder 事件", () => {
@@ -36,5 +36,22 @@ describe("parseBusEvent", () => {
 
   it("未知类型返回 null 不抛异常", () => {
     expect(parseBusEvent('data: {"type":"unknown_event","x":1}')).toBeNull();
+  });
+});
+
+describe("parseBusPayload（EventSource msg.data 场景，已剥离 data: 前缀）", () => {
+  it("解析纯 JSON payload", () => {
+    const ev = parseBusPayload(
+      '{"type":"reminder","id":1,"uid":"elder_001","title":"吃药"}'
+    );
+    expect(ev?.type).toBe("reminder");
+  });
+
+  it("坏 JSON 返回 null 不抛异常", () => {
+    expect(parseBusPayload("not-json{")).toBeNull();
+  });
+
+  it("未知类型返回 null", () => {
+    expect(parseBusPayload('{"type":"unknown_event"}')).toBeNull();
   });
 });
