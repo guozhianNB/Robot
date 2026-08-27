@@ -473,13 +473,45 @@ dist/
 }
 ```
 
-创建 `frontend/packages/shared/vitest.config.ts`：
+创建 `frontend/packages/shared/vitest.config.mjs`（**注意：.mjs 纯 JS 配置，不用 .ts**——沙箱环境 vitest 加载 .ts 配置需 esbuild spawn 会 EPERM；.mjs 走 vite 原生 import；测试文件转译用进程内 typescript API，见下）：
 
-```ts
+```js
+import ts from "typescript";
 import { defineConfig } from "vitest/config";
 
+// 沙箱环境禁止 fork/pipe 子进程（EPERM）：
+//  - pool: "threads" —— worker_threads 同进程线程，绕开 tinypool fork
+//  - esbuild: false + 进程内 typescript 转译插件 —— 绕开 esbuild spawn
+//  - deps.optimizer 全关 —— 绕开依赖预构建（esbuild）
+const tsTranspilePlugin = {
+  name: "ts-transpile-in-process",
+  enforce: "pre",
+  transform(code, id) {
+    if (!/\.[cm]?tsx?$/.test(id)) return null;
+    const out = ts.transpileModule(code, {
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        jsx: ts.JsxEmit.Preserve,
+        esModuleInterop: true,
+        sourceMap: false,
+      },
+      fileName: id,
+    });
+    return { code: out.outputText, map: null };
+  },
+};
+
 export default defineConfig({
-  test: { environment: "node" },
+  esbuild: false,
+  plugins: [tsTranspilePlugin],
+  test: {
+    environment: "node",
+    pool: "threads",
+    deps: {
+      optimizer: { ssr: { enabled: false }, web: { enabled: false } },
+    },
+  },
 });
 ```
 
@@ -714,7 +746,9 @@ export interface ReminderEvent {
 
 export interface ReminderConfirmedEvent {
   type: "reminder_confirmed";
-  rid: number;
+  id: number;       // 与后端 reminder.py:151 publish("reminder_confirmed", id=rid, ...) 一致（同 reminder 事件用 id 键）
+  uid?: string;
+  title?: string;
 }
 
 export interface AlarmEvent {

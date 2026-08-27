@@ -14,7 +14,9 @@ export interface ReminderEvent {
 
 export interface ReminderConfirmedEvent {
   type: "reminder_confirmed";
-  rid: number;
+  id: number;       // 与后端 reminder.py:151 publish("reminder_confirmed", id=rid, ...) 一致（同 reminder 事件用 id 键）
+  uid?: string;
+  title?: string;
 }
 
 export interface AlarmEvent {
