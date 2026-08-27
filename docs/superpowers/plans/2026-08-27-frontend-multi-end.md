@@ -226,7 +226,16 @@ git commit -m "feat: voice worker 支持锁定模式（locked_uid + 锁定外识
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import server
+from LLM import server, log as audit, voice_api
+
+
+@pytest.fixture(autouse=True)
+def isolated(tmp_path, monkeypatch):
+    """重置会话全局状态 + 隔离审计日志（防测试间污染真实 audit.jsonl）。"""
+    voice_api._session_uid = None
+    voice_api._session_locked = False
+    monkeypatch.setattr(audit, "AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    yield
 
 
 @pytest.fixture()
@@ -1141,7 +1150,7 @@ const emit = defineEmits<{ (e: "sos"): void }>();
 // kiosk 主界面：状态条 + 对话区 + 提醒 + SOS（规格 §5）
 import { onMounted, ref } from "vue";
 import {
-  type BusEvent, type ReminderEvent, parseSseChunk, setSessionUser,
+  type BusEvent, type ReminderEvent, setSessionUser,
   reportAlarm, getSessionUser,
 } from "shared";
 import { useBus } from "./useBus";
@@ -1180,6 +1189,8 @@ function onEvent(ev: BusEvent) {
 
 async function sendText(text: string) {
   messages.value.push({ role: "user", content: text, uid: uid.value ?? undefined });
+  messages.value.push({ role: "assistant", content: "" });  // 占位，流式填充
+  const last = messages.value[messages.value.length - 1];
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -1189,19 +1200,23 @@ async function sendText(text: string) {
     if (!res.ok || !res.body) throw new Error("chat failed");
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let assistant = "";
+    // /api/chat 返回的是 chat_stream 事件（reasoning/content/done），
+    // 不是 bus 广播事件 —— 直接按 data: 行解析，不能用 parseSseChunk（只认 bus 类型）
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      for (const ev of parseSseChunk(decoder.decode(value, { stream: true }))) {
-        if (ev.type === "chat_new") {
-          // 后端语音链路广播的完整回合；HTTP 流里 chat_stream 事件名不同，仅取 content 类
-        }
+      for (const line of decoder.decode(value, { stream: true }).split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try {
+          const ev = JSON.parse(line.slice(5).trim());
+          if (ev.type === "content") last.content += ev.content;
+          if (ev.type === "done") break;
+        } catch { /* 坏帧忽略 */ }
       }
     }
-    void assistant;
+    if (!last.content) last.content = "（无回复）";
   } catch {
-    messages.value.push({ role: "assistant", content: "（发送失败，请重试）" });
+    last.content = "（发送失败，请重试）";
   }
 }
 
