@@ -37,8 +37,12 @@ class VoiceprintOnlyFusion:
         return self._source.probe(wav)
 
 
-def effective_uid(vote: IdentityVote, current_uid: Optional[str]) -> Optional[str]:
-    """宁问勿猜：高置信度用识别结果，低置信度沿用当前 uid。"""
+def effective_uid(vote: IdentityVote, current_uid: Optional[str],
+                  locked_uid: Optional[str] = None) -> Optional[str]:
+    """锁定优先：手动锁定时固定返回锁定用户（声纹只提示不切换，规格 D11）；
+    未锁定：高置信度用识别结果，低置信度沿用当前 uid（宁问勿猜）。"""
+    if locked_uid:
+        return locked_uid
     if vote.candidate_uid is not None:
         return vote.candidate_uid
     return current_uid
