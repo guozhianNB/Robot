@@ -10,12 +10,16 @@ import VoiceStatusBar from "./components/VoiceStatusBar.vue";
 import ChatArea, { type Msg } from "./components/ChatArea.vue";
 import ReminderBanner from "./components/ReminderBanner.vue";
 import SosButton from "./components/SosButton.vue";
+import UserSwitcher from "./components/UserSwitcher.vue";
+import SettingsSheet from "./components/SettingsSheet.vue";
 
 const state = ref("idle");
 const uid = ref<string | null>(null);
 const locked = ref(false);
 const messages = ref<Msg[]>([]);
 const reminder = ref<ReminderEvent | null>(null);
+const showSwitcher = ref(false);
+const showSettings = ref(false);
 const { connected } = useBus(onEvent);
 
 async function loadSession() {
@@ -83,6 +87,7 @@ async function onSwitchUser(nextUid: string) {
   await setSessionUser(nextUid, true);   // 手动切换即锁定（规格 D11）
   uid.value = nextUid;
   locked.value = true;
+  showSwitcher.value = false;
 }
 
 async function onConfirmReminder(rid: number) {
@@ -97,13 +102,17 @@ onMounted(loadSession);
 
 <template>
   <div class="kiosk">
-    <VoiceStatusBar :state="state" :uid="uid" :locked="locked" />
+    <VoiceStatusBar :state="state" :uid="uid" :locked="locked" @open-switcher="showSwitcher = true" />
     <ReminderBanner v-if="reminder" :reminder="reminder" @confirm="onConfirmReminder" />
     <ChatArea :messages="messages" @send="sendText" />
     <div class="bottom">
       <SosButton @sos="onSos" />
+      <button class="settings-btn" @click="showSettings = true">⚙ 设置</button>
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
     </div>
+    <UserSwitcher v-if="showSwitcher" :current="uid"
+                  @pick="onSwitchUser" @close="showSwitcher = false" />
+    <SettingsSheet v-if="showSettings" @close="showSettings = false" />
   </div>
 </template>
 
@@ -116,4 +125,6 @@ body { background: #0b1220; color: #f9fafb; font-family: system-ui, sans-serif; 
 .bottom { display: flex; align-items: center; gap: 20px; padding: 16px 24px; }
 .conn { color: #22c55e; font-size: 20px; }
 .conn.off { color: #ef4444; }
+.settings-btn { background: #374151; color: #f9fafb; border: none;
+  padding: 16px 24px; border-radius: 16px; font-size: 22px; }
 </style>
