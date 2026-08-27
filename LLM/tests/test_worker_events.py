@@ -32,7 +32,8 @@ def test_wake_publish(monkeypatch):
     w.vad = type("Vad", (), {"accept": lambda self, c: None})()
     w.kws = type("Kws", (), {"accept": lambda self, c: "小机器人"})()
     w._step({})
-    assert ("voice_state", {"state": "wake"}) in events
+    # 唤醒后进入 LISTENING（最终审查 I-2 修复：worker 发 listening 而非 wake）
+    assert ("voice_state", {"state": "listening"}) in events
 
 
 def test_speech_publishes_recognized_and_chat_new(monkeypatch):
@@ -51,10 +52,14 @@ def test_speech_publishes_recognized_and_chat_new(monkeypatch):
         {"resolve": lambda self, seg: type("Vote", (), {"candidate_uid": "elder_002", "confidence": 0.9})()},
     )()
     w._handle_speech("seg", {"asr_enabled": True, "tts_enabled": False})
-    assert events[0] == ("voice_state",
-                         {"state": "recognized", "uid": "elder_002", "text": "我今天有点头晕"})
-    assert events[1] == ("chat_new",
-                         {"uid": "elder_002", "user": "我今天有点头晕", "assistant": "好的，我记住了"})
+    # 最终审查 I-1 修复：声纹切换先广播 user_changed（source=voiceprint），
+    # 再广播 recognized——断言改按 in 匹配，不依赖索引顺序
+    assert ("voice_state",
+            {"state": "recognized", "uid": "elder_002", "text": "我今天有点头晕"}) in events
+    assert ("chat_new",
+            {"uid": "elder_002", "user": "我今天有点头晕", "assistant": "好的，我记住了"}) in events
+    assert ("user_changed",
+            {"uid": "elder_002", "locked": False, "source": "voiceprint"}) in events
     assert calls == [("elder_002", "我今天有点头晕")]
 
 
