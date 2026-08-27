@@ -558,3 +558,31 @@ async def _delayed_exit():
 async def tools_list():
     """返回当前可用工具清单 + 每工具开关状态（前端展示/切换用）。"""
     return {"ok": True, "tools": tool_mod.tools_with_state(db.get_settings())}
+
+
+# ---------------------------------------------------------------- 前端静态托管
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+_FRONTEND_DIST = BASE_DIR / "frontend" / "packages"
+_KIOSK_DIST = _FRONTEND_DIST / "kiosk" / "dist"
+_ADMIN_DIST = _FRONTEND_DIST / "admin" / "dist"
+
+
+def _serve_dist(dist: Path, path: str):
+    """挂载单个端构建产物；SPA 回退到 index.html（无 router，实际用不到回退，防御性）。"""
+    app.mount(path, StaticFiles(directory=str(dist), html=True), name=path.strip("/"))
+
+
+if _KIOSK_DIST.exists():
+    _serve_dist(_KIOSK_DIST, "/kiosk")
+if _ADMIN_DIST.exists():
+    _serve_dist(_ADMIN_DIST, "/admin")
+
+
+@app.get("/")
+async def root():
+    """默认入口：有 admin 产物则给 admin，否则提示构建。"""
+    if _ADMIN_DIST.exists():
+        return FileResponse(str(_ADMIN_DIST / "index.html"))
+    return {"ok": True, "message": "前端未构建。运行 scripts/build_frontend.ps1 生成产物。"}

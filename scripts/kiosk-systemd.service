@@ -1,0 +1,15 @@
+[Unit]
+Description=Robot kiosk display (Chromium)
+After=network.target llm-server.service
+Wants=llm-server.service
+
+[Service]
+Type=simple
+User=sunrise
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/chromium --kiosk --noerrdialogs --disable-infobars http://127.0.0.1:8000/kiosk/
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
