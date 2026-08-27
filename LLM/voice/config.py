@@ -21,7 +21,7 @@ TTS_DIR = MODEL_DIR / "sherpa-onnx-vits-zh-ll"
 # 声纹（3D-Speaker ERes2NetV2，经 modelscope）
 SPK_MODEL_ID = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 SPK_EMBED_DIM = 192
-SPK_THRESHOLD = 0.55          # 官方基线 0.360，精准优先上调；运行时可被 settings 覆盖
+SPK_THRESHOLD = 0.40          # 声纹余弦阈值（实测校准：真人 0.46-0.47 / 异人 0.14，取 0.40 留余量；运行时可被 settings 覆盖）
 
 # VAD（silero）
 VAD_THRESHOLD = 0.5

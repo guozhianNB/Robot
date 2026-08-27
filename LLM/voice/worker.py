@@ -118,7 +118,9 @@ class VoiceWorker(threading.Thread):
             seg = self.vad.pop_speech()
             if seg is not None:
                 self._handle_speech(seg, settings)
-            self.session.expire()
+            if self.session.expire() == session_mod.State.IDLE:
+                # 30s 免唤醒窗口超时 → 回待机，前端同步（否则状态条停在"正在听…"）
+                self._publish("voice_state", state="idle")
 
         elif self.session.state == session_mod.State.SPEAKING:
             if (self._speak_started is not None
@@ -128,9 +130,11 @@ class VoiceWorker(threading.Thread):
                 self.session.barge_in()
                 audit.log("voice_barge_in")
             if self.sink.is_done():
-                self.session.finish_speaking()
+                self.session.finish_speaking()   # SPEAKING → LISTENING（回到 30s 免唤醒收音窗口）
                 self._speak_started = None
-                self._publish("voice_state", state="idle")
+                # 播报完成仍处收音窗口：发 listening（前端"正在听…"），
+                # 不是 idle——30s 超时回 IDLE 由 expire() 处理
+                self._publish("voice_state", state="listening")
 
     def _handle_speech(self, seg, settings):
         self.session.note_speech()

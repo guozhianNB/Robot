@@ -28,7 +28,7 @@ DEFAULT_SETTINGS = {
     "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）
     "wakeword": "小机器人",          # 唤醒词（显示用；实际检测用 kws_keywords.txt）
     "handsfree_seconds": 30,        # 免唤醒连续对话窗口
-    "spk_threshold": 0.55,          # 声纹余弦阈值（官方基线 0.360，精准优先上调）
+    "spk_threshold": 0.40,          # 声纹余弦阈值（实测校准：真人 0.46-0.47 / 异人 0.14，取 0.40 留余量）
     "alarm_enabled": True,          # 报警上报开关（未确认提醒升级时写审计日志）
     "silent_start": "22:00",        # 静默时段开始（主动播报不发）
     "silent_end": "07:00",          # 静默时段结束

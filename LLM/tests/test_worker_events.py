@@ -74,7 +74,8 @@ def test_speak_publishes_speaking(monkeypatch):
     assert ("voice_state", {"state": "speaking", "text": "你好呀"}) in events
 
 
-def test_speaking_done_publishes_idle(monkeypatch):
+def test_speaking_done_publishes_listening(monkeypatch):
+    """播报完成 → 回到 30s 免唤醒收音窗口（LISTENING），前端应显示"正在听…"（用户问题 1）。"""
     _silence_audit(monkeypatch)
     w, events = _make_worker()
     w.session = session_mod.Session()
@@ -85,6 +86,33 @@ def test_speaking_done_publishes_idle(monkeypatch):
                              "is_speech_now": lambda self: False})()
     w.sink = type("Sink", (), {"is_done": lambda self: True})()
     w._step({})
+    # finish_speaking 回 LISTENING → 发 listening（不是 idle）
+    assert ("voice_state", {"state": "listening"}) in events
+    assert w.session.state == session_mod.State.LISTENING
+
+
+def test_listen_timeout_publishes_idle(monkeypatch):
+    """30s 免唤醒窗口超时 → 回待机（IDLE），前端同步为"待机"（用户问题 1 配套）。"""
+    _silence_audit(monkeypatch)
+    w, events = _make_worker()
+    w.session = session_mod.Session()
+    w.session.wake()
+    w.src = type("Src", (), {"read": lambda self: b"\x00" * 320})()
+    w.vad = type("Vad", (), {"accept": lambda self, c: None,
+                             "pop_speech": lambda self: None})()
+    w.sink = type("Sink", (), {"is_done": lambda self: False})()
+    # 伪造时钟：让 expire 判定超时
+    fake_clock = [100.0]
+
+    class FakeClock:
+        @staticmethod
+        def __call__():
+            return fake_clock[0]
+
+    w.session._clock = FakeClock()
+    w.session._last_activity = 50.0   # 50s 前活动，超过 handsfree 30s
+    w._step({})
+    assert w.session.state == session_mod.State.IDLE
     assert ("voice_state", {"state": "idle"}) in events
 
 
