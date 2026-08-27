@@ -22,6 +22,7 @@ class VoiceWorker(threading.Thread):
         self.status = "stopped"           # running / degraded / disabled / stopped
         self.sub_status = {}
         self.current_uid = None
+        self.locked_uid = None       # 手动锁定用户（None=未锁定，规格 D11）
         self.src = self.sink = None
         self.vad = self.kws = self.asr = self.tts = self.spk = self.fusion = None
         self.session = session_mod.Session()
@@ -140,7 +141,11 @@ class VoiceWorker(threading.Thread):
         audit.log("voice_asr", text=text[:200])
 
         vote = self.fusion.resolve(seg)
-        uid = id_mod.effective_uid(vote, self.current_uid)
+        uid = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
+        # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
+        if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
+            audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
+                      detected=vote.candidate_uid, score=round(vote.confidence, 3))
         self.current_uid = uid or self.current_uid
         audit.log("voice_spk", identified=(vote.candidate_uid is not None),
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
