@@ -3,11 +3,12 @@
 import { onMounted, ref } from "vue";
 
 interface Reminder { id: number; uid: string; kind: string; title: string;
-  content: string; status: string; trigger_type: string; trigger_time: string }
+  content: string; status: string; trigger_type: string; trigger_time: string;
+  trigger_date?: string }
 
 const items = ref<Reminder[]>([]);
 const form = ref({ uid: "elder_001", content: "", trigger_type: "once",
-  trigger_time: "08:00" });
+  trigger_time: "08:00", trigger_date: "" });
 
 async function load() {
   const res = await fetch("/api/reminders");
@@ -47,13 +48,15 @@ onMounted(load);
         <option value="once">一次</option>
         <option value="daily">每日</option>
       </select>
+      <input v-if="form.trigger_type === 'once'" v-model="form.trigger_date"
+             type="date" placeholder="触发日期" />
       <input v-model="form.trigger_time" placeholder="08:00" />
       <button @click="add">新增</button>
     </div>
     <div v-for="r in items" :key="r.id" class="row">
       <div>
         <b>{{ r.title }}</b>：{{ r.content }}
-        <small>（{{ r.uid }} · {{ r.status }} · {{ r.trigger_time }}）</small>
+        <small>（{{ r.uid }} · {{ r.status }} · {{ r.trigger_time }}<template v-if="r.trigger_date">（{{ r.trigger_date }}）</template>）</small>
       </div>
       <div class="actions">
         <button v-if="r.status === 'triggered' || r.status === 'unconfirmed'"
