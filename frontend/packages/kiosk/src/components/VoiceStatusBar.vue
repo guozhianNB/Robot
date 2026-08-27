@@ -3,7 +3,7 @@
 import { computed } from "vue";
 
 const props = defineProps<{
-  state: string;          // idle / wake / listening / speaking / unavailable
+  state: string;          // idle / listening / speaking / unavailable（wake 已并入 listening）
   uid: string | null;
   locked: boolean;
 }>();
