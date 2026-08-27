@@ -361,7 +361,10 @@ async def alarm_report(a: AlarmIn):
     from . import log as audit
     audit.log("alarm", action="report", type=a.type, uid=a.uid,
               message=a.message[:200], by="nurse")
-    bus.publish("alarm", level="critical", type=a.type, uid=a.uid, message=a.message)
+    # 注意：payload 键用 alarm_type 而非 type —— bus.publish 内部构造
+    # {"type": event_type, **payload}，payload 里再用 type 会覆盖事件类型，
+    # 导致广播的事件 type 变成 "sos" 而非 "alarm"，前端会丢弃该事件（已修复）
+    bus.publish("alarm", level="critical", alarm_type=a.type, uid=a.uid, message=a.message)
     return {"ok": True}
 ```
 
@@ -717,7 +720,7 @@ export interface ReminderConfirmedEvent {
 export interface AlarmEvent {
   type: "alarm";
   level: string;
-  type: string;      // sos / fall / health / no_activity ...
+  alarm_type?: string;  // sos / fall / health / no_activity ...（不能叫 type，会与 bus.publish 的事件类型键冲突）
   uid?: string;
   message?: string;
 }
