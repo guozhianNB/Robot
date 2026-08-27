@@ -2113,9 +2113,18 @@ onMounted(load);
     <div class="card">
       <h3>模块状态</h3>
       <ul>
+        <!-- 兼容两种后端形状：voice 用 status/reason；embed/ragstore/graph 用 available/missing -->
         <li v-for="(m, name) in modules" :key="String(name)">
-          {{ name }}：{{ (m as any).status }}
-          <span v-if="(m as any).reason">（{{ (m as any).reason }}）</span>
+          <template v-if="(m as any).status !== undefined">
+            {{ name }}：{{ (m as any).status }}
+            <span v-if="(m as any).reason">（{{ (m as any).reason }}）</span>
+          </template>
+          <template v-else>
+            {{ name }}：{{ (m as any).available ? "✅ 可用" : "❌ 缺失" }}
+            <span v-if="!((m as any).available) && ((m as any).missing?.length)">
+              （{{ ((m as any).missing as string[]).join("；") }}）
+            </span>
+          </template>
         </li>
       </ul>
     </div>
