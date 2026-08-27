@@ -21,7 +21,10 @@ async function send() {
   const t = text.value.trim();
   if (!t || sending.value) return;
   sending.value = true;
+  // I-4：先 push 空 assistant 占位，流式循环更新占位 —— 否则 length-1 是刚 push 的 user 消息，
+  // 循环里直接覆盖会导致用户消息丢失（参照 kiosk App.vue sendText 写法）
   messages.value.push({ role: "user", content: t });
+  messages.value.push({ role: "assistant", content: "" });
   text.value = "";
   let assistant = "";
   try {
@@ -49,7 +52,7 @@ async function send() {
       messages.value[messages.value.length - 1] = { role: "assistant", content: assistant };
     }
   } catch {
-    messages.value.push({ role: "assistant", content: "（发送失败）" });
+    messages.value[messages.value.length - 1] = { role: "assistant", content: "（发送失败）" };
   } finally {
     sending.value = false;
   }

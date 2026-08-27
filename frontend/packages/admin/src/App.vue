@@ -34,7 +34,7 @@ function pushToast(text: string) {
 
 function onEvent(ev: BusEvent) {
   if (ev.type === "reminder") pushToast(`⏰ ${ev.title}：${ev.content}`);
-  if (ev.type === "alarm") pushToast(`🚨 ${ev.type}：${ev.message ?? "告警"}`);
+  if (ev.type === "alarm") pushToast(`🚨 ${ev.alarm_type ?? ev.type}：${ev.message ?? "告警"}`);
   if (ev.type === "user_changed") pushToast(`👤 当前用户切换为 ${ev.uid}`);
 }
 

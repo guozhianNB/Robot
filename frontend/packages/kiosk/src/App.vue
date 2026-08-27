@@ -31,7 +31,15 @@ async function loadSession() {
 }
 
 function onEvent(ev: BusEvent) {
-  if (ev.type === "voice_state") state.value = ev.state;
+  if (ev.type === "voice_state") {
+    state.value = ev.state;
+    // I-1：声纹识别事件带 uid → 同步状态条（声纹切换用户时前端即时反映）
+    if (ev.uid) uid.value = ev.uid;
+  }
+  if (ev.type === "voice_status" && ev.status === "degraded") {
+    // I-2：worker._report 广播的降级 → 状态条置为"语音不可用"（原本是死代码）
+    state.value = "unavailable";
+  }
   if (ev.type === "chat_new") {
     messages.value.push({ role: "user", content: ev.user, uid: ev.uid });
     messages.value.push({ role: "assistant", content: ev.assistant });
@@ -90,6 +98,13 @@ async function onSwitchUser(nextUid: string) {
   showSwitcher.value = false;
 }
 
+// Minor：解锁 = 恢复声纹自动判定（不换人；后端清 _session_uid 残留 + worker.locked_uid）
+async function onUnlock() {
+  await setSessionUser(uid.value ?? "elder_001", false);
+  locked.value = false;
+  showSwitcher.value = false;
+}
+
 async function onConfirmReminder(rid: number) {
   try {
     await fetch(`/api/reminders/${rid}/confirm`, { method: "POST" });
@@ -111,7 +126,7 @@ onMounted(loadSession);
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
     </div>
     <UserSwitcher v-if="showSwitcher" :current="uid"
-                  @pick="onSwitchUser" @close="showSwitcher = false" />
+                  @pick="onSwitchUser" @unlock="onUnlock" @close="showSwitcher = false" />
     <SettingsSheet v-if="showSettings" @close="showSettings = false" />
   </div>
 </template>

@@ -48,13 +48,21 @@ export interface UserChangedEvent {
   source: "manual" | "voiceprint";
 }
 
+export interface VoiceStatusEvent {
+  type: "voice_status";
+  status: string;   // running / degraded / disabled / stopped（worker._report 广播）
+  error?: string;
+  retries?: number;
+}
+
 export type BusEvent =
   | ReminderEvent
   | ReminderConfirmedEvent
   | AlarmEvent
   | ChatNewEvent
   | VoiceStateEvent
-  | UserChangedEvent;
+  | UserChangedEvent
+  | VoiceStatusEvent;
 
 const KNOWN_TYPES = new Set([
   "reminder",
@@ -63,6 +71,7 @@ const KNOWN_TYPES = new Set([
   "chat_new",
   "voice_state",
   "user_changed",
+  "voice_status",
 ]);
 
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */

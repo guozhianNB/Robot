@@ -57,7 +57,9 @@ def set_session_uid(uid: str, locked: bool) -> dict:
     锁定时写 worker.locked_uid（声纹不再自动切换）；解锁时清空。
     语音不可用时仍返回 ok —— 会话状态独立于语音能力。"""
     global _session_uid, _session_locked
-    _session_uid = uid
+    # I-1：解锁（locked=False）必须清 _session_uid 残留，否则 get_session_uid 永远返回
+    # 手动 uid（source='none'），声纹自动判定无法恢复
+    _session_uid = uid if locked else None
     _session_locked = bool(locked)
     if _worker is not None:
         try:

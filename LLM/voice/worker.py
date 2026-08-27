@@ -111,7 +111,8 @@ class VoiceWorker(threading.Thread):
             if hit:
                 self.session.wake()
                 audit.log("voice_wake", keyword=hit)
-                self._publish("voice_state", state="wake")
+                # I-2：唤醒即进入 LISTENING，发 listening（前端 VoiceStatusBar 映射"正在听…"）
+                self._publish("voice_state", state="listening")
 
         elif self.session.state == session_mod.State.LISTENING:
             seg = self.vad.pop_speech()
@@ -146,11 +147,17 @@ class VoiceWorker(threading.Thread):
         if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
             audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
                       detected=vote.candidate_uid, score=round(vote.confidence, 3))
+        prev_uid = self.current_uid
         self.current_uid = uid or self.current_uid
         audit.log("voice_spk", identified=(vote.candidate_uid is not None),
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
         chat_uid = self.current_uid or "elder_001"
+        # I-1：声纹识别切换了用户（或首次识别出用户）→ 广播 user_changed，
+        # 与 server.py 手动切换的广播格式一致，前端状态条/admin toast 同步
+        if self.current_uid and self.current_uid != prev_uid:
+            self._publish("user_changed", uid=chat_uid,
+                          locked=bool(self.locked_uid), source="voiceprint")
         self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
         reply = self.chat_fn(chat_uid, text)
         if self.post_turn_fn:

@@ -5,7 +5,11 @@ import { onMounted, ref } from "vue";
 interface Profile { uid: string; name: string; nickname: string; bed: string }
 
 const props = defineProps<{ current: string | null }>();
-const emit = defineEmits<{ (e: "pick", uid: string): void; (e: "close"): void }>();
+const emit = defineEmits<{
+  (e: "pick", uid: string): void;
+  (e: "unlock"): void;
+  (e: "close"): void;
+}>();
 
 const profiles = ref<Profile[]>([]);
 const loading = ref(true);
@@ -34,6 +38,8 @@ onMounted(async () => {
           <span v-if="p.uid === current">✓</span>
         </li>
       </ul>
+      <!-- Minor：解锁项——恢复声纹自动判定（不换人），缓解"锁定模式被误触"无出口 -->
+      <button class="unlock" @click="emit('unlock')">🔓 解锁（自动识别）</button>
       <button class="close" @click="emit('close')">关闭</button>
     </div>
   </div>
@@ -51,4 +57,6 @@ onMounted(async () => {
 .sheet li span { margin-left: auto; color: #22c55e; }
 .close { margin-top: 18px; width: 100%; padding: 14px; border-radius: 12px;
   background: #374151; color: #f9fafb; border: none; font-size: 20px; }
+.unlock { margin-top: 14px; width: 100%; padding: 14px; border-radius: 12px;
+  background: #14532d; color: #f9fafb; border: none; font-size: 20px; }
 </style>
