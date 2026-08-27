@@ -1,0 +1,10 @@
+{
+  "name": "robot-frontend",
+  "private": true,
+  "scripts": {
+    "dev:admin": "pnpm --filter admin dev",
+    "dev:kiosk": "pnpm --filter kiosk dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  }
+}

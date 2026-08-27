@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+
+# esbuild 的平台二进制由 optional 依赖 @esbuild/win32-x64 提供（已安装到位），
+# 其 postinstall 仅做版本校验；本沙箱禁止 postinstall 内部 spawn 子进程（EPERM），
+# 故显式禁止构建脚本，避免 pnpm 每次运行都重试导致失败。
+allowBuilds:
+  esbuild: false
