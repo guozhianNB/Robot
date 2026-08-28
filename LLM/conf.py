@@ -11,11 +11,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
-FEEDS_FILE = DATA_DIR / "feeds.json"     # 新闻 RSS 源配置
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
 DEFAULT_SETTINGS = {
-    "web_search_enabled": True,     # 联网搜索/新闻工具开关
     "proactive_enabled": False,     # 主动交互（目前只做广播通道，未接自动话术）
     "auto_switch_user": False,      # 自动切换老人（未接人脸/声纹，占位）
     "reminder_enabled": True,       # 定时提醒总开关
@@ -34,6 +32,7 @@ DEFAULT_SETTINGS = {
     "silent_end": "07:00",          # 静默时段结束
     "confirm_timeout_min": 30,      # 提醒送达后多少分钟未确认 → 升级"未确认"
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
+    "mcp_enabled": False,          # MCP 外部工具总开关（开启后在启动时拉起 MCP_SERVERS）
 }
 
 # 声纹录制
@@ -97,6 +96,26 @@ GRAPH_REL_TYPES = ["likes", "dislikes", "family", "related_to", "happened_at"]
 
 # 身份字段红线：模型永不写、永不改（护士只读档案）
 IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号", "昵称", "称呼"]
+
+# ---- MCP 外部工具服务器（可选能力，见 mcp_client.py）----
+# 服务器名 -> {"command", "args", "env"(可选,None=继承), "enabled"(可选,默认True)}
+# 由后台独立线程常驻拉起（stdio 子进程），工具自动并入 OpenAI function-calling 循环。
+# 新增 MCP 服务器 = 在这里加一条配置，无需改任何代码；启动后自动握手、自动转 schema、
+# run_tool 自动分发、前端 /api/tools 自动显示。
+# 注意：Windows 上 npx 是 .cmd 脚本，command 须写 npx.cmd（Linux 写 npx）；
+# 下面用 _NPX 按平台自动选择，直接照抄即可。
+import sys as _sys
+_NPX = "npx.cmd" if _sys.platform == "win32" else "npx"
+
+# MCP工具列表
+MCP_SERVERS: dict[str, dict] = {
+    # 网页抓取（需要本机有 node/npx，首次会自动 npx 下载包）：
+    # 工具名 fetch_html —— 可用来替代原 web_search/get_news 的联网能力
+    "fetch": {"command": _NPX, "args": ["-y", "@tokenizin/mcp-npx-fetch"], "enabled": True},
+}
+
+MCP_TOOL_TIMEOUT = 30             # 单次 MCP 工具调用超时（秒）
+MCP_CONNECT_TIMEOUT = 60          # 单台服务器握手超时（秒）
 
 # LLM 参数
 MODEL = "deepseek-v4-flash"

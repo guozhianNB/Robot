@@ -24,7 +24,7 @@ const BOOLS = [
   ["asr_enabled", "语音识别"],
   ["tts_enabled", "语音播报"],
   ["reminder_enabled", "定时提醒"],
-  ["web_search_enabled", "联网搜索"],
+  ["mcp_enabled", "MCP 外部工具（联网/新闻等，改后重启后端生效）"],
   ["thinking_router_enabled", "思考路由"],
   ["memory_consolidation_enabled", "记忆整理"],
   ["alarm_enabled", "报警上报"],

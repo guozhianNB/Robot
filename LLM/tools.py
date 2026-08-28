@@ -1,24 +1,27 @@
 # -*- coding: utf-8 -*-
 r"""
-联网工具集（模块 9）：
-  - web_search(query)  通用搜索：有 BOCHA_API_KEY / SERPAPI_KEY 时走官方 API；
-                        否则走 DuckDuckGo Instant Answer + 本地新闻语料关键词检索兜底。
-  - get_news(category) 结构化新闻：抓取 RSS（人民日报/央视/新华社/BBC中文等，按分类）。
-安全约束：结果只做摘要；健康类信息在返回里注明"仅供参考"；过滤惊悚关键词。
+工具注册中心 + 分发入口（模块 9）：
+  - 本地工具：LLM/tool/ 下的模块用 @tool 装饰器注册（OpenAI function-calling 格式），
+    自动加载、自动分发、per-tool 开关自动生效，前端工具页自动显示；
+  - MCP 工具：conf.MCP_SERVERS 配置的外部 MCP 服务器，mcp_client 启动时拉起并转 schema，
+    与本地工具一样参与对话工具循环（重名时本地优先）。
+  - 原 web_search / get_news 本地工具已于 2026-08-29 移除，联网能力改由 MCP 服务器提供。
 
-工具以 OpenAI Function Calling 格式暴露给大模型，由 chat 引擎调用。
-
-【新增工具三步走】schema 与实现写在一起，装饰器自动注册：
+【新增本地工具三步走】schema 与实现写在一起，装饰器自动注册：
     @tool("工具名", "何时用/怎么用的描述（模型靠它决定调用）", {参数 JSON Schema}, enabled=True)
     def 工具名(参数: str = "默认值") -> dict:
         ...
         return {"ok": True, "result": "..."}   # 或 {"ok": False, "message": "..."}
 注册后 run_tool 自动分发、TOOLS 自动收录、per-tool 开关 <工具名>_enabled 自动生效，
 前端工具页自动显示开关，无需再改 chat.py / server.py / db.py / conf.py。
+
+【新增 MCP 服务器】只需在 conf.py 的 MCP_SERVERS 加一条配置，无需改任何代码。
 """
 import importlib
 import inspect
 import pkgutil
+
+from . import mcp_client   # MCP 桥（可选能力，内部自行降级，import 永远安全）
 
 # ---------------------------------------------------------------- 注册表
 # name -> {"schema": OpenAI function-calling 声明, "fn": 实现函数, "enabled": 默认开关}
@@ -78,19 +81,36 @@ TOOL_DEFAULTS = {f"{n}_enabled": reg["enabled"] for n, reg in _TOOL_REGISTRY.ite
 
 
 def effective_tools(settings: dict) -> list[dict]:
-    """按 per-tool 开关（`<工具名>_enabled`）过滤，返回要传给模型的 schema 列表。"""
-    return [reg["schema"] for name, reg in _TOOL_REGISTRY.items()
-            if settings.get(f"{name}_enabled", reg["enabled"])]
+    """按 per-tool 开关（`<工具名>_enabled`）过滤，返回要传给模型的 schema 列表。
+    MCP 工具在 `mcp_enabled` 开启时合并进来；与本地工具重名时本地优先。"""
+    local_names = set(_TOOL_REGISTRY)
+    tools = [reg["schema"] for name, reg in _TOOL_REGISTRY.items()
+             if settings.get(f"{name}_enabled", reg["enabled"])]
+    if settings.get("mcp_enabled"):
+        tools += [s for name, s in ((n, e["schema"]) for n, e in mcp_client.tools().items())
+                  if name not in local_names]
+    return tools
 
 
 def tools_with_state(settings: dict) -> list[dict]:
-    """给前端用：schema + enabled（当前开关状态）+ switch_key（设置项 key）。"""
+    """给前端用：schema + enabled（当前开关状态）+ switch_key（设置项 key）。
+    MCP 工具挂到全局开关 mcp_enabled 下（服务器级，非 per-tool）。"""
+    local_names = set(_TOOL_REGISTRY)
     out = []
     for name, reg in _TOOL_REGISTRY.items():
         item = dict(reg["schema"])
         item["enabled"] = bool(settings.get(f"{name}_enabled", reg["enabled"]))
         item["switch_key"] = f"{name}_enabled"
         out.append(item)
+    if settings.get("mcp_enabled"):
+        for name, entry in mcp_client.tools().items():
+            if name in local_names:
+                continue
+            item = dict(entry["schema"])
+            item["enabled"] = True
+            item["switch_key"] = "mcp_enabled"
+            item["server"] = entry["server"]
+            out.append(item)
     return out
 
 
@@ -98,6 +118,9 @@ def tools_with_state(settings: dict) -> list[dict]:
 def run_tool(name: str, args: dict) -> dict:
     reg = _TOOL_REGISTRY.get(name)
     if not reg:
+        # 不在本地注册表 → 尝试 MCP 工具（未注册/未连接时 mcp_client 返回 ok=False）
+        if name in mcp_client.tools():
+            return mcp_client.call_tool(name, args or {})
         return {"ok": False, "message": f"未知工具 {name}"}
     try:
         return _run_fn(reg["fn"], args or {})

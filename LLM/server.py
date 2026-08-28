@@ -30,6 +30,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
+from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
 from .conf import MODEL, BASE_DIR
 
 load_dotenv(BASE_DIR / ".env")
@@ -66,7 +67,9 @@ async def lifespan(app: FastAPI):
     reminder.start()          # 独立线程的定时提醒调度器
     drain_task = bus.start_drain()   # 广播扇出任务
     voice_api.start_voice(client, MODEL, _post_chat_jobs)
+    mcp_client.start(db.get_settings())   # MCP 外部工具（mcp_enabled 开启时拉起）
     yield
+    mcp_client.stop()
     voice_api.stop_voice()
     drain_task.cancel()
 
@@ -199,7 +202,7 @@ async def health():
 
 @app.get("/api/modules/status")
 async def modules_status():
-    """可选模块状态聚合：语音 / embedding / RAG 存储 / 知识图谱。
+    """可选模块状态聚合：语音 / embedding / RAG 存储 / 知识图谱 / MCP 工具。
     各模块缺失依赖时自行降级（available=False / status=unavailable），接口照常返回。"""
     from . import embed as e, ragstore, graph as g
     return {"ok": True, "modules": {
@@ -207,6 +210,7 @@ async def modules_status():
         "embed":    e.status(),
         "ragstore": ragstore.status(),
         "graph":    g.status(),
+        "mcp":      mcp_client.status(),
     }}
 
 
