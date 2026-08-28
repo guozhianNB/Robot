@@ -280,3 +280,27 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 新增 3 个测试文件共 24 用例：`test_speaker_enroll.py`（7：追加合并/覆盖重置/删除/旧 npz 兼容）、`test_voice_api_enroll.py`（9：暂存/提交/试听/丢弃/清除/降级路径/TTL 清理）、`test_server_voice_routes.py`（8：record/enroll/audio/discard/delete speakers/face status 路由）；`test_speaker_math.py` 增补 merge_profile 用例（上批基线已含）。
 - 全量回归：`pytest LLM/tests -q` → **52 passed**（8 个测试文件，无回归；上批基线 28 → 本批 +24）。
 - 端到端手工验证（启动后端 + 浏览器走完注册向导 + 声纹试听/追加/清除）由控制者执行，结果见任务 7 报告。
+
+---
+
+## 2026-08-29 · 移除 web_search / get_news 本地工具，联网能力切换为 MCP
+
+**背景：** 原 `web_search`（博查/SerpAPI/DuckDuckGo + 本地 RSS 语料兜底）与 `get_news`（RSS 抓取）两条联网工具链路不再维护，统一改用 MCP 服务器提供联网/新闻能力（`LLM/mcp_client.py` + `conf.MCP_SERVERS` 已有完整支撑：启动拉起、schema 转换、run_tool 分发、降级运行）。
+
+### 做了什么
+
+- **删除** `LLM/tool/web_search.py`、`LLM/tool/get_news.py`、`LLM/tool/_rss.py`（共享辅助，仅被前两者使用）。
+- `LLM/conf.py`：删除 `web_search_enabled` 默认设置与 `FEEDS_FILE`；`MCP_SERVERS` 的 `fetch` 服务器 command 改为平台自适应（Windows 用 `npx.cmd`，Linux 用 `npx`），此前硬编码 `npx` 在 Windows 上会静默拉起失败。
+- `LLM/tools.py`：模块 docstring 更新——本地工具注册与 MCP 工具两条路径说明，标注旧工具已移除。
+- 前端 `frontend/packages/admin/src/pages/SettingsPage.vue`：设置页移除「联网搜索」开关，新增「MCP 外部工具」总开关（`mcp_enabled`，改后重启后端生效）。
+
+### 有什么用
+
+- 联网能力收敛为单一入口：想换搜索/新闻服务 = 在 `conf.MCP_SERVERS` 加一台 MCP 服务器，改配置不改代码；大模型侧工具名由 MCP 服务器 `tools/list` 决定。
+- 移除 RSS 兜底后，无 key 环境下不再有 4~5s 的语料匹配延迟路径。
+
+### 注意
+
+- 历史库 `settings` 表可能残留 `web_search_enabled` 行，无害（注册表已无此工具，`effective_tools` 不再读取）。
+- `docs/2.pre/大模型端开发目标.md` 模块 9 仍按旧设计描述 `web_search`/`get_news`，待 MCP 方案定型后更新。
+- 验证：`python -c "import LLM.tools"` 正常；本地注册表为空、MCP 工具合并路径不受影响；MCP 冒烟可跑 `LLM/tool/_mcp_demo.py`。
