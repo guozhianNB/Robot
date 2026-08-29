@@ -9,6 +9,7 @@
 /stm32/control_test/
 /stm32/led_test/
 .real_frame.jpg
+temp.*
 
 __pycache__/
 *.py[cod]

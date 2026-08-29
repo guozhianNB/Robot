@@ -17,6 +17,12 @@ from .conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
                    LLM_TIMEOUT)
 
+# 导入MCP客户端会话类：ClientSession封装全部MCP协议逻辑（initialize、list_tools、call_tool）
+from mcp.client.session import ClientSession
+
+# stdio_client：用来把你的mcp服务端程序，启动为一个子进程，通过标准输入输出和客户端通信
+from mcp.client.stdio import stdio_client
+
 PERSONA = (
     "你是'小护'，一位温柔、耐心、专业的 AI 陪护机器小车，正在照顾一位老人。"
     "说话要像护工又像家人：语气亲切温和、句子简短口语化、多用'您'、适当关心起居饮食。"
@@ -38,6 +44,7 @@ ROUTER_HIT = (
     "语气要格外谨慎，不确定就建议问护士。"
 )
 
+global _mcp_session
 
 def llm_json(client, model: str, prompt: str, timeout: int = LLM_TIMEOUT) -> dict | list:
     """非流式 JSON 输出（用于记忆提取/历史摘要）。失败返回 {}。"""
@@ -148,6 +155,62 @@ def summarize_old(uid: str, client, model: str):
         db.trim_history(uid, keep=HISTORY_WINDOW)
         audit.log("chat", action="summarize", uid=uid, summary=summary)
 
+async def mcp_init(client, model: str):
+    """MCP 初始化：启动子进程、建立通信管道、握手、获取工具列表。"""
+    global _mcp_session
+    # ====================== 配置：指定怎么启动你的MCP服务端 ======================
+    # 这是命令列表，等价于终端执行：python my_mcp_server.py
+    # 第一个元素是程序，后面是参数
+    server_command = ["python", "my_mcp_server.py"]
+
+
+    # ====================== 1、启动子进程，建立通信管道 ======================
+    # stdio_client 会自动拉起上面的服务端作为子进程
+    # read：客户端【读取】服务端发过来的数据流
+    # write：客户端【发送】数据给服务端的输出流
+    # async with 是异步上下文管理器：代码块结束，会自动关闭子进程、释放资源，不用手动写关闭
+    async with stdio_client(server_command) as (read, write):
+        # ====================== 2、创建MCP会话对象，封装全部协议交互 ======================
+        # ClientSession 接收读写流，内部帮你处理 JSON‑RPC 消息组装、id匹配、解析
+        async with ClientSession(read, write) as session:
+            # 进入这个代码块，session对象就绪，可以开始MCP握手
+
+            # --------------------------
+            # 第一步：执行 initialize 初始化握手（MCP协议强制第一步）
+            # 客户端告诉服务端：我的协议版本、我的能力；服务端返回它自己的版本、支持什么能力
+            # await：等待网络/IPC通信完成，拿到返回结果，异步代码必须写await
+            init_result = await session.initialize()
+
+            # 打印握手返回信息，看服务端名字、版本
+            print("[MCP]==== 握手完成 ====")
+            print("服务端名称：", init_result.serverInfo.name)
+            print("服务端版本：", init_result.serverInfo.version)
+            print("服务端具备的能力：", init_result.capabilities)
+            audit.log("mcp", action="initialize", server_name=init_result.serverInfo.name,
+                      server_version=init_result.serverInfo.version, capabilities=init_result.capabilities)
+
+
+            # --------------------------
+            # ⚠️非常关键，极易漏掉！发送 initialized 通知
+            # 协议规定：initialize请求收到回复之后，客户端必须发送这条单向通知
+            # 不发这条，后面 list_tools / call_tool 会直接卡死超时！
+            # 通知 = 单向消息，服务端不需要回复
+            await session.send_initialized_notification()
+
+
+            # --------------------------
+            # 第二步：向服务端查询有哪些可用工具 list_tools
+            tools_response = await session.list_tools()
+
+            print("[MCP]==== 获取到全部工具列表 ====")
+            audit.log("mcp", action="list_tools", tools=[t.name for t in tools_response.tools])
+            # tools_response.tools 是一个列表，每一项是一个工具对象
+            for one_tool in tools_response.tools:
+                print(f"工具名：{one_tool.name}")
+
+            audit.log("mcp", action="list_tools", tools=[t.name for t in tools_response.tools])
+
+            _mcp_session = session
 
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict):
     """
@@ -170,6 +233,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
 
     full_assistant = ""
     try:
+        #--------------------------
+        # 1、调用模型生成器，stream=True 流式输出
         for round_i in range(2):
             extra = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"} if thinking_on \
                 else {"thinking": {"type": "disabled"}}
@@ -192,7 +257,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     )
                 else:
                     raise
-
+        #-------------------------
+            # 解析流式输出，逐条 yield SSE 事件
             tool_calls = {}
             finish = None
             for chunk in stream:
