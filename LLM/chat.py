@@ -200,6 +200,7 @@ async def mcp_init(client, model: str):
 
             # --------------------------
             # 第二步：向服务端查询有哪些可用工具 list_tools
+            # 同时让网关启动初始化所有mcp服务器
             tools_response = await session.list_tools()
 
             print("[MCP]==== 获取到全部工具列表 ====")

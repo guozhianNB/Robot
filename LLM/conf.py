@@ -4,6 +4,7 @@ r"""
 所有模块从这里拿路径/默认值，避免散落魔法字符串。
 """
 from pathlib import Path
+import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent   # 项目根
 DATA_DIR = Path(__file__).resolve().parent / "data"  # LLM 侧数据目录
@@ -112,6 +113,13 @@ MCP_SERVERS: dict[str, dict] = {
     # 网页抓取（需要本机有 node/npx，首次会自动 npx 下载包）：
     # 工具名 fetch_html —— 可用来替代原 web_search/get_news 的联网能力
     "fetch": {"command": _NPX, "args": ["-y", "@tokenizin/mcp-npx-fetch"], "enabled": True},
+    "tavily": {
+        "command": "node",
+        "args": [str(BASE_DIR / "LLM" / "mcp_servers" / "node_modules" / "tavily-mcp" / "build" / "index.js")],
+        # env 值留空串 = 运行时从 os.environ 继承（.env 由 server.py 加载后才有值）
+        "env": {"TAVILY_API_KEY": ""},
+        "enabled": True,
+    },
 }
 
 MCP_TOOL_TIMEOUT = 30             # 单次 MCP 工具调用超时（秒）
