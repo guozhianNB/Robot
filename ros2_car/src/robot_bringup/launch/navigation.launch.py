@@ -71,6 +71,26 @@ def generate_launch_description():
         condition=IfCondition(rviz),
     )
 
+    # 大模型端对接（契约 docs/目标文档及说明/ROS底盘接口需求.md）：
+    # robot_actions = robot/move + robot/turn + robot/navigate_to 服务 + exec_state/arrived
+    # cmd_stop      = robot/cmd_stop 急停（取消 Nav2 + 零速）
+    robot_actions_node = Node(
+        package='robot_navigation',
+        executable='robot_actions',
+        name='robot_actions',
+        output='screen',
+        emulate_tty=True,
+    )
+
+    cmd_stop_node = Node(
+        package='robot_navigation',
+        executable='cmd_stop',
+        name='cmd_stop',
+        output='screen',
+        emulate_tty=True,
+    )
+
     return LaunchDescription(
-        declare_args + [localization, navigation, rviz_node]
+        declare_args + [localization, navigation, rviz_node,
+                        robot_actions_node, cmd_stop_node]
     )

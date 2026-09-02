@@ -6,9 +6,10 @@ RDK X5（Ubuntu 22.04 / ROS2 Humble）小车端：**激光雷达 + 里程计 + S
 
 ```
 car_ws/src/
+├── robot_interfaces/   自定义服务定义（robot/move、robot/turn、robot/navigate_to，ament_cmake）
 ├── robot_chassis/      底盘驱动（cmd_vel → STM32 USB CDC 协议；STATUS 心跳 → /odom + tf）
 ├── robot_bringup/      一键启动（launch + nav2/slam 参数 + URDF + rviz 配置）
-└── robot_navigation/   导航辅助（命令行发 Nav2 目标、robot/cmd_stop 急停）
+└── robot_navigation/   大模型端对接（move/turn/navigate 服务 + exec_state/arrived 状态 + 急停）
 ```
 
 ## 环境
@@ -88,6 +89,19 @@ ros2 launch robot_bringup bringup.launch.py mode:=mapping odom_source:=chassis
 
 ## 后续对接（大模型端）
 
-- 控制服务 `robot/move`、`robot/turn`、`robot/navigate_to`：见 `docs/目标文档及说明/ROS底盘接口需求.md`，
-  在 `robot_navigation` 包内基于 `navigate_to_pose.py` 扩展服务端实现。
-- 状态话题 odom / exec_state / battery / obstacle / arrived：`chassis_driver` 已发布 `/odom`，其余按契约补充。
+契约见 `docs/目标文档及说明/ROS底盘接口需求.md`。已实现（navigation 模式自动带起 `robot_actions` 节点）：
+
+```bash
+# robot/move：直线/横移，到位自动停（forward|back|left|right）
+ros2 service call /robot/move robot_interfaces/srv/Move "{direction: forward, distance_m: 1.0}"
+# robot/turn：原地转向，到位自动停（角度，正=左转）
+ros2 service call /robot/turn robot_interfaces/srv/Turn "{angle_deg: 90}"
+# robot/navigate_to：Nav2 导航到坐标（地点表后置，place 暂不支持）
+ros2 service call /robot/navigate_to robot_interfaces/srv/NavigateTo "{place: '', x: 1.0, y: 0.5, theta: 90}"
+# 状态话题：robot/exec_state（idle/moving/navigating/error）、robot/arrived（bool）
+ros2 topic echo /robot/exec_state
+# 急停
+ros2 topic pub -1 /robot/cmd_stop std_msgs/msg/Bool "{data: true}"
+```
+
+待后续（第二批）：`robot/obstacle` / `robot/battery` 状态、地点表 + 语义区域框（建图后标注坐标）。
