@@ -37,8 +37,8 @@
  *   KP 太小 → 速度跟不上目标（稳态误差大）；KP 太大 → 振荡/啸叫
  *   KI 消除稳态误差，太大 → 超调/震荡
  *   KD 抑制超调，但会放大编码器量化噪声（低速时建议保持 0）        */
-#define MC_PID_KP             6.5f
-#define MC_PID_KI             2.0f
+#define MC_PID_KP             13.0f
+#define MC_PID_KI             3.0f
 #define MC_PID_KD             0.0f
 #define MC_PID_INTEGRAL_LIMIT 1000.0f /* 积分项上限：放宽到与输出限幅一致（等效不限幅）。
                                           防饱和由"条件积分+输出限幅"双保险兜底：
