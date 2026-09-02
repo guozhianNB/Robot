@@ -1,9 +1,8 @@
 # robot_localization EKF 参数（可选，默认关闭）
-# 作用：融合底盘编码器里程计(/odom) 与 rf2o 激光里程计(/odom_laser)，
-#       输出更平滑的 /odom_filtered，并发布 odom→base_link tf。
-# 用法：bringup.launch.py 传 use_ekf:=true
-# 注意：rf2o 需要把 odom_topic 改为 /odom_laser（见 odom.launch.py），
-#       避免与 EKF 输出话题冲突。
+# 作用：融合底盘编码器里程计(/odom)，输出更平滑的 /odom_filtered，
+#       并发布 odom→base_link tf（此时 chassis_driver 关闭自身 tf 避免双发布）。
+# 用法：bringup.launch.py 传 use_ekf:=true（需 odom_source:=chassis）
+# 可选输入：rf2o 激光里程计(/odom_laser) 见下方注释段，需要时放开。
 
 ekf_filter_node:
   ros__parameters:
@@ -26,15 +25,17 @@ ekf_filter_node:
     odom0_differential: false
     odom0_queue_size: 5
 
-    # 输入2：rf2o 激光里程计（如启用）
-    odom1: /odom_laser
-    odom1_config: [true,  true,  false,
-                   false, false, false,
-                   true,  true,  true,
-                   false, false, true,
-                   false, false, false]
-    odom1_differential: false
-    odom1_queue_size: 5
+    # 输入2：rf2o 激光里程计（可选，默认关闭）
+    # 启用需同时跑 rf2o 且其 odom_topic 为 /odom_laser（odom.launch.py odom_source:=rf2o 时才有数据）。
+    # 底盘模式下无 rf2o 数据，留着会在日志里持续打 waiting 告警，故注释掉；需要时放开并让 rf2o 输出 /odom_laser。
+    # odom1: /odom_laser
+    # odom1_config: [true,  true,  false,
+    #                false, false, false,
+    #                true,  true,  true,
+    #                false, false, true,
+    #                false, false, false]
+    # odom1_differential: false
+    # odom1_queue_size: 5
 
     # 协方差初值
     process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,

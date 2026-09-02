@@ -53,6 +53,9 @@ class ChassisDriver(Node):
         self.declare_parameter("cmd_stop_topic", "/robot/cmd_stop")
         self.declare_parameter("odom_frame_id", "odom")
         self.declare_parameter("base_frame_id", "base_link")
+        # 是否由本节点发布 odom→base_link TF。
+        # use_ekf:=true 时由 EKF 统一发布 TF（见 robot_bringup/odom.launch.py），本节点应关掉避免双发布。
+        self.declare_parameter("publish_tf", True)
 
         # 麦轮运动学几何（单位 m）—— 真机标定后修改
         self.declare_parameter("wheel_radius", 0.04)      # 轮半径 = 0.08/2（固件 MC_WHEEL_DIAMETER_MM=80）
@@ -76,11 +79,15 @@ class ChassisDriver(Node):
         # Humble rclpy Node 没有 get_parameter_names()，显式列出已声明参数
         self._p = {p.name: p.value for p in self.get_parameters([
             "serial_port", "baudrate", "cmd_vel_topic", "odom_topic", "cmd_stop_topic",
-            "odom_frame_id", "base_frame_id", "wheel_radius", "rotate_radius",
+            "odom_frame_id", "base_frame_id", "publish_tf", "wheel_radius", "rotate_radius",
             "wheel_signs", "sign_vx", "sign_vy", "sign_wz",
             "max_vx", "max_vy", "max_wz", "accel_limit", "ang_accel_limit",
             "send_period", "watchdog_timeout",
         ])}
+        # launch 层（odom.launch.py）传 publish_tf 时是字符串，归一化为 bool
+        if isinstance(self._p["publish_tf"], str):
+            self._p["publish_tf"] = self._p["publish_tf"].lower() in ("true", "1", "yes")
+        self._p["publish_tf"] = bool(self._p["publish_tf"])
 
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先安装: pip3 install pyserial")
@@ -293,16 +300,17 @@ class ChassisDriver(Node):
         odom.twist.covariance[35] = 0.05
         self._odom_pub.publish(odom)
 
-        # tf odom → base_link
-        t = TransformStamped()
-        t.header.stamp = now
-        t.header.frame_id = self._p["odom_frame_id"]
-        t.child_frame_id = self._p["base_frame_id"]
-        t.transform.translation.x = x
-        t.transform.translation.y = y
-        t.transform.rotation.z = math.sin(yaw / 2.0)
-        t.transform.rotation.w = math.cos(yaw / 2.0)
-        self._tf_broadcaster.sendTransform(t)
+        # tf odom → base_link（use_ekf 模式下由 EKF 发布，本节点关闭以免双发布）
+        if self._p["publish_tf"]:
+            t = TransformStamped()
+            t.header.stamp = now
+            t.header.frame_id = self._p["odom_frame_id"]
+            t.child_frame_id = self._p["base_frame_id"]
+            t.transform.translation.x = x
+            t.transform.translation.y = y
+            t.transform.rotation.z = math.sin(yaw / 2.0)
+            t.transform.rotation.w = math.cos(yaw / 2.0)
+            self._tf_broadcaster.sendTransform(t)
 
 
 def main(args=None):

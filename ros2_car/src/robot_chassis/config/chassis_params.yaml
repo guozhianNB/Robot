@@ -13,6 +13,9 @@ chassis_driver:
     cmd_stop_topic: /robot/cmd_stop
     odom_frame_id: odom
     base_frame_id: base_link
+    # 是否由本节点发布 odom→base_link TF；use_ekf:=true 时 odom.launch.py 会强制传 false
+    # （TF 由 EKF 统一发布，避免双发布）
+    publish_tf: true
 
     # ---- 麦轮运动学几何（单位 m）----
     wheel_radius: 0.04        # 轮半径；固件默认轮径 80mm → 0.04
