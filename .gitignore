@@ -1,7 +1,7 @@
 .dsh-meow/
 .kagent/
 .venv/
-
+.dsh-meow/
 # env隐私数据
 .env
 
@@ -9,6 +9,7 @@
 /stm32/control_test/
 /stm32/led_test/
 .real_frame.jpg
+temp.*
 
 __pycache__/
 *.py[cod]

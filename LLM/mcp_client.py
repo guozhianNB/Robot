@@ -28,6 +28,7 @@ r"""MCP 客户端桥（可选能力）：把外部 MCP 服务器工具并入 Ope
   新增 MCP 服务器：只需在 conf.py 的 MCP_SERVERS 里加一条配置即可，本模块无需改动。
 """
 import asyncio       # 跨线程桥接：run_coroutine_threadsafe / wait_for / new_event_loop / run_forever
+import os            # env 懒加载：子进程缺的环境变量从 os.environ 运行时补全
 import threading     # 后台守护线程，承载 MCP 专属 asyncio 事件循环
 
 from . import log as audit                 # 审计日志：所有状态变更落 JSONL（事件类型 mcp / mcp_degraded）
@@ -161,10 +162,19 @@ async def _connect_one(name: str, params: dict):
       失败 → 抛出异常（由 _connect_all 捕获并记入 _errors，不会影响其它服务器）。
     """
     # 1) 组装 stdio 子进程启动参数：可执行命令 + 命令行参数 + 可选环境变量。
+    #    注意 env 的懒加载：conf.MCP_SERVERS 里 env 的值若是空串（如
+    #    {"TAVILY_API_KEY": ""}），表示"该变量从父进程环境继承"——在【这里】
+    #    运行时从 os.environ 补全。原因：conf.py 在模块导入时执行，而 .env
+    #    由 server.py 的 load_dotenv() 在导入之后才加载；若在 conf.py 里直接
+    #    os.getenv() 求值会拿到空串，导致子进程缺 key 启动即崩（Connection closed）。
+    env = dict(params.get("env") or {})
+    for _k, _v in list(env.items()):
+        if not _v:
+            env[_k] = os.environ.get(_k, "")
     server_params = StdioServerParameters(
         command=params["command"],              # 启动 MCP 服务器的可执行程序
         args=params.get("args") or [],          # 传给子进程的参数（可缺省，缺省给空表）
-        env=params.get("env"),                  # 可选的子进程环境变量覆盖
+        env=env or None,                        # 子进程环境变量覆盖（mcp SDK 会与父进程环境合并）
     )
     # 2) 进入 stdio 客户端上下文：真正拉起子进程，拿到它的 stdout/stdin 读写流。
     #    注意：这里是手动调用 __aenter__()（而非 async with），因为返回的 ctx 需要
@@ -343,7 +353,7 @@ async def _call(session, name: str, args: dict) -> dict:
     # 拼接所有文本块；全空则给占位提示，避免返回空串让上层误判。
     body = "\n".join(p for p in parts if p).strip() or "（MCP 工具无文本返回）"
     # 服务器显式标了 isError → 按"工具执行失败"处理（消息截断到 1000 字符防刷屏）。
-    if getattr(result, "isError", False):
+    if getattr(result, "is_error", False) or getattr(result, "isError", False):
         return {"ok": False, "message": body[:1000]}
     # 正常结果截断到 4000 字符，防止超长结果撑爆对话上下文。
     return {"ok": True, "result": body[:4000]}
