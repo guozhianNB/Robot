@@ -35,6 +35,7 @@ ros2_car/log/
 
 # 外部教程项目（自带独立 .git 的嵌套仓库，不入库）
 /localization-with-ROS/
+/linorobot2/
 
 # Python
 ros2_car/**/__pycache__/
@@ -48,3 +49,4 @@ ros2_car/src/robot_bringup/maps/*.yaml
 LLM/models/
 .research_sherpa/
 .pip-cache/
+.pip-tmp/
