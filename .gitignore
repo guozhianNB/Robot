@@ -33,6 +33,9 @@ ros2_car/build/
 ros2_car/install/
 ros2_car/log/
 
+# 板卡 ROS 现场诊断一次性脚本（不入库）
+.diag/
+
 # 外部教程项目（自带独立 .git 的嵌套仓库，不入库）
 /localization-with-ROS/
 /linorobot2/
