@@ -304,3 +304,44 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 历史库 `settings` 表可能残留 `web_search_enabled` 行，无害（注册表已无此工具，`effective_tools` 不再读取）。
 - `docs/2.pre/大模型端开发目标.md` 模块 9 仍按旧设计描述 `web_search`/`get_news`，待 MCP 方案定型后更新。
 - 验证：`python -c "import LLM.tools"` 正常；本地注册表为空、MCP 工具合并路径不受影响；MCP 冒烟可跑 `LLM/tool/_mcp_demo.py`。
+
+---
+
+## 2026-09-06 · 记忆系统对标 MaiBot：P0-P3 全部落地
+
+**背景：** 调研 MaiBot 记忆子系统（A_memorix v2.0）与说话风格学习（learners），产出 `docs/maibot参考/2026-09-05-MaiBot记忆风格对标报告.md`，随后按其 P0-P3 路线逐批落地。参考材料：源码 `D:\_project\MaiBot\src`、文档 `D:\_project\maibot_docs\zh`。
+
+### P0 —— 安全/防重复（commit 51f9b04、ce2b45f）
+
+- **external_id 幂等**：`rag_memories` 增 `external_id` 列 + `external_refs` 表（uid+external_id 复合唯一）；`ragstore.add` 带 external_id 时写前查重跳过；consolidate 的 digest 用对话内容 sha256 指纹作 external_id——同段对话重复整理只落一条 episode，根治"定时摘要/并发触发导致记忆重复"。
+- **软删除 + 回收站**：memories/core/rag 三表软删列 + `delete_operations` 快照表；`delete_memory/delete_core_memory/delete_rag_memory` 改为软删（返回 op_id），TTL 到期与画像内部覆盖改用 `*_hard` 物理删（不进回收站）；ragstore 增 `delete_by_chroma_id`（软删联动清向量，检索立即失效）与 `reindex_row`（恢复时重建向量）。
+- **API**：reject/delete 返回 op_id；新增 `/api/memories/recycle`（list/restore/purge）、`/api/memories/rag/{rid}` DELETE。
+- **账本定稿分层**：`core_memories` 增 `authority`（llm=AI归纳 uncertain / nurse=护士定稿），按 source 自动推断（manual/correct:/nurse → nurse，llm/migrate → llm）；recall_v3 注入时 llm 记忆标注"（AI 归纳，仅供参考）"；API `/api/memories/core/{mid}/confirm|unconfirm`。防"把 AI 猜错当老人真相"。
+
+### P1 —— 沉淀异步与纠错联动（commit a42cd49、d879aa6）
+
+- **consolidate 租约**：`_in_flight` 集合，同 uid 同一时刻只跑一个 consolidate（空闲定时器/上下文满/手动 suggest 竞争防重）。
+- **回收站周期深清**：reminder tick 顺带 `purge_soft_deleted`（`recycle_purge_days` 默认 30，settings 可调）。
+- **反馈纠错 stale 联动**：`correct_from_feedback` 定位旧记忆（core/rag 内容匹配）→ 软删 + 清 Chroma 向量 → 写回正确内容（护士入口定稿 authority=nurse）；API `POST /api/memories/correct`；医疗/身份红线照常拦截。对标 MaiBot "否定=软失效 + 三层撤退 + 可回滚"。
+
+### P2 —— 对话体验（commit 79697d2、737f0de）
+
+- **记忆召回节流缓存**：chat.build_system 的 RAG 召回走短 TTL 缓存（同 uid 15s 复用），避免短时间多轮重复向量检索省 embedding；缓存上限 32 uid。
+- **表达习惯注入**：`expressions` 语录表（situation/style/count/checked/authority，同 situation+style merge 累加）；chat 注入【表达习惯参考】块（≤3 条已审语录），带护工身份边界措辞（"酌情自然使用，不逐字模仿"）。
+- **风格学习（expression）**：consolidate 时 LLM 顺带提取老人表达习惯（CONSOLIDATE_PROMPT 增 expressions 输出 ≤3 条）；`_apply_expression` 服务端自审（医疗/身份/脏话红线多字词过滤、长度限制）→ 落待审（checked=0）；API `/api/memories/expressions` + approve/reject（对标 MaiBot checked_only 审核双环）。
+
+### P3 —— 保护与导入（commit 03d1869）
+
+- **核心记忆保护**：`core_memories` 增 `pinned`（护士保护：不被自动清理、不被画像整体覆盖——persona 覆盖跳过 pinned）；API pin/unpin。
+- **批量导入中心**：`db.import_memories` 按段落/行切分（超长按句切 ≤160 字）入 pending 待护士审核；API `POST /api/memories/import`。导入不绕过审核，医疗红线由护士把关。
+- **暂缓项**：多路分数校准（Robot 单路 Chroma+图谱一跳，跨路不可比问题弱）与关系半衰期演化（记忆走 TTL + 核心稳定 + pinned），ROI 低，记 TODO。
+
+### 前端与测试
+
+- `frontend/packages/admin` 记忆页升级：核心记忆 定稿/退AI/保护/删除 + RAG 删除 + 待确认 确认/拒绝 + 批量导入 + 回收站（恢复/深清）；已构建 dist。
+- 新增 `LLM/tests/test_memory_v4.py` 9 用例（幂等/软删/恢复/定稿/纠错/表达合并与红线/导入/pinned 画像守卫）；全量回归 **62 passed**。
+
+### 验证
+
+- `pytest LLM/tests -q` → 62 passed；临时库冒烟（init_db + migrate + settings + 新列）；`import LLM.server` 路由 52+ 无冲突；前端 pnpm build 通过。
+- 端到端（真实起服 + 浏览器走记忆管理）待控制者执行。

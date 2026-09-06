@@ -45,3 +45,4 @@ ros2_car/src/robot_bringup/maps/*.yaml
 LLM/models/
 .research_sherpa/
 .pip-cache/
+LLM/data/*.wal
