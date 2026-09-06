@@ -41,6 +41,21 @@ _buf_lock = threading.Lock()
 _pending_turns: dict[str, list[dict]] = {}   # uid -> [{role, content}, ...]
 _last_activity: dict[str, float] = {}        # uid -> 最后对话时间戳
 _timers: dict[str, threading.Timer] = {}     # uid -> 空闲定时器
+_in_flight: set[str] = set()                 # uid -> 正在 consolidate（租约，防并发重复整理）
+
+
+def _try_acquire(uid: str) -> bool:
+    """租约：同一 uid 同一时刻只允许一个 consolidate 在跑（空闲定时器/上下文满/手动 suggest 竞争时防重）。"""
+    with _buf_lock:
+        if uid in _in_flight:
+            return False
+        _in_flight.add(uid)
+        return True
+
+
+def _release(uid: str) -> None:
+    with _buf_lock:
+        _in_flight.discard(uid)
 
 
 def _profile_memory(profile: dict | None, uid: str) -> list[str]:
@@ -442,7 +457,19 @@ def _apply_entry(uid: str, e: dict) -> dict:
 
 
 def consolidate(uid: str, client, model: str) -> dict:
-    """整理某位老人这段时间的对话：提取记忆（去重/合并/冲突）+ 话题摘要 + 画像。"""
+    """整理某位老人这段时间的对话：提取记忆（去重/合并/冲突）+ 话题摘要 + 画像。
+
+    P1a 租约：同 uid 正在整理时直接跳过（空闲定时器/上下文满/手动触发并发竞争防重）。
+    """
+    if not _try_acquire(uid):
+        return {"ok": True, "skipped": True, "reason": "该老人正在整理中（租约占用）"}
+    try:
+        return _consolidate_locked(uid, client, model)
+    finally:
+        _release(uid)
+
+
+def _consolidate_locked(uid: str, client, model: str) -> dict:
     turns = _take_pending(uid)
     if not turns:
         return {"ok": True, "skipped": True, "reason": "无待整理对话"}

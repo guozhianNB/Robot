@@ -22,6 +22,7 @@ DEFAULT_SETTINGS = {
     "router_llm_enabled": True,     # 思考路由：规则未命中时用 LLM 快速预判兜底
     "memory_consolidation_enabled": True,  # 记忆整理（话题结束后批量沉淀）
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
+    "recycle_purge_days": 30,       # 回收站软删记忆保留多少天后物理清理
     "asr_enabled": True,            # 语音识别（真实开关）
     "tts_enabled": True,            # 语音合成（真实开关）
     "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）

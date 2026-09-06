@@ -121,6 +121,14 @@ def _run():
             expired = db.cleanup_expired_memories()
             if expired:
                 audit.log("memory_change", action="expire", count=expired, note="TTL 到期自动清除")
+            # 回收站周期深清（软删超宽限期行物理清理，默认 30 天）
+            try:
+                purged = db.purge_soft_deleted(days=float(settings.get("recycle_purge_days", 30)))
+                if purged:
+                    audit.log("memory_change", action="purge_tick", count=purged,
+                              note="回收站软删超过 30 天已物理清理")
+            except Exception as e:
+                audit.log("memory_change", action="purge_tick_error", error=str(e))
         except Exception as e:
             audit.log("reminder", action="tick_error", error=str(e))
         _stop_evt.wait(_tick)      # 置位后立即醒来退出，无需等整轮 tick
