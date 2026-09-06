@@ -364,19 +364,54 @@ def _append_summary_and_episode(uid: str, digest: str, external_id: str = "") ->
         audit.log("memory_change", action="episode_add", uid=uid, content=digest)
 
 
-def _upsert_portrait(uid: str, portrait: str) -> None:
+# R2 画像防退化：AI 新画像与现 persona 相似度 ≥ 该阈值 → 跳过重写（防 LLM 抖动/内容退化）
+PORTRAIT_SKIP_SIM = 0.90
+
+
+def _upsert_portrait(uid: str, portrait: str, source: str = "llm:consolidate",
+                     by: str = "nurse") -> None:
+    """画像写入核心记忆（type=persona, importance=5），旧 persona 软覆盖（删旧写新）。
+
+    - P3: pinned（护士保护/手动维护）条目绝不覆盖
+    - R2: AI 生成的新画像与现 persona 高度相似（≥PORTRAIT_SKIP_SIM）→ 跳过不重写，
+          防止 consolidate 每轮 LLM 输出微小抖动导致画像反复重写、内容退化
+    """
     if any(k in portrait for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type="persona",
                   content=portrait, reason="医疗只读红线")
         return
-    # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
-    # P3: pinned（护士保护的）条目绝不覆盖
-    for m in db.list_core_memories(uid):
-        if m["type"] == "persona" and not m.get("pinned"):
+    existing = [m for m in db.list_core_memories(uid) if m["type"] == "persona"]
+    # 护士手动维护的画像（pinned）存在且本次为 AI 归纳 → 直接跳过，绝不覆盖
+    if source.startswith("llm") and any(m.get("pinned") for m in existing):
+        audit.log("memory_change", action="portrait_skip", uid=uid,
+                  reason="护士已手动维护画像(pinned)，AI 不覆盖")
+        return
+    # 防退化：AI 归纳且与现状几乎相同 → 不重写（护士手动维护不受此限）
+    if source.startswith("llm") and existing:
+        prev = max(existing, key=lambda m: m.get("importance", 0) or 0)
+        prev_text = prev.get("content") or ""
+        if prev_text:
+            idx = vectors.build_index([{"id": "p", "text": prev_text}])
+            hits = vectors.recall(idx, portrait, top_k=1)
+            if hits and hits[0]["score"] >= PORTRAIT_SKIP_SIM:
+                audit.log("memory_change", action="portrait_skip", uid=uid,
+                          reason="与现画像相似度过高")
+                return
+    for m in existing:
+        if not m.get("pinned"):
             db.delete_core_memory_hard(m["id"])
-    db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
+    db.add_core_memory(uid, "persona", portrait, importance=5,
+                       source=source if not source.startswith("nurse") else "nurse:manual",
+                       authority="nurse" if source.startswith(("nurse", "manual")) else "llm")
+    if source.startswith(("nurse", "manual")):
+        # 护士手动维护的画像：pinned 防 AI 覆盖
+        for m in db.list_core_memories(uid):
+            if m["type"] == "persona" and m.get("content") == portrait:
+                db.set_core_pinned(m["id"], True)
+                break
     db.set_portrait(uid, portrait)  # 双写过渡，兼容 chat.py/server.py 旧读路径
-    audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
+    audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait,
+              source=source, by=by)
 
 
 CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句老人新说的话。

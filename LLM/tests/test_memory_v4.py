@@ -124,3 +124,24 @@ def test_correct_instant_signal_gate(d):
     # 超长句不做即时预判
     r3 = rag.correct_instant("e1", "其实我" + "聊" * 90, None, "fake")
     assert r3["reason"] == "no_signal"
+
+
+def test_portrait_guard_and_nurse_override(d):
+    """R2 画像防退化 + 护士手动维护优先（pinned 不被 AI 覆盖）。"""
+    from LLM import memory as rag
+    # 首次 AI 画像
+    rag._upsert_portrait("e1", "老人性格温和，喜欢京剧，说话亲切", source="llm:consolidate")
+    personas = [m for m in d.list_core_memories("e1") if m["type"] == "persona"]
+    assert len(personas) == 1 and personas[0]["authority"] == "llm"
+    # 高度相似 → 跳过重写（防退化）
+    rag._upsert_portrait("e1", "老人性格温和，喜欢京剧，说话亲切", source="llm:consolidate")
+    personas = [m for m in d.list_core_memories("e1") if m["type"] == "persona"]
+    assert len(personas) == 1
+    # 护士手动维护 → pinned
+    rag._upsert_portrait("e1", "护士备注：老人听力稍弱，说话要大声些", source="nurse:manual", by="nurse")
+    personas = [m for m in d.list_core_memories("e1") if m["type"] == "persona"]
+    assert len(personas) == 1 and personas[0]["pinned"] == 1 and personas[0]["authority"] == "nurse"
+    # AI 再整理 → 不覆盖护士维护画像
+    rag._upsert_portrait("e1", "AI 生成的另一个画像内容", source="llm:consolidate")
+    personas = [m for m in d.list_core_memories("e1") if m["type"] == "persona"]
+    assert len(personas) == 1 and "听力稍弱" in personas[0]["content"]

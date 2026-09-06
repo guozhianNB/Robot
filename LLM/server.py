@@ -176,6 +176,11 @@ class MemoryImportIn(BaseModel):
     split: str = "paragraph"     # paragraph | line
 
 
+class PortraitIn(BaseModel):
+    uid: str
+    content: str
+
+
 class SuggestIn(BaseModel):
     uid: str
     user_text: str = ""
@@ -388,6 +393,15 @@ async def memories_import(m: MemoryImportIn):
     if not (m.text or "").strip():
         return {"ok": False, "error": "text 不能为空"}
     return await asyncio.to_thread(db.import_memories, m.uid, m.text, by="nurse", split=m.split)
+
+
+@app.post("/api/memories/portrait")
+async def memories_portrait_set(p: PortraitIn):
+    """护士手动维护老人画像：写入 pinned 保护，AI consolidate 不再覆盖（对标 MaiBot 画像 override）。"""
+    if not (p.content or "").strip():
+        return {"ok": False, "error": "content 不能为空"}
+    await asyncio.to_thread(rag._upsert_portrait, p.uid, p.content, source="nurse:manual", by="nurse")
+    return {"ok": True}
 
 
 @app.delete("/api/memories/core/{mid}")
