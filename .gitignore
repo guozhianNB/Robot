@@ -46,3 +46,5 @@ LLM/models/
 .research_sherpa/
 .pip-cache/
 LLM/data/*.wal
+/linorobot2/
+/localization-with-ROS/
