@@ -373,3 +373,7 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 ### 测试
 
 - `test_memory_v4.py` 新增 3 例（correct_instant 信号门 ×3 断言、画像防退化 + 护士 pinned 守卫）；全量回归 **64 passed**。
+
+### 补充（同日）：admin 记忆页画像维护卡片
+
+- R2 的 `POST /api/memories/portrait` 补前端入口：记忆页新增「老人画像」卡片（textarea + 保存为护士维护版），显示当前版本状态（AI 归纳 / 护士维护 pinned），护士可直接修正画像且 AI consolidate 不再覆盖——R2 闭环收尾。前端已构建 dist，回归 64 passed。

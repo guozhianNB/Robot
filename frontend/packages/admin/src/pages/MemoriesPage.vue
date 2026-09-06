@@ -51,7 +51,7 @@ async function act(fn: () => Promise<void>) {
   try { await fn(); await load(); } catch (e) { msg.value = `操作失败：${e}`; }
 }
 
-function onChange() { load(); loadRecycle(); }
+function onChange() { load(); loadRecycle(); loadPortrait(); }
 
 // 核心记忆操作
 const coreConfirm = (mid: number) => act(async () => { await api(`/api/memories/core/${mid}/confirm`, "POST"); });
@@ -82,7 +82,37 @@ const doImport = async () => {
   await load();
 };
 
-onMounted(async () => { await loadProfiles(); await load(); await loadRecycle(); });
+// ---- 老人画像：护士手动维护（R2：写 pinned，AI consolidate 不再覆盖）----
+const portrait = ref("");
+const portraitNurse = ref(false);   // 当前画像是否护士维护(pinned)
+const portraitSaving = ref(false);
+
+async function loadPortrait() {
+  const b = await api(`/api/context?uid=${uid.value}`);
+  portrait.value = b.portrait ?? "";
+  const persona = (core.value ?? []).find((m: Mem) => m.type === "persona");
+  portraitNurse.value = !!(persona?.pinned && (persona.authority ?? "llm") === "nurse");
+}
+
+async function savePortrait() {
+  if (!portrait.value.trim()) return;
+  portraitSaving.value = true;
+  msg.value = "";
+  try {
+    await fetch("/api/memories/portrait", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uid: uid.value, content: portrait.value }),
+    });
+    await load();
+    await loadPortrait();
+  } catch (e) {
+    msg.value = `保存失败：${e}`;
+  } finally {
+    portraitSaving.value = false;
+  }
+}
+
+onMounted(async () => { await loadProfiles(); await load(); await loadRecycle(); await loadPortrait(); });
 </script>
 
 <template>
@@ -98,6 +128,18 @@ onMounted(async () => { await loadProfiles(); await load(); await loadRecycle();
       <button @click="load">刷新</button>
       <span v-if="msg" class="err">{{ msg }}</span>
     </div>
+
+    <section class="portrait-card">
+      <h3>👤 老人画像
+        <small>（护士可直接维护修正；保存后 AI 不再自动覆盖）</small>
+      </h3>
+      <textarea v-model="portrait" rows="3" placeholder="老人画像：性格/习惯/偏好/说话风格（≤150字）"></textarea>
+      <div class="row-actions">
+        <button :disabled="portraitSaving" @click="savePortrait">保存画像（护士维护）</button>
+        <span v-if="portraitNurse" class="ok">✓ 当前为护士维护版本（AI 不再覆盖）</span>
+        <span v-else class="guess">当前为 AI 归纳版本，保存后转护士维护</span>
+      </div>
+    </section>
 
     <section>
       <h3>🧠 核心记忆
@@ -179,6 +221,11 @@ onMounted(async () => { await loadProfiles(); await load(); await loadRecycle();
 .pick select { padding: 8px 10px; border-radius: 8px; border: none;
   background: #1e293b; color: #e2e8f0; min-width: 180px; }
 .err { color: #f87171; font-size: 13px; }
+.portrait-card { background: #17233f; border: 1px solid #1e3a5f; border-radius: 10px; padding: 14px; }
+.row-actions { display: flex; align-items: center; gap: 10px; }
+.row-actions button { padding: 8px 14px; border-radius: 8px; border: none;
+  background: #1e3a5f; color: #e2e8f0; cursor: pointer; }
+.row-actions button:disabled { opacity: 0.6; cursor: default; }
 section { margin-bottom: 24px; }
 h3 { margin: 0 0 10px; font-size: 16px; }
 h3 small { color: #64748b; font-weight: normal; font-size: 12px; }
