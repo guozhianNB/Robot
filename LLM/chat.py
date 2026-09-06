@@ -23,6 +23,32 @@ from mcp.client.session import ClientSession
 # stdio_client：用来把你的mcp服务端程序，启动为一个子进程，通过标准输入输出和客户端通信
 from mcp.client.stdio import stdio_client
 
+# ---- P2a 记忆召回节流缓存（对标 MaiBot heuristic 记忆的缓存思想，省 embedding/上下文）----
+# 同 uid 的 RAG 召回 context 做短 TTL 缓存：短时间多轮对话复用同一份召回，避免每轮重复向量检索
+_MEM_CACHE_TTL = 15.0          # 秒：记忆召回结果缓存有效期
+_mem_cache: dict[str, tuple[float, str]] = {}   # uid -> (ts, recall_context)
+
+
+def _recall_cached(uid: str, query: str) -> str:
+    """带节流的 recall_v3：TTL 内复用缓存 context；话题变化(query 语义漂移)则立即刷新。"""
+    import hashlib as _hl
+    import time as _t
+    from . import memory as rag
+    now = _t.time()
+    qsig = _hl.md5(query.encode("utf-8")).hexdigest()[:12]
+    prev = _mem_cache.get(uid)
+    if prev and (now - prev[0]) < _MEM_CACHE_TTL:
+        cached_ctx = prev[1]
+        if cached_ctx:
+            return cached_ctx   # 节流期内：直接用上次召回结果（对话轮次间话题连续，够用）
+    ctx = rag.recall_v3(uid, query)["context"]
+    _mem_cache[uid] = (now, ctx)
+    # 防缓存无限增长：只保留最近 32 个 uid
+    if len(_mem_cache) > 32:
+        for k in list(_mem_cache)[:-32]:
+            _mem_cache.pop(k, None)
+    return ctx
+
 PERSONA = (
     "你是'小护'，一位温柔、耐心、专业的 AI 陪护机器小车，正在照顾一位老人。"
     "说话要像护工又像家人：语气亲切温和、句子简短口语化、多用'您'、适当关心起居饮食。"
@@ -105,18 +131,42 @@ def _build_query(user_text: str, history: list[dict]) -> str:
     return " ".join(parts).strip()
 
 
+def _expression_hint(uid: str) -> str:
+    """表达习惯参考块（对标 MaiBot 表达注入）：注入已审核的「情景→说法」语录，让模型自然吸收。
+
+    注意身份边界：这是老人习惯的说法参考，机器人保持护工身份、酌情自然使用，不逐字模仿。
+    """
+    exprs = db.pick_expressions(uid, limit=3)
+    if not exprs:
+        return ""
+    lines = []
+    for e in exprs:
+        situation = (e.get("situation") or "").strip()
+        style = (e.get("style") or "").strip()
+        if situation and style:
+            lines.append(f'- 当老人"{situation}"时，可以用"{style}"这样的口吻回应')
+    if not lines:
+        return ""
+    return ("【表达习惯参考（老人习惯的口吻，仅供回应时酌情自然使用；"
+            "你始终是护工'小护'，保持亲切得体的身份，不逐字模仿）】\n" + "\n".join(lines))
+
+
 def build_system(uid: str, settings: dict, query: str = "") -> str:
     """组装 System Prompt：角色 + 安全红线 + 记忆（recall_v3 已含档案 style/画像与核心记忆 persona）+ 摘要。
-    query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。"""
-    recall = rag.recall_v3(uid, query)
+    query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。
+    P2a：RAG 召回走短 TTL 缓存（同 uid 15s 内复用），避免短时间多轮重复向量检索。"""
+    recall_ctx = _recall_cached(uid, query) if query else rag.recall_v3(uid, "")["context"]
     parts = [
         PERSONA,
         SAFETY,
-        f"\n【我了解到的关于这位老人的信息（可能不全，仅供参考）】\n{recall['context']}",
+        f"\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n{recall_ctx}",
     ]
     summary = db.get_summary(uid)
     if summary:
         parts.append(f"\n【更早对话的历史摘要】\n{summary}")
+    expr_hint = _expression_hint(uid)
+    if expr_hint:
+        parts.append("\n" + expr_hint)
     parts.append(
         "\n【当前时间】" + time.strftime("%Y-%m-%d %H:%M (%A)") +
         "\n如果老人问'现在几点/今天星期几'，按上面的时间回答。"

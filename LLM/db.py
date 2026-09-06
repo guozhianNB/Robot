@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS delete_operations (
   snapshot_json TEXT DEFAULT '{}', reason TEXT DEFAULT '', by TEXT DEFAULT '',
   created_at TEXT, restored_at TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS expressions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT DEFAULT '', situation TEXT DEFAULT '', style TEXT DEFAULT '',
+  count INTEGER DEFAULT 1, checked INTEGER DEFAULT 0,   -- 0 待审 1 已审可用
+  authority TEXT DEFAULT 'llm',   -- llm(自动学) | nurse(人工维护)
+  source TEXT DEFAULT '', ts TEXT, updated_at TEXT
+);
 """
 
 
@@ -106,7 +113,7 @@ def init_db():
                 "birthday": "birthday TEXT DEFAULT ''",
             })
             # 软删 / 幂等列（跨表统一补齐，兼容旧库）
-            for table in ("memories", "core_memories", "rag_memories"):
+            for table in ("memories", "core_memories", "rag_memories", "expressions"):
                 _ensure_columns(conn, table, {
                     "is_deleted": "is_deleted INTEGER DEFAULT 0",
                     "deleted_at": "deleted_at TEXT DEFAULT ''",
@@ -491,7 +498,7 @@ def list_external_refs(uid: str = "") -> list[dict]:
 # ---------------------------------------------------------------- 软删 + 回收站（delete_operations 快照）
 def soft_delete(table: str, row_id: int, uid: str = "", reason: str = "", by: str = "") -> int:
     """软删任意记忆表行：置 is_deleted=1 + 全量快照入 delete_operations。表名白名单防注入。"""
-    table = table if table in ("memories", "core_memories", "rag_memories") else "memories"
+    table = table if table in ("memories", "core_memories", "rag_memories", "expressions") else "memories"
     ts = now_iso()
     with _lock:
         conn = _conn()
@@ -574,6 +581,76 @@ def purge_soft_deleted(days: float = 30.0) -> int:
             return total
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------- expressions（表达习惯语录库）
+def upsert_expression(uid: str, situation: str, style: str, authority: str = "llm",
+                      source: str = "") -> int:
+    """记录一条「情景→说法」。同 uid+situation+style 合并累加 count（对标 MaiBot Expression merge）。"""
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM expressions WHERE uid=? AND situation=? AND style=? AND is_deleted=0",
+                (uid, situation, style)).fetchone()
+            if row:
+                conn.execute("UPDATE expressions SET count=count+1, updated_at=? WHERE id=?",
+                             (ts, row["id"]))
+                conn.commit()
+                return row["id"]
+            cur = conn.execute(
+                "INSERT INTO expressions (uid,situation,style,count,checked,authority,source,ts,updated_at) "
+                "VALUES (?,?,?,1,0,?,?,?,?)",
+                (uid, situation, style, authority, source, ts, ts))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def list_expressions(uid: str = "", checked_only: bool = False, limit: int = 100) -> list[dict]:
+    sql = "SELECT * FROM expressions WHERE is_deleted=0"
+    args = []
+    if uid:
+        sql += " AND uid=?"
+        args.append(uid)
+    if checked_only:
+        sql += " AND checked=1"
+    sql += " ORDER BY count DESC, id DESC LIMIT ?"
+    args.append(limit)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def set_expression_checked(eid: int, checked: bool) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE expressions SET checked=?, updated_at=? WHERE id=?",
+                         (1 if checked else 0, now_iso(), eid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def soft_delete_expression(eid: int, uid: str = "") -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE expressions SET is_deleted=1, deleted_at=? WHERE id=?",
+                         (now_iso(), eid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def pick_expressions(uid: str, limit: int = 3) -> list[dict]:
+    """对话注入用：取该 uid 已审核的高频表达（checked=1）。"""
+    return list_expressions(uid=uid, checked_only=True, limit=limit)
 
 
 # ---------------------------------------------------------------- reminders
