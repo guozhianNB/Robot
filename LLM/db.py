@@ -272,14 +272,19 @@ def cleanup_expired_memories() -> int:
 
 
 # ---------------------------------------------------------------- core_memories
-def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source="", ts=None) -> int:
+def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source="", ts=None,
+                    authority=None) -> int:
     ts = ts or now_iso()
+    if authority is None:
+        # 来源推断：人工/护士/迁移修正 → 定稿；模型归纳/整理 → llm(uncertain)
+        authority = "nurse" if (source or "").startswith(("manual", "correct:", "nurse")) else "llm"
     with _lock:
         conn = _conn()
         try:
             cur = conn.execute(
-                "INSERT INTO core_memories (uid,type,content,confidence,importance,source,ts,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                (uid, mtype, content, confidence, importance, source, ts, ts))
+                "INSERT INTO core_memories (uid,type,content,confidence,importance,source,ts,updated_at,authority) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (uid, mtype, content, confidence, importance, source, ts, ts, authority))
             conn.commit()
             return cur.lastrowid
         finally:
@@ -383,6 +388,33 @@ def get_rag_by_external(uid: str, external_id: str) -> dict | None:
             "SELECT * FROM rag_memories WHERE uid=? AND external_id=? AND is_deleted=0",
             (uid, external_id)).fetchone()
         return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def find_memories_by_content(uid: str, content: str, tables=("core_memories", "rag_memories"),
+                             fuzzy: bool = True) -> dict[str, list[dict]]:
+    """按内容找指定表的行（精确或包含匹配，供纠错/批量作废定位源条目）。"""
+    out: dict[str, list[dict]] = {}
+    conn = _conn()
+    try:
+        for t in tables:
+            if t not in ("core_memories", "rag_memories", "memories"):
+                continue
+            if fuzzy:
+                pat = content[:30].strip() if content else ""
+                if not pat:
+                    out[t] = []
+                    continue
+                rows = conn.execute(
+                    f"SELECT * FROM {t} WHERE uid=? AND is_deleted=0 AND content LIKE ? "
+                    "ORDER BY id DESC LIMIT 20", (uid, f"%{pat}%")).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM {t} WHERE uid=? AND is_deleted=0 AND content=? "
+                    "ORDER BY id DESC LIMIT 20", (uid, content)).fetchall()
+            out[t] = [dict(r) for r in rows]
+        return out
     finally:
         conn.close()
 

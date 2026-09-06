@@ -534,3 +534,49 @@ def _clean_expired():
             db.delete_memory_hard(m["id"])
             audit.log("memory_change", action="expire", uid=m["uid"], mid=m["id"],
                       content=m["content"], reason="TTL 到期")
+
+
+# ---------------------------------------------------------------- P1b 反馈纠错（stale 联动）
+def correct_from_feedback(uid: str, old_content: str, new_content: str,
+                          target: str = "auto", by: str = "nurse") -> dict:
+    """老人/护士反馈"记错了"时的纠错写回（对标 MaiBot reject→FORGET + correct 写回语义）：
+
+    - 定位旧记忆（core_memories / rag_memories 精确/包含匹配）
+    - 旧条目软删（进回收站可回滚）—— rag 条目同步清 Chroma 向量（检索侧立即失效）
+    - 新内容按 authority 语义写入 core（nurse 定稿）；无旧条目命中则当作新增
+    - 全程审计留痕；纯服务端实现，不依赖 LLM
+    """
+    from . import ragstore as _rs
+    results = db.find_memories_by_content(uid, old_content,
+                                          tables=("core_memories", "rag_memories"))
+    stats = {"core_softdel": 0, "rag_softdel": 0, "added": 0, "redline": 0}
+    new_text = (new_content or "").strip()
+    if any(k in new_text for k in MEDICAL_KEYWORDS) or any(k in new_text for k in IDENTITY_KEYWORDS):
+        audit.log("memory_correct", action="blocked", uid=uid, content=new_text,
+                  reason="医疗/身份红线")
+        return {"ok": False, "error": "医疗/身份信息不允许通过此入口修改", "stats": stats}
+
+    hits = list(results.get("core_memories", [])) + list(results.get("rag_memories", []))
+    for m in hits:
+        table = "core_memories" if m.get("chroma_id") is None else "rag_memories"
+        # rag 行特征：有 chroma_id 字段 → 走 rag 软删
+        if "chroma_id" in m and m.get("chroma_id"):
+            db.delete_rag_memory(m["id"], uid=uid, reason="feedback_correct", by=by)
+            _rs.delete_by_chroma_id(uid, m["chroma_id"])
+            stats["rag_softdel"] += 1
+        else:
+            db.delete_core_memory(m["id"], uid=uid, reason="feedback_correct", by=by)
+            stats["core_softdel"] += 1
+
+    if new_text:
+        # 纠错后的正确内容 → core 记忆（type=fact），护士入口即定稿
+        if _rag_dedup_check(uid, new_text):
+            stats["added"] = 0
+        else:
+            mid = db.add_core_memory(uid, "fact", new_text, confidence=1.0, importance=3,
+                                     source=f"correct:{by}")
+            stats["added"] = 1 if mid else 0
+
+    audit.log("memory_correct", action="feedback", uid=uid, old=old_content[:200],
+              new=new_text[:200], by=by, stats=stats)
+    return {"ok": True, "stats": stats}

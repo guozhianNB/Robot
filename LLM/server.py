@@ -163,6 +163,13 @@ class MemoryIn(BaseModel):
     status: str = "pending"
 
 
+class MemoryCorrectIn(BaseModel):
+    uid: str
+    old_content: str
+    new_content: str = ""
+    by: str = "nurse"
+
+
 class SuggestIn(BaseModel):
     uid: str
     user_text: str = ""
@@ -354,6 +361,19 @@ async def recycle_purge(days: float = Query(30.0)):
     from . import log as audit
     audit.log("memory_change", action="purge", count=n, days=days, by="nurse")
     return {"ok": True, "purged": n}
+
+
+@app.post("/api/memories/correct")
+async def memories_correct(c: MemoryCorrectIn):
+    """反馈纠错：老人/护士指出旧记忆错误 → 旧条目软删(回收站可回滚) + RAG 向量失效 + 写回正确内容。
+
+    对标 MaiBot stale 联动：检索/画像不再命中旧条目，纠正全程留痕可回滚。
+    """
+    if not (c.old_content or "").strip():
+        return {"ok": False, "error": "old_content 不能为空"}
+    result = await asyncio.to_thread(rag.correct_from_feedback,
+                                     c.uid, c.old_content, c.new_content, by=c.by)
+    return result
 
 
 @app.delete("/api/memories/core/{mid}")
