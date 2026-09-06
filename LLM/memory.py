@@ -33,6 +33,13 @@ from .conf import (MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS,
 MEDICAL_KEYWORDS = ["药", "剂量", "病史", "诊断", "血压", "血糖", "手术", "住院", "过敏",
                     "服用", "胰岛素", "病历", "医嘱", "检查结果", "癌", "肿瘤"]
 
+# R1 即时纠错信号词（对标 MaiBot feedback_signal_tokens）：命中才让 LLM 判断是否有纠正，省每轮 LLM 调用
+CORRECT_SIGNALS = [
+    "不是", "不对", "错了", "记错", "说错", "说反", "搞错", "更正", "纠正",
+    "其实", "应该是", "不是的", "改一下", "更新", "忘了说", "补充一下", "以后别",
+    "别再", "不要叫我", "别叫我", "我姓", "我不叫", "其实我", "我是",
+]
+
 # 记忆整理：去重向量相似度阈值（超过视为重复）
 DEDUP_SIM_THRESHOLD = 0.55
 
@@ -386,11 +393,22 @@ CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句
 
 
 def correct_instant(uid: str, user_text: str, client, model: str) -> dict:
-    """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。"""
+    """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。
+
+    R1（对标 MaiBot feedback_signal_tokens）：先做信号词规则预筛，无纠正信号直接返回，
+    省去每轮一次无谓的 LLM 调用（原先每轮对话都让 LLM 判断，很费 token）。
+    """
     from .chat import llm_json
+    # ---- 规则预筛：纠正信号词 ----
+    text = (user_text or "").strip()
+    if not text or len(text) > 80:   # 超长句不预判（可能含复杂纠正，交给 consolidate）
+        return {"corrected": False, "reason": "no_signal"}
+    signal_hit = any(sig in text for sig in CORRECT_SIGNALS)
+    if not signal_hit:
+        return {"corrected": False, "reason": "no_signal"}
     cores = db.list_core_memories(uid, limit=30)
     mem_text = "\n".join(f"[#{m['id']}] {m['content']}" for m in cores) or "（暂无）"
-    data = llm_json(client, model, CORRECT_PROMPT.format(memories=mem_text, text=user_text))
+    data = llm_json(client, model, CORRECT_PROMPT.format(memories=mem_text, text=text))
     if not data:
         # llm_json 失败/解析失败返回空 dict，区别于"无纠正"
         audit.log("memory_correct", action="instant_error", uid=uid, error="LLM 返回空或解析失败")

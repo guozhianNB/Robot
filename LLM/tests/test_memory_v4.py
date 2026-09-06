@@ -109,3 +109,18 @@ def test_core_pinned_guard(d):
     personas = [m for m in core if m["type"] == "persona"]
     assert len(personas) == 1 and "新画像" in personas[0]["content"]
     assert any(m["id"] == mid and m["pinned"] == 1 for m in core)
+
+
+def test_correct_instant_signal_gate(d):
+    """R1 信号词预筛：无纠正信号 → 不调 LLM 直接 no_signal 早退（省每轮调用）。"""
+    from LLM import memory as rag
+
+    # 无信号词（日常闲聊）→ no_signal，不触发 LLM
+    r = rag.correct_instant("e1", "今天天气不错", None, "fake")
+    assert r == {"corrected": False, "reason": "no_signal"}
+    # 有信号词（client=None 无法真调 LLM）→ 门放行进入 LLM 阶段并报 llm_error，证明信号门生效
+    r2 = rag.correct_instant("e1", "我不是姓张，我姓王", None, "fake")
+    assert r2["reason"] == "llm_error"
+    # 超长句不做即时预判
+    r3 = rag.correct_instant("e1", "其实我" + "聊" * 90, None, "fake")
+    assert r3["reason"] == "no_signal"
