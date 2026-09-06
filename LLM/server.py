@@ -466,6 +466,33 @@ async def graph_view(uid: str = Query("elder_001")):
             "entities": g.list_entities(uid), "relations": g.list_relations(uid)}
 
 
+# ---------------------------------------------------------------- 表达习惯（风格学习产物）
+@app.get("/api/memories/expressions")
+async def expressions_list(uid: str = Query("elder_001")):
+    return {"ok": True, "expressions": db.list_expressions(uid=uid)}
+
+
+@app.post("/api/memories/expressions/{eid}/approve")
+async def expressions_approve(eid: int):
+    """护士审核通过 → 该语录参与对话注入（对标 MaiBot checked_only）。"""
+    db.set_expression_checked(eid, True)
+    from . import log as audit
+    audit.log("memory_change", action="expression_approve", eid=eid, by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/expressions/{eid}/reject")
+async def expressions_reject(eid: int):
+    """护士拒绝 → 软删（进回收站可恢复）。"""
+    db.soft_delete_expression(eid)
+    from . import log as audit
+    audit.log("memory_change", action="expression_reject", eid=eid, by="nurse")
+    return {"ok": True}
+
+
+@app.get("/api/memories/health")
+
+
 @app.get("/api/memories/health")
 async def memories_health():
     from . import embed as e, ragstore, graph as g

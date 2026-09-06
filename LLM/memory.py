@@ -225,7 +225,8 @@ CONSOLIDATE_PROMPT = """你是陪护机器人的记忆管家。下面是刚结�
 {{
   "entries": [...],
   "digest": "这段对话的一句话摘要（≤80字）",
-  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/说话风格（不得包含任何医疗/用药/病史信息））"
+  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/说话风格（不得包含任何医疗/用药/病史信息））",
+  "expressions": [{{"situation": "场景描述", "style": "老人当时的原话说法"}}]
 }}
 
 entries 规则：
@@ -241,6 +242,12 @@ entries 规则：
      普通事件/一般事实填 0-2
 6. 若某条新信息是在【修正】已有记忆（已有记忆编号见上文《已有记忆》列表），
    用 {{"action":"correct", "correct_id":<已有记忆编号>, "content":"修正后的完整内容"}} 表示。
+
+expressions 规则（提取老人说话风格，供机器人学口吻但保持护工身份）：
+- situation=触发场景（如"夸她"、"聊到老伴儿"、"让她喝水"），style=老人原话说法（≤20字，保留原词）。
+- 只提取稳定重复出现或有代表性的口吻/称呼习惯；玩笑、情绪化发泄、无意义口头语不提取。
+- 不得含脏话、医疗用药内容、人名全名、个人隐私（只用"老伴儿""孙女"这类称呼即可）。
+- 每次最多输出 3 条；风格不明则输出空数组。
 """
 
 
@@ -469,6 +476,26 @@ def consolidate(uid: str, client, model: str) -> dict:
         _release(uid)
 
 
+def _apply_expression(uid: str, e: dict) -> dict:
+    """一条老人说话风格表达 → 自审 → 落 expressions 待审（checked=0，护士审核后参与注入）。"""
+    situation = (e.get("situation") or "").strip()
+    style = (e.get("style") or "").strip()
+    if not situation or not style:
+        return {"action": "skip"}
+    if len(style) > 40:
+        return {"action": "skip", "reason": "style 过长"}
+    # 自审：脏话/医疗/身份/隐私红线（服务端兜底，模型也可能漏）
+    # 注意用多字词避免误伤（"操"会误杀"操心"）
+    banned = MEDICAL_KEYWORDS + IDENTITY_KEYWORDS + \
+        ["妈的", "他妈", "混蛋", "滚蛋", "去死", "放屁", "傻逼", "贱人", "妈的逼", "草泥马", "日你", "操你"]
+    if any(k in situation for k in banned) or any(k in style for k in banned):
+        return {"action": "reject", "reason": "红线"}
+    if re.search(r"[\u4e00-\u9fff]{4,}", situation) is None:
+        situation = "日常对话"  # 兜底场景描述
+    eid = db.upsert_expression(uid, situation, style, authority="llm", source="llm:consolidate")
+    return {"action": "add", "eid": eid}
+
+
 def _consolidate_locked(uid: str, client, model: str) -> dict:
     turns = _take_pending(uid)
     if not turns:
@@ -498,6 +525,15 @@ def _consolidate_locked(uid: str, client, model: str) -> dict:
         for rel in data.get("relations", []) or []:
             _upsert_relation(uid, rel)
 
+        expr_stats = {"skip": 0, "reject": 0, "add": 0}
+        for e in data.get("expressions", []) or []:
+            try:
+                r = _apply_expression(uid, e)
+                expr_stats[r.get("action", "skip")] = expr_stats.get(r.get("action", "skip"), 0) + 1
+            except Exception as exc:  # noqa: BLE001
+                audit.log("memory_change", action="expression_error", uid=uid, error=str(exc))
+                expr_stats["skip"] += 1
+
         digest = (data.get("digest") or "").strip()
         if digest:
             _append_summary_and_episode(uid, digest, external_id=ext_id)
@@ -508,7 +544,8 @@ def _consolidate_locked(uid: str, client, model: str) -> dict:
     else:
         audit.log("memory_change", action="consolidate_error", uid=uid, error="解析失败")
 
-    audit.log("memory_change", action="consolidate", uid=uid, turns=len(turns), stats=stats)
+    audit.log("memory_change", action="consolidate", uid=uid, turns=len(turns),
+              stats=stats, expressions=expr_stats)
     return {"ok": True, "stats": stats}
 
 
