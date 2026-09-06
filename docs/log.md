@@ -345,3 +345,31 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 
 - `pytest LLM/tests -q` → 62 passed；临时库冒烟（init_db + migrate + settings + 新列）；`import LLM.server` 路由 52+ 无冲突；前端 pnpm build 通过。
 - 端到端（真实起服 + 浏览器走记忆管理）待控制者执行。
+
+---
+
+## 2026-09-06（下）· 对标 MaiBot 渐进补齐：R1 纠错信号预筛 + R2 画像防退化
+
+**背景：** P0-P3 落地后，用户希望继续渐进补齐（不入整仓 fork MaiBot）。本批做两件高 ROI 项，commit b2e342e（R1）、c0c91b2（R2）。
+
+### R1 —— correct_instant 信号词预筛（commit b2e342e）
+
+- 原实现每轮对话后都让 LLM 判断"这句话是否在纠正旧记忆"（`_post_chat_jobs` → `correct_instant` 无条件调 LLM），很费 token。
+- 新增 `CORRECT_SIGNALS`（24 词：不是/不对/错了/记错/说错/其实/应该是/以后别/我姓/我不叫…，对标 MaiBot feedback_signal_tokens）；无信号词直接 `no_signal` 早退，不调 LLM。
+- 超长句（>80 字）不预判，交给 consolidate 批量处理。
+- 效果：日常闲聊每轮省一次 LLM 调用；纠正语不遗漏（宁多调不放过）。
+
+### R2 —— 画像防退化 + 护士手动维护（commit c0c91b2）
+
+- **AI 画像防退化**：`_upsert_portrait` 中 AI 归纳的新画像与现 persona 字符 n-gram 相似度 ≥ `PORTRAIT_SKIP_SIM`(0.90) → 跳过重写。防 consolidate 每轮 LLM 输出微小抖动反复覆盖画像导致退化。
+- **护士手动维护优先**：`source="nurse:manual"` 写入 persona 时 authority=nurse 且 pinned；之后 AI consolidate 一律不覆盖护士维护的画像（对标 MaiBot 画像 override 与"指纹相同只续期"）。
+- API：`POST /api/memories/portrait`（护士手动画像）。
+
+### 取舍记录
+
+- **R3 访问强化/降权暂缓**：Robot 记忆架构是"核心全量注入 + 话题 RAG 检索"，无关系衰减场景；访问强化（MaiBot 主要用于关系记忆半衰期）在此架构收益低，硬做增加回归风险——与 P3 半衰期同类判断，记 TODO。
+- 剩余可选项：Episode 细粒度多段化、多路分数校准，均已在报告标注 ROI 低，等真有检索质量问题时再做。
+
+### 测试
+
+- `test_memory_v4.py` 新增 3 例（correct_instant 信号门 ×3 断言、画像防退化 + 护士 pinned 守卫）；全量回归 **64 passed**。
