@@ -170,6 +170,12 @@ class MemoryCorrectIn(BaseModel):
     by: str = "nurse"
 
 
+class MemoryImportIn(BaseModel):
+    uid: str
+    text: str
+    split: str = "paragraph"     # paragraph | line
+
+
 class SuggestIn(BaseModel):
     uid: str
     user_text: str = ""
@@ -376,6 +382,14 @@ async def memories_correct(c: MemoryCorrectIn):
     return result
 
 
+@app.post("/api/memories/import")
+async def memories_import(m: MemoryImportIn):
+    """批量导入中心：粘贴文本按段落/行切分入 pending，护士审核确认（对标 MaiBot 导入中心）。"""
+    if not (m.text or "").strip():
+        return {"ok": False, "error": "text 不能为空"}
+    return await asyncio.to_thread(db.import_memories, m.uid, m.text, by="nurse", split=m.split)
+
+
 @app.delete("/api/memories/core/{mid}")
 async def core_memories_delete(mid: int):
     m = db.get_core_memory(mid)
@@ -456,6 +470,30 @@ async def core_memories_unconfirm(mid: int):
     from . import log as audit
     audit.log("memory_change", action="core_unconfirm", mid=mid, uid=m.get("uid", ""),
               authority="llm", by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/core/{mid}/pin")
+async def core_memories_pin(mid: int):
+    """护士保护该核心记忆：不被自动清理、不被画像整体覆盖。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_pinned(mid, True)
+    from . import log as audit
+    audit.log("memory_change", action="core_pin", mid=mid, uid=m.get("uid", ""), by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/core/{mid}/unpin")
+async def core_memories_unpin(mid: int):
+    """解除保护。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_pinned(mid, False)
+    from . import log as audit
+    audit.log("memory_change", action="core_unpin", mid=mid, uid=m.get("uid", ""), by="nurse")
     return {"ok": True}
 
 

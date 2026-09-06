@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS core_memories (
   uid TEXT, type TEXT, content TEXT,
   confidence REAL DEFAULT 0.5, importance INTEGER DEFAULT 0,
   source TEXT DEFAULT '', ts TEXT, updated_at TEXT,
-  authority TEXT DEFAULT 'llm'       -- llm(模型归纳,uncertain) | nurse(人工定稿) | claim(账本定稿)
+  authority TEXT DEFAULT 'llm', pinned INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rag_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +121,8 @@ def init_db():
             _ensure_columns(conn, "rag_memories", {"external_id": "external_id TEXT DEFAULT ''"})
             # P0c 账本定稿：authority=llm(模型归纳) | nurse(护士定稿) | claim(档案账本)
             _ensure_columns(conn, "core_memories", {"authority": "authority TEXT DEFAULT 'llm'"})
+            # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
+            _ensure_columns(conn, "core_memories", {"pinned": "pinned INTEGER DEFAULT 0"})
             conn.commit()
             conn.commit()
         finally:
@@ -209,6 +211,61 @@ def add_memory(uid, mtype, content, status="pending", ttl_days=None,
             return cur.lastrowid
         finally:
             conn.close()
+
+
+def import_memories(uid: str, text: str, by: str = "nurse",
+                    split: str = "paragraph") -> dict:
+    """批量导入中心：粘贴文本按段落/行切分逐条入 memories(pending)，护士审核确认。
+    对标 MaiBot 导入中心；医疗字段仍是待审核状态由护士把关，导入本身不绕过红线。"""
+    text = (text or "").strip()
+    if not text:
+        return {"ok": True, "imported": 0, "skipped": 0}
+    if split == "line":
+        chunks = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    else:  # paragraph：按空行分隔
+        import re as _re
+        chunks = [c.strip() for c in _re.split(r"\n\s*\n", text) if c.strip()]
+    # 过长的段落再按 120 字内按句切，避免单条过大
+    final_chunks: list[str] = []
+    for c in chunks:
+        if len(c) <= 160:
+            final_chunks.append(c)
+        else:
+            import re as _re
+            sents = _re.split(r"(?<=[。！？；])", c)
+            buf = ""
+            for s in sents:
+                if not s.strip():
+                    continue
+                if len(buf) + len(s) > 160 and buf:
+                    final_chunks.append(buf.strip())
+                    buf = s
+                else:
+                    buf += s
+            if buf.strip():
+                final_chunks.append(buf.strip())
+    imported = 0
+    skipped = 0
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            for c in final_chunks:
+                if len(c) > 500:
+                    c = c[:500]
+                if not c:
+                    continue
+                conn.execute(
+                    "INSERT INTO memories (uid,type,content,status,ts,source,created_at,updated_at) "
+                    "VALUES (?,?,?,'pending',?,'import:manual',?,?)",
+                    (uid, "fact", c, ts, ts, ts))
+                imported += 1
+            conn.commit()
+        finally:
+            conn.close()
+    from . import log as audit
+    audit.log("memory_change", action="import", uid=uid, count=imported, by=by)
+    return {"ok": True, "imported": imported, "skipped": skipped}
 
 
 def list_memories(uid: str = None, status: str = None) -> list[dict]:
@@ -363,6 +420,18 @@ def set_core_authority(mid: int, authority: str) -> None:
         try:
             conn.execute("UPDATE core_memories SET authority=?, updated_at=? WHERE id=?",
                          (authority, now_iso(), mid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_core_pinned(mid: int, pinned: bool) -> None:
+    """护士保护核心记忆(pinned)：不被自动清理、不被画像整体覆盖（对标 MaiBot protect/pinned）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE core_memories SET pinned=?, updated_at=? WHERE id=?",
+                         (1 if pinned else 0, now_iso(), mid))
             conn.commit()
         finally:
             conn.close()

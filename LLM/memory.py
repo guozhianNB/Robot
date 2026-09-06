@@ -363,8 +363,9 @@ def _upsert_portrait(uid: str, portrait: str) -> None:
                   content=portrait, reason="医疗只读红线")
         return
     # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
+    # P3: pinned（护士保护的）条目绝不覆盖
     for m in db.list_core_memories(uid):
-        if m["type"] == "persona":
+        if m["type"] == "persona" and not m.get("pinned"):
             db.delete_core_memory_hard(m["id"])
     db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
     db.set_portrait(uid, portrait)  # 双写过渡，兼容 chat.py/server.py 旧读路径
