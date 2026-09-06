@@ -413,6 +413,32 @@ async def core_memories_list(uid: str = Query("elder_001")):
     return {"ok": True, "memories": db.list_core_memories(uid)}
 
 
+@app.post("/api/memories/core/{mid}/confirm")
+async def core_memories_confirm(mid: int):
+    """护士确认核心记忆 = 定稿(nurse)：不再标注'AI 归纳仅供参考'，进入可信层。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_authority(mid, "nurse")
+    from . import log as audit
+    audit.log("memory_change", action="core_confirm", mid=mid, uid=m.get("uid", ""),
+              authority="nurse", by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/core/{mid}/unconfirm")
+async def core_memories_unconfirm(mid: int):
+    """撤销定稿，退回 AI 归纳层（llm）。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_authority(mid, "llm")
+    from . import log as audit
+    audit.log("memory_change", action="core_unconfirm", mid=mid, uid=m.get("uid", ""),
+              authority="llm", by="nurse")
+    return {"ok": True}
+
+
 @app.get("/api/memories/graph")
 async def graph_view(uid: str = Query("elder_001")):
     from . import graph as g

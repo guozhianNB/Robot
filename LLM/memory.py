@@ -114,7 +114,10 @@ def recall_v3(uid: str, query: str) -> dict:
 
     cores = db.list_core_memories(uid, limit=CORE_MEMORY_CAP)
     for m in cores:
-        parts.append(f"[核心] {m['content']}（{m['type']}）")
+        # P0c 账本定稿：AI 归纳(llm)标注"仅供参考"，护士确认(nurse)才视为可信事实
+        auth = (m.get("authority") or "llm")
+        tag = "" if auth in ("nurse", "claim") else "（AI 归纳，仅供参考）"
+        parts.append(f"[核心] {m['content']}（{m['type']}）{tag}")
     sources += [{"type": "core", "id": m["id"]} for m in cores]
 
     for h in ragstore.query(uid, query, top_k=MEMORY_TOP_K):

@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS core_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uid TEXT, type TEXT, content TEXT,
   confidence REAL DEFAULT 0.5, importance INTEGER DEFAULT 0,
-  source TEXT DEFAULT '', ts TEXT, updated_at TEXT
+  source TEXT DEFAULT '', ts TEXT, updated_at TEXT,
+  authority TEXT DEFAULT 'llm'       -- llm(模型归纳,uncertain) | nurse(人工定稿) | claim(账本定稿)
 );
 CREATE TABLE IF NOT EXISTS rag_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +112,9 @@ def init_db():
                     "deleted_at": "deleted_at TEXT DEFAULT ''",
                 })
             _ensure_columns(conn, "rag_memories", {"external_id": "external_id TEXT DEFAULT ''"})
+            # P0c 账本定稿：authority=llm(模型归纳) | nurse(护士定稿) | claim(档案账本)
+            _ensure_columns(conn, "core_memories", {"authority": "authority TEXT DEFAULT 'llm'"})
+            conn.commit()
             conn.commit()
         finally:
             conn.close()
@@ -335,6 +339,18 @@ def delete_core_memory_hard(mid) -> None:
         conn = _conn()
         try:
             conn.execute("DELETE FROM core_memories WHERE id=?", (mid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_core_authority(mid: int, authority: str) -> None:
+    """定稿/降级核心记忆来源：nurse=护士确认定稿(可信), llm=AI 归纳(uncertain,仅参考)。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE core_memories SET authority=?, updated_at=? WHERE id=?",
+                         (authority, now_iso(), mid))
             conn.commit()
         finally:
             conn.close()
