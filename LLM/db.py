@@ -66,6 +66,17 @@ CREATE TABLE IF NOT EXISTS rag_memories (
   uid TEXT, chroma_id TEXT, type TEXT, content TEXT,
   importance INTEGER DEFAULT 0, source TEXT DEFAULT '', ts TEXT
 );
+CREATE TABLE IF NOT EXISTS external_refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  external_id TEXT, uid TEXT, kind TEXT DEFAULT '', created_at TEXT,
+  UNIQUE(uid, external_id)
+);
+CREATE TABLE IF NOT EXISTS delete_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT, target_table TEXT, target_id INTEGER,
+  snapshot_json TEXT DEFAULT '{}', reason TEXT DEFAULT '', by TEXT DEFAULT '',
+  created_at TEXT, restored_at TEXT DEFAULT ''
+);
 """
 
 
@@ -93,6 +104,13 @@ def init_db():
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
             })
+            # 软删 / 幂等列（跨表统一补齐，兼容旧库）
+            for table in ("memories", "core_memories", "rag_memories"):
+                _ensure_columns(conn, table, {
+                    "is_deleted": "is_deleted INTEGER DEFAULT 0",
+                    "deleted_at": "deleted_at TEXT DEFAULT ''",
+                })
+            _ensure_columns(conn, "rag_memories", {"external_id": "external_id TEXT DEFAULT ''"})
             conn.commit()
         finally:
             conn.close()
@@ -183,7 +201,7 @@ def add_memory(uid, mtype, content, status="pending", ttl_days=None,
 
 
 def list_memories(uid: str = None, status: str = None) -> list[dict]:
-    sql = "SELECT * FROM memories WHERE 1=1"
+    sql = "SELECT * FROM memories WHERE is_deleted=0"
     args = []
     if uid:
         sql += " AND uid=?"
@@ -218,7 +236,13 @@ def set_memory_status(mid: int, status: str) -> None:
             conn.close()
 
 
-def delete_memory(mid: int) -> None:
+def delete_memory(mid: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """删除 memories 行 → 软删（置 is_deleted + delete_operations 快照），可回收站恢复。返回 op_id。"""
+    return soft_delete("memories", mid, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def delete_memory_hard(mid: int) -> None:
+    """物理删除 memories 行（TTL 到期等生命周期清理用，不进回收站）。"""
     with _lock:
         conn = _conn()
         try:
@@ -268,7 +292,7 @@ def get_core_memory(mid: int) -> dict | None:
 
 
 def list_core_memories(uid, limit=None) -> list[dict]:
-    sql = "SELECT * FROM core_memories WHERE uid=? ORDER BY importance DESC, id DESC"
+    sql = "SELECT * FROM core_memories WHERE uid=? AND is_deleted=0 ORDER BY importance DESC, id DESC"
     args = [uid]
     if limit:
         sql += " LIMIT ?"
@@ -299,7 +323,14 @@ def update_core_memory(mid, content=None, importance=None, confidence=None) -> N
             conn.close()
 
 
-def delete_core_memory(mid) -> None:
+def delete_core_memory(mid, uid="", reason="", by="") -> int:
+    """删除 core_memories 行 → 软删。注意：persona 画像"删旧写新"属于内部覆盖，
+    语义上不应进回收站（旧画像直接作废），调用处可继续物理删——见 purge 语义。"""
+    return soft_delete("core_memories", mid, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def delete_core_memory_hard(mid) -> None:
+    """物理删除 core_memories 行（内部画像覆盖等场景用，不进回收站）。"""
     with _lock:
         conn = _conn()
         try:
@@ -310,22 +341,38 @@ def delete_core_memory(mid) -> None:
 
 
 # ---------------------------------------------------------------- rag_memories（镜像表）
-def add_rag_memory(uid, mtype, content, chroma_id, importance=0, source="", ts=None) -> int:
+def add_rag_memory(uid, mtype, content, chroma_id, importance=0, source="", ts=None,
+                   external_id="") -> int:
     ts = ts or now_iso()
     with _lock:
         conn = _conn()
         try:
             cur = conn.execute(
-                "INSERT INTO rag_memories (uid,chroma_id,type,content,importance,source,ts) VALUES (?,?,?,?,?,?,?)",
-                (uid, chroma_id, mtype, content, importance, source, ts))
+                "INSERT INTO rag_memories (uid,chroma_id,type,content,importance,source,ts,external_id) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (uid, chroma_id, mtype, content, importance, source, ts, external_id))
             conn.commit()
             return cur.lastrowid
         finally:
             conn.close()
 
 
+def get_rag_by_external(uid: str, external_id: str) -> dict | None:
+    """按 uid+external_id 查已写入的 RAG 行（幂等命中判断）。"""
+    if not external_id:
+        return None
+    conn = _conn()
+    try:
+        r = conn.execute(
+            "SELECT * FROM rag_memories WHERE uid=? AND external_id=? AND is_deleted=0",
+            (uid, external_id)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
 def list_rag_memories(uid, limit=None) -> list[dict]:
-    sql = "SELECT * FROM rag_memories WHERE uid=? ORDER BY id DESC"
+    sql = "SELECT * FROM rag_memories WHERE uid=? AND is_deleted=0 ORDER BY id DESC"
     args = [uid]
     if limit:
         sql += " LIMIT ?"
@@ -335,6 +382,150 @@ def list_rag_memories(uid, limit=None) -> list[dict]:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
     finally:
         conn.close()
+
+
+def delete_rag_memory(row_id: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """软删 rag_memories 行（镜像表），返回 op_id。向量清理由调用方 ragstore.delete_by_chroma_id。"""
+    return soft_delete("rag_memories", row_id, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def get_rag_memory(row_id: int) -> dict | None:
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM rag_memories WHERE id=?", (row_id,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def set_rag_chroma_id(row_id: int, chroma_id: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE rag_memories SET chroma_id=? WHERE id=?", (chroma_id, row_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- external refs（写入幂等）
+def claim_external(uid: str, external_id: str, kind: str = "") -> bool:
+    """幂等注册外部业务键：首次返回 True，已存在返回 False（同业务只写一次）。"""
+    if not external_id:
+        return True
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO external_refs (external_id,uid,kind,created_at) VALUES (?,?,?,?)",
+                (external_id, uid, kind, ts))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_external_refs(uid: str = "") -> list[dict]:
+    sql = "SELECT * FROM external_refs"
+    args = []
+    if uid:
+        sql += " WHERE uid=?"
+        args.append(uid)
+    sql += " ORDER BY created_at DESC LIMIT 200"
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 软删 + 回收站（delete_operations 快照）
+def soft_delete(table: str, row_id: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """软删任意记忆表行：置 is_deleted=1 + 全量快照入 delete_operations。表名白名单防注入。"""
+    table = table if table in ("memories", "core_memories", "rag_memories") else "memories"
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+            if not row or row["is_deleted"]:
+                return 0
+            snapshot = json.dumps(dict(row), ensure_ascii=False)
+            conn.execute(f"UPDATE {table} SET is_deleted=1, deleted_at=? WHERE id=? AND is_deleted=0",
+                         (ts, row_id))
+            op_id = conn.execute(
+                "INSERT INTO delete_operations (uid,target_table,target_id,snapshot_json,reason,by,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (uid or row["uid"], table, row_id, snapshot, reason, by, ts)).lastrowid
+            conn.commit()
+            return op_id or 0
+        finally:
+            conn.close()
+
+
+def restore_operation(op_id: int) -> bool:
+    """按 delete_operations 快照恢复行（清除软删标记）；RAG 行另需重建向量（调用方处理）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            op = conn.execute("SELECT * FROM delete_operations WHERE id=?", (op_id,)).fetchone()
+            if not op or op["restored_at"]:
+                return False
+            table, row_id = op["target_table"], op["target_id"]
+            snap = json.loads(op["snapshot_json"] or "{}")
+            ts = now_iso()
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+            if row:  # 行还在 → 仅清软删标记
+                conn.execute(f"UPDATE {table} SET is_deleted=0, deleted_at='' WHERE id=?", (row_id,))
+            else:    # 行已被物理清理 → 按快照重建
+                cols = [c for c in snap.keys() if c != "id"]
+                placeholders = ", ".join("?" for _ in cols)
+                colnames = ", ".join(cols)
+                conn.execute(
+                    f"INSERT INTO {table} ({colnames}) VALUES ({placeholders})",
+                    [snap[c] for c in cols])
+            conn.execute("UPDATE delete_operations SET restored_at=? WHERE id=?", (ts, op_id))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def list_delete_operations(uid: str = "", include_restored: bool = False) -> list[dict]:
+    sql = "SELECT * FROM delete_operations WHERE 1=1"
+    args = []
+    if uid:
+        sql += " AND uid=?"
+        args.append(uid)
+    if not include_restored:
+        sql += " AND restored_at=''"
+    sql += " ORDER BY id DESC LIMIT 200"
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def purge_soft_deleted(days: float = 30.0) -> int:
+    """物理清理软删超过宽限期的行（回收站深清），幂等可反复调用。"""
+    import time as _t
+    cutoff = _t.time() - days * 86400
+    ts_cut = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+    total = 0
+    with _lock:
+        conn = _conn()
+        try:
+            for table in ("memories", "core_memories", "rag_memories"):
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE is_deleted=1 AND deleted_at!='' AND deleted_at < ?",
+                    (ts_cut,))
+                total += cur.rowcount
+            conn.commit()
+            return total
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------- reminders

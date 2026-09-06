@@ -318,7 +318,7 @@ def _upsert_relation(uid: str, rel: dict) -> None:
     graph.upsert_relation(uid, sid, did, rel.get("rel", "related_to"))
 
 
-def _append_summary_and_episode(uid: str, digest: str) -> None:
+def _append_summary_and_episode(uid: str, digest: str, external_id: str = "") -> None:
     if any(k in digest for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type="digest",
                   content=digest, reason="医疗只读红线")
@@ -326,8 +326,9 @@ def _append_summary_and_episode(uid: str, digest: str) -> None:
     prev = db.get_summary(uid)
     new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
     db.set_summary(uid, new_sum[-900:])
+    # 幂等落 episode：同一段对话（由 external_id=对话内容指纹标识）只生成一次，防重复整理
     if not _rag_dedup_check(uid, digest, mtype="episodic"):
-        ragstore.add(uid, "episodic", digest, source="llm:consolidate")
+        ragstore.add(uid, "episodic", digest, source="llm:consolidate", external_id=external_id)
         audit.log("memory_change", action="episode_add", uid=uid, content=digest)
 
 
@@ -339,7 +340,7 @@ def _upsert_portrait(uid: str, portrait: str) -> None:
     # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
     for m in db.list_core_memories(uid):
         if m["type"] == "persona":
-            db.delete_core_memory(m["id"])
+            db.delete_core_memory_hard(m["id"])
     db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
     db.set_portrait(uid, portrait)  # 双写过渡，兼容 chat.py/server.py 旧读路径
     audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
@@ -446,6 +447,9 @@ def consolidate(uid: str, client, model: str) -> dict:
     if len(conversation) > 6000:
         conversation = conversation[-6000:]
 
+    # P0a 幂等锚点：本段对话的稳定指纹作为 external_id（含 uid，同段对话重复整理只落一次 episode）
+    import hashlib as _hl
+    ext_id = f"consolidate:{uid}:{_hl.sha256(conversation.encode('utf-8')).hexdigest()[:20]}"
     from .chat import llm_json
     prompt = CONSOLIDATE_PROMPT.format(conversation=conversation, existing=_existing_context(uid))
     data = llm_json(client, model, prompt)
@@ -466,7 +470,7 @@ def consolidate(uid: str, client, model: str) -> dict:
 
         digest = (data.get("digest") or "").strip()
         if digest:
-            _append_summary_and_episode(uid, digest)
+            _append_summary_and_episode(uid, digest, external_id=ext_id)
 
         portrait = (data.get("portrait") or "").strip()
         if portrait:
@@ -497,6 +501,6 @@ def _clean_expired():
     """清理过期事件记忆（TTL 到期自动降权/清除）。"""
     for m in db.list_memories():
         if m.get("expires_at") and m["expires_at"] < db.now_iso() and m["status"] == "confirmed":
-            db.delete_memory(m["id"])
+            db.delete_memory_hard(m["id"])
             audit.log("memory_change", action="expire", uid=m["uid"], mid=m["id"],
                       content=m["content"], reason="TTL 到期")

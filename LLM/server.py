@@ -303,16 +303,88 @@ async def memories_confirm(mid: int):
 @app.post("/api/memories/{mid}/reject")
 async def memories_reject(mid: int):
     m = db.get_memory(mid)
-    db.delete_memory(mid)
+    op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="reject", by="nurse")
     from . import log as audit
-    audit.log("memory_change", action="reject", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
-    return {"ok": True}
+    audit.log("memory_change", action="reject", mid=mid, op_id=op_id,
+              uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id, "note": "已软删，可在回收站恢复"}
 
 
 @app.delete("/api/memories/{mid}")
 async def memories_delete(mid: int):
-    db.delete_memory(mid)
-    return {"ok": True}
+    m = db.get_memory(mid)
+    op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
+    return {"ok": True, "op_id": op_id}
+
+
+# ---------------------------------------------------------------- 回收站（软删恢复）
+@app.get("/api/memories/recycle")
+async def recycle_list(uid: str = Query("")):
+    return {"ok": True, "operations": db.list_delete_operations(uid=uid)}
+
+
+@app.post("/api/memories/recycle/{op_id}/restore")
+async def recycle_restore(op_id: int):
+    """恢复软删记忆。RAG 行会重建向量（chroma_id 可能变化）并回写。"""
+    op = next((o for o in db.list_delete_operations(include_restored=True) if o["id"] == op_id), None)
+    if not op:
+        return {"ok": False, "error": "操作不存在"}
+    table = op["target_table"]
+    restored = db.restore_operation(op_id)
+    if not restored:
+        return {"ok": False, "error": "恢复失败或已恢复"}
+    if table == "rag_memories":
+        row = db.get_rag_memory(op["target_id"])
+        if row and row.get("chroma_id"):
+            from . import ragstore as _rs
+            new_cid = _rs.reindex_row(row["uid"], row["type"], row["content"],
+                                      importance=row.get("importance", 0),
+                                      source=row.get("source", ""), old_chroma_id=row["chroma_id"])
+            if new_cid and new_cid != row["chroma_id"]:
+                db.set_rag_chroma_id(op["target_id"], new_cid)
+    from . import log as audit
+    audit.log("memory_change", action="restore", op_id=op_id, uid=op.get("uid", ""),
+              table=table, by="nurse")
+    return {"ok": True, "table": table, "op_id": op_id}
+
+
+@app.post("/api/memories/recycle/purge")
+async def recycle_purge(days: float = Query(30.0)):
+    n = db.purge_soft_deleted(days=days)
+    from . import log as audit
+    audit.log("memory_change", action="purge", count=n, days=days, by="nurse")
+    return {"ok": True, "purged": n}
+
+
+@app.delete("/api/memories/core/{mid}")
+async def core_memories_delete(mid: int):
+    m = db.get_core_memory(mid)
+    op_id = db.delete_core_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
+    from . import log as audit
+    audit.log("memory_change", action="core_delete", mid=mid, op_id=op_id,
+              uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id}
+
+
+@app.get("/api/memories/rag")
+async def rag_memories_list(uid: str = Query("elder_001")):
+    return {"ok": True, "memories": db.list_rag_memories(uid)}
+
+
+@app.delete("/api/memories/rag/{rid}")
+async def rag_memories_delete(rid: int):
+    """删除 RAG 记忆：镜像表软删 + Chroma 向量同步清理。"""
+    row = db.get_rag_memory(rid)
+    if not row:
+        return {"ok": False, "error": "不存在"}
+    op_id = db.delete_rag_memory(rid, uid=row.get("uid", ""), reason="manual_delete", by="nurse")
+    if row.get("chroma_id"):
+        from . import ragstore as _rs
+        _rs.delete_by_chroma_id(row.get("uid", ""), row["chroma_id"])
+    from . import log as audit
+    audit.log("memory_change", action="rag_delete", mid=rid, op_id=op_id,
+              uid=row.get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id}
 
 
 @app.post("/api/memories/suggest")
@@ -339,21 +411,6 @@ async def context_view(uid: str = Query("elder_001")):
 @app.get("/api/memories/core")
 async def core_memories_list(uid: str = Query("elder_001")):
     return {"ok": True, "memories": db.list_core_memories(uid)}
-
-
-@app.delete("/api/memories/core/{mid}")
-async def core_memories_delete(mid: int):
-    m = db.get_core_memory(mid)
-    db.delete_core_memory(mid)
-    from . import log as audit
-    audit.log("memory_change", action="core_delete", mid=mid,
-              uid=(m or {}).get("uid", ""), by="nurse")
-    return {"ok": True}
-
-
-@app.get("/api/memories/rag")
-async def rag_memories_list(uid: str = Query("elder_001")):
-    return {"ok": True, "memories": db.list_rag_memories(uid)}
 
 
 @app.get("/api/memories/graph")
