@@ -1,3 +1,4 @@
 [console_scripts]
 cmd_stop = robot_navigation.cmd_stop:main
 navigate_to_pose = robot_navigation.navigate_to_pose:main
+robot_actions = robot_navigation.robot_actions:main

@@ -214,10 +214,13 @@ class ChassisDriver(Node):
             if abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
                 self._send(build_stop())
             else:
+                # 命令侧镜像：odom 解码已是标准约定(+y=左/+wz=左转, sign 见 odom 侧)。
+                # 实测真机：cmd +vy→物理右、cmd +wz→物理右，恰为 odom 标准(+y=左,+yaw=左转)的反方向。
+                # 故下发前把 vy/wz 取反，使 命令=odom 自洽（闭环/导航才不会朝反方向开）。vx 方向本已正确，不动。
                 frame = build_set_car_vel(
                     int(round(vx * 1000)),          # m/s → mm/s
-                    int(round(vy * 1000)),
-                    int(round(wz * RAD_S_TO_TENTH_DEG)),
+                    int(round(-vy * 1000)),
+                    int(round(-wz * RAD_S_TO_TENTH_DEG)),
                 )
                 self._send(frame)
         elif time.monotonic() - self._last_cmd_time < 5.0:

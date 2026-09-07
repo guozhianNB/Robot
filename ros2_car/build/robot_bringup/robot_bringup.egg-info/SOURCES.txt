@@ -16,6 +16,7 @@ launch/bringup.launch.py
 launch/lidar.launch.py
 launch/navigation.launch.py
 launch/odom.launch.py
+launch/robot_base.launch.py
 launch/slam.launch.py
 maps/README.md
 resource/robot_bringup

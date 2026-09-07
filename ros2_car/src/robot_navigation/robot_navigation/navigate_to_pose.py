@@ -14,6 +14,7 @@
 
 import argparse
 import math
+import sys
 
 import rclpy
 from rclpy.node import Node
@@ -78,7 +79,7 @@ def main(args=None):
     parser.add_argument("--yaw", type=float, default=0.0, help="目标朝向（度）")
     parser.add_argument("--frame_id", default="map")
     parser.add_argument("--timeout", type=float, default=60.0)
-    argv = rclpy.utilities.remove_ros_args(args or [])
+    argv = rclpy.utilities.remove_ros_args(sys.argv if args is None else args)
     parsed, _ = parser.parse_known_args(argv)
 
     node = NavigateToPoseClient(

@@ -2,6 +2,10 @@
 
 RDK X5（Ubuntu 22.04 / ROS2 Humble）小车端：**激光雷达 + 里程计 + SLAM 建图 + Nav2 导航**。
 
+> ⚠️ **工作区路径勘误**：板卡上本仓库实际路径是 **`/home/sunrise/Robot/ros2_car`**，
+> 下文及老文档里的 `~/ros2/car_ws` / `D:\_project\Robot\ros2_car` 是 Windows/旧布局，**上板请全部替换**。
+> 详细调试经验与勘误见 `ros2_car/ROS2导航调试经验.md`。
+
 ## 包结构
 
 ```
@@ -16,8 +20,8 @@ car_ws/src/
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ros2/yahboomcar_ws/install/setup.bash   # ydlidar 驱动、rf2o（bashrc 已自动加载）
-source ~/ros2/car_ws/install/setup.bash          # 本工作区
+source ~/ros2/yahboomcar_ws/install/setup.bash          # ydlidar 驱动、rf2o（bashrc 已自动加载）
+source /home/sunrise/Robot/ros2_car/install/setup.bash  # 本工作区
 ```
 
 硬件：YDLidar Tmini Plus（/dev/ttyUSB0，230400）｜ STM32 麦轮底盘（/dev/ttyACM0，USB CDC，按 `docs/USB车控接口.md`）。
@@ -31,14 +35,19 @@ ros2 launch robot_bringup bringup.launch.py mode:=mapping
 # ② 另开终端，键盘开小车逛房间
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 
-# ③ 逛完保存地图
-ros2 run nav2_map_server map_saver_cli -f ~/ros2/car_ws/maps/my_map
+# ③ 逛完保存地图（async slam 的 /map 按需发布，map_saver 可能报
+#    "Failed to spin map subscription"→ 重试几次即成功；仍不行见 ROS2导航调试经验.md 第三节）
+ros2 run nav2_map_server map_saver_cli -f /home/sunrise/Robot/ros2_car/maps/my_map
 
 # ④ 自主导航（加载刚存的地图）
-ros2 launch robot_bringup bringup.launch.py mode:=navigation map:=~/ros2/car_ws/maps/my_map.yaml
+# ⚠️ 已知 bug：走 bringup mode:=navigation 时 map 参数会被 nav2 双层 include 丢掉(map_server 报
+#    yaml_filename not initialized)。请改成分步：先起基础节点，再直接跑 navigation.launch.py：
+ros2 launch robot_bringup robot_base.launch.py odom_source:=chassis   # 或 lidar+odom+robot_state_publisher 分别起
+ros2 launch robot_bringup navigation.launch.py map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml
 ```
 
-导航模式在 rviz 里点 **2D Pose Estimate** 给出初始位姿（AMCL 定位），再点 **2D Goal Pose** 下发目标。
+导航模式在 rviz 里点 **2D Pose Estimate** 给出初始位姿（AMCL 定位），再点 **"Nav2 Goal"（nav2_rviz_plugins/GoalTool）** 下发目标。
+> 注意：**不要用旧的 "2D Goal Pose"（rviz_default_plugins/SetGoal，发 `/goal_pose`）**——Nav2 不订阅 `/goal_pose`，点了不会动。这个旧工具名是老文档残留。
 免 rviz 也能发目标：
 
 ```bash
@@ -53,7 +62,7 @@ ros2 run robot_navigation navigate_to_pose --x 1.0 --y 0.5 --yaw 90
 | 里程计(激光) | `ros2 launch robot_bringup odom.launch.py odom_source:=rf2o` |
 | 里程计(底盘) | `ros2 launch robot_bringup odom.launch.py odom_source:=chassis` |
 | SLAM 建图 | `ros2 launch robot_bringup slam.launch.py mode:=mapping` |
-| SLAM 定位 | `ros2 launch robot_bringup slam.launch.py mode:=localization map:=~/ros2/car_ws/maps/my_map.yaml` |
+| SLAM 定位 | `ros2 launch robot_bringup slam.launch.py mode:=localization map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml` |
 
 ## 底盘接入（STM32 接上后）
 
@@ -64,8 +73,10 @@ ros2 launch robot_bringup bringup.launch.py mode:=mapping odom_source:=chassis
 ### 标定（真机必做，按顺序）
 
 1. **轴方向**：`ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1}}"`，
-   车应**直行不偏转**；歪了改 `chassis_params.yaml` 的 `sign_vx/sign_wz`。
-   同理测 `linear.y`（横移，改 `sign_vy`）与 `angular.z`（自转，改 `sign_wz`）。
+   **真机目测**车头是否朝前；同理测 `linear.y`（横移）与 `angular.z`（自转）。
+   ⚠️ **sign 只改 odom 读数、不改下发命令**（见 `chassis_driver.py` 269–271 行）；若"车实际往哪走"错了，
+   改的是**命令侧**。当前真机定稿：odom `sign_vx=+1 / sign_vy=-1 / sign_wz=-1`，且 `chassis_driver.py`
+   下发命令对 `vy/wz` 做了镜像取反（vx 不动）。详见 `ROS2导航调试经验.md` 第二节。
 2. **轮径/旋转半径**：直行 1m 看 `/odom` 读数，偏差按比例修 `wheel_radius`；
    原地转 360° 看 yaw 读数，修 `rotate_radius`。
 3. **四轮方向**：若某轮装反，用 `wheel_signs` 单独取反。

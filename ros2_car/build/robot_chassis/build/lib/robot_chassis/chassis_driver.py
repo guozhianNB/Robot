@@ -53,6 +53,9 @@ class ChassisDriver(Node):
         self.declare_parameter("cmd_stop_topic", "/robot/cmd_stop")
         self.declare_parameter("odom_frame_id", "odom")
         self.declare_parameter("base_frame_id", "base_link")
+        # 是否由本节点发布 odom→base_link TF。
+        # use_ekf:=true 时由 EKF 统一发布 TF（见 robot_bringup/odom.launch.py），本节点应关掉避免双发布。
+        self.declare_parameter("publish_tf", True)
 
         # 麦轮运动学几何（单位 m）—— 真机标定后修改
         self.declare_parameter("wheel_radius", 0.04)      # 轮半径 = 0.08/2（固件 MC_WHEEL_DIAMETER_MM=80）
@@ -76,11 +79,15 @@ class ChassisDriver(Node):
         # Humble rclpy Node 没有 get_parameter_names()，显式列出已声明参数
         self._p = {p.name: p.value for p in self.get_parameters([
             "serial_port", "baudrate", "cmd_vel_topic", "odom_topic", "cmd_stop_topic",
-            "odom_frame_id", "base_frame_id", "wheel_radius", "rotate_radius",
+            "odom_frame_id", "base_frame_id", "publish_tf", "wheel_radius", "rotate_radius",
             "wheel_signs", "sign_vx", "sign_vy", "sign_wz",
             "max_vx", "max_vy", "max_wz", "accel_limit", "ang_accel_limit",
             "send_period", "watchdog_timeout",
         ])}
+        # launch 层（odom.launch.py）传 publish_tf 时是字符串，归一化为 bool
+        if isinstance(self._p["publish_tf"], str):
+            self._p["publish_tf"] = self._p["publish_tf"].lower() in ("true", "1", "yes")
+        self._p["publish_tf"] = bool(self._p["publish_tf"])
 
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先安装: pip3 install pyserial")
@@ -207,10 +214,13 @@ class ChassisDriver(Node):
             if abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
                 self._send(build_stop())
             else:
+                # 命令侧镜像：odom 解码已是标准约定(+y=左/+wz=左转, sign 见 odom 侧)。
+                # 实测真机：cmd +vy→物理右、cmd +wz→物理右，恰为 odom 标准(+y=左,+yaw=左转)的反方向。
+                # 故下发前把 vy/wz 取反，使 命令=odom 自洽（闭环/导航才不会朝反方向开）。vx 方向本已正确，不动。
                 frame = build_set_car_vel(
                     int(round(vx * 1000)),          # m/s → mm/s
-                    int(round(vy * 1000)),
-                    int(round(wz * RAD_S_TO_TENTH_DEG)),
+                    int(round(-vy * 1000)),
+                    int(round(-wz * RAD_S_TO_TENTH_DEG)),
                 )
                 self._send(frame)
         elif time.monotonic() - self._last_cmd_time < 5.0:
@@ -251,12 +261,17 @@ class ChassisDriver(Node):
         now = self.get_clock().now().to_msg()
 
         # 麦轮逆运动学（X 型四轮，rpm 顺序 LF,RF,LR,RR）
+        # 对照固件 mc_car_set 正向解：
+        #   LF=f+l+rot  RF=f-l-rot  LR=f-l+rot  RR=f+l-rot
+        # 反解：vx=(LF+RF+LR+RR)/4
+        #       vy=(LF-RF-LR+RR)/4      （正=左移）
+        #       wz=(LF-RF+LR-RR)/(4·L)  （正=左转）
         w = [rpm[i] * RAD_PER_RPM * self._p["wheel_signs"][i] for i in range(4)]
         r = self._p["wheel_radius"]
         lw = self._p["rotate_radius"]
-        vx = self._p["sign_vx"] * r / 4.0 * (w[0] + w[1] + w[2] + w[3])
-        vy = self._p["sign_vy"] * r / 4.0 * (-w[0] + w[1] + w[2] - w[3])
-        wz = self._p["sign_wz"] * r / (4.0 * lw) * (-w[0] + w[1] - w[2] + w[3])
+        vx = self._p["sign_vx"] * r / 4.0 * ( w[0] + w[1] + w[2] + w[3])
+        vy = self._p["sign_vy"] * r / 4.0 * ( w[0] - w[1] - w[2] + w[3])
+        wz = self._p["sign_wz"] * r / (4.0 * lw) * ( w[0] - w[1] + w[2] - w[3])
 
         # 积分位姿（odom 世界系：x 前 y 左 z 上）
         dt = 0.1  # 心跳周期 100ms；若长期偏差可改由时间戳差分
@@ -288,16 +303,17 @@ class ChassisDriver(Node):
         odom.twist.covariance[35] = 0.05
         self._odom_pub.publish(odom)
 
-        # tf odom → base_link
-        t = TransformStamped()
-        t.header.stamp = now
-        t.header.frame_id = self._p["odom_frame_id"]
-        t.child_frame_id = self._p["base_frame_id"]
-        t.transform.translation.x = x
-        t.transform.translation.y = y
-        t.transform.rotation.z = math.sin(yaw / 2.0)
-        t.transform.rotation.w = math.cos(yaw / 2.0)
-        self._tf_broadcaster.sendTransform(t)
+        # tf odom → base_link（use_ekf 模式下由 EKF 发布，本节点关闭以免双发布）
+        if self._p["publish_tf"]:
+            t = TransformStamped()
+            t.header.stamp = now
+            t.header.frame_id = self._p["odom_frame_id"]
+            t.child_frame_id = self._p["base_frame_id"]
+            t.transform.translation.x = x
+            t.transform.translation.y = y
+            t.transform.rotation.z = math.sin(yaw / 2.0)
+            t.transform.rotation.w = math.cos(yaw / 2.0)
+            self._tf_broadcaster.sendTransform(t)
 
 
 def main(args=None):
