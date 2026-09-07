@@ -21,6 +21,7 @@ const messages = ref<Msg[]>([]);
 const reminder = ref<ReminderEvent | null>(null);
 const showSwitcher = ref(false);
 const showSettings = ref(false);
+const asrProvider = ref("cloud");   // local | cloud（识别引擎，重启服务后生效）
 const { connected } = useBus(onEvent);
 
 async function loadSession() {
@@ -29,6 +30,27 @@ async function loadSession() {
     uid.value = s.uid;
     locked.value = s.locked;
   } catch { /* 后端未就绪时忽略 */ }
+}
+
+async function loadAsrProvider() {
+  try {
+    const res = await fetch("/api/settings");
+    const body = await res.json();
+    asrProvider.value = body.settings?.asr_provider ?? "cloud";
+  } catch { /* 忽略，保留默认 */ }
+}
+
+async function toggleAsrProvider() {
+  const next = asrProvider.value === "cloud" ? "local" : "cloud";
+  asrProvider.value = next;
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: { asr_provider: next } }),
+    });
+  } catch { /* 保存失败也提示用户 */ }
+  alert(`识别引擎已切换为${next === "cloud" ? "云端（火山）" : "本地"}，重启服务后生效`);
 }
 
 function onEvent(ev: BusEvent) {
@@ -121,7 +143,10 @@ async function onConfirmReminder(rid: number) {
   } catch { /* 忽略 */ }
 }
 
-onMounted(loadSession);
+onMounted(() => {
+  loadSession();
+  loadAsrProvider();
+});
 </script>
 
 <template>
@@ -132,6 +157,9 @@ onMounted(loadSession);
     <ChatArea :messages="messages" @send="sendText" />
     <div class="bottom">
       <SosButton @sos="onSos" />
+      <button class="settings-btn asr-toggle" @click="toggleAsrProvider">
+        识别：{{ asrProvider === "cloud" ? "云端" : "本地" }}
+      </button>
       <button class="settings-btn" @click="showSettings = true">⚙ 设置</button>
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
     </div>
@@ -154,4 +182,5 @@ body { background: #0b1220; color: #f9fafb; font-family: system-ui, sans-serif; 
 .conn.off { color: #ef4444; }
 .settings-btn { background: #374151; color: #f9fafb; border: none;
   padding: 16px 24px; border-radius: 16px; font-size: 22px; }
+.asr-toggle { background: #1d4ed8; }
 </style>

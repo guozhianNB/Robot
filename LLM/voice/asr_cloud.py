@@ -284,9 +284,13 @@ class CloudStreamASR:
                     self._text = t
 
     def _recv(self, timeout: float):
-        """读一条消息 → (kind, obj)；超时返回 (None, None)；连接异常抛给上层。"""
+        """读一条消息 → (kind, obj)；超时返回 (None, None)；连接异常抛给上层。
+
+        注意：websocket-client 的 WebSocket.recv() 不接受 timeout 关键字，
+        超时必须用 settimeout(timeout) + recv()（超时抛 WebSocketTimeoutException）。"""
         try:
-            raw = self._ws.recv(timeout=timeout)   # websocket-client 内部已处理 ping/pong
+            self._ws.settimeout(timeout)
+            raw = self._ws.recv()
         except websocket.WebSocketTimeoutException:
             return None, None
         return decode_server_message(raw)

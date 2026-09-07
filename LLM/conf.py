@@ -25,7 +25,7 @@ DEFAULT_SETTINGS = {
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
     "recycle_purge_days": 30,       # 回收站软删记忆保留多少天后物理清理
     "asr_enabled": True,            # 语音识别（真实开关）
-    "asr_provider": "local",        # 识别引擎：local=本地 sherpa / cloud=火山流式识别（重启生效，worker 启动时读取）
+    "asr_provider": "cloud",        # 识别引擎：cloud=火山流式识别（默认；不可用自动回退本地）/ local=sherpa（重启生效，worker 启动时读取）
     "tts_enabled": True,            # 语音合成（真实开关）
     "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）
     "wakeword": "小机器人",          # 唤醒词（显示用；实际检测用 kws_keywords.txt）

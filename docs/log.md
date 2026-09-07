@@ -406,3 +406,13 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 现象：机器人 TTS 播报时自己的声音被麦克风拾入 → VAD 攒成语音段 → 播报结束回到收听态后把这些"自己的话"当用户语句弹给 ASR 转写（自问自答）；自声还可能误触发打断（过了 0.3s 宽限后）。
 - 修复（LLM/voice/worker.py + oice/config.py）：新增 _flush_vad()（sherpa VoiceActivityDetector.reset()，退化兜底 pop 丢弃），在播报**自然结束**与**打断**两个出口清空 VAD 缓冲、丢掉自声段；自然播报结束另设 SPEAK_TAIL_BLANK_S=0.25s 回声尾巴静音窗（该窗口内丢弃麦克风块、不喂 VAD/ASR，且 sink.is_done()+finish_speaking() 保证打断路径不误套此窗）；打断式插话不套静音窗、立即收音。
 - 认知：单麦无 AEC 时软件无法区分"机器人自己的声音"与"老人声音"——外置麦克风拉远扬声器/降低喇叭音量能压低自声电平，silero VAD 阈值化后自然不判为语音，是最有效的硬件配合手段。
+
+### 补充（同日）：崩溃加固 + 默认云端 + kiosk 引擎一键切换
+
+- 报错：uvicorn 退出码 3221225477 = 0xC0000005（原生访问违规，非 Python 异常）。审计定位：崩溃前 ~2 分钟内 4 次「长播报（16~53s 整段）→ 2s 左右被 barge_in 打断」；Ignore OOV 洪流来自 sherpa TTS 转写 markdown 故事回复（**、半角引号、ZywOo/SSG/DANK1NG 等词表外内容），属噪音非崩溃主因。候选根因 A（无 faulting module 证据，按最可能修复）：AudioSink 整段一次 write + stop() 与写线程 finally 双关闭的 PortAudio 竞态。
+- LLM/voice/audio.py 加固：写入线程分块阻塞写（0.2s/块），流对象仅由写线程创建/唯一一次关闭；stop() 置停止事件 + abort() 唤醒阻塞 write 再 join，消除双关闭竞态。
+- LLM/voice/tts.py：新增 sanitize_tts_text() —— 播报前清洗（去 URL/HTML/markdown 装饰/emoji/半角引号等词表外符号），消除 OOV 刷屏与朗读错乱；清洗后为空则不播报（worker._speak 长度 0 早退）。
+- 默认引擎改 cloud：conf.DEFAULT_SETTINGS sr_provider=cloud；worker 云端不可用（未配 VOLC_ASR_API_KEY/缺 websocket-client）时自动回退本地并 audit sr_provider_fallback，不再整机降级。注意老库 settings 表存的 local 会压过新默认——本机已 db.set_settings 置 cloud，其它部署升级后需切一次或照做。
+- kiosk：主界面底部新增「识别：云端/本地」一键切换按钮（POST /api/settings，提示重启生效），设置弹层原有单选保留；生产 dist 已重建（pnpm --filter kiosk build 成功，08-27 → 09-07 产物）。
+- 引擎语义：本地 sherpa streaming-zipformer-zh-14M = 单向（因果）流式；云端火山 bigmodel = 双向流式（火山另有 bigmodel_async / bigmodel_nostream 未采用）。本地 14M 精度有限，默认云端以提升识别质量。
+- 验证：后端 py_compile / 导入冒烟 / sanitize 单测通过；崩溃修复是否根治需真机复测（若复现，请补事件查看器 faulting module）。

@@ -72,14 +72,22 @@ class VoiceWorker(threading.Thread):
         self.sink = audio.AudioSink()
         self.vad = vad_mod.VAD()
         self.kws = kws_mod.WakeWordDetector()
-        provider = db.get_settings().get("asr_provider", "local")
+        provider = db.get_settings().get("asr_provider", "cloud")
         if provider == "cloud":
-            from . import asr_cloud as cloud_mod   # 缺 websocket-client / key 时构造抛错 → 上层降级
-            self.asr = cloud_mod.CloudStreamASR()
+            try:
+                from . import asr_cloud as cloud_mod   # 缺 websocket-client / key 时构造抛错
+                self.asr = cloud_mod.CloudStreamASR()
+            except Exception as e:
+                # 云端不可用（未配 key / 缺依赖）→ 回退本地，语音链路照常，不降级整机
+                audit.log("voice_error", action="asr_provider_fallback",
+                          provider="cloud", error=str(e))
+                provider = "local"
+                self.asr = asr_mod.StreamASR()
+                self.sub_status["asr_fallback"] = "云端不可用，已回退本地：{}".format(str(e)[:120])
         else:
             provider = "local"
             self.asr = asr_mod.StreamASR()
-        self.sub_status["asr"] = provider          # /api/voice/status modules 显示当前引擎
+        self.sub_status["asr"] = provider          # /api/voice/status modules 显示实际引擎
         self.tts = tts_mod.TTS()
         self.spk = spk_mod.SpeakerRecognizer()
         self.fusion = id_mod.VoiceprintOnlyFusion(self.spk)
@@ -296,6 +304,8 @@ class VoiceWorker(threading.Thread):
 
     def _speak(self, text):
         samples, sr = self.tts.synthesize(text)
+        if len(samples) == 0:
+            return   # 清洗后无内容（纯符号/表情/URL 的回复）：不播报，保持收听态
         self._speak_started = time.monotonic()
         self._speak_ended_at = None
         self.session.start_speaking()
