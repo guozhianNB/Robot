@@ -45,3 +45,6 @@ torchaudio
 
 # ------------------------- 开发 / 测试 -------------------------
 pytest
+
+# 云端流式 ASR（火山引擎流式识别2.0）：websocket-client（仅 asr_provider=cloud 需要）
+websocket-client

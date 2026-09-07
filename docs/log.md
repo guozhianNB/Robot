@@ -391,3 +391,12 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 行为对齐旧 `UI(old)/index.html`：uid 自动 `elder_00N`（profiles 最大编号 +1，可手改）；声纹可试听/重录/跳过（语音不可用不卡流程）；人脸置灰展示后端 reason。
 - 注册后切换老人（规格第 4 步"自动切换到新老人"的 Vue 实现）：完成时新 uid 写 `localStorage("uid")`；`ChatPage.vue` / `MemoriesPage.vue` 初始 uid 改为读 `localStorage("uid") ?? "elder_001"`。
 - 验证：`pnpm --filter admin build` 通过（42 modules，dist 内含注册向导代码与关键文案）。vue-tsc 2.0.0 在 Node 24 下不可用（MODULE_NOT_FOUND，工具链问题与代码无关；admin 无 typecheck script）。
+
+## 2026-09-07 · 语音链路：流式 ASR 双引擎（本地/云端）+ 实时字幕 + 重启切换
+
+- 需求要点（用户原话）："不管是本地 asr 还是云端 asr 都能流式识别；说的什么实时在前端显现；有切换按钮选本地/云端，重启即切换"。云端 = 火山引擎「豆包语音」控制台的 API Key（流式识别大模型2.0 / Seed-ASR）。
+- asr.py 重写为统一流式接口（start_session / accept→partial / finish / abort / close），本地 sherpa online recognizer 改增量解码出字；保留 transcribe() 整段转写作兜底。新增 LLM/voice/asr_cloud.py：火山流式识别2.0 SAUC WebSocket（wss://openspeech.bytedance.com/api/v3/sauc/bigmodel，握手 header X-Api-Key + X-Api-Resource-Id: volc.seedasr.sauc.duration，PCM16 16k 每 100ms 一帧，每句一条连接），帧编解码为纯函数便于单测；websocket-client 属可选依赖。
+- worker.py 流式编排：VAD 管句边界不变，LISTENING 期间 VAD 判定开口 → 起 ASR 会话（回补 config.ASR_ONSET_TAIL_S=0.5s 前沿防丢句首），边说边喂，文本变化即 publish voice_state=asr_partial（SSE → kiosk 实时字幕）；VAD 整段弹出 → finish() 取最终文本 → 原声纹/LLM/TTS 链路（recognized/chat_new 事件不变）；起会话失败等走整段转写兜底，不崩主循环。
+- 引擎切换：conf.DEFAULT_SETTINGS += asr_provider(local|cloud)，worker 启动时读取（重启生效）；.env += VOLC_ASR_API_KEY / VOLC_ASR_RESOURCE_ID；/api/voice/status 增 asr_provider 字段、modules.asr 显示当前引擎；云端缺依赖/未配 key → 启动降级并给出可读原因。
+- kiosk 前端：App.vue 状态条下新增实时字幕行（voice_state=asr_partial 驱动，recognized/speaking/idle 清空，视觉状态保持 listening）；SettingsSheet 设置弹层新增「识别引擎」单选（本地/云端），标注"重启服务后生效"。events.ts VoiceStateEvent 注释同步 asr_partial。
+- 验证：后端改动 py_compile 通过、asr_cloud 帧编解码离线自测通过；本地引擎与真云端链路需在板卡/带 sherpa+真 key 环境回归（本机无火山 key，云端握手错误会经 status 上报）。

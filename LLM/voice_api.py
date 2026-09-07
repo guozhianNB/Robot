@@ -135,16 +135,18 @@ def stop_voice():
 
 def get_status():
     settings = db.get_settings()
+    prov = settings.get("asr_provider", "local")
     if not _VOICE_AVAILABLE:
         return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
                 "status": "unavailable", "modules": {}, "speakers": [],
-                "reason": _degraded_msg()}
+                "asr_provider": prov, "reason": _degraded_msg()}
     if _worker is None:
         return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
-                "status": "stopped", "modules": {}, "speakers": list_speakers()}
+                "status": "stopped", "modules": {}, "speakers": list_speakers(),
+                "asr_provider": prov}
     return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
             "status": _worker.status, "modules": dict(_worker.sub_status),
-            "speakers": list_speakers()}
+            "speakers": list_speakers(), "asr_provider": prov}
 
 
 def list_speakers():
