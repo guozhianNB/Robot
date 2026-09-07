@@ -4,11 +4,18 @@
 任务5 流式问答语义（改动签名与行为均以本文件为准）：
 - VoiceWorker(stream_fn, post_turn_fn=None, publish_fn=None)；stream_fn(uid, text)
   返回 chat_stream 事件迭代器（不再是返回整段文本的 chat_fn）；
-- _consume_reply 同步消费事件流：content → chat_partial 逐字广播 + 分句缓冲，
-  完整句切出后按句合成入队（仅 speak 模式）；speaking 在首句触发 start_speaking 时广播；
+- _consume_reply(uid, user_text, settings, turn) 同步消费事件流：content →
+  chat_partial 逐字广播 + 分句缓冲，完整句切出后按句合成入队（仅 speak 模式）；
+  speaking 在首句触发 start_speaking 时广播；
 - chat_new 由 _answer（应答线程）在流收尾后发布，_consume_reply 自身不发；
+- 轮次代数：_start_answer 每轮 self._turn += 1 抢占；被取代的旧轮在检查点
+  （循环顶/入队闸 self._turn != turn）静默退出——不发 chat_new/post_turn/end_of_stream；
+  消费异常由 _consume_reply 吞掉，_answer 仍以最新轮身份落已收文本 chat_new（W2）；
 - 主循环播报结束判定 = sink.is_done() and not self._answering and finish_speaking()。
 """
+import threading
+import time
+
 import numpy as np
 
 from LLM.voice import worker as worker_mod
@@ -78,7 +85,9 @@ def test_consume_reply_streams_partial_and_chat_new(monkeypatch):
                                publish_fn=pub)
     _install_stubs(w)
     w.current_uid = "elder_002"
-    assistant = w._consume_reply("elder_002", "今天吃药了吗", {"tts_enabled": True})
+    w._turn += 1                                  # 模拟 _start_answer 已分配轮次
+    assistant = w._consume_reply("elder_002", "今天吃药了吗",
+                                 {"tts_enabled": True}, w._turn)
     assert assistant == "好的，我记住了。"
     partials = [p for ev, p in events if ev == "chat_partial"]
     assert "".join(p["delta"] for p in partials) == "好的，我记住了。"
@@ -195,4 +204,116 @@ def test_publish_failure_is_silent(monkeypatch):
     w.fusion = type("Fusion", (),
                     {"resolve": lambda self, seg: type("Vote", (), {"candidate_uid": None, "confidence": 0.1})()})()
     # content 广播（chat_partial/speaking）全部走 publish → 抛异常 → 应被 _publish 吞掉
-    assert w._consume_reply("elder_001", "测试", {"tts_enabled": True}) == "好的"
+    w._turn += 1                                  # 模拟 _start_answer 已分配轮次
+    assert w._consume_reply("elder_001", "测试", {"tts_enabled": True}, w._turn) == "好的"
+
+
+# ---- 最终审查修复（K1 轮次代数 / W2 异常收尾）----
+
+def _settle_answer_threads(timeout=5.0):
+    """join 全部 voice-answer 应答线程（K1/W2 测试收尾：防泄漏挂起线程）。"""
+    for t in list(threading.enumerate()):
+        if t.name == "voice-answer" and t.is_alive():
+            t.join(timeout)
+            assert not t.is_alive(), "应答线程未在超时内退出"
+
+
+def _wait_no_answering(w, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while w._answering and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return not w._answering
+
+
+def _counting_sink():
+    """记录 end_of_stream 调用次数的 sink 桩（K1/W2 断言收流不变量）。"""
+    eos = []
+    sink = type("Sink", (), {"enqueue": lambda self, s: None,
+                             "stop": lambda self: None,
+                             "is_done": lambda self: True,
+                             "end_of_stream": lambda self: eos.append(1)})()
+    sink._eos = eos
+    return sink
+
+
+def test_new_speech_supersedes_old_answer(monkeypatch):
+    """K1：think 期新整句启动第二轮应答 → 轮次代数取代旧轮：
+    旧轮阻塞在流读上（对 _abort 脉冲不可见），放行后在其检查点发现被取代——
+    不发任何 chat_partial/chat_new、不触发 end_of_stream；收流/落历史只由新轮
+    收尾一次，_answering 最终复位 False，线程全部退出。"""
+    _silence_audit(monkeypatch)
+    events = []
+
+    def pub(ev, **payload):
+        events.append((ev, payload))
+
+    entered = threading.Event()      # 旧轮已进入阻塞流（gate.wait 中）
+    gate = threading.Event()         # 放行旧轮流
+
+    def stream_fn(uid, text):
+        if text == "第一问":
+            def blocked():
+                entered.set()
+                gate.wait(timeout=10)
+                yield {"type": "content", "content": "旧轮不应上屏"}
+                yield {"type": "done", "assistant": "旧轮全文"}
+            return blocked()
+        return iter([{"type": "content", "content": "新轮已接管"},
+                     {"type": "done", "assistant": "新轮已接管"}])
+
+    w = worker_mod.VoiceWorker(stream_fn=stream_fn,
+                               post_turn_fn=lambda uid, u, a: None,
+                               publish_fn=pub)
+    _install_stubs(w)
+    sink = _counting_sink()
+    w.sink = sink
+    uid = "elder_001"
+    try:
+        w._start_answer(uid, "第一问", {"tts_enabled": True})
+        assert entered.wait(5), "第一轮应答线程未进入阻塞流"
+        # think 期新整句：新轮启动（_turn 自增接管；_answering 收尾复位在 join 后断言）
+        w._start_answer(uid, "第二问", {"tts_enabled": True})
+        assert w._turn == 2, "新轮应抢占轮次代数"
+    finally:
+        gate.set()                 # 放行旧轮（断言失败也要清理，防挂起线程）
+        _settle_answer_threads()
+    assert _wait_no_answering(w)
+    partials = "".join(p["delta"] for ev, p in events if ev == "chat_partial")
+    assert "旧轮不应上屏" not in partials, "被取代的旧轮不得再上屏文字"
+    assert partials == "新轮已接管"
+    news = [p for ev, p in events if ev == "chat_new"]
+    assert len(news) == 1, f"只有最新轮发 chat_new：{news}"
+    assert news[0] == {"uid": uid, "user": "第二问", "assistant": "新轮已接管"}
+    assert len(sink._eos) == 1, "end_of_stream 只能由最新轮收尾一次（旧轮静默退出）"
+
+
+def test_consume_exception_still_finalizes_chat_new(monkeypatch):
+    """W2：消费异常（如设备掉线）→ _consume_reply 记审计后带已收文本返回，不抛穿；
+    _answer 仍以最新轮身份收尾：chat_new 落已收文本 + post_turn + end_of_stream 一次。"""
+    _silence_audit(monkeypatch)
+    events = []
+    posted = []
+
+    def pub(ev, **payload):
+        events.append((ev, payload))
+
+    def stream_fn(uid, text):
+        def gen():
+            yield {"type": "content", "content": "前半段"}
+            raise RuntimeError("设备掉线")
+        return gen()
+
+    w = worker_mod.VoiceWorker(stream_fn=stream_fn,
+                               post_turn_fn=lambda uid, u, a: posted.append((uid, u, a)),
+                               publish_fn=pub)
+    _install_stubs(w)
+    sink = _counting_sink()
+    w.sink = sink
+    w._start_answer("elder_001", "测试问", {"tts_enabled": True})
+    _settle_answer_threads()
+    assert _wait_no_answering(w)
+    news = [p for ev, p in events if ev == "chat_new"]
+    assert len(news) == 1
+    assert news[0] == {"uid": "elder_001", "user": "测试问", "assistant": "前半段"}
+    assert posted == [("elder_001", "测试问", "前半段")]
+    assert len(sink._eos) == 1, "异常路径也要收流一次"

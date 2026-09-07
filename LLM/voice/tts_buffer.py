@@ -9,9 +9,10 @@ r"""LLM 回复流式分句缓冲器（句级 TTS 流式的前置组件，纯逻�
   断点后紧跟的右引号 ”’」』 并入前句再断（。" / 。” 场景）；
 - 换行 \n 亦为断点：\n 前内容整段成句出；本批内容含 \n 时，末行残余随换行语义一并
   切出（测试约定 feed("A；B\nC") → ["A；B", "C"] 且 flush 为空）；
-- 超 max_chars 且缓冲内无任何断点 → 长度兜底：不足一段直接全出，否则在
-  buf[:max_chars] 窗口内取最后一个空格/逗号/顿号切（含分隔符），窗口内无次级分隔则
-  硬切 max_chars，直至缓冲切空；
+- 超 max_chars 且缓冲内无任何断点，或唯一终止标点断点距起点过远（枚举/逗号链等
+  长句句号迟迟才到）→ 长度兜底：不足一段直接全出，否则在 buf[:max_chars] 窗口内取
+  最后一个空格/逗号/顿号切（含分隔符），窗口内无次级分隔则硬切 max_chars，
+  直至缓冲切空——句长被 cap 在 ~max_chars，及时分段合成出声；
 - 不需要语义/句法解析，不需要超时强切。"""
 import re
 
@@ -50,7 +51,16 @@ class SentenceBuffer:
             nl = buf.find("\n")
             m = _SENT_END.search(buf)
             if m is not None and (nl == -1 or m.start() < nl):
-                # 终止标点串（连续整体 + 可选后随引号）归属前句 → 整段切走
+                # 终止标点串（连续整体 + 可选后随引号）归属前句 → 整段切走；
+                # 护栏：句子内容（m.start() 前）已超 max_chars（200-400 字无句号的
+                # 枚举/逗号链，句号迟迟才到）→ 先走长度兜底切出前段（_force_cut），
+                # 不等远端句号，避免整段一次切出拖垮首音
+                if m.start() > self.max_chars:
+                    cut = self._force_cut(buf)
+                    out.append(buf[:cut])
+                    self._buf = buf[cut:]
+                    flush_rest = True
+                    continue
                 out.append(buf[: m.end()])
                 self._buf = buf[m.end():]
                 flush_rest = False

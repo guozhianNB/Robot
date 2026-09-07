@@ -55,3 +55,18 @@ def test_boundary_cross_feed():
     assert out == ["这是第一句。"]
     out += b.feed("是第二句！")
     assert out == ["这是第一句。", "这是第二句！"]
+
+
+def test_long_sentence_with_trailing_punct_capped():
+    """W1：超长句（无中间断点的长串）带尾部句号 → 句号虽在缓冲内但距起点过远，
+    不得整段一次切出等远端句号，先按长度兜底分段：join 还原原文、末段含句号、
+    每段 ≤ max_chars 附近（句长 cap 保证及时分段合成出声）。"""
+    b = SentenceBuffer(max_chars=10)
+    text = "一二三四五六七八九十" * 3 + "。"
+    out = b.feed(text)
+    assert "".join(out) == text
+    assert len(out) >= 2, "长句应被分段而非整段一次切出"
+    assert out[-1].endswith("。"), "终止标点归属末段"
+    assert all(len(s) <= b.max_chars + 1 for s in out), "每段不得超过 max_chars 太多"
+    assert b.flush() == ""
+    assert all(s for s in out)
