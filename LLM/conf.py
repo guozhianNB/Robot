@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "asr_enabled": True,            # 语音识别（真实开关）
     "asr_provider": "cloud",        # 识别引擎：cloud=火山流式识别（默认；不可用自动回退本地）/ local=sherpa（重启生效，worker 启动时读取）
     "tts_enabled": True,            # 语音合成（真实开关）
+    "tts_provider": "cloud",        # 合成引擎：cloud=豆包语音(默认；不可用自动回退本地)/ local=sherpa（重启生效，worker 启动时读取）
     "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）
     "wakeword": "小机器人",          # 唤醒词（显示用；实际检测用 kws_keywords.txt）
     "handsfree_seconds": 30,        # 免唤醒连续对话窗口
