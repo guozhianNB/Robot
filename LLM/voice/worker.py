@@ -195,8 +195,8 @@ class VoiceWorker(threading.Thread):
             if (self._speak_started is not None
                     and (time.monotonic() - self._speak_started) > config.BARGE_IN_GRACE_S
                     and self.vad.is_speech_now()):
-                self.sink.stop()
-                self._abort.set()          # 通知应答线程停止后续合成/入队
+                self._abort.set()          # 打断先行：先通知应答线程停手，再停输出流
+                self.sink.stop()           # stop() 内 join(≤2s)：期间应答线程已见 abort，不会 enqueue 续播
                 self.session.barge_in()
                 audit.log("voice_barge_in")
                 self._reset_asr()
@@ -369,7 +369,10 @@ class VoiceWorker(threading.Thread):
             try:
                 chunks = list(self.tts.synthesize_chunks(clean))
             except Exception as e:
-                audit.log("voice_error", action="tts_cloud_sentence", error=str(e)[:160])
+                audit.log("voice_error",
+                          action="tts_cloud_sentence" if self.tts is not self._local_tts
+                          else "tts_local_sentence",
+                          error=str(e)[:160])
                 if self.tts is not self._local_tts and self._local_tts is not None:
                     try:                  # 云端句失败 → 本地兜底，不中断播报
                         chunks = list(self._local_tts.synthesize_chunks(clean))
@@ -380,6 +383,8 @@ class VoiceWorker(threading.Thread):
             if not chunks:
                 return
             if speak:
+                if self._abort.is_set():
+                    return                # abort 已置位：绝不入队/发声（合成期间被打断）
                 if not started.is_set():
                     started.set()
                     self._speak_started = time.monotonic()
@@ -403,13 +408,15 @@ class VoiceWorker(threading.Thread):
                 if delta:
                     self._publish("chat_partial", uid=uid, delta=delta)
                     full.append(delta)
-                    for sent in buf.feed(delta):
-                        enqueue_sentence(sent)
+                    if speak:             # 仅 speak 模式分句+合成（非 speak 不逐句调 TTS）
+                        for sent in buf.feed(delta):
+                            enqueue_sentence(sent)
             elif t == "done":
                 break
-        tail = buf.flush()
-        if tail:
-            enqueue_sentence(tail)
+        if speak:
+            tail = buf.flush()
+            if tail:
+                enqueue_sentence(tail)
         return "".join(full)
 
     def stop(self):

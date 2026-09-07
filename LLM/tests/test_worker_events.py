@@ -9,13 +9,10 @@
 - chat_new 由 _answer（应答线程）在流收尾后发布，_consume_reply 自身不发；
 - 主循环播报结束判定 = sink.is_done() and not self._answering and finish_speaking()。
 """
-import threading
-
 import numpy as np
 
 from LLM.voice import worker as worker_mod
 from LLM.voice import session as session_mod
-from LLM.voice import tts_buffer
 
 
 def _make_worker(stream_fn=None, post_turn_fn=None):
