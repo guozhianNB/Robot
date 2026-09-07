@@ -100,14 +100,11 @@ def _cleanup_pending():
         _pending.pop(k, None)
 
 
-def _chat_fn(client, model):
+def _stream_fn(client, model):
+    """(uid, text) -> chat_stream 事件迭代器（worker 流式问答消费，任务5）。"""
     def _fn(uid, text):
         settings = db.get_settings()
-        parts = []
-        for ev in chat.chat_stream(client, model, uid, text, "auto", settings):
-            if ev["type"] == "content":
-                parts.append(ev["content"])
-        return "".join(parts)
+        return chat.chat_stream(client, model, uid, text, "auto", settings)
     return _fn
 
 
@@ -119,7 +116,8 @@ def start_voice(client, model, post_turn_fn):
         return None
     if not db.get_settings().get("voice_enabled", True):
         return None
-    _worker = worker_mod.VoiceWorker(_chat_fn(client, model), post_turn_fn, publish_fn=bus.publish)
+    _worker = worker_mod.VoiceWorker(_stream_fn(client, model), post_turn_fn,
+                                     publish_fn=bus.publish)
     _worker.start()
     return _worker
 
@@ -136,17 +134,20 @@ def stop_voice():
 def get_status():
     settings = db.get_settings()
     prov = settings.get("asr_provider", "local")
+    tts_prov = settings.get("tts_provider", "cloud")
     if not _VOICE_AVAILABLE:
         return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
                 "status": "unavailable", "modules": {}, "speakers": [],
-                "asr_provider": prov, "reason": _degraded_msg()}
+                "asr_provider": prov, "tts_provider": tts_prov,
+                "reason": _degraded_msg()}
     if _worker is None:
         return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
                 "status": "stopped", "modules": {}, "speakers": list_speakers(),
-                "asr_provider": prov}
+                "asr_provider": prov, "tts_provider": tts_prov}
     return {"ok": True, "voice_enabled": settings.get("voice_enabled", True),
             "status": _worker.status, "modules": dict(_worker.sub_status),
-            "speakers": list_speakers(), "asr_provider": prov}
+            "speakers": list_speakers(), "asr_provider": prov,
+            "tts_provider": tts_prov}
 
 
 def list_speakers():
