@@ -11,8 +11,14 @@ r"""音频采集/播放抽象（sounddevice）。唯一接触声卡的模块。
   - 流对象**只由写入线程创建并唯一一次关闭**；stop() 只置停止事件 + abort() 唤醒
     阻塞中的 write，然后 join 写入线程 —— 消除"stop() close 与写线程 finally 再
     close 同一流"的双关闭竞态。
+  - 播放队列（AudioSink，2026-09-07）：enqueue(samples) 把 16k 样本段追加进内部
+    队列（首个段启动输出流与写线程）；end_of_stream() 标记"无更多段"，写线程在
+    队列清空后自行收流（自然播完）；stop() 打断=置停止事件 + 清队列 + abort 唤醒
+    + join（barge-in）；写线程从队列取段、段内分块连续写（句间无缝），仍是输出流
+    唯一创建/关闭者。play(samples, sample_rate) 兼容旧调用（= stop + 复位 + enqueue）。
 """
 import threading
+import time
 
 import numpy as np
 
@@ -62,48 +68,73 @@ class AudioSource:
 
 
 class AudioSink:
-    """播放：独立线程分块写数据，可从外部 stop() 打断（barge-in）。
+    """队列播放器：独立线程从内部队列取"样本段"，段内分块连续写（句间无缝）。
+    语义：enqueue 追加一段（首个段启动输出流）；end_of_stream() 标记无更多段，
+    队列清空后写线程自行收流（自然播完）；stop() 打断=置停止事件+清队列+abort
+    唤醒并 join（barge-in）；is_done()=输出流已关闭。写线程是输出流唯一创建/关闭者
+    （沿用分块写+单次关闭模型，防 PortAudio 双关闭竞态）。
+    本类只处理 16k 样本（云端 TTS 固定请求 16k，与本地一致），不做重采样。"""
 
-    状态约定：流对象由 _run 写入线程创建/唯一关闭；stop() 置事件并 abort() 唤醒；
-    is_done() 在流关闭后返回 True。"""
-
-    _WRITE_BLOCK_S = 0.2          # 每次 write 的音频时长（秒），避免整段巨帧阻塞写
+    _WRITE_BLOCK_S = 0.2
 
     def __init__(self):
         self._lock = threading.Lock()
         self._stream = None
         self._thread = None
         self._stop_write = threading.Event()
+        self._queue = []          # 待播样本段（float32 16k）
+        self._ended = False       # end_of_stream 已调用：无更多段
         self._write_frames = int(config.SAMPLE_RATE * self._WRITE_BLOCK_S)
 
-    def play(self, samples: np.ndarray, sample_rate: int):
+    def enqueue(self, samples: np.ndarray):
+        """追加一段 16k float32 音频到播放队列；首个段时启动输出流。"""
         _require_sd()
-        self.stop()
-        self._write_frames = max(1, int(sample_rate * self._WRITE_BLOCK_S))
+        arr = np.asarray(samples, dtype=np.float32)
+        if arr.size == 0:
+            return
         with self._lock:
-            self._stop_write = threading.Event()
-            try:
-                stream = sd.OutputStream(
-                    samplerate=sample_rate, channels=1, dtype="float32")
-                stream.start()
-            except Exception:
-                self._stream = None
-                raise
-            self._stream = stream
-        self._thread = threading.Thread(
-            target=self._run, args=(stream, samples), daemon=True)
-        self._thread.start()
+            self._queue.append(arr)
+            if self._thread is None and self._stream is None:
+                self._stop_write = threading.Event()
+                self._ended = False
+                try:
+                    stream = sd.OutputStream(
+                        samplerate=config.SAMPLE_RATE, channels=1, dtype="float32")
+                    stream.start()
+                except Exception:
+                    self._queue.clear()
+                    raise
+                self._stream = stream
+                self._thread = threading.Thread(
+                    target=self._run, args=(stream,), daemon=True)
+                self._thread.start()
 
-    def _run(self, stream, samples):
-        """分块阻塞写；stop() 触发事件/abort 后退出；本线程是流的唯一关闭者。"""
+    def end_of_stream(self):
+        """标记无更多段：队列清空后写线程自行收流（自然播完语义）。"""
+        with self._lock:
+            self._ended = True
+
+    def _run(self, stream):
+        """取段 → 段内分块阻塞写；stop/收流条件满足后退出；本线程唯一关闭流。"""
         n = self._write_frames
         try:
-            for i in range(0, len(samples), n):
-                if self._stop_write.is_set():
-                    break
-                stream.write(samples[i:i + n])   # 阻塞 ~0.2s/块；被打断时抛错退出
+            while not self._stop_write.is_set():
+                with self._lock:
+                    if self._queue:
+                        samples = self._queue.pop(0)
+                    elif self._ended:
+                        break
+                    else:
+                        samples = None
+                if samples is None:
+                    time.sleep(0.02)
+                    continue
+                for i in range(0, len(samples), n):
+                    if self._stop_write.is_set():
+                        break
+                    stream.write(samples[i:i + n])    # 阻塞 ~0.2s/块；打断时抛错退出
         except Exception:
-            pass                                 # 被打断（abort）或设备丢失，静默结束
+            pass
         finally:
             with self._lock:
                 try:
@@ -113,15 +144,17 @@ class AudioSink:
                     pass
                 if self._stream is stream:
                     self._stream = None
-            self._thread = None
+                self._thread = None
 
     def stop(self):
+        """打断播放：清队列并关闭输出流（同步等待写线程退出）。"""
         with self._lock:
             self._stop_write.set()
+            self._queue.clear()
             stream = self._stream
             if stream is not None:
                 try:
-                    stream.abort()               # 唤醒阻塞中的 write（抛错 → 写线程收尾）
+                    stream.abort()
                 except Exception:
                     pass
         if self._thread is not None:
@@ -129,4 +162,12 @@ class AudioSink:
 
     def is_done(self) -> bool:
         with self._lock:
-            return self._stream is None
+            return self._stream is None and self._thread is None
+
+    def play(self, samples: np.ndarray, sample_rate: int):
+        """旧语义兼容：打断当前播放后播这一段（内部复刻 stop+enqueue）。"""
+        self.stop()
+        with self._lock:
+            self._stop_write = threading.Event()
+            self._ended = False
+        self.enqueue(samples)
