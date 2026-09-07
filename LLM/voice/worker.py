@@ -111,8 +111,7 @@ class VoiceWorker(threading.Thread):
                           provider="cloud", error=str(e))
                 self.tts = self._local_tts
                 self.sub_status["tts_fallback"] = "云端不可用，已回退本地：{}".format(str(e)[:120])
-        # 本地 TTS 无 provider 属性（仅云端引擎声明），getattr 兜底取 "local"
-        self.sub_status["tts"] = getattr(self.tts, "provider", "local")
+        self.sub_status["tts"] = self.tts.provider   # 本地/云端引擎均声明 provider 类属性
         self.spk = spk_mod.SpeakerRecognizer()
         self.fusion = id_mod.VoiceprintOnlyFusion(self.spk)
 
@@ -392,7 +391,7 @@ class VoiceWorker(threading.Thread):
                     return                # 已被打断（后续句）：不再入队
                 self.sink.enqueue(np.concatenate(chunks))
                 audit.log("voice_tts", text=clean[:80],
-                          provider=getattr(self.tts, "provider", "local"),
+                          provider=self.tts.provider,
                           ms=len(clean) * 250)   # 播报时长粗估（中文 ~4字/秒，仅日志参考）
 
         for ev in self.stream_fn(uid, user_text):

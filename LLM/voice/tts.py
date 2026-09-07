@@ -41,6 +41,8 @@ def sanitize_tts_text(text: str) -> str:
 
 
 class TTS:
+    provider = "local"
+
     def __init__(self, tts_dir=config.TTS_DIR, sid=2):
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
