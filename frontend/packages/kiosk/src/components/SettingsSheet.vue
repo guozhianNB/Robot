@@ -42,6 +42,21 @@ async function save(key: string, value: unknown) {
                  @change="save('tts_enabled', ($event.target as HTMLInputElement).checked)" />
           语音播报
         </label>
+        <div class="group">
+          <div class="group-title">识别引擎（重启服务后生效）</div>
+          <label>
+            <input type="radio" name="asr_provider" value="local"
+                   :checked="settings.asr_provider !== 'cloud'"
+                   @change="save('asr_provider', 'local')" />
+            本地识别（离线）
+          </label>
+          <label>
+            <input type="radio" name="asr_provider" value="cloud"
+                   :checked="settings.asr_provider === 'cloud'"
+                   @change="save('asr_provider', 'cloud')" />
+            云端识别（火山）
+          </label>
+        </div>
         <label>
           唤醒词：<b>{{ settings.wakeword ?? "小机器人" }}</b>
         </label>
@@ -59,6 +74,10 @@ async function save(key: string, value: unknown) {
 .sheet h2 { margin-top: 0; }
 .sheet label { display: flex; gap: 12px; align-items: center; }
 .sheet input[type="checkbox"] { width: 26px; height: 26px; }
+.sheet input[type="radio"] { width: 22px; height: 22px; }
+.sheet .group { display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 14px; border: 1px solid #374151; border-radius: 12px; }
+.sheet .group-title { font-size: 16px; color: #9ca3af; margin-bottom: 2px; }
 .close { padding: 14px; border-radius: 12px; background: #374151;
   color: #f9fafb; border: none; font-size: 20px; }
 </style>

@@ -16,10 +16,12 @@ import SettingsSheet from "./components/SettingsSheet.vue";
 const state = ref("idle");
 const uid = ref<string | null>(null);
 const locked = ref(false);
+const liveText = ref("");        // 流式 ASR 实时字幕（asr_partial 事件）
 const messages = ref<Msg[]>([]);
 const reminder = ref<ReminderEvent | null>(null);
 const showSwitcher = ref(false);
 const showSettings = ref(false);
+const asrProvider = ref("cloud");   // local | cloud（识别引擎，重启服务后生效）
 const { connected } = useBus(onEvent);
 
 async function loadSession() {
@@ -30,17 +32,46 @@ async function loadSession() {
   } catch { /* 后端未就绪时忽略 */ }
 }
 
+async function loadAsrProvider() {
+  try {
+    const res = await fetch("/api/settings");
+    const body = await res.json();
+    asrProvider.value = body.settings?.asr_provider ?? "cloud";
+  } catch { /* 忽略，保留默认 */ }
+}
+
+async function toggleAsrProvider() {
+  const next = asrProvider.value === "cloud" ? "local" : "cloud";
+  asrProvider.value = next;
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: { asr_provider: next } }),
+    });
+  } catch { /* 保存失败也提示用户 */ }
+  alert(`识别引擎已切换为${next === "cloud" ? "云端（火山）" : "本地"}，重启服务后生效`);
+}
+
 function onEvent(ev: BusEvent) {
   if (ev.type === "voice_state") {
+    // 实时识别字幕：边听边出字（状态条视觉保持 listening，不进状态机）
+    if (ev.state === "asr_partial") {
+      liveText.value = ev.text ?? "";
+      return;
+    }
     state.value = ev.state;
-    // I-1：声纹识别事件带 uid → 同步状态条（声纹切换用户时前端即时反映）
     if (ev.uid) uid.value = ev.uid;
+    if (ev.state === "recognized" && ev.text) liveText.value = ev.text;  // 定格最终识别（等待回复期间可见）
+    else if (ev.state === "idle") liveText.value = "";
   }
   if (ev.type === "voice_status" && ev.status === "degraded") {
     // I-2：worker._report 广播的降级 → 状态条置为"语音不可用"（原本是死代码）
     state.value = "unavailable";
+    liveText.value = "";
   }
   if (ev.type === "chat_new") {
+    liveText.value = "";  // 已进对话区，字幕行收起
     messages.value.push({ role: "user", content: ev.user, uid: ev.uid });
     messages.value.push({ role: "assistant", content: ev.assistant });
   }
@@ -112,16 +143,23 @@ async function onConfirmReminder(rid: number) {
   } catch { /* 忽略 */ }
 }
 
-onMounted(loadSession);
+onMounted(() => {
+  loadSession();
+  loadAsrProvider();
+});
 </script>
 
 <template>
   <div class="kiosk">
     <VoiceStatusBar :state="state" :uid="uid" :locked="locked" @open-switcher="showSwitcher = true" />
+    <div v-if="liveText" class="live-asr">🗣 {{ liveText }}</div>
     <ReminderBanner v-if="reminder" :reminder="reminder" @confirm="onConfirmReminder" />
     <ChatArea :messages="messages" @send="sendText" />
     <div class="bottom">
       <SosButton @sos="onSos" />
+      <button class="settings-btn asr-toggle" @click="toggleAsrProvider">
+        识别：{{ asrProvider === "cloud" ? "云端" : "本地" }}
+      </button>
       <button class="settings-btn" @click="showSettings = true">⚙ 设置</button>
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
     </div>
@@ -137,9 +175,12 @@ body { background: #0b1220; color: #f9fafb; font-family: system-ui, sans-serif; 
 </style>
 <style scoped>
 .kiosk { height: 100vh; display: flex; flex-direction: column; }
+.live-asr { padding: 10px 24px; background: #1e293b; color: #fbbf24;
+  font-size: 24px; line-height: 1.4; min-height: 44px; }
 .bottom { display: flex; align-items: center; gap: 20px; padding: 16px 24px; }
 .conn { color: #22c55e; font-size: 20px; }
 .conn.off { color: #ef4444; }
 .settings-btn { background: #374151; color: #f9fafb; border: none;
   padding: 16px 24px; border-radius: 16px; font-size: 22px; }
+.asr-toggle { background: #1d4ed8; }
 </style>

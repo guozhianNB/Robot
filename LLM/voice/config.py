@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-r"""语音链路专属配置：模型路径、音频/VAD/KWS 参数。纯常量。"""
+r"""语音链路专属配置：模型路径、音频/VAD/KWS 参数。纯常量。
+
+云端流式 ASR（火山引擎「豆包语音」控制台）：
+  凭据放项目根 .env（server.py load_dotenv 加载），因加载时机在模块 import 之后，
+  这里用读取函数（延迟到调用时 os.getenv），不要做成 import 期常量。"""
+import os
+
 from ..conf import BASE_DIR, DATA_DIR
 
 # 目录
@@ -34,5 +40,28 @@ KWS_THRESHOLD = 0.25
 
 # 打断：播报开始后忽略 VAD 的宽限时长（防开场误判）
 BARGE_IN_GRACE_S = 0.3
+# 播报自然结束后的回声尾巴静音时长：这段时间丢弃麦克风块（不喂 VAD/ASR），
+# 防止机器人自己的 TTS 回声被 VAD 判成语音段进而被 ASR 识别（自问自答）。
+# 仅"自然播报结束"生效；打断式插话不套用（老人正在说话，要立即收音）。
+SPEAK_TAIL_BLANK_S = 0.25
 # 音频设备掉线：连续失败多少次判定为 degraded（仍持续重试，不退出线程）
 MAX_RECONNECT = 5
+
+# ---- 流式 ASR（worker 编排用）----
+# VAD 判定"开始说话"需要一小段窗口，起会话时回补这段前沿音频，避免丢句首字
+ASR_ONSET_TAIL_S = 0.5
+
+
+# ---- 云端 ASR 环境变量（延迟读取，见模块 docstring）----
+def cloud_asr_ws():
+    """SAUC 双向流式端点；如开通/使用的是流式1.0，可改配 volc.bigasr 资源。"""
+    return os.getenv("VOLC_ASR_WS_URL") or "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+
+
+def cloud_asr_api_key():
+    return os.getenv("VOLC_ASR_API_KEY") or ""
+
+
+def cloud_asr_resource_id():
+    """流式识别2.0(Seed-ASR)=volc.seedasr.sauc.duration；1.0=volc.bigasr.sauc.duration"""
+    return os.getenv("VOLC_ASR_RESOURCE_ID") or "volc.seedasr.sauc.duration"

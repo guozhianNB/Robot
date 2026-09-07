@@ -36,7 +36,7 @@ export interface ChatNewEvent {
 
 export interface VoiceStateEvent {
   type: "voice_state";
-  state: string;     // idle / wake / listening / recognized / speaking
+  state: string;     // idle / listening / recognized / speaking / asr_partial（实时识别字幕，带 text）
   uid?: string;
   text?: string;
 }

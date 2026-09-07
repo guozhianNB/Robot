@@ -33,6 +33,13 @@ from .conf import (MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS,
 MEDICAL_KEYWORDS = ["药", "剂量", "病史", "诊断", "血压", "血糖", "手术", "住院", "过敏",
                     "服用", "胰岛素", "病历", "医嘱", "检查结果", "癌", "肿瘤"]
 
+# R1 即时纠错信号词（对标 MaiBot feedback_signal_tokens）：命中才让 LLM 判断是否有纠正，省每轮 LLM 调用
+CORRECT_SIGNALS = [
+    "不是", "不对", "错了", "记错", "说错", "说反", "搞错", "更正", "纠正",
+    "其实", "应该是", "不是的", "改一下", "更新", "忘了说", "补充一下", "以后别",
+    "别再", "不要叫我", "别叫我", "我姓", "我不叫", "其实我", "我是",
+]
+
 # 记忆整理：去重向量相似度阈值（超过视为重复）
 DEDUP_SIM_THRESHOLD = 0.55
 
@@ -41,6 +48,21 @@ _buf_lock = threading.Lock()
 _pending_turns: dict[str, list[dict]] = {}   # uid -> [{role, content}, ...]
 _last_activity: dict[str, float] = {}        # uid -> 最后对话时间戳
 _timers: dict[str, threading.Timer] = {}     # uid -> 空闲定时器
+_in_flight: set[str] = set()                 # uid -> 正在 consolidate（租约，防并发重复整理）
+
+
+def _try_acquire(uid: str) -> bool:
+    """租约：同一 uid 同一时刻只允许一个 consolidate 在跑（空闲定时器/上下文满/手动 suggest 竞争时防重）。"""
+    with _buf_lock:
+        if uid in _in_flight:
+            return False
+        _in_flight.add(uid)
+        return True
+
+
+def _release(uid: str) -> None:
+    with _buf_lock:
+        _in_flight.discard(uid)
 
 
 def _profile_memory(profile: dict | None, uid: str) -> list[str]:
@@ -114,7 +136,10 @@ def recall_v3(uid: str, query: str) -> dict:
 
     cores = db.list_core_memories(uid, limit=CORE_MEMORY_CAP)
     for m in cores:
-        parts.append(f"[核心] {m['content']}（{m['type']}）")
+        # P0c 账本定稿：AI 归纳(llm)标注"仅供参考"，护士确认(nurse)才视为可信事实
+        auth = (m.get("authority") or "llm")
+        tag = "" if auth in ("nurse", "claim") else "（AI 归纳，仅供参考）"
+        parts.append(f"[核心] {m['content']}（{m['type']}）{tag}")
     sources += [{"type": "core", "id": m["id"]} for m in cores]
 
     for h in ragstore.query(uid, query, top_k=MEMORY_TOP_K):
@@ -207,7 +232,8 @@ CONSOLIDATE_PROMPT = """你是陪护机器人的记忆管家。下面是刚结�
 {{
   "entries": [...],
   "digest": "这段对话的一句话摘要（≤80字）",
-  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/说话风格（不得包含任何医疗/用药/病史信息））"
+  "portrait": "整合档案与已有记忆后，老人的精简画像（≤150字，含性格/习惯/偏好/说话风格（不得包含任何医疗/用药/病史信息））",
+  "expressions": [{{"situation": "场景描述", "style": "老人当时的原话说法"}}]
 }}
 
 entries 规则：
@@ -223,6 +249,12 @@ entries 规则：
      普通事件/一般事实填 0-2
 6. 若某条新信息是在【修正】已有记忆（已有记忆编号见上文《已有记忆》列表），
    用 {{"action":"correct", "correct_id":<已有记忆编号>, "content":"修正后的完整内容"}} 表示。
+
+expressions 规则（提取老人说话风格，供机器人学口吻但保持护工身份）：
+- situation=触发场景（如"夸她"、"聊到老伴儿"、"让她喝水"），style=老人原话说法（≤20字，保留原词）。
+- 只提取稳定重复出现或有代表性的口吻/称呼习惯；玩笑、情绪化发泄、无意义口头语不提取。
+- 不得含脏话、医疗用药内容、人名全名、个人隐私（只用"老伴儿""孙女"这类称呼即可）。
+- 每次最多输出 3 条；风格不明则输出空数组。
 """
 
 
@@ -318,7 +350,7 @@ def _upsert_relation(uid: str, rel: dict) -> None:
     graph.upsert_relation(uid, sid, did, rel.get("rel", "related_to"))
 
 
-def _append_summary_and_episode(uid: str, digest: str) -> None:
+def _append_summary_and_episode(uid: str, digest: str, external_id: str = "") -> None:
     if any(k in digest for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type="digest",
                   content=digest, reason="医疗只读红线")
@@ -326,23 +358,60 @@ def _append_summary_and_episode(uid: str, digest: str) -> None:
     prev = db.get_summary(uid)
     new_sum = (prev + "\n" + f"[{db.now_iso()[:10]}] {digest}").strip()
     db.set_summary(uid, new_sum[-900:])
+    # 幂等落 episode：同一段对话（由 external_id=对话内容指纹标识）只生成一次，防重复整理
     if not _rag_dedup_check(uid, digest, mtype="episodic"):
-        ragstore.add(uid, "episodic", digest, source="llm:consolidate")
+        ragstore.add(uid, "episodic", digest, source="llm:consolidate", external_id=external_id)
         audit.log("memory_change", action="episode_add", uid=uid, content=digest)
 
 
-def _upsert_portrait(uid: str, portrait: str) -> None:
+# R2 画像防退化：AI 新画像与现 persona 相似度 ≥ 该阈值 → 跳过重写（防 LLM 抖动/内容退化）
+PORTRAIT_SKIP_SIM = 0.90
+
+
+def _upsert_portrait(uid: str, portrait: str, source: str = "llm:consolidate",
+                     by: str = "nurse") -> None:
+    """画像写入核心记忆（type=persona, importance=5），旧 persona 软覆盖（删旧写新）。
+
+    - P3: pinned（护士保护/手动维护）条目绝不覆盖
+    - R2: AI 生成的新画像与现 persona 高度相似（≥PORTRAIT_SKIP_SIM）→ 跳过不重写，
+          防止 consolidate 每轮 LLM 输出微小抖动导致画像反复重写、内容退化
+    """
     if any(k in portrait for k in MEDICAL_KEYWORDS):
         audit.log("memory_change", action="reject", uid=uid, type="persona",
                   content=portrait, reason="医疗只读红线")
         return
-    # 画像写入核心记忆（type=persona, importance=5），旧 persona 条目软覆盖（删旧写新）
-    for m in db.list_core_memories(uid):
-        if m["type"] == "persona":
-            db.delete_core_memory(m["id"])
-    db.add_core_memory(uid, "persona", portrait, importance=5, source="llm:consolidate")
+    existing = [m for m in db.list_core_memories(uid) if m["type"] == "persona"]
+    # 护士手动维护的画像（pinned）存在且本次为 AI 归纳 → 直接跳过，绝不覆盖
+    if source.startswith("llm") and any(m.get("pinned") for m in existing):
+        audit.log("memory_change", action="portrait_skip", uid=uid,
+                  reason="护士已手动维护画像(pinned)，AI 不覆盖")
+        return
+    # 防退化：AI 归纳且与现状几乎相同 → 不重写（护士手动维护不受此限）
+    if source.startswith("llm") and existing:
+        prev = max(existing, key=lambda m: m.get("importance", 0) or 0)
+        prev_text = prev.get("content") or ""
+        if prev_text:
+            idx = vectors.build_index([{"id": "p", "text": prev_text}])
+            hits = vectors.recall(idx, portrait, top_k=1)
+            if hits and hits[0]["score"] >= PORTRAIT_SKIP_SIM:
+                audit.log("memory_change", action="portrait_skip", uid=uid,
+                          reason="与现画像相似度过高")
+                return
+    for m in existing:
+        if not m.get("pinned"):
+            db.delete_core_memory_hard(m["id"])
+    db.add_core_memory(uid, "persona", portrait, importance=5,
+                       source=source if not source.startswith("nurse") else "nurse:manual",
+                       authority="nurse" if source.startswith(("nurse", "manual")) else "llm")
+    if source.startswith(("nurse", "manual")):
+        # 护士手动维护的画像：pinned 防 AI 覆盖
+        for m in db.list_core_memories(uid):
+            if m["type"] == "persona" and m.get("content") == portrait:
+                db.set_core_pinned(m["id"], True)
+                break
     db.set_portrait(uid, portrait)  # 双写过渡，兼容 chat.py/server.py 旧读路径
-    audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait)
+    audit.log("memory_change", action="portrait_update", uid=uid, portrait=portrait,
+              source=source, by=by)
 
 
 CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句老人新说的话。
@@ -359,11 +428,22 @@ CORRECT_PROMPT = """下面是该老人已有的核心记忆列表，以及一句
 
 
 def correct_instant(uid: str, user_text: str, client, model: str) -> dict:
-    """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。"""
+    """即时纠错：对话返回后异步调用。识别"纠正/更新旧记忆"，直接更新（医疗/身份红线除外）。
+
+    R1（对标 MaiBot feedback_signal_tokens）：先做信号词规则预筛，无纠正信号直接返回，
+    省去每轮一次无谓的 LLM 调用（原先每轮对话都让 LLM 判断，很费 token）。
+    """
     from .chat import llm_json
+    # ---- 规则预筛：纠正信号词 ----
+    text = (user_text or "").strip()
+    if not text or len(text) > 80:   # 超长句不预判（可能含复杂纠正，交给 consolidate）
+        return {"corrected": False, "reason": "no_signal"}
+    signal_hit = any(sig in text for sig in CORRECT_SIGNALS)
+    if not signal_hit:
+        return {"corrected": False, "reason": "no_signal"}
     cores = db.list_core_memories(uid, limit=30)
     mem_text = "\n".join(f"[#{m['id']}] {m['content']}" for m in cores) or "（暂无）"
-    data = llm_json(client, model, CORRECT_PROMPT.format(memories=mem_text, text=user_text))
+    data = llm_json(client, model, CORRECT_PROMPT.format(memories=mem_text, text=text))
     if not data:
         # llm_json 失败/解析失败返回空 dict，区别于"无纠正"
         audit.log("memory_correct", action="instant_error", uid=uid, error="LLM 返回空或解析失败")
@@ -438,7 +518,39 @@ def _apply_entry(uid: str, e: dict) -> dict:
 
 
 def consolidate(uid: str, client, model: str) -> dict:
-    """整理某位老人这段时间的对话：提取记忆（去重/合并/冲突）+ 话题摘要 + 画像。"""
+    """整理某位老人这段时间的对话：提取记忆（去重/合并/冲突）+ 话题摘要 + 画像。
+
+    P1a 租约：同 uid 正在整理时直接跳过（空闲定时器/上下文满/手动触发并发竞争防重）。
+    """
+    if not _try_acquire(uid):
+        return {"ok": True, "skipped": True, "reason": "该老人正在整理中（租约占用）"}
+    try:
+        return _consolidate_locked(uid, client, model)
+    finally:
+        _release(uid)
+
+
+def _apply_expression(uid: str, e: dict) -> dict:
+    """一条老人说话风格表达 → 自审 → 落 expressions 待审（checked=0，护士审核后参与注入）。"""
+    situation = (e.get("situation") or "").strip()
+    style = (e.get("style") or "").strip()
+    if not situation or not style:
+        return {"action": "skip"}
+    if len(style) > 40:
+        return {"action": "skip", "reason": "style 过长"}
+    # 自审：脏话/医疗/身份/隐私红线（服务端兜底，模型也可能漏）
+    # 注意用多字词避免误伤（"操"会误杀"操心"）
+    banned = MEDICAL_KEYWORDS + IDENTITY_KEYWORDS + \
+        ["妈的", "他妈", "混蛋", "滚蛋", "去死", "放屁", "傻逼", "贱人", "妈的逼", "草泥马", "日你", "操你"]
+    if any(k in situation for k in banned) or any(k in style for k in banned):
+        return {"action": "reject", "reason": "红线"}
+    if re.search(r"[\u4e00-\u9fff]{4,}", situation) is None:
+        situation = "日常对话"  # 兜底场景描述
+    eid = db.upsert_expression(uid, situation, style, authority="llm", source="llm:consolidate")
+    return {"action": "add", "eid": eid}
+
+
+def _consolidate_locked(uid: str, client, model: str) -> dict:
     turns = _take_pending(uid)
     if not turns:
         return {"ok": True, "skipped": True, "reason": "无待整理对话"}
@@ -446,6 +558,9 @@ def consolidate(uid: str, client, model: str) -> dict:
     if len(conversation) > 6000:
         conversation = conversation[-6000:]
 
+    # P0a 幂等锚点：本段对话的稳定指纹作为 external_id（含 uid，同段对话重复整理只落一次 episode）
+    import hashlib as _hl
+    ext_id = f"consolidate:{uid}:{_hl.sha256(conversation.encode('utf-8')).hexdigest()[:20]}"
     from .chat import llm_json
     prompt = CONSOLIDATE_PROMPT.format(conversation=conversation, existing=_existing_context(uid))
     data = llm_json(client, model, prompt)
@@ -464,9 +579,18 @@ def consolidate(uid: str, client, model: str) -> dict:
         for rel in data.get("relations", []) or []:
             _upsert_relation(uid, rel)
 
+        expr_stats = {"skip": 0, "reject": 0, "add": 0}
+        for e in data.get("expressions", []) or []:
+            try:
+                r = _apply_expression(uid, e)
+                expr_stats[r.get("action", "skip")] = expr_stats.get(r.get("action", "skip"), 0) + 1
+            except Exception as exc:  # noqa: BLE001
+                audit.log("memory_change", action="expression_error", uid=uid, error=str(exc))
+                expr_stats["skip"] += 1
+
         digest = (data.get("digest") or "").strip()
         if digest:
-            _append_summary_and_episode(uid, digest)
+            _append_summary_and_episode(uid, digest, external_id=ext_id)
 
         portrait = (data.get("portrait") or "").strip()
         if portrait:
@@ -474,7 +598,8 @@ def consolidate(uid: str, client, model: str) -> dict:
     else:
         audit.log("memory_change", action="consolidate_error", uid=uid, error="解析失败")
 
-    audit.log("memory_change", action="consolidate", uid=uid, turns=len(turns), stats=stats)
+    audit.log("memory_change", action="consolidate", uid=uid, turns=len(turns),
+              stats=stats, expressions=expr_stats)
     return {"ok": True, "stats": stats}
 
 
@@ -497,6 +622,52 @@ def _clean_expired():
     """清理过期事件记忆（TTL 到期自动降权/清除）。"""
     for m in db.list_memories():
         if m.get("expires_at") and m["expires_at"] < db.now_iso() and m["status"] == "confirmed":
-            db.delete_memory(m["id"])
+            db.delete_memory_hard(m["id"])
             audit.log("memory_change", action="expire", uid=m["uid"], mid=m["id"],
                       content=m["content"], reason="TTL 到期")
+
+
+# ---------------------------------------------------------------- P1b 反馈纠错（stale 联动）
+def correct_from_feedback(uid: str, old_content: str, new_content: str,
+                          target: str = "auto", by: str = "nurse") -> dict:
+    """老人/护士反馈"记错了"时的纠错写回（对标 MaiBot reject→FORGET + correct 写回语义）：
+
+    - 定位旧记忆（core_memories / rag_memories 精确/包含匹配）
+    - 旧条目软删（进回收站可回滚）—— rag 条目同步清 Chroma 向量（检索侧立即失效）
+    - 新内容按 authority 语义写入 core（nurse 定稿）；无旧条目命中则当作新增
+    - 全程审计留痕；纯服务端实现，不依赖 LLM
+    """
+    from . import ragstore as _rs
+    results = db.find_memories_by_content(uid, old_content,
+                                          tables=("core_memories", "rag_memories"))
+    stats = {"core_softdel": 0, "rag_softdel": 0, "added": 0, "redline": 0}
+    new_text = (new_content or "").strip()
+    if any(k in new_text for k in MEDICAL_KEYWORDS) or any(k in new_text for k in IDENTITY_KEYWORDS):
+        audit.log("memory_correct", action="blocked", uid=uid, content=new_text,
+                  reason="医疗/身份红线")
+        return {"ok": False, "error": "医疗/身份信息不允许通过此入口修改", "stats": stats}
+
+    hits = list(results.get("core_memories", [])) + list(results.get("rag_memories", []))
+    for m in hits:
+        table = "core_memories" if m.get("chroma_id") is None else "rag_memories"
+        # rag 行特征：有 chroma_id 字段 → 走 rag 软删
+        if "chroma_id" in m and m.get("chroma_id"):
+            db.delete_rag_memory(m["id"], uid=uid, reason="feedback_correct", by=by)
+            _rs.delete_by_chroma_id(uid, m["chroma_id"])
+            stats["rag_softdel"] += 1
+        else:
+            db.delete_core_memory(m["id"], uid=uid, reason="feedback_correct", by=by)
+            stats["core_softdel"] += 1
+
+    if new_text:
+        # 纠错后的正确内容 → core 记忆（type=fact），护士入口即定稿
+        if _rag_dedup_check(uid, new_text):
+            stats["added"] = 0
+        else:
+            mid = db.add_core_memory(uid, "fact", new_text, confidence=1.0, importance=3,
+                                     source=f"correct:{by}")
+            stats["added"] = 1 if mid else 0
+
+    audit.log("memory_correct", action="feedback", uid=uid, old=old_content[:200],
+              new=new_text[:200], by=by, stats=stats)
+    return {"ok": True, "stats": stats}

@@ -163,6 +163,24 @@ class MemoryIn(BaseModel):
     status: str = "pending"
 
 
+class MemoryCorrectIn(BaseModel):
+    uid: str
+    old_content: str
+    new_content: str = ""
+    by: str = "nurse"
+
+
+class MemoryImportIn(BaseModel):
+    uid: str
+    text: str
+    split: str = "paragraph"     # paragraph | line
+
+
+class PortraitIn(BaseModel):
+    uid: str
+    content: str
+
+
 class SuggestIn(BaseModel):
     uid: str
     user_text: str = ""
@@ -303,16 +321,118 @@ async def memories_confirm(mid: int):
 @app.post("/api/memories/{mid}/reject")
 async def memories_reject(mid: int):
     m = db.get_memory(mid)
-    db.delete_memory(mid)
+    op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="reject", by="nurse")
     from . import log as audit
-    audit.log("memory_change", action="reject", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
-    return {"ok": True}
+    audit.log("memory_change", action="reject", mid=mid, op_id=op_id,
+              uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id, "note": "已软删，可在回收站恢复"}
 
 
 @app.delete("/api/memories/{mid}")
 async def memories_delete(mid: int):
-    db.delete_memory(mid)
+    m = db.get_memory(mid)
+    op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
+    return {"ok": True, "op_id": op_id}
+
+
+# ---------------------------------------------------------------- 回收站（软删恢复）
+@app.get("/api/memories/recycle")
+async def recycle_list(uid: str = Query("")):
+    return {"ok": True, "operations": db.list_delete_operations(uid=uid)}
+
+
+@app.post("/api/memories/recycle/{op_id}/restore")
+async def recycle_restore(op_id: int):
+    """恢复软删记忆。RAG 行会重建向量（chroma_id 可能变化）并回写。"""
+    op = next((o for o in db.list_delete_operations(include_restored=True) if o["id"] == op_id), None)
+    if not op:
+        return {"ok": False, "error": "操作不存在"}
+    table = op["target_table"]
+    restored = db.restore_operation(op_id)
+    if not restored:
+        return {"ok": False, "error": "恢复失败或已恢复"}
+    if table == "rag_memories":
+        row = db.get_rag_memory(op["target_id"])
+        if row and row.get("chroma_id"):
+            from . import ragstore as _rs
+            new_cid = _rs.reindex_row(row["uid"], row["type"], row["content"],
+                                      importance=row.get("importance", 0),
+                                      source=row.get("source", ""), old_chroma_id=row["chroma_id"])
+            if new_cid and new_cid != row["chroma_id"]:
+                db.set_rag_chroma_id(op["target_id"], new_cid)
+    from . import log as audit
+    audit.log("memory_change", action="restore", op_id=op_id, uid=op.get("uid", ""),
+              table=table, by="nurse")
+    return {"ok": True, "table": table, "op_id": op_id}
+
+
+@app.post("/api/memories/recycle/purge")
+async def recycle_purge(days: float = Query(30.0)):
+    n = db.purge_soft_deleted(days=days)
+    from . import log as audit
+    audit.log("memory_change", action="purge", count=n, days=days, by="nurse")
+    return {"ok": True, "purged": n}
+
+
+@app.post("/api/memories/correct")
+async def memories_correct(c: MemoryCorrectIn):
+    """反馈纠错：老人/护士指出旧记忆错误 → 旧条目软删(回收站可回滚) + RAG 向量失效 + 写回正确内容。
+
+    对标 MaiBot stale 联动：检索/画像不再命中旧条目，纠正全程留痕可回滚。
+    """
+    if not (c.old_content or "").strip():
+        return {"ok": False, "error": "old_content 不能为空"}
+    result = await asyncio.to_thread(rag.correct_from_feedback,
+                                     c.uid, c.old_content, c.new_content, by=c.by)
+    return result
+
+
+@app.post("/api/memories/import")
+async def memories_import(m: MemoryImportIn):
+    """批量导入中心：粘贴文本按段落/行切分入 pending，护士审核确认（对标 MaiBot 导入中心）。"""
+    if not (m.text or "").strip():
+        return {"ok": False, "error": "text 不能为空"}
+    return await asyncio.to_thread(db.import_memories, m.uid, m.text, by="nurse", split=m.split)
+
+
+@app.post("/api/memories/portrait")
+async def memories_portrait_set(p: PortraitIn):
+    """护士手动维护老人画像：写入 pinned 保护，AI consolidate 不再覆盖（对标 MaiBot 画像 override）。"""
+    if not (p.content or "").strip():
+        return {"ok": False, "error": "content 不能为空"}
+    await asyncio.to_thread(rag._upsert_portrait, p.uid, p.content, source="nurse:manual", by="nurse")
     return {"ok": True}
+
+
+@app.delete("/api/memories/core/{mid}")
+async def core_memories_delete(mid: int):
+    m = db.get_core_memory(mid)
+    op_id = db.delete_core_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
+    from . import log as audit
+    audit.log("memory_change", action="core_delete", mid=mid, op_id=op_id,
+              uid=(m or {}).get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id}
+
+
+@app.get("/api/memories/rag")
+async def rag_memories_list(uid: str = Query("elder_001")):
+    return {"ok": True, "memories": db.list_rag_memories(uid)}
+
+
+@app.delete("/api/memories/rag/{rid}")
+async def rag_memories_delete(rid: int):
+    """删除 RAG 记忆：镜像表软删 + Chroma 向量同步清理。"""
+    row = db.get_rag_memory(rid)
+    if not row:
+        return {"ok": False, "error": "不存在"}
+    op_id = db.delete_rag_memory(rid, uid=row.get("uid", ""), reason="manual_delete", by="nurse")
+    if row.get("chroma_id"):
+        from . import ragstore as _rs
+        _rs.delete_by_chroma_id(row.get("uid", ""), row["chroma_id"])
+    from . import log as audit
+    audit.log("memory_change", action="rag_delete", mid=rid, op_id=op_id,
+              uid=row.get("uid", ""), by="nurse")
+    return {"ok": True, "op_id": op_id}
 
 
 @app.post("/api/memories/suggest")
@@ -341,19 +461,54 @@ async def core_memories_list(uid: str = Query("elder_001")):
     return {"ok": True, "memories": db.list_core_memories(uid)}
 
 
-@app.delete("/api/memories/core/{mid}")
-async def core_memories_delete(mid: int):
+@app.post("/api/memories/core/{mid}/confirm")
+async def core_memories_confirm(mid: int):
+    """护士确认核心记忆 = 定稿(nurse)：不再标注'AI 归纳仅供参考'，进入可信层。"""
     m = db.get_core_memory(mid)
-    db.delete_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_authority(mid, "nurse")
     from . import log as audit
-    audit.log("memory_change", action="core_delete", mid=mid,
-              uid=(m or {}).get("uid", ""), by="nurse")
+    audit.log("memory_change", action="core_confirm", mid=mid, uid=m.get("uid", ""),
+              authority="nurse", by="nurse")
     return {"ok": True}
 
 
-@app.get("/api/memories/rag")
-async def rag_memories_list(uid: str = Query("elder_001")):
-    return {"ok": True, "memories": db.list_rag_memories(uid)}
+@app.post("/api/memories/core/{mid}/unconfirm")
+async def core_memories_unconfirm(mid: int):
+    """撤销定稿，退回 AI 归纳层（llm）。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_authority(mid, "llm")
+    from . import log as audit
+    audit.log("memory_change", action="core_unconfirm", mid=mid, uid=m.get("uid", ""),
+              authority="llm", by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/core/{mid}/pin")
+async def core_memories_pin(mid: int):
+    """护士保护该核心记忆：不被自动清理、不被画像整体覆盖。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_pinned(mid, True)
+    from . import log as audit
+    audit.log("memory_change", action="core_pin", mid=mid, uid=m.get("uid", ""), by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/core/{mid}/unpin")
+async def core_memories_unpin(mid: int):
+    """解除保护。"""
+    m = db.get_core_memory(mid)
+    if not m:
+        return {"ok": False, "error": "不存在"}
+    db.set_core_pinned(mid, False)
+    from . import log as audit
+    audit.log("memory_change", action="core_unpin", mid=mid, uid=m.get("uid", ""), by="nurse")
+    return {"ok": True}
 
 
 @app.get("/api/memories/graph")
@@ -361,6 +516,33 @@ async def graph_view(uid: str = Query("elder_001")):
     from . import graph as g
     return {"ok": True, "status": g.status(),
             "entities": g.list_entities(uid), "relations": g.list_relations(uid)}
+
+
+# ---------------------------------------------------------------- 表达习惯（风格学习产物）
+@app.get("/api/memories/expressions")
+async def expressions_list(uid: str = Query("elder_001")):
+    return {"ok": True, "expressions": db.list_expressions(uid=uid)}
+
+
+@app.post("/api/memories/expressions/{eid}/approve")
+async def expressions_approve(eid: int):
+    """护士审核通过 → 该语录参与对话注入（对标 MaiBot checked_only）。"""
+    db.set_expression_checked(eid, True)
+    from . import log as audit
+    audit.log("memory_change", action="expression_approve", eid=eid, by="nurse")
+    return {"ok": True}
+
+
+@app.post("/api/memories/expressions/{eid}/reject")
+async def expressions_reject(eid: int):
+    """护士拒绝 → 软删（进回收站可恢复）。"""
+    db.soft_delete_expression(eid)
+    from . import log as audit
+    audit.log("memory_change", action="expression_reject", eid=eid, by="nurse")
+    return {"ok": True}
+
+
+@app.get("/api/memories/health")
 
 
 @app.get("/api/memories/health")

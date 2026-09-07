@@ -59,12 +59,31 @@ CREATE TABLE IF NOT EXISTS core_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uid TEXT, type TEXT, content TEXT,
   confidence REAL DEFAULT 0.5, importance INTEGER DEFAULT 0,
-  source TEXT DEFAULT '', ts TEXT, updated_at TEXT
+  source TEXT DEFAULT '', ts TEXT, updated_at TEXT,
+  authority TEXT DEFAULT 'llm', pinned INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rag_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uid TEXT, chroma_id TEXT, type TEXT, content TEXT,
   importance INTEGER DEFAULT 0, source TEXT DEFAULT '', ts TEXT
+);
+CREATE TABLE IF NOT EXISTS external_refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  external_id TEXT, uid TEXT, kind TEXT DEFAULT '', created_at TEXT,
+  UNIQUE(uid, external_id)
+);
+CREATE TABLE IF NOT EXISTS delete_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT, target_table TEXT, target_id INTEGER,
+  snapshot_json TEXT DEFAULT '{}', reason TEXT DEFAULT '', by TEXT DEFAULT '',
+  created_at TEXT, restored_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS expressions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT DEFAULT '', situation TEXT DEFAULT '', style TEXT DEFAULT '',
+  count INTEGER DEFAULT 1, checked INTEGER DEFAULT 0,   -- 0 待审 1 已审可用
+  authority TEXT DEFAULT 'llm',   -- llm(自动学) | nurse(人工维护)
+  source TEXT DEFAULT '', ts TEXT, updated_at TEXT
 );
 """
 
@@ -93,6 +112,18 @@ def init_db():
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
             })
+            # 软删 / 幂等列（跨表统一补齐，兼容旧库）
+            for table in ("memories", "core_memories", "rag_memories", "expressions"):
+                _ensure_columns(conn, table, {
+                    "is_deleted": "is_deleted INTEGER DEFAULT 0",
+                    "deleted_at": "deleted_at TEXT DEFAULT ''",
+                })
+            _ensure_columns(conn, "rag_memories", {"external_id": "external_id TEXT DEFAULT ''"})
+            # P0c 账本定稿：authority=llm(模型归纳) | nurse(护士定稿) | claim(档案账本)
+            _ensure_columns(conn, "core_memories", {"authority": "authority TEXT DEFAULT 'llm'"})
+            # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
+            _ensure_columns(conn, "core_memories", {"pinned": "pinned INTEGER DEFAULT 0"})
+            conn.commit()
             conn.commit()
         finally:
             conn.close()
@@ -182,8 +213,63 @@ def add_memory(uid, mtype, content, status="pending", ttl_days=None,
             conn.close()
 
 
+def import_memories(uid: str, text: str, by: str = "nurse",
+                    split: str = "paragraph") -> dict:
+    """批量导入中心：粘贴文本按段落/行切分逐条入 memories(pending)，护士审核确认。
+    对标 MaiBot 导入中心；医疗字段仍是待审核状态由护士把关，导入本身不绕过红线。"""
+    text = (text or "").strip()
+    if not text:
+        return {"ok": True, "imported": 0, "skipped": 0}
+    if split == "line":
+        chunks = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    else:  # paragraph：按空行分隔
+        import re as _re
+        chunks = [c.strip() for c in _re.split(r"\n\s*\n", text) if c.strip()]
+    # 过长的段落再按 120 字内按句切，避免单条过大
+    final_chunks: list[str] = []
+    for c in chunks:
+        if len(c) <= 160:
+            final_chunks.append(c)
+        else:
+            import re as _re
+            sents = _re.split(r"(?<=[。！？；])", c)
+            buf = ""
+            for s in sents:
+                if not s.strip():
+                    continue
+                if len(buf) + len(s) > 160 and buf:
+                    final_chunks.append(buf.strip())
+                    buf = s
+                else:
+                    buf += s
+            if buf.strip():
+                final_chunks.append(buf.strip())
+    imported = 0
+    skipped = 0
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            for c in final_chunks:
+                if len(c) > 500:
+                    c = c[:500]
+                if not c:
+                    continue
+                conn.execute(
+                    "INSERT INTO memories (uid,type,content,status,ts,source,created_at,updated_at) "
+                    "VALUES (?,?,?,'pending',?,'import:manual',?,?)",
+                    (uid, "fact", c, ts, ts, ts))
+                imported += 1
+            conn.commit()
+        finally:
+            conn.close()
+    from . import log as audit
+    audit.log("memory_change", action="import", uid=uid, count=imported, by=by)
+    return {"ok": True, "imported": imported, "skipped": skipped}
+
+
 def list_memories(uid: str = None, status: str = None) -> list[dict]:
-    sql = "SELECT * FROM memories WHERE 1=1"
+    sql = "SELECT * FROM memories WHERE is_deleted=0"
     args = []
     if uid:
         sql += " AND uid=?"
@@ -218,7 +304,13 @@ def set_memory_status(mid: int, status: str) -> None:
             conn.close()
 
 
-def delete_memory(mid: int) -> None:
+def delete_memory(mid: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """删除 memories 行 → 软删（置 is_deleted + delete_operations 快照），可回收站恢复。返回 op_id。"""
+    return soft_delete("memories", mid, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def delete_memory_hard(mid: int) -> None:
+    """物理删除 memories 行（TTL 到期等生命周期清理用，不进回收站）。"""
     with _lock:
         conn = _conn()
         try:
@@ -244,14 +336,19 @@ def cleanup_expired_memories() -> int:
 
 
 # ---------------------------------------------------------------- core_memories
-def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source="", ts=None) -> int:
+def add_core_memory(uid, mtype, content, confidence=0.5, importance=0, source="", ts=None,
+                    authority=None) -> int:
     ts = ts or now_iso()
+    if authority is None:
+        # 来源推断：人工/护士/迁移修正 → 定稿；模型归纳/整理 → llm(uncertain)
+        authority = "nurse" if (source or "").startswith(("manual", "correct:", "nurse")) else "llm"
     with _lock:
         conn = _conn()
         try:
             cur = conn.execute(
-                "INSERT INTO core_memories (uid,type,content,confidence,importance,source,ts,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                (uid, mtype, content, confidence, importance, source, ts, ts))
+                "INSERT INTO core_memories (uid,type,content,confidence,importance,source,ts,updated_at,authority) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (uid, mtype, content, confidence, importance, source, ts, ts, authority))
             conn.commit()
             return cur.lastrowid
         finally:
@@ -268,7 +365,7 @@ def get_core_memory(mid: int) -> dict | None:
 
 
 def list_core_memories(uid, limit=None) -> list[dict]:
-    sql = "SELECT * FROM core_memories WHERE uid=? ORDER BY importance DESC, id DESC"
+    sql = "SELECT * FROM core_memories WHERE uid=? AND is_deleted=0 ORDER BY importance DESC, id DESC"
     args = [uid]
     if limit:
         sql += " LIMIT ?"
@@ -299,7 +396,14 @@ def update_core_memory(mid, content=None, importance=None, confidence=None) -> N
             conn.close()
 
 
-def delete_core_memory(mid) -> None:
+def delete_core_memory(mid, uid="", reason="", by="") -> int:
+    """删除 core_memories 行 → 软删。注意：persona 画像"删旧写新"属于内部覆盖，
+    语义上不应进回收站（旧画像直接作废），调用处可继续物理删——见 purge 语义。"""
+    return soft_delete("core_memories", mid, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def delete_core_memory_hard(mid) -> None:
+    """物理删除 core_memories 行（内部画像覆盖等场景用，不进回收站）。"""
     with _lock:
         conn = _conn()
         try:
@@ -309,23 +413,90 @@ def delete_core_memory(mid) -> None:
             conn.close()
 
 
+def set_core_authority(mid: int, authority: str) -> None:
+    """定稿/降级核心记忆来源：nurse=护士确认定稿(可信), llm=AI 归纳(uncertain,仅参考)。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE core_memories SET authority=?, updated_at=? WHERE id=?",
+                         (authority, now_iso(), mid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_core_pinned(mid: int, pinned: bool) -> None:
+    """护士保护核心记忆(pinned)：不被自动清理、不被画像整体覆盖（对标 MaiBot protect/pinned）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE core_memories SET pinned=?, updated_at=? WHERE id=?",
+                         (1 if pinned else 0, now_iso(), mid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
 # ---------------------------------------------------------------- rag_memories（镜像表）
-def add_rag_memory(uid, mtype, content, chroma_id, importance=0, source="", ts=None) -> int:
+def add_rag_memory(uid, mtype, content, chroma_id, importance=0, source="", ts=None,
+                   external_id="") -> int:
     ts = ts or now_iso()
     with _lock:
         conn = _conn()
         try:
             cur = conn.execute(
-                "INSERT INTO rag_memories (uid,chroma_id,type,content,importance,source,ts) VALUES (?,?,?,?,?,?,?)",
-                (uid, chroma_id, mtype, content, importance, source, ts))
+                "INSERT INTO rag_memories (uid,chroma_id,type,content,importance,source,ts,external_id) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (uid, chroma_id, mtype, content, importance, source, ts, external_id))
             conn.commit()
             return cur.lastrowid
         finally:
             conn.close()
 
 
+def get_rag_by_external(uid: str, external_id: str) -> dict | None:
+    """按 uid+external_id 查已写入的 RAG 行（幂等命中判断）。"""
+    if not external_id:
+        return None
+    conn = _conn()
+    try:
+        r = conn.execute(
+            "SELECT * FROM rag_memories WHERE uid=? AND external_id=? AND is_deleted=0",
+            (uid, external_id)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def find_memories_by_content(uid: str, content: str, tables=("core_memories", "rag_memories"),
+                             fuzzy: bool = True) -> dict[str, list[dict]]:
+    """按内容找指定表的行（精确或包含匹配，供纠错/批量作废定位源条目）。"""
+    out: dict[str, list[dict]] = {}
+    conn = _conn()
+    try:
+        for t in tables:
+            if t not in ("core_memories", "rag_memories", "memories"):
+                continue
+            if fuzzy:
+                pat = content[:30].strip() if content else ""
+                if not pat:
+                    out[t] = []
+                    continue
+                rows = conn.execute(
+                    f"SELECT * FROM {t} WHERE uid=? AND is_deleted=0 AND content LIKE ? "
+                    "ORDER BY id DESC LIMIT 20", (uid, f"%{pat}%")).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM {t} WHERE uid=? AND is_deleted=0 AND content=? "
+                    "ORDER BY id DESC LIMIT 20", (uid, content)).fetchall()
+            out[t] = [dict(r) for r in rows]
+        return out
+    finally:
+        conn.close()
+
+
 def list_rag_memories(uid, limit=None) -> list[dict]:
-    sql = "SELECT * FROM rag_memories WHERE uid=? ORDER BY id DESC"
+    sql = "SELECT * FROM rag_memories WHERE uid=? AND is_deleted=0 ORDER BY id DESC"
     args = [uid]
     if limit:
         sql += " LIMIT ?"
@@ -335,6 +506,220 @@ def list_rag_memories(uid, limit=None) -> list[dict]:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
     finally:
         conn.close()
+
+
+def delete_rag_memory(row_id: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """软删 rag_memories 行（镜像表），返回 op_id。向量清理由调用方 ragstore.delete_by_chroma_id。"""
+    return soft_delete("rag_memories", row_id, uid=uid, reason=reason or "manual_delete", by=by)
+
+
+def get_rag_memory(row_id: int) -> dict | None:
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM rag_memories WHERE id=?", (row_id,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def set_rag_chroma_id(row_id: int, chroma_id: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE rag_memories SET chroma_id=? WHERE id=?", (chroma_id, row_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- external refs（写入幂等）
+def claim_external(uid: str, external_id: str, kind: str = "") -> bool:
+    """幂等注册外部业务键：首次返回 True，已存在返回 False（同业务只写一次）。"""
+    if not external_id:
+        return True
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO external_refs (external_id,uid,kind,created_at) VALUES (?,?,?,?)",
+                (external_id, uid, kind, ts))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_external_refs(uid: str = "") -> list[dict]:
+    sql = "SELECT * FROM external_refs"
+    args = []
+    if uid:
+        sql += " WHERE uid=?"
+        args.append(uid)
+    sql += " ORDER BY created_at DESC LIMIT 200"
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 软删 + 回收站（delete_operations 快照）
+def soft_delete(table: str, row_id: int, uid: str = "", reason: str = "", by: str = "") -> int:
+    """软删任意记忆表行：置 is_deleted=1 + 全量快照入 delete_operations。表名白名单防注入。"""
+    table = table if table in ("memories", "core_memories", "rag_memories", "expressions") else "memories"
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+            if not row or row["is_deleted"]:
+                return 0
+            snapshot = json.dumps(dict(row), ensure_ascii=False)
+            conn.execute(f"UPDATE {table} SET is_deleted=1, deleted_at=? WHERE id=? AND is_deleted=0",
+                         (ts, row_id))
+            op_id = conn.execute(
+                "INSERT INTO delete_operations (uid,target_table,target_id,snapshot_json,reason,by,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (uid or row["uid"], table, row_id, snapshot, reason, by, ts)).lastrowid
+            conn.commit()
+            return op_id or 0
+        finally:
+            conn.close()
+
+
+def restore_operation(op_id: int) -> bool:
+    """按 delete_operations 快照恢复行（清除软删标记）；RAG 行另需重建向量（调用方处理）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            op = conn.execute("SELECT * FROM delete_operations WHERE id=?", (op_id,)).fetchone()
+            if not op or op["restored_at"]:
+                return False
+            table, row_id = op["target_table"], op["target_id"]
+            snap = json.loads(op["snapshot_json"] or "{}")
+            ts = now_iso()
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+            if row:  # 行还在 → 仅清软删标记
+                conn.execute(f"UPDATE {table} SET is_deleted=0, deleted_at='' WHERE id=?", (row_id,))
+            else:    # 行已被物理清理 → 按快照重建
+                cols = [c for c in snap.keys() if c != "id"]
+                placeholders = ", ".join("?" for _ in cols)
+                colnames = ", ".join(cols)
+                conn.execute(
+                    f"INSERT INTO {table} ({colnames}) VALUES ({placeholders})",
+                    [snap[c] for c in cols])
+            conn.execute("UPDATE delete_operations SET restored_at=? WHERE id=?", (ts, op_id))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def list_delete_operations(uid: str = "", include_restored: bool = False) -> list[dict]:
+    sql = "SELECT * FROM delete_operations WHERE 1=1"
+    args = []
+    if uid:
+        sql += " AND uid=?"
+        args.append(uid)
+    if not include_restored:
+        sql += " AND restored_at=''"
+    sql += " ORDER BY id DESC LIMIT 200"
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def purge_soft_deleted(days: float = 30.0) -> int:
+    """物理清理软删超过宽限期的行（回收站深清），幂等可反复调用。"""
+    import time as _t
+    cutoff = _t.time() - days * 86400
+    ts_cut = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+    total = 0
+    with _lock:
+        conn = _conn()
+        try:
+            for table in ("memories", "core_memories", "rag_memories"):
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE is_deleted=1 AND deleted_at!='' AND deleted_at < ?",
+                    (ts_cut,))
+                total += cur.rowcount
+            conn.commit()
+            return total
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- expressions（表达习惯语录库）
+def upsert_expression(uid: str, situation: str, style: str, authority: str = "llm",
+                      source: str = "") -> int:
+    """记录一条「情景→说法」。同 uid+situation+style 合并累加 count（对标 MaiBot Expression merge）。"""
+    ts = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM expressions WHERE uid=? AND situation=? AND style=? AND is_deleted=0",
+                (uid, situation, style)).fetchone()
+            if row:
+                conn.execute("UPDATE expressions SET count=count+1, updated_at=? WHERE id=?",
+                             (ts, row["id"]))
+                conn.commit()
+                return row["id"]
+            cur = conn.execute(
+                "INSERT INTO expressions (uid,situation,style,count,checked,authority,source,ts,updated_at) "
+                "VALUES (?,?,?,1,0,?,?,?,?)",
+                (uid, situation, style, authority, source, ts, ts))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def list_expressions(uid: str = "", checked_only: bool = False, limit: int = 100) -> list[dict]:
+    sql = "SELECT * FROM expressions WHERE is_deleted=0"
+    args = []
+    if uid:
+        sql += " AND uid=?"
+        args.append(uid)
+    if checked_only:
+        sql += " AND checked=1"
+    sql += " ORDER BY count DESC, id DESC LIMIT ?"
+    args.append(limit)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def set_expression_checked(eid: int, checked: bool) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE expressions SET checked=?, updated_at=? WHERE id=?",
+                         (1 if checked else 0, now_iso(), eid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def soft_delete_expression(eid: int, uid: str = "") -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE expressions SET is_deleted=1, deleted_at=? WHERE id=?",
+                         (now_iso(), eid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def pick_expressions(uid: str, limit: int = 3) -> list[dict]:
+    """对话注入用：取该 uid 已审核的高频表达（checked=1）。"""
+    return list_expressions(uid=uid, checked_only=True, limit=limit)
 
 
 # ---------------------------------------------------------------- reminders

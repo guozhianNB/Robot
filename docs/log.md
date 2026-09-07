@@ -304,3 +304,115 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 历史库 `settings` 表可能残留 `web_search_enabled` 行，无害（注册表已无此工具，`effective_tools` 不再读取）。
 - `docs/2.pre/大模型端开发目标.md` 模块 9 仍按旧设计描述 `web_search`/`get_news`，待 MCP 方案定型后更新。
 - 验证：`python -c "import LLM.tools"` 正常；本地注册表为空、MCP 工具合并路径不受影响；MCP 冒烟可跑 `LLM/tool/_mcp_demo.py`。
+
+---
+
+## 2026-09-06 · 记忆系统对标 MaiBot：P0-P3 全部落地
+
+**背景：** 调研 MaiBot 记忆子系统（A_memorix v2.0）与说话风格学习（learners），产出 `docs/maibot参考/2026-09-05-MaiBot记忆风格对标报告.md`，随后按其 P0-P3 路线逐批落地。参考材料：源码 `D:\_project\MaiBot\src`、文档 `D:\_project\maibot_docs\zh`。
+
+### P0 —— 安全/防重复（commit 51f9b04、ce2b45f）
+
+- **external_id 幂等**：`rag_memories` 增 `external_id` 列 + `external_refs` 表（uid+external_id 复合唯一）；`ragstore.add` 带 external_id 时写前查重跳过；consolidate 的 digest 用对话内容 sha256 指纹作 external_id——同段对话重复整理只落一条 episode，根治"定时摘要/并发触发导致记忆重复"。
+- **软删除 + 回收站**：memories/core/rag 三表软删列 + `delete_operations` 快照表；`delete_memory/delete_core_memory/delete_rag_memory` 改为软删（返回 op_id），TTL 到期与画像内部覆盖改用 `*_hard` 物理删（不进回收站）；ragstore 增 `delete_by_chroma_id`（软删联动清向量，检索立即失效）与 `reindex_row`（恢复时重建向量）。
+- **API**：reject/delete 返回 op_id；新增 `/api/memories/recycle`（list/restore/purge）、`/api/memories/rag/{rid}` DELETE。
+- **账本定稿分层**：`core_memories` 增 `authority`（llm=AI归纳 uncertain / nurse=护士定稿），按 source 自动推断（manual/correct:/nurse → nurse，llm/migrate → llm）；recall_v3 注入时 llm 记忆标注"（AI 归纳，仅供参考）"；API `/api/memories/core/{mid}/confirm|unconfirm`。防"把 AI 猜错当老人真相"。
+
+### P1 —— 沉淀异步与纠错联动（commit a42cd49、d879aa6）
+
+- **consolidate 租约**：`_in_flight` 集合，同 uid 同一时刻只跑一个 consolidate（空闲定时器/上下文满/手动 suggest 竞争防重）。
+- **回收站周期深清**：reminder tick 顺带 `purge_soft_deleted`（`recycle_purge_days` 默认 30，settings 可调）。
+- **反馈纠错 stale 联动**：`correct_from_feedback` 定位旧记忆（core/rag 内容匹配）→ 软删 + 清 Chroma 向量 → 写回正确内容（护士入口定稿 authority=nurse）；API `POST /api/memories/correct`；医疗/身份红线照常拦截。对标 MaiBot "否定=软失效 + 三层撤退 + 可回滚"。
+
+### P2 —— 对话体验（commit 79697d2、737f0de）
+
+- **记忆召回节流缓存**：chat.build_system 的 RAG 召回走短 TTL 缓存（同 uid 15s 复用），避免短时间多轮重复向量检索省 embedding；缓存上限 32 uid。
+- **表达习惯注入**：`expressions` 语录表（situation/style/count/checked/authority，同 situation+style merge 累加）；chat 注入【表达习惯参考】块（≤3 条已审语录），带护工身份边界措辞（"酌情自然使用，不逐字模仿"）。
+- **风格学习（expression）**：consolidate 时 LLM 顺带提取老人表达习惯（CONSOLIDATE_PROMPT 增 expressions 输出 ≤3 条）；`_apply_expression` 服务端自审（医疗/身份/脏话红线多字词过滤、长度限制）→ 落待审（checked=0）；API `/api/memories/expressions` + approve/reject（对标 MaiBot checked_only 审核双环）。
+
+### P3 —— 保护与导入（commit 03d1869）
+
+- **核心记忆保护**：`core_memories` 增 `pinned`（护士保护：不被自动清理、不被画像整体覆盖——persona 覆盖跳过 pinned）；API pin/unpin。
+- **批量导入中心**：`db.import_memories` 按段落/行切分（超长按句切 ≤160 字）入 pending 待护士审核；API `POST /api/memories/import`。导入不绕过审核，医疗红线由护士把关。
+- **暂缓项**：多路分数校准（Robot 单路 Chroma+图谱一跳，跨路不可比问题弱）与关系半衰期演化（记忆走 TTL + 核心稳定 + pinned），ROI 低，记 TODO。
+
+### 前端与测试
+
+- `frontend/packages/admin` 记忆页升级：核心记忆 定稿/退AI/保护/删除 + RAG 删除 + 待确认 确认/拒绝 + 批量导入 + 回收站（恢复/深清）；已构建 dist。
+- 新增 `LLM/tests/test_memory_v4.py` 9 用例（幂等/软删/恢复/定稿/纠错/表达合并与红线/导入/pinned 画像守卫）；全量回归 **62 passed**。
+
+### 验证
+
+- `pytest LLM/tests -q` → 62 passed；临时库冒烟（init_db + migrate + settings + 新列）；`import LLM.server` 路由 52+ 无冲突；前端 pnpm build 通过。
+- 端到端（真实起服 + 浏览器走记忆管理）待控制者执行。
+
+---
+
+## 2026-09-06（下）· 对标 MaiBot 渐进补齐：R1 纠错信号预筛 + R2 画像防退化
+
+**背景：** P0-P3 落地后，用户希望继续渐进补齐（不入整仓 fork MaiBot）。本批做两件高 ROI 项，commit b2e342e（R1）、c0c91b2（R2）。
+
+### R1 —— correct_instant 信号词预筛（commit b2e342e）
+
+- 原实现每轮对话后都让 LLM 判断"这句话是否在纠正旧记忆"（`_post_chat_jobs` → `correct_instant` 无条件调 LLM），很费 token。
+- 新增 `CORRECT_SIGNALS`（24 词：不是/不对/错了/记错/说错/其实/应该是/以后别/我姓/我不叫…，对标 MaiBot feedback_signal_tokens）；无信号词直接 `no_signal` 早退，不调 LLM。
+- 超长句（>80 字）不预判，交给 consolidate 批量处理。
+- 效果：日常闲聊每轮省一次 LLM 调用；纠正语不遗漏（宁多调不放过）。
+
+### R2 —— 画像防退化 + 护士手动维护（commit c0c91b2）
+
+- **AI 画像防退化**：`_upsert_portrait` 中 AI 归纳的新画像与现 persona 字符 n-gram 相似度 ≥ `PORTRAIT_SKIP_SIM`(0.90) → 跳过重写。防 consolidate 每轮 LLM 输出微小抖动反复覆盖画像导致退化。
+- **护士手动维护优先**：`source="nurse:manual"` 写入 persona 时 authority=nurse 且 pinned；之后 AI consolidate 一律不覆盖护士维护的画像（对标 MaiBot 画像 override 与"指纹相同只续期"）。
+- API：`POST /api/memories/portrait`（护士手动画像）。
+
+### 取舍记录
+
+- **R3 访问强化/降权暂缓**：Robot 记忆架构是"核心全量注入 + 话题 RAG 检索"，无关系衰减场景；访问强化（MaiBot 主要用于关系记忆半衰期）在此架构收益低，硬做增加回归风险——与 P3 半衰期同类判断，记 TODO。
+- 剩余可选项：Episode 细粒度多段化、多路分数校准，均已在报告标注 ROI 低，等真有检索质量问题时再做。
+
+### 测试
+
+- `test_memory_v4.py` 新增 3 例（correct_instant 信号门 ×3 断言、画像防退化 + 护士 pinned 守卫）；全量回归 **64 passed**。
+
+### 补充（同日）：admin 记忆页画像维护卡片
+
+- R2 的 `POST /api/memories/portrait` 补前端入口：记忆页新增「老人画像」卡片（textarea + 保存为护士维护版），显示当前版本状态（AI 归纳 / 护士维护 pinned），护士可直接修正画像且 AI consolidate 不再覆盖——R2 闭环收尾。前端已构建 dist，回归 64 passed。
+
+### 补充（同日）：前端位置文档翻新 + 注册向导迁移待办
+
+- 背景：前端早已（2026-08-27）从单文件 `UI/index.html` 重构为 `frontend/`（Vue3 + pnpm monorepo：`packages/admin` 管理端 / `packages/kiosk` 车载端 / `packages/shared` 共享层），旧文件改名到 `UI(old)/`。但 AGENTS.md 等文档仍指向旧位置，本次翻新：
+  - `AGENTS.md`：目录树 / 快速上手（开发 `pnpm dev:admin` :5173、`pnpm dev:kiosk` :5174，代理 `/api`→8000；生产 `scripts/build_frontend.ps1` 构建后由后端挂载 `/admin`、`/kiosk`）/ SSE 耦合约定（前端消费侧唯一源 = `frontend/packages/shared/src/events.ts`）/ 前端节 / 文档导航路径（目标文档在 `docs/目标文档及说明/`、开发日志在 `docs/log.md`）／API 端点摘要补全（alarm、session/user、memories 一族、voice/record、face/status、modules/status 等）。
+  - `docs/目标文档及说明/大模型端开发目标.md` 模块 8：旧的「复用 `UI/chat.html`」引用更新为 `frontend/packages/admin`。
+- **已知缺口（TODO）**：老人注册向导尚未迁入 Vue admin——旧入口在 `UI(old)/index.html`「➕ 注册老人」4 步向导（基本信息→声纹→人脸占位→完成），后端 `/api/profiles` + `/api/voice/enroll` 齐备，规格见 `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`。补"注册老人"时按规格从旧实现迁移，别从零重造。
+
+### 补充（同日）：老人注册向导迁入 Vue admin（TODO 闭环）
+
+- 按 2026-08-24 规格把注册向导迁为 admin 新页签「老人注册」（第 2 页签）：新建 `frontend/packages/admin/src/pages/RegisterPage.vue`（4 步：基本信息 → 声纹两步式 record/enroll `append:false` → 人脸占位 `face/status` → 完成），`App.vue` 登记页签与分支。
+- 行为对齐旧 `UI(old)/index.html`：uid 自动 `elder_00N`（profiles 最大编号 +1，可手改）；声纹可试听/重录/跳过（语音不可用不卡流程）；人脸置灰展示后端 reason。
+- 注册后切换老人（规格第 4 步"自动切换到新老人"的 Vue 实现）：完成时新 uid 写 `localStorage("uid")`；`ChatPage.vue` / `MemoriesPage.vue` 初始 uid 改为读 `localStorage("uid") ?? "elder_001"`。
+- 验证：`pnpm --filter admin build` 通过（42 modules，dist 内含注册向导代码与关键文案）。vue-tsc 2.0.0 在 Node 24 下不可用（MODULE_NOT_FOUND，工具链问题与代码无关；admin 无 typecheck script）。
+
+## 2026-09-07 · 语音链路：流式 ASR 双引擎（本地/云端）+ 实时字幕 + 重启切换
+
+- 需求要点（用户原话）："不管是本地 asr 还是云端 asr 都能流式识别；说的什么实时在前端显现；有切换按钮选本地/云端，重启即切换"。云端 = 火山引擎「豆包语音」控制台的 API Key（流式识别大模型2.0 / Seed-ASR）。
+- asr.py 重写为统一流式接口（start_session / accept→partial / finish / abort / close），本地 sherpa online recognizer 改增量解码出字；保留 transcribe() 整段转写作兜底。新增 LLM/voice/asr_cloud.py：火山流式识别2.0 SAUC WebSocket（wss://openspeech.bytedance.com/api/v3/sauc/bigmodel，握手 header X-Api-Key + X-Api-Resource-Id: volc.seedasr.sauc.duration，PCM16 16k 每 100ms 一帧，每句一条连接），帧编解码为纯函数便于单测；websocket-client 属可选依赖。
+- worker.py 流式编排：VAD 管句边界不变，LISTENING 期间 VAD 判定开口 → 起 ASR 会话（回补 config.ASR_ONSET_TAIL_S=0.5s 前沿防丢句首），边说边喂，文本变化即 publish voice_state=asr_partial（SSE → kiosk 实时字幕）；VAD 整段弹出 → finish() 取最终文本 → 原声纹/LLM/TTS 链路（recognized/chat_new 事件不变）；起会话失败等走整段转写兜底，不崩主循环。
+- 引擎切换：conf.DEFAULT_SETTINGS += asr_provider(local|cloud)，worker 启动时读取（重启生效）；.env += VOLC_ASR_API_KEY / VOLC_ASR_RESOURCE_ID；/api/voice/status 增 asr_provider 字段、modules.asr 显示当前引擎；云端缺依赖/未配 key → 启动降级并给出可读原因。
+- kiosk 前端：App.vue 状态条下新增实时字幕行（voice_state=asr_partial 驱动，recognized/speaking/idle 清空，视觉状态保持 listening）；SettingsSheet 设置弹层新增「识别引擎」单选（本地/云端），标注"重启服务后生效"。events.ts VoiceStateEvent 注释同步 asr_partial。
+- 验证：后端改动 py_compile 通过、asr_cloud 帧编解码离线自测通过；本地引擎与真云端链路需在板卡/带 sherpa+真 key 环境回归（本机无火山 key，云端握手错误会经 status 上报）。
+
+### 补充（同日）：防自声识别修复（播报回声把自己话当用户语句）
+
+- 现象：机器人 TTS 播报时自己的声音被麦克风拾入 → VAD 攒成语音段 → 播报结束回到收听态后把这些"自己的话"当用户语句弹给 ASR 转写（自问自答）；自声还可能误触发打断（过了 0.3s 宽限后）。
+- 修复（LLM/voice/worker.py + oice/config.py）：新增 _flush_vad()（sherpa VoiceActivityDetector.reset()，退化兜底 pop 丢弃），在播报**自然结束**与**打断**两个出口清空 VAD 缓冲、丢掉自声段；自然播报结束另设 SPEAK_TAIL_BLANK_S=0.25s 回声尾巴静音窗（该窗口内丢弃麦克风块、不喂 VAD/ASR，且 sink.is_done()+finish_speaking() 保证打断路径不误套此窗）；打断式插话不套静音窗、立即收音。
+- 认知：单麦无 AEC 时软件无法区分"机器人自己的声音"与"老人声音"——外置麦克风拉远扬声器/降低喇叭音量能压低自声电平，silero VAD 阈值化后自然不判为语音，是最有效的硬件配合手段。
+
+### 补充（同日）：崩溃加固 + 默认云端 + kiosk 引擎一键切换
+
+- 报错：uvicorn 退出码 3221225477 = 0xC0000005（原生访问违规，非 Python 异常）。审计定位：崩溃前 ~2 分钟内 4 次「长播报（16~53s 整段）→ 2s 左右被 barge_in 打断」；Ignore OOV 洪流来自 sherpa TTS 转写 markdown 故事回复（**、半角引号、ZywOo/SSG/DANK1NG 等词表外内容），属噪音非崩溃主因。候选根因 A（无 faulting module 证据，按最可能修复）：AudioSink 整段一次 write + stop() 与写线程 finally 双关闭的 PortAudio 竞态。
+- LLM/voice/audio.py 加固：写入线程分块阻塞写（0.2s/块），流对象仅由写线程创建/唯一一次关闭；stop() 置停止事件 + abort() 唤醒阻塞 write 再 join，消除双关闭竞态。
+- LLM/voice/tts.py：新增 sanitize_tts_text() —— 播报前清洗（去 URL/HTML/markdown 装饰/emoji/半角引号等词表外符号），消除 OOV 刷屏与朗读错乱；清洗后为空则不播报（worker._speak 长度 0 早退）。
+- 默认引擎改 cloud：conf.DEFAULT_SETTINGS sr_provider=cloud；worker 云端不可用（未配 VOLC_ASR_API_KEY/缺 websocket-client）时自动回退本地并 audit sr_provider_fallback，不再整机降级。注意老库 settings 表存的 local 会压过新默认——本机已 db.set_settings 置 cloud，其它部署升级后需切一次或照做。
+- kiosk：主界面底部新增「识别：云端/本地」一键切换按钮（POST /api/settings，提示重启生效），设置弹层原有单选保留；生产 dist 已重建（pnpm --filter kiosk build 成功，08-27 → 09-07 产物）。
+- 引擎语义：本地 sherpa streaming-zipformer-zh-14M = 单向（因果）流式；云端火山 bigmodel = 双向流式（火山另有 bigmodel_async / bigmodel_nostream 未采用）。本地 14M 精度有限，默认云端以提升识别质量。
+- 验证：后端 py_compile / 导入冒烟 / sanitize 单测通过；崩溃修复是否根治需真机复测（若复现，请补事件查看器 faulting module）。

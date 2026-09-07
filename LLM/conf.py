@@ -12,6 +12,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
+PROMPT_FILE = Path(__file__).resolve().parent / "prompt.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
 DEFAULT_SETTINGS = {
@@ -22,7 +23,9 @@ DEFAULT_SETTINGS = {
     "router_llm_enabled": True,     # 思考路由：规则未命中时用 LLM 快速预判兜底
     "memory_consolidation_enabled": True,  # 记忆整理（话题结束后批量沉淀）
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
+    "recycle_purge_days": 30,       # 回收站软删记忆保留多少天后物理清理
     "asr_enabled": True,            # 语音识别（真实开关）
+    "asr_provider": "cloud",        # 识别引擎：cloud=火山流式识别（默认；不可用自动回退本地）/ local=sherpa（重启生效，worker 启动时读取）
     "tts_enabled": True,            # 语音合成（真实开关）
     "voice_enabled": True,          # 语音链路总开关（启动时是否拉起 worker）
     "wakeword": "小机器人",          # 唤醒词（显示用；实际检测用 kws_keywords.txt）
