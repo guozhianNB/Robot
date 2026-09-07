@@ -416,3 +416,38 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - kiosk：主界面底部新增「识别：云端/本地」一键切换按钮（POST /api/settings，提示重启生效），设置弹层原有单选保留；生产 dist 已重建（pnpm --filter kiosk build 成功，08-27 → 09-07 产物）。
 - 引擎语义：本地 sherpa streaming-zipformer-zh-14M = 单向（因果）流式；云端火山 bigmodel = 双向流式（火山另有 bigmodel_async / bigmodel_nostream 未采用）。本地 14M 精度有限，默认云端以提升识别质量。
 - 验证：后端 py_compile / 导入冒烟 / sanitize 单测通过；崩溃修复是否根治需真机复测（若复现，请补事件查看器 faulting module）。
+
+---
+
+## 2026-09-07（下）· 语音链路：云端 TTS（豆包语音 2.0）+ 句级流式播报
+
+- 需求要点（用户原话）：「本地/云端 TTS 都要流式输出；LLM 流式内容实时上屏 kiosk；有切换按钮选本地/云端，重启即切换」——与同日 ASR 批次对称：语音链路新增 `tts_provider`(cloud|local) 引擎切换（worker 启动时读取、重启生效），播报从「整段合成」升级为「LLM 流式 → 逐字上屏 + 句级合成无缝播放」。
+- 依据：`docs/superpowers/specs/2026-09-07-cloud-tts-streaming-design.md`、`docs/superpowers/plans/2026-09-07-cloud-tts-streaming.md`（remote_tts 分支，计划提交 `9e5d125` 起，任务 1-6 分派收尾）。
+
+### 后端（LLM/voice/…）
+
+- `6a19895`（任务 1）：`conf.DEFAULT_SETTINGS += tts_provider="cloud"`（db.py set_settings 白名单 = DEFAULT_SETTINGS ∪ TOOL_DEFAULTS，新键自动纳入）；`LLM/voice/config.py` 云端 TTS 配置延迟读取：`VOLC_TTS_API_KEY`（未配回落 ASR 同一把控制台 key）、`VOLC_TTS_SPEAKER`、`VOLC_TTS_RESOURCE_ID`（默认 `seed-tts-2.0`）、`VOLC_TTS_ENDPOINT`（默认 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`）。
+- `ba6f041`（任务 2）：新增 `LLM/voice/tts_buffer.py` SentenceBuffer 分句缓冲器（纯逻辑无 IO，8 单测：标点切分/连续标点不切/右引号归前句/换行断点/长度兜底 `_force_cut`（窗口内远断点优先、保序不丢字符、兜底置 flush_rest）/跨 feed 缓冲）。**计划内部矛盾（测试强制换行切空 vs 规格「未完成尾部留缓冲」）上呈用户裁定 = 维持现状**：换行切句语义 flush_rest 保留、零返工，真机听感再评估。
+- `c146e68`（任务 3）：`LLM/voice/audio.py` AudioSink 改队列播放器：`enqueue()` 分块写（16k 单声道）无缝拼接句间无爆音、`end_of_stream()` 队列清空后自然收流、`stop()` 清队（打断语义）；真实 PortAudio abort 唤醒行为列为真机验证项。
+- `5113d18`（任务 4）：新增 `LLM/voice/tts_cloud.py` CloudStreamTTS（provider="cloud"、sample_rate=16000）：豆包语音 TTS 2.0 **HTTP 单向流式**（蓝本 GizClaw/doubao-speech-go tts_v2.go）——POST `{endpoint}/api/v3/tts/unidirectional`，body `{user.uid, req_params:{text, speaker, audio_params:{format:"pcm", sample_rate:16000}}}`，header `X-Api-Key`（同 ASR 控制台 key）+ `X-Api-Resource-Id=seed-tts-2.0`；响应 NDJSON 逐行 `{code(0/20000000 成功)/done/data=base64(PCM16 分片)}`，逐分片 yield float32；**requests 实现免 websocket-client**（缺 requests 仅云端不可用：模块可导入、实例化抛错、worker 降级，不污染后端导入链）；按句短请求首音最快（双向 WS 文本增量流 YAGNI 未用；端点/鉴权以 `docs/2.pre/tts2_probe.py` 实测为准）；`build_request_body`/`parse_stream_line` 纯函数便于单测。本地 `tts.py` 同步补 `synthesize_chunks`/`sample_rate`，`e8fb26b` 再补 provider="local" 对齐云端接口——worker 统一按 chunks 接口驱动双引擎。
+- `f970d62`（任务 5 主改造）：`LLM/voice/worker.py` 流式问答编排：整段识别文本后 `_start_answer` 起应答线程（单活跃，上一轮滞留则 abort 接管），`_consume_reply` 同步消费 chat_stream——content 事件 → publish `chat_partial{uid,delta}` 逐字上屏 → SentenceBuffer 切句 → 完整句 `sanitize_tts_text` 清洗 → 逐句 `synthesize_chunks` 合成入队（仅 speak 模式；云端句失败 audit 并按句回退本地，不中断播报）→ done 后 flush 尾句；收尾 publish `chat_new{uid,user,assistant}` 终稿覆盖 + post_turn 落库，`finally` 里 `sink.end_of_stream()` 自然收流（任务 3 发现「play()-only 调用方不调 end_of_stream 则永不收流」由此闭环）；首句入队经 started 事件触发一次 speaking/start_speaking；旧整段 `_speak` 删除。打断沿用 barge_in → abort 置位，合成前/入队前双出口检查。
+- `5260504`（任务 5 审查修复轮，二轮 review clean）：R1 打断 abort 先行 + enqueue 双闸；R2 Session 状态机六方法加锁（语义零改）；用户批准 R3 speak=False 跳过切句/合成（chat_partial 逐字上屏不受影响）、R4 audit action 按引擎区分（tts_cloud_sentence/tts_local_sentence）、R5 测试清理未用 import。**用户裁定不修**：started.set() 时机（R2 加锁后窗口已消失）。
+- `LLM/voice_api.py`：worker 构造接 `_stream_fn`（chat_stream 事件流，VoiceWorker 直用）；`GET /api/voice/status` 增 `tts_provider` 字段，`modules.tts` 显示实际引擎（`sub_status["tts"]=self.tts.provider`，与 asr 对称）；云端不可用（缺 key/缺 requests/合成失败）→ 构造失败自动回退本地 + audit `tts_provider_fallback`，不整机降级。
+
+### 前端（frontend/，cab39f8，任务 6）
+
+- `shared/events.ts`：新增 `ChatPartialEvent{type:"chat_partial", uid, delta}`（类型联合 + parseBusPayload 白名单同步）。
+- kiosk `App.vue`：recognized → 新气泡；chat_partial 驱动当前气泡**逐字渐进增长**；chat_new 终稿**覆盖去重**（播完与历史一致）；设置弹层 + 主界面「合成引擎：云端/本地」一键切换按钮（POST /api/settings，标注重启生效）；admin `VoiceStatusPage.vue` 语音状态页增显示「识别引擎/合成引擎/实际 TTS」（含 tts_fallback 回退标记）。
+- shared vitest 11/11 通过（含临时 chat_partial 断言，已还原）；vue-tsc（pnpm store 残缺）+ vite build（沙箱 esbuild EPERM 已知环境限制）→ 类型检查与产物构建交用户侧执行。
+
+### 测试
+
+- 新增 `test_tts_buffer.py`（8）、`test_tts_cloud.py`（4，纯函数）；`test_audio_sink.py` 队列语义 3 例（monkeypatch）；`test_worker_events.py` 按流式契约整体重写（7 例，含 `test_consume_reply_streams_partial_and_chat_new`）。
+- 全量回归轨迹：批次前基线 **61 passed + 3 failed**（3 红态 = test_worker_events.py 旧签名漂移，与 pristine HEAD 一致、回归中性）→ 任务 5 重写随批清除 → 批次末 `pytest LLM/tests -q` → **80 passed / 0 failed**（12 个测试文件）。
+
+### 待办 / 用户侧
+
+- 真机复测清单：①语音问答边说边播、首句延迟可接受、句间连续无爆音；②kiosk 气泡逐字渐进、播完与历史一致；③播放期/合成期插话打断都生效、无自问自答复发；④kiosk/admin 切本地/云端 → 重启后端 → `/api/voice/status` modules.tts 变化；⑤断网/错 key 时云端回退本地不崩。
+- 任务 0 探针（`docs/2.pre/tts2_probe.py` 尚未创建）实测定案端点鉴权——真机若 401/404 则 tts_cloud 按规格改双向 WS（/api/v3/tts/bidirection）蓝本；本机 `.env` 收尾核查已含 `VOLC_TTS_SPEAKER=zh_female_vv_uranus_bigtts`（批次内曾记「用户称已写、实测未见」，现已补齐；云端引擎初始化即依赖该值），板卡部署需随 .env 同步。
+- 用户侧跑 vue-tsc（pnpm store 残缺）+ `scripts/build_frontend.ps1`（沙箱 esbuild EPERM 已知限制）。
+- root `tests/test_unlock_switch.py` 陈旧红态为**基线既有**（voice 批次遗留，3 failed，与 LLM/tests 回归无关），迁移与否交用户定夺。
