@@ -8,6 +8,9 @@ r"""语音后台线程：编排 采集→VAD→(KWS|流式ASR)→声纹→LLM→
   - VAD 弹出一整句 → ASR finish() 收尾拿最终文本 → 走原声纹/LLM/TTS 链路
     （recognized 事件不变）；起会话失败等异常由整段一次性转写兜底（旧语义）。
   - 引擎选择：启动时读 settings.asr_provider（local|cloud），重启生效。
+  - 防自声识别：播报(Speaking)期间 VAD 会把机器人自己的 TTS 回声当语音——结束/打断时
+    _flush_vad() 清掉自声段，自然播报结束再叠加 config.SPEAK_TAIL_BLANK_S 回声静音窗，
+    避免"自己的话被 ASR 识别 → 自问自答"；打断式插话不套静音窗（要立即收音）。
 
 稳健性核心：run() 顶层 try/except 兜住初始化；主循环任何异常只记审计 + 退避重连，
 绝不向调用方（FastAPI 事件循环）抛出 → 主程序不崩。"""
@@ -37,6 +40,7 @@ class VoiceWorker(threading.Thread):
         self.vad = self.kws = self.asr = self.tts = self.spk = self.fusion = None
         self.session = session_mod.Session()
         self._speak_started = None
+        self._speak_ended_at = None   # 播报自然结束时刻（回声尾巴静音窗用；打断时置 None）
         # 流式 ASR 会话状态
         self._asr_tail = []          # 开口判定前的音频前沿缓冲（防丢句首）
         self._asr_active = False     # 当前是否处于一句话的 ASR 流式会话中
@@ -136,12 +140,22 @@ class VoiceWorker(threading.Thread):
                 self._publish("voice_state", state="listening")
 
         elif st == session_mod.State.LISTENING:
-            self._listen_chunk(chunk, settings)
+            # 播报自然结束后的回声尾巴静音窗：丢弃麦克风块（不喂 VAD/ASR），
+            # 防止机器人自己的 TTS 回声被当用户语句（自问自答）；打断式插话不设此窗
+            if self._speak_ended_at is not None:
+                if (time.monotonic() - self._speak_ended_at) < config.SPEAK_TAIL_BLANK_S:
+                    pass
+                else:
+                    self._speak_ended_at = None
+                    self._listen_chunk(chunk, settings)
+            else:
+                self._listen_chunk(chunk, settings)
             seg = self.vad.pop_speech()
             if seg is not None:
                 self._finish_utterance(seg, settings)
             if self.session.expire() == session_mod.State.IDLE:
                 # 30s 免唤醒窗口超时 → 回待机，前端同步（否则状态条停在"正在听…"）
+                self._speak_ended_at = None
                 self._reset_asr()
                 self._publish("voice_state", state="idle")
 
@@ -154,9 +168,13 @@ class VoiceWorker(threading.Thread):
                 self.session.barge_in()
                 audit.log("voice_barge_in")
                 self._reset_asr()
-            if self.sink.is_done():
-                self.session.finish_speaking()   # SPEAKING → LISTENING（回到 30s 免唤醒收音窗口）
+                self._flush_vad()          # 清掉播报期间攒的自声段
+                self._speak_ended_at = None  # 老人正在说话：立即收音，不套回声静音窗
+            if self.sink.is_done() and self.session.finish_speaking():
+                # SPEAKING → LISTENING（回到 30s 免唤醒收音窗口）；打断已切走状态则跳过
                 self._speak_started = None
+                self._flush_vad()              # 丢掉播报期间 VAD 攒下的自声段
+                self._speak_ended_at = time.monotonic()   # 回声尾巴静音窗起点
                 # 播报完成仍处收音窗口：发 listening（前端"正在听…"），
                 # 不是 idle——30s 超时回 IDLE 由 expire() 处理
                 self._publish("voice_state", state="listening")
@@ -221,6 +239,18 @@ class VoiceWorker(threading.Thread):
         if text:
             self._handle_speech(seg, text, settings)
 
+    def _flush_vad(self):
+        """丢弃 VAD 缓冲：播报结束/打断时清掉自声段，防止自己的话被当用户语句识别。
+        reset 优先（连缓冲中的进行中语音一起清）；个别版本不支持时退化为丢弃已完成段。"""
+        try:
+            self.vad.reset()
+        except Exception:
+            try:
+                while self.vad.pop_speech() is not None:
+                    pass
+            except Exception:
+                pass
+
     def _reset_asr(self):
         """放弃当前流式 ASR 会话并清状态（句中断/超时回待机/打断时调用）。"""
         if self._asr_active:
@@ -267,6 +297,7 @@ class VoiceWorker(threading.Thread):
     def _speak(self, text):
         samples, sr = self.tts.synthesize(text)
         self._speak_started = time.monotonic()
+        self._speak_ended_at = None
         self.session.start_speaking()
         self.sink.play(samples, sr)
         audit.log("voice_tts", text=text[:100], ms=len(samples) * 1000 // sr)

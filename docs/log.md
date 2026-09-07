@@ -400,3 +400,9 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 引擎切换：conf.DEFAULT_SETTINGS += asr_provider(local|cloud)，worker 启动时读取（重启生效）；.env += VOLC_ASR_API_KEY / VOLC_ASR_RESOURCE_ID；/api/voice/status 增 asr_provider 字段、modules.asr 显示当前引擎；云端缺依赖/未配 key → 启动降级并给出可读原因。
 - kiosk 前端：App.vue 状态条下新增实时字幕行（voice_state=asr_partial 驱动，recognized/speaking/idle 清空，视觉状态保持 listening）；SettingsSheet 设置弹层新增「识别引擎」单选（本地/云端），标注"重启服务后生效"。events.ts VoiceStateEvent 注释同步 asr_partial。
 - 验证：后端改动 py_compile 通过、asr_cloud 帧编解码离线自测通过；本地引擎与真云端链路需在板卡/带 sherpa+真 key 环境回归（本机无火山 key，云端握手错误会经 status 上报）。
+
+### 补充（同日）：防自声识别修复（播报回声把自己话当用户语句）
+
+- 现象：机器人 TTS 播报时自己的声音被麦克风拾入 → VAD 攒成语音段 → 播报结束回到收听态后把这些"自己的话"当用户语句弹给 ASR 转写（自问自答）；自声还可能误触发打断（过了 0.3s 宽限后）。
+- 修复（LLM/voice/worker.py + oice/config.py）：新增 _flush_vad()（sherpa VoiceActivityDetector.reset()，退化兜底 pop 丢弃），在播报**自然结束**与**打断**两个出口清空 VAD 缓冲、丢掉自声段；自然播报结束另设 SPEAK_TAIL_BLANK_S=0.25s 回声尾巴静音窗（该窗口内丢弃麦克风块、不喂 VAD/ASR，且 sink.is_done()+finish_speaking() 保证打断路径不误套此窗）；打断式插话不套静音窗、立即收音。
+- 认知：单麦无 AEC 时软件无法区分"机器人自己的声音"与"老人声音"——外置麦克风拉远扬声器/降低喇叭音量能压低自声电平，silero VAD 阈值化后自然不判为语音，是最有效的硬件配合手段。
