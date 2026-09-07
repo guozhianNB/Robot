@@ -33,6 +33,9 @@ ros2_car/build/
 ros2_car/install/
 ros2_car/log/
 
+# 外部教程项目（自带独立 .git 的嵌套仓库，不入库）
+/localization-with-ROS/
+
 # Python
 ros2_car/**/__pycache__/
 ros2_car/**/*.py[cod]
