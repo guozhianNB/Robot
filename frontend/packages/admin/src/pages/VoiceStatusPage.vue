@@ -23,6 +23,7 @@ onMounted(load);
     <div v-if="status" class="card">
       <h3>状态：{{ status.status }}</h3>
       <p v-if="status.reason">{{ status.reason }}</p>
+      <p>识别引擎：{{ status.asr_provider ?? "-" }} ｜ 合成引擎：{{ status.tts_provider ?? "-" }} ｜ 实际 TTS：{{ status.modules?.tts ?? "-" }}<span v-if="status.modules?.tts_fallback">（已回退本地）</span></p>
       <pre>{{ JSON.stringify(status.modules ?? {}, null, 2) }}</pre>
     </div>
     <div class="card">

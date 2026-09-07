@@ -57,6 +57,21 @@ async function save(key: string, value: unknown) {
             云端识别（火山）
           </label>
         </div>
+        <div class="group">
+          <div class="group-title">合成引擎（重启服务后生效）</div>
+          <label>
+            <input type="radio" name="tts_provider" value="local"
+                   :checked="settings.tts_provider !== 'cloud'"
+                   @change="save('tts_provider', 'local')" />
+            本地合成（离线）
+          </label>
+          <label>
+            <input type="radio" name="tts_provider" value="cloud"
+                   :checked="settings.tts_provider === 'cloud'"
+                   @change="save('tts_provider', 'cloud')" />
+            云端合成（火山）
+          </label>
+        </div>
         <label>
           唤醒词：<b>{{ settings.wakeword ?? "小机器人" }}</b>
         </label>
