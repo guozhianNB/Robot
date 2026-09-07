@@ -377,3 +377,17 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 ### 补充（同日）：admin 记忆页画像维护卡片
 
 - R2 的 `POST /api/memories/portrait` 补前端入口：记忆页新增「老人画像」卡片（textarea + 保存为护士维护版），显示当前版本状态（AI 归纳 / 护士维护 pinned），护士可直接修正画像且 AI consolidate 不再覆盖——R2 闭环收尾。前端已构建 dist，回归 64 passed。
+
+### 补充（同日）：前端位置文档翻新 + 注册向导迁移待办
+
+- 背景：前端早已（2026-08-27）从单文件 `UI/index.html` 重构为 `frontend/`（Vue3 + pnpm monorepo：`packages/admin` 管理端 / `packages/kiosk` 车载端 / `packages/shared` 共享层），旧文件改名到 `UI(old)/`。但 AGENTS.md 等文档仍指向旧位置，本次翻新：
+  - `AGENTS.md`：目录树 / 快速上手（开发 `pnpm dev:admin` :5173、`pnpm dev:kiosk` :5174，代理 `/api`→8000；生产 `scripts/build_frontend.ps1` 构建后由后端挂载 `/admin`、`/kiosk`）/ SSE 耦合约定（前端消费侧唯一源 = `frontend/packages/shared/src/events.ts`）/ 前端节 / 文档导航路径（目标文档在 `docs/目标文档及说明/`、开发日志在 `docs/log.md`）／API 端点摘要补全（alarm、session/user、memories 一族、voice/record、face/status、modules/status 等）。
+  - `docs/目标文档及说明/大模型端开发目标.md` 模块 8：旧的「复用 `UI/chat.html`」引用更新为 `frontend/packages/admin`。
+- **已知缺口（TODO）**：老人注册向导尚未迁入 Vue admin——旧入口在 `UI(old)/index.html`「➕ 注册老人」4 步向导（基本信息→声纹→人脸占位→完成），后端 `/api/profiles` + `/api/voice/enroll` 齐备，规格见 `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`。补"注册老人"时按规格从旧实现迁移，别从零重造。
+
+### 补充（同日）：老人注册向导迁入 Vue admin（TODO 闭环）
+
+- 按 2026-08-24 规格把注册向导迁为 admin 新页签「老人注册」（第 2 页签）：新建 `frontend/packages/admin/src/pages/RegisterPage.vue`（4 步：基本信息 → 声纹两步式 record/enroll `append:false` → 人脸占位 `face/status` → 完成），`App.vue` 登记页签与分支。
+- 行为对齐旧 `UI(old)/index.html`：uid 自动 `elder_00N`（profiles 最大编号 +1，可手改）；声纹可试听/重录/跳过（语音不可用不卡流程）；人脸置灰展示后端 reason。
+- 注册后切换老人（规格第 4 步"自动切换到新老人"的 Vue 实现）：完成时新 uid 写 `localStorage("uid")`；`ChatPage.vue` / `MemoriesPage.vue` 初始 uid 改为读 `localStorage("uid") ?? "elder_001"`。
+- 验证：`pnpm --filter admin build` 通过（42 modules，dist 内含注册向导代码与关键文案）。vue-tsc 2.0.0 在 Node 24 下不可用（MODULE_NOT_FOUND，工具链问题与代码无关；admin 无 typecheck script）。

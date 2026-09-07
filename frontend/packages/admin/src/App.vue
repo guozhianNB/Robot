@@ -3,6 +3,7 @@
 import { onUnmounted, ref } from "vue";
 import { type BusEvent, parseBusPayload } from "shared";
 import OverviewPage from "./pages/OverviewPage.vue";
+import RegisterPage from "./pages/RegisterPage.vue";
 import ChatPage from "./pages/ChatPage.vue";
 import MemoriesPage from "./pages/MemoriesPage.vue";
 import RemindersPage from "./pages/RemindersPage.vue";
@@ -12,6 +13,7 @@ import VoiceStatusPage from "./pages/VoiceStatusPage.vue";
 
 const tabs = [
   { id: "overview", label: "监控总览" },
+  { id: "register", label: "老人注册" },
   { id: "chat", label: "对话" },
   { id: "memories", label: "记忆" },
   { id: "reminders", label: "提醒" },
@@ -60,6 +62,7 @@ onUnmounted(() => es?.close());
     </nav>
     <main>
       <OverviewPage v-if="active === 'overview'" />
+      <RegisterPage v-else-if="active === 'register'" />
       <ChatPage v-else-if="active === 'chat'" />
       <MemoriesPage v-else-if="active === 'memories'" />
       <RemindersPage v-else-if="active === 'reminders'" />

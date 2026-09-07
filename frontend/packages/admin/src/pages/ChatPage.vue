@@ -4,7 +4,8 @@ import { onMounted, ref } from "vue";
 
 interface Msg { role: "user" | "assistant"; content: string }
 
-const uid = ref("elder_001");
+// 初始 uid 优先取注册向导完成时写入的 localStorage("uid")，其次默认 elder_001
+const uid = ref(localStorage.getItem("uid") ?? "elder_001");
 const messages = ref<Msg[]>([]);
 const text = ref("");
 const sending = ref(false);

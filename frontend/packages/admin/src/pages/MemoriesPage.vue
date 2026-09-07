@@ -9,7 +9,8 @@ interface RecycleOp { id: number; uid: string; target_table: string; target_id: 
   reason?: string; created_at?: string }
 
 const profiles = ref<Profile[]>([]);
-const uid = ref("elder_001");
+// 初始 uid 优先取注册向导完成时写入的 localStorage("uid")，其次默认 elder_001
+const uid = ref(localStorage.getItem("uid") ?? "elder_001");
 const core = ref<Mem[]>([]);
 const rag = ref<Mem[]>([]);
 const pending = ref<Mem[]>([]);
