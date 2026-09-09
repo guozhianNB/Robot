@@ -26,7 +26,9 @@ class CmdStop(Node):
         super().__init__("cmd_stop")
         self._sub = self.create_subscription(Bool, "/robot/cmd_stop", self._on_stop, 10)
         self._vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self._clients = {
+        # 注意：不要用 self._clients —— 那是 rclpy Node 内部属性（client 句柄字典），
+        # 覆盖会导致 destroy_node 时 destroy_client KeyError:0 / executor can_execute 崩溃
+        self._nav_clients = {
             "navigate_to_pose": ActionClient(self, NavigateToPose, "navigate_to_pose"),
             "navigate_through_poses": ActionClient(self, NavigateThroughPoses, "navigate_through_poses"),
         }
@@ -36,7 +38,7 @@ class CmdStop(Node):
         if not msg.data:
             return
         self.get_logger().warn("⚠️ 收到急停指令 → 取消导航目标 + 发布零速")
-        for name, client in self._clients.items():
+        for name, client in self._nav_clients.items():
             if client.server_is_ready():
                 future = client.cancel_all_goals_async()
                 # 不阻塞等待
@@ -53,9 +55,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # 防御 rclpy destroy_node 时序 bug（destroy_client 访问 self._clients[0] 可能 KeyError: 0）
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
     main()
+
