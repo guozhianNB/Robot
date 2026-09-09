@@ -26,7 +26,7 @@ def generate_launch_description():
         package='robot_state_publisher', executable='robot_state_publisher',
         name='robot_state_publisher', output='screen', parameters=[{
             'robot_description': open(os.path.join(share_dir, 'urdf', 'car.urdf')).read(),
-            'use_sim_time': use_sim_time}]),
+            'use_sim_time': use_sim_time}])
     lidar = IncludeLaunchDescription(PythonLaunchDescriptionSource(
         os.path.join(share_dir, 'launch', 'lidar.launch.py')))
     odom = IncludeLaunchDescription(PythonLaunchDescriptionSource(
