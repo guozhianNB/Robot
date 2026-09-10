@@ -23,6 +23,7 @@ from robot_bringup.odom_fusion import (  # noqa: E402
 
 RELAY_PY = os.path.join(PKG_ROOT, 'robot_bringup', 'odom_relay.py')
 EKF_YAML = os.path.join(PKG_ROOT, 'config', 'ekf_params.yaml')
+ODOM_LAUNCH = os.path.join(PKG_ROOT, 'launch', 'odom.launch.py')
 
 
 def check_zero():
@@ -160,12 +161,25 @@ def check_ekf_yaml():
     print('  [ok] ekf_params.yaml 双源接线')
 
 
+def check_launch_wiring():
+    """launch 必须走模式表，且 fused 模式下 rf2o 输出到 raw 话题、relay 接 raw→激光话题。"""
+    src = open(ODOM_LAUNCH, encoding='utf-8').read()
+    assert 'plan_odom_sources' in src, 'launch 必须复用 odom_fusion 的模式表'
+    assert 'OpaqueFunction' in src, '改用 OpaqueFunction，不再用 PythonExpression 拼条件'
+    assert 'PythonExpression' not in src, 'launch 里不应再有 PythonExpression 字符串条件'
+    assert 'LASER_ODOM_RAW' in src and 'LASER_ODOM' in src
+    assert 'odom_relay' in src
+    assert "'/odom_filtered'" in src, 'EKF 输出重映射到 /odom_filtered'
+    print('  [ok] odom.launch.py 接线')
+
+
 def main():
     check_zero()
     check_modes()
     check_covariance()
     check_ekf_yaml()
     check_relay()
+    check_launch_wiring()
     print('全部通过')
 
 
