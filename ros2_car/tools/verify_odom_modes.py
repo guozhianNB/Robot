@@ -25,6 +25,14 @@ RELAY_PY = os.path.join(PKG_ROOT, 'robot_bringup', 'odom_relay.py')
 EKF_YAML = os.path.join(PKG_ROOT, 'config', 'ekf_params.yaml')
 ODOM_LAUNCH = os.path.join(PKG_ROOT, 'launch', 'odom.launch.py')
 
+CHASSIS_ROOT = os.path.abspath(os.path.join(HERE, '..', 'src', 'robot_chassis'))
+sys.path.insert(0, CHASSIS_ROOT)
+from robot_chassis.usb_protocol import (  # noqa: E402
+    CMD_IMU,
+    IMU_PAYLOAD_LEN,
+    decode_imu,
+)
+
 
 def check_zero():
     """话题名常量必须是设计文档里定死的三个。"""
@@ -173,6 +181,32 @@ def check_launch_wiring():
     print('  [ok] odom.launch.py 接线')
 
 
+def check_imu_protocol():
+    """IMU(0x83) 帧契约：命令号、长度、编解码往返（与固件 usb_proto.c 一致）。"""
+    import struct as _struct
+
+    assert CMD_IMU == 0x83
+    assert IMU_PAYLOAD_LEN == 8
+
+    # 与固件 up_send_imu() 完全同构的组包：yaw/roll/pitch 0.01°，yaw_rate 0.1°/s
+    def pack(yaw_cdeg, rate_ddps, roll_cdeg, pitch_cdeg):
+        return _struct.pack('<4h', yaw_cdeg, rate_ddps, roll_cdeg, pitch_cdeg)
+
+    yaw, rate, roll, pitch = decode_imu(pack(-12345, -250, 100, -300))
+    assert abs(yaw - (-123.45)) < 1e-9, yaw
+    assert abs(rate - (-25.0)) < 1e-9, rate
+    assert abs(roll - 1.0) < 1e-9, roll
+    assert abs(pitch - (-3.0)) < 1e-9, pitch
+
+    try:
+        decode_imu(b'\x00' * 7)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('长度不为 8 未报错')
+    print('  [ok] IMU(0x83) 帧契约与编解码往返')
+
+
 def main():
     check_zero()
     check_modes()
@@ -180,6 +214,7 @@ def main():
     check_ekf_yaml()
     check_relay()
     check_launch_wiring()
+    check_imu_protocol()
     print('全部通过')
 
 
