@@ -70,8 +70,16 @@ int IMU_GetEuler(float out[3]);
 /** @brief 初始化 IMU 串口（启用 USART3 NVIC 中断 & 启动 RX 中断接收） */
 void IMU_UART_Init(void);
 
-/** @brief USART3 中断处理（直接寄存器操作，由 stm32f1xx_it.c 调用） */
+/** @brief USART3 中断处理（直接寄存器操作）。
+ *  @note  当前采用主循环轮询模式：不注册 NVIC、本函数不会被调用。
+ *         若改回中断方式，需在 stm32f1xx_it.c 的 USER CODE 段加 USART3_IRQHandler 调它。 */
 void IMU_UART_IRQHandler(void);
+
+/** @brief 轮询 USART3 已到达字节并推入环形缓冲（主循环调用，绝不阻塞） */
+void IMU_UART_PollRx(void);
+
+/** @brief 模块长期无帧时主动请求数据（限频，防「只答不问」） */
+void IMU_UART_EnsureStreaming(void);
 
 /** @brief 将接收到的字节推入环形缓冲区（由 HAL_UART_RxCpltCallback 自动调用） */
 void IMU_UART_RxBytes(volatile uint8_t *data, uint16_t len);

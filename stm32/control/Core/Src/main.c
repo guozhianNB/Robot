@@ -30,6 +30,7 @@
 #include "motor_control.h"
 #include "usb_proto.h"
 #include "oled.h"
+#include "imu.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -242,6 +243,7 @@ int main(void)
    *   已软件补偿：motor_driver.c 的 md_init() 默认 sign=-1。 */
   mc_init();               /* 清零 PID 闭环状态 */
   up_init();               /* 清零 USB 车控协议状态 */
+  IMU_Init();              /* IMU：USART3/PB10-PB11 自包含 bring-up（115200 8N1） */
 
   /* ===== 单轮测试通道：KEY1(PE3) 按下 → 电机闭环测试 =====
    * 按住 KEY1 上电即进入单电机闭环测试，用于底盘调试；
@@ -269,6 +271,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     up_poll();                                 /* USB 协议：命令分发 + 心跳 */
+    IMU_Process();                             /* IMU：轮询收字节 + 解析 + 无帧自愈 */
     mc_update_all();                           /* 10ms 周期闭环  */
     HAL_Delay(10);                             /* 10ms 周期      */
   }

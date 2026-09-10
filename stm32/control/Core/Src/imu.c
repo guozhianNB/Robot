@@ -15,22 +15,28 @@
   */
 
 #include "imu.h"
-#include "usart.h"
 #include "stm32f1xx_hal.h"
 #include <string.h>
 
-/* ===================== 移植配置 ============================= */
-/*
- * 移植到其他串口时，只修改本文件中的这四项配置：
- * - UART HAL 句柄
- * - UART 寄存器实例
- * - UART 中断号
- * - 中断优先级
- */
-#define IMU_PORT_UART_HANDLE       huart3
-#define IMU_PORT_UART_INSTANCE     USART3
-#define IMU_PORT_UART_IRQn         USART3_IRQn
-#define IMU_PORT_UART_IRQ_PRIORITY 0u
+/* ===================== 移植配置（自包含，不依赖 usart.c / huart3） =========
+ * 本工程没有 usart.c（一个 USART 都没初始化过），故 UART 由本文件自行 bring-up：
+ *   - 时钟/引脚/波特率：寄存器级 IMU_UART_Init()
+ *   - 收字节：主循环轮询 IMU_UART_PollRx()（不用中断，不碰 10ms 硬约束）
+ *   - 发字节：寄存器级 TXE 写 IMU_UART_SendByte()
+ * 移植到其它串口只需改下面 5 个宏（保持 USART3 默认映射，PD8/PD9 留给电机方向脚）。 */
+#define IMU_PORT_UART_INSTANCE  USART3        /* 寄存器实例（默认映射 PB10=TX / PB11=RX） */
+#define IMU_PORT_GPIO           GPIOB
+#define IMU_PORT_TX_PIN         GPIO_PIN_10
+#define IMU_PORT_RX_PIN         GPIO_PIN_11
+#define IMU_PORT_BAUD           115200u
+
+#define IMU_PORT_RX_IDLE_MS     1000u         /* 超过此时长无新帧 → 主动请求一次 */
+#define IMU_PORT_REQ_PERIOD_MS  200u          /* 主动请求的最小间隔（限频） */
+
+/* 自愈状态：观察「解析帧数是否还在涨」 */
+static uint32_t s_seen_frames   = 0u;
+static uint32_t s_last_progress = 0u;
+static uint32_t s_last_req_time = 0u;
 
 /* ===================== 环形缓冲区 ========================== */
 static volatile uint8_t  s_rx_buffer[IMU_UART_RX_BUF_SIZE];
@@ -283,12 +289,39 @@ void IMU_UART_Process(void)
 /* ===================== 初始化 ============================== */
 void IMU_UART_Init(void)
 {
-    /* 使能 USART3 NVIC 中断 */
-    HAL_NVIC_SetPriority(IMU_PORT_UART_IRQn, IMU_PORT_UART_IRQ_PRIORITY, 0);
-    HAL_NVIC_EnableIRQ(IMU_PORT_UART_IRQn);
+    GPIO_InitTypeDef gpio = {0};
 
-    /* 直接使能 USART3 RXNE 中断（不依赖 HAL 状态机） */
-    IMU_PORT_UART_INSTANCE->CR1 |= USART_CR1_RXNEIE;
+    /* ① 时钟：GPIOB + USART3（APB1）+ AFIO */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_USART3_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+
+    /* ② 引脚：PB10=TX（复用推挽）、PB11=RX（浮空输入）；
+     *    USART3 保持默认映射（PB10/PB11），PD8/PD9 留给电机方向脚 */
+    CLEAR_BIT(AFIO->MAPR, AFIO_MAPR_USART3_REMAP);
+
+    gpio.Pin   = IMU_PORT_TX_PIN;
+    gpio.Mode  = GPIO_MODE_AF_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(IMU_PORT_GPIO, &gpio);
+
+    gpio.Pin  = IMU_PORT_RX_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(IMU_PORT_GPIO, &gpio);
+
+    /* ③ 波特率：由 PCLK1 现算 BRR，不写死魔数（115200 @36MHz → 312） */
+    IMU_PORT_UART_INSTANCE->BRR =
+        (uint16_t)((HAL_RCC_GetPCLK1Freq() + IMU_PORT_BAUD / 2u) / IMU_PORT_BAUD);
+
+    /* ④ 8N1、收发使能、开串口；不开中断（主循环轮询收字节） */
+    IMU_PORT_UART_INSTANCE->CR2 = 0u;
+    IMU_PORT_UART_INSTANCE->CR3 = 0u;
+    IMU_PORT_UART_INSTANCE->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+
+    s_seen_frames   = IMU_UART_GetFrameCount();
+    s_last_progress = HAL_GetTick();
+    s_last_req_time = HAL_GetTick();
 }
 
 /* ===================== 直接中断接收 ======================== */
@@ -316,11 +349,9 @@ void IMU_UART_IRQHandler(void)
     }
 }
 
-/** HAL 兼容回调（保留但不依赖，防止链接冲突） */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    /* 不再使用 */
-}
+/* 注：原 HAL_UART_RxCpltCallback 已删除——本工程未启用 HAL 的 UART 模块
+ * （stm32f1xx_hal_conf.h 里没有 HAL_UART_MODULE_ENABLED，故 UART_HandleTypeDef 不存在），
+ * 收发全部走上面的寄存器级实现。 */
 
 /* ===================== 命令发送 ============================ */
 /**
@@ -399,7 +430,11 @@ int IMU_UART_SetOutputRate(uint8_t hz)
   */
 void IMU_UART_SendByte(uint8_t data)
 {
-    HAL_UART_Transmit(&IMU_PORT_UART_HANDLE, &data, 1, HAL_MAX_DELAY);
+    /* 寄存器级发送：等 TXE 后写 DR（最坏 ~87us/字节，仅初始化/自愈请求时用） */
+    while ((IMU_PORT_UART_INSTANCE->SR & USART_SR_TXE) == 0u)
+    {
+    }
+    IMU_PORT_UART_INSTANCE->DR = (uint16_t)data;
 }
 
 /**
@@ -409,7 +444,9 @@ void IMU_UART_SendByte(uint8_t data)
   */
 void IMU_UART_SendArray(uint8_t *pData, uint8_t length)
 {
-    HAL_UART_Transmit(&IMU_PORT_UART_HANDLE, pData, length, HAL_MAX_DELAY);
+    if (pData == NULL) return;
+    for (uint8_t i = 0u; i < length; i++)
+        IMU_UART_SendByte(pData[i]);
 }
 
 /* ===================== 上层数据接口 ========================= */
@@ -428,9 +465,51 @@ void IMU_Init(void)
   * @param  无
   * @return 无
   */
+void IMU_UART_PollRx(void)
+{
+    /* 只读「已经到达」的字节：无新字节立刻返回，绝不阻塞主循环 */
+    while ((IMU_PORT_UART_INSTANCE->SR & USART_SR_RXNE) != 0u)
+    {
+        uint8_t byte = (uint8_t)(IMU_PORT_UART_INSTANCE->DR & 0xFFu);
+        ++s_rx_byte_count;
+        _rxbuf_push(byte);
+        _debug_push(byte);
+    }
+    if ((IMU_PORT_UART_INSTANCE->SR & USART_SR_ORE) != 0u)
+    {
+        (void)IMU_PORT_UART_INSTANCE->DR;   /* 读 SR 后再读 DR 清 ORE */
+        ++s_overrun_count;
+    }
+}
+
+/**
+  * @brief 模块「只答不问」时自愈：1s 内帧数不涨 → 每 200ms 主动要一次欧拉角 + 原始陀螺
+  * @note  只在长期无数据时限频触发，最坏 ~0.7ms 的 TXE 等待，不影响 10ms 闭环
+  */
+void IMU_UART_EnsureStreaming(void)
+{
+    uint32_t now    = HAL_GetTick();
+    uint32_t frames = IMU_UART_GetFrameCount();
+
+    if (frames != s_seen_frames)
+    {
+        s_seen_frames   = frames;
+        s_last_progress = now;
+        return;
+    }
+    if ((now - s_last_progress) < IMU_PORT_RX_IDLE_MS) return;
+    if ((now - s_last_req_time) < IMU_PORT_REQ_PERIOD_MS) return;
+
+    s_last_req_time = now;
+    (void)IMU_UART_RequestData(IMU_FUNC_EULER);
+    (void)IMU_UART_RequestData(IMU_FUNC_RAW_GYRO);
+}
+
 void IMU_Process(void)
 {
-    IMU_UART_Process();
+    IMU_UART_PollRx();            /* ① 已到达字节 → 环形缓冲 */
+    IMU_UART_Process();           /* ② 解析完整帧，更新缓存数据 */
+    IMU_UART_EnsureStreaming();   /* ③ 无帧自愈（限频） */
 }
 
 /**

@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/usb_proto.c
     Core/Src/oled.c
     Core/Src/font.c
+    Core/Src/imu.c
 )
 
 # Add include paths
