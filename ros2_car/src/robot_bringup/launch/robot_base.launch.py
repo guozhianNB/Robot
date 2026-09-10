@@ -4,6 +4,7 @@
 
 用法(与 bringup 兼容的可复用基底):
     ros2 launch robot_bringup robot_base.launch.py odom_source:=chassis
+    ros2 launch robot_bringup robot_base.launch.py odom_source:=fused   # 轮速+激光 EKF 双源融合
 """
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -17,9 +18,15 @@ from launch_ros.actions import Node
 def generate_launch_description():
     share_dir = get_package_share_directory('robot_bringup')
     odom_source = LaunchConfiguration('odom_source')
+    use_ekf = LaunchConfiguration('use_ekf')
     use_sim_time = LaunchConfiguration('use_sim_time')
     declare = [
-        DeclareLaunchArgument('odom_source', default_value='rf2o'),
+        DeclareLaunchArgument('odom_source', default_value='rf2o',
+                              description='chassis | rf2o | fused（fused=轮速+激光 EKF 双源融合）'),
+        # 原来这里把 use_ekf 写死成 false 传给 odom.launch.py，导致从 robot_base
+        # 起永远开不了 EKF；现在提成启动参数透传（默认 false 保持原行为）
+        DeclareLaunchArgument('use_ekf', default_value='false',
+                              description='chassis 模式下是否启用 EKF 融合（fused 模式自带 EKF）'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
     ]
     rsp = Node(
@@ -31,6 +38,5 @@ def generate_launch_description():
         os.path.join(share_dir, 'launch', 'lidar.launch.py')))
     odom = IncludeLaunchDescription(PythonLaunchDescriptionSource(
         os.path.join(share_dir, 'launch', 'odom.launch.py')),
-        launch_arguments={'odom_source': odom_source, 'use_ekf': 'false'}.items())
+        launch_arguments={'odom_source': odom_source, 'use_ekf': use_ekf}.items())
     return LaunchDescription(declare + [rsp, lidar, odom])
-
