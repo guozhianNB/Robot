@@ -61,8 +61,32 @@ ros2 run robot_navigation navigate_to_pose --x 1.0 --y 0.5 --yaw 90
 | 雷达 | `ros2 launch robot_bringup lidar.launch.py` |
 | 里程计(激光) | `ros2 launch robot_bringup odom.launch.py odom_source:=rf2o` |
 | 里程计(底盘) | `ros2 launch robot_bringup odom.launch.py odom_source:=chassis` |
+| 里程计(双源融合) | `ros2 launch robot_bringup odom.launch.py odom_source:=fused`（轮速+激光 EKF，麦轮打滑场景） |
 | SLAM 建图 | `ros2 launch robot_bringup slam.launch.py mode:=mapping` |
 | SLAM 定位 | `ros2 launch robot_bringup slam.launch.py mode:=localization map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml` |
+
+## 双源里程计融合（odom_source:=fused，麦轮打滑场景）
+
+```bash
+ros2 launch robot_bringup robot_base.launch.py odom_source:=fused
+```
+
+- 数据流：`chassis_driver`（`/odom` 轮速速度）+ `rf2o`（`/odom_laser_raw` → `odom_relay` → `/odom_laser` 激光位姿）
+  → `ekf_filter_node` → `/odom_filtered` + **odom→base_link TF**（本模式下这段 TF 只有 EKF 发）
+- 为什么需要 `odom_relay`：rf2o 的 odom 消息协方差全为 0，robot_localization 会当成"绝对可信"
+  从而退化成 rf2o 复读机，故由 relay 补协方差并重打时间戳（细节见
+  `docs/superpowers/specs/2026-09-10-rf2o-ekf-odom-fusion-design.md`）
+- 校验：
+
+  ```bash
+  ros2 topic hz /odom /odom_laser_raw /odom_laser /odom_filtered   # 约 10/10/10/20 Hz
+  ros2 run tf2_tools view_frames.py                                # odom→base_link 只有 ekf_filter_node
+  ```
+
+- 打滑验收：车架空、四轮离地后发 `cmd_vel` 让轮子空转 → `/odom` 位置一路飞走、`/odom_laser`
+  基本不动、`/odom_filtered` 明显比 `/odom` 稳。若 filtered 仍漂太多，调小 `odom_relay` 的
+  `pose_covariance` 前两项（x, y）
+- 回退：不加 `odom_source:=fused` 即回到原来的单源模式
 
 ## 底盘接入（STM32 接上后）
 
