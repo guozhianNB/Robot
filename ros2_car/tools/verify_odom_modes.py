@@ -145,7 +145,8 @@ def check_ekf_yaml():
     assert odom1[6:12] == ['false'] * 6, 'odom1 是位姿源，不再融它的速度（避免同一源重复计入）'
 
     pnc = _array(text, 'process_noise_covariance')
-    assert len(pnc) == 225, 'process_noise_covariance 必须 225 个元素（15x15 行优先），实际 %d' % len(pnc)
+    assert len(pnc) in (15, 225), \
+        'process_noise_covariance 必须 15（对角线简写）或 225 个元素，实际 %d' % len(pnc)
 
     imu0 = _array(text, 'imu0_config')
     assert len(imu0) == 15, 'imu0_config 必须 15 个布尔，实际 %d' % len(imu0)
@@ -170,10 +171,18 @@ def check_ekf_yaml():
     else:
         root = yaml.safe_load(text)['ekf_filter_node']['ros__parameters']
         assert len(root['odom0_config']) == 15 and len(root['odom1_config']) == 15
-        assert len(root['process_noise_covariance']) == 225
+        assert len(root['imu0_config']) == 15
+        assert len(root['process_noise_covariance']) in (15, 225)
+        # rcl 要求 YAML 序列元素同类型：混用 int/float（如 0.05 与 0）会让 ekf_node 启动即崩
+        # （实机踩过：Sequence should be of same type. Value type 'integer' do not belong）
+        for key, val in root.items():
+            if isinstance(val, list):
+                types = {type(v).__name__ for v in val}
+                assert len(types) == 1, \
+                    '%s 元素类型不唯一 %s → rcl 拒绝解析，ekf_node 会崩' % (key, sorted(types))
         assert root['publish_tf'] is True and root['world_frame'] == 'odom'
         assert root['odom0'] == WHEEL_ODOM and root['odom1'] == LASER_ODOM
-        print('  [ok] PyYAML %s 严格解析' % yaml.__version__)
+        print('  [ok] PyYAML %s 严格解析（含序列元素类型一致性）' % yaml.__version__)
     print('  [ok] ekf_params.yaml 双源接线')
 
 

@@ -79,8 +79,11 @@ ros2 launch robot_bringup robot_base.launch.py odom_source:=fused
 - 校验：
 
   ```bash
-  ros2 topic hz /odom /odom_laser_raw /odom_laser /odom_filtered   # 约 10/10/10/20 Hz
-  ros2 run tf2_tools view_frames.py                                # odom→base_link 只有 ekf_filter_node
+  ros2 topic hz /odom /odom_laser_raw /odom_laser /odom_filtered
+  # 板卡实测：约 9 / 10 / 10 / 13~15 Hz（EKF 只在拿到新测量时才发，不是恒定 20Hz）
+  python3 tools/check_tf_authors.py 6
+  # 权威判据：odom→base_link 动态变换应只有一段且 ≈ EKF 频率；
+  # 只看 `ros2 topic info /tf` 的发布者数量会误判（rf2o/chassis_driver 无条件建了广播器但没发）
   ```
 
 - 打滑验收：车架空、四轮离地后发 `cmd_vel` 让轮子空转 → `/odom` 位置一路飞走、`/odom_laser`
