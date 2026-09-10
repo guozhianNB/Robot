@@ -20,6 +20,8 @@ from robot_bringup.odom_fusion import (  # noqa: E402
     plan_odom_sources,
 )
 
+RELAY_PY = os.path.join(PKG_ROOT, 'robot_bringup', 'odom_relay.py')
+
 
 def check_zero():
     """话题名常量必须是设计文档里定死的三个。"""
@@ -93,10 +95,22 @@ def check_covariance():
     print('  [ok] 协方差对角展开')
 
 
+def check_relay():
+    """relay 节点必须用 odom_fusion 的常量做默认话题，且不发布任何 TF。"""
+    src = open(RELAY_PY, encoding='utf-8').read()
+    assert 'input_topic' in src and 'LASER_ODOM_RAW' in src
+    assert 'output_topic' in src and 'LASER_ODOM' in src
+    assert 'restamp' in src
+    assert 'TransformBroadcaster' not in src, 'relay 不允许发布 TF'
+    assert 'diag6_to_covariance36' in src, 'relay 必须复用协方差展开函数'
+    print('  [ok] odom_relay 接线与无 TF 约束')
+
+
 def main():
     check_zero()
     check_modes()
     check_covariance()
+    check_relay()
     print('全部通过')
 
 

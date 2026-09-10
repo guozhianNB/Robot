@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'odom_to_tf = robot_bringup.odom_to_tf:main',
+            'odom_relay = robot_bringup.odom_relay:main',
         ],
     },
 )
