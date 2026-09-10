@@ -151,7 +151,7 @@ ekf_filter_node:
 | 直接把 rf2o 当 odom→base_link（不接 EKF） | 放弃轮速的低噪声/高频率预测，rf2o 单点跳变直接进 TF；且无传感器回退 |
 | 用 rf2o 话题直接喂 EKF（不加 relay） | 结论 2：协方差全 0 → EKF 退化成复读机 |
 | slam_toolbox localization 取代 AMCL | 另一条独立路线，与本次正交，不在 Stage 1 范围 |
-| AMCL 换 `OmniMotionModel`、`chassis_driver` dt 硬编码修复、IMU | Stage 2，Stage 1 上板验证通过后再做（同时改多处无法归因） |
+| AMCL 换 `OmniMotionModel`、`chassis_driver` dt 硬编码修复、IMU | Stage 2，Stage 1 上板验证通过后再做（同时改多处无法归因）；**IMU 已改为接 STM32 板，接入路径见 §十** |
 
 ## 六、改动清单
 
@@ -202,3 +202,31 @@ ekf_filter_node:
 - 不做：Stage 2 各项（AMCL 模型/recovery、dt 修复、IMU）、`robot_chassis` 与 `stm32` 改动、
   Nav2 参数调整、`bt_navigator` 的 `odom_topic` 改指向 `/odom_filtered`。
 - 不动：`nav2_params.yaml`、`slam_toolbox_params.yaml`、`car.urdf`、`bringup.launch.py`。
+
+## 十、Stage 2 · IMU 接入路径（2026-09-10 调整）
+
+**结论：IMU 改为接在 STM32 板上**（此前记录的"直插 RDK X5 板卡"作废）。因此 IMU 数据要经
+`STM32 → USB CDC 协议 → robot_chassis → /imu`，**涉及固件改动，不能只写板卡侧节点**。
+
+固件现状（2026-09-10 实查，工作量由此决定）：
+
+| 项 | 现状 |
+|---|---|
+| `stm32/control/Core/Src/imu.c` | 736 行驱动已写好（帧头 `0x7E 0x23`，功能码 0x01/0x04/0x0A/0x10/0x16/0x26/0x60/0x61/0x80…，环形缓冲 + 校验），**但从未编译过** |
+| CMake `target_sources` | 未注册 `imu.c`（显式列表，漏加不报错也不链接） |
+| UART 外设 | 工程里**根本没有 `usart.c` / `huart3`**——一个 USART 都没初始化；`imu.c` 却 `#include "usart.h"` 并 `#define IMU_PORT_UART_HANDLE huart3` → **当前不可编译** |
+| 中断 | `IMU_UART_IRQHandler()` 靠 CubeMX 生成的 `stm32f1xx_it.c::USART3_IRQHandler` 调用，该 handler 不存在 |
+| 主循环 | `main.c` 10ms 周期硬约束内调 `up_poll()` + `mc_update_all()`；IMU 解析需并入且不得阻塞 |
+| 协议 | USB v1.0 的 `STATUS(0x82)` 26 字节里没有 IMU 字段，需新增上行帧 |
+
+**推荐路径（最小风险，不动 CubeMX 文件）**：把 `imu.c` 改成自包含——自带 GPIOB/PB10-PB11 与
+USART3 寄存器级初始化（115200 8N1），在 `IMU_Process()` 里用**主循环轮询**读 SR/DR 收字节
+（115200 下 10ms 约 115 字节，寄存器读几微秒，不碰 10ms 硬约束），既不需要 NVIC、也不需要改
+`stm32f1xx_it.c` 或重新生成 `.ioc`。另一条路是用 CubeMX 重新生成加 USART3（更规范，但要
+CubeMX 工具 + `control.ioc`，且会覆盖 CubeMX 文件）。
+
+后续四步：①固件 bring-up + 注册 CMake；②USB 协议 v1.1 新增上行帧 `0x83`（IMU，建议 payload
+6~8 字节：yaw int16/0.01° + gyro_z int16/0.1°/s + 可选 roll/pitch），同步更新
+`docs/目标文档及说明/USB车控接口.md`；③`robot_chassis` 解析 `0x83` 发 `sensor_msgs/Imu`
+（REP-103 ENU），URDF 加 `base_link→imu_link` 静态 TF；④EKF 加 `imu0` 只融 `vyaw`
+（Stage 1 的 `ekf_params.yaml` 已留好位置）。
