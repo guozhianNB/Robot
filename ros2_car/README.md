@@ -88,6 +88,24 @@ ros2 launch robot_bringup robot_base.launch.py odom_source:=fused
   `pose_covariance` 前两项（x, y）
 - 回退：不加 `odom_source:=fused` 即回到原来的单源模式
 
+## IMU（接 STM32，进 EKF）
+
+- 硬件：IMU 接 STM32 的 `USART3`（PB10=TX / PB11=RX，115200 8N1）；STM32 以 20Hz 上行协议帧
+  `0x83`（yaw / yaw_rate / roll / pitch），`chassis_driver` 转成 `/imu`，EKF `imu0` 只融 `vyaw`
+- IMU 未接/无数据时固件不发 `0x83`（新鲜度门控），此时 `/imu` 不存在 —— 属正常，不是故障
+- 校验：
+
+  ```bash
+  ros2 topic hz /imu                 # ≈ 20Hz
+  ros2 topic echo /imu --once        # 协方差必须非零
+  ```
+
+- 符号标定：手托车体**逆时针**转 → `/imu` 的 `orientation` 与 `angular_velocity.z` 应增大；
+  不对改 `chassis_params.yaml` 的 `imu_sign_yaw` / `imu_sign_wz`
+- 打滑验收：车架空、四轮离地发 `cmd_vel` 空转 → `/odom` 的 yaw 疯长，`/imu` 基本不动，
+  `/odom_filtered` 明显比 `/odom` 稳
+- 回退：`ekf_params.yaml` 删掉 `imu0` 四行（含 config/differential/queue_size）即回到纯 rf2o+轮速融合
+
 ## 底盘接入（STM32 接上后）
 
 ```bash

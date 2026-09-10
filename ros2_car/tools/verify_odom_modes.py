@@ -147,6 +147,14 @@ def check_ekf_yaml():
     pnc = _array(text, 'process_noise_covariance')
     assert len(pnc) == 225, 'process_noise_covariance 必须 225 个元素（15x15 行优先），实际 %d' % len(pnc)
 
+    imu0 = _array(text, 'imu0_config')
+    assert len(imu0) == 15, 'imu0_config 必须 15 个布尔，实际 %d' % len(imu0)
+    assert imu0[11] == 'true', 'imu0 只融 vyaw（index 11）'
+    assert imu0[:11] == ['false'] * 11 and imu0[12:] == ['false'] * 3, \
+        'imu0 只融 vyaw，其它位必须 false（避免与 rf2o 的 yaw 两个朝向源打架）'
+    assert re.search(r'imu0:\s*/imu\s*$', text, re.M)
+    assert re.search(r'imu0_differential:\s*false', text)
+
     assert re.search(r'odom1:\s*' + re.escape(LASER_ODOM) + r'\s*$', text, re.M), \
         'odom1 必须指向 relay 输出 %s' % LASER_ODOM
     assert re.search(r'odom0:\s*' + re.escape(WHEEL_ODOM) + r'\s*$', text, re.M)

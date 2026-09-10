@@ -41,6 +41,18 @@ ekf_filter_node:
     odom1_differential: false
     odom1_queue_size: 5
 
+    # 输入3：IMU（接 STM32 USART3，经 USB 帧 0x83 转发到 /imu，见 docs/目标文档及说明/USB车控接口.md v1.1）
+    # 只融 vyaw：麦轮原地转打滑时，陀螺仪测的角速度仍然可信；绝对 yaw 不融
+    # （rf2o 位姿已在提供朝向，两个朝向源协方差不准时会互相打架）
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_queue_size: 10
+
     # 过程噪声（对角线展开，225 元素行优先）
     process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
                                0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
