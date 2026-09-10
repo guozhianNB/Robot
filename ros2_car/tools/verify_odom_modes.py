@@ -5,6 +5,7 @@
     python tools/verify_odom_modes.py
 """
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,6 +22,7 @@ from robot_bringup.odom_fusion import (  # noqa: E402
 )
 
 RELAY_PY = os.path.join(PKG_ROOT, 'robot_bringup', 'odom_relay.py')
+EKF_YAML = os.path.join(PKG_ROOT, 'config', 'ekf_params.yaml')
 
 
 def check_zero():
@@ -106,10 +108,63 @@ def check_relay():
     print('  [ok] odom_relay 接线与无 TF 约束')
 
 
+def _array(text, key):
+    """取 'key: [ ... ]' 里的元素（本文件数组内不写注释，故可粗解析）。"""
+    m = re.search(key + r':\s*\[(.*?)\]', text, re.S)
+    assert m, 'ekf_params.yaml 缺少 %s' % key
+    return [t.strip() for t in m.group(1).replace('\n', ' ').split(',') if t.strip()]
+
+
+def check_ekf_yaml():
+    """EKF 双源接线：数组长度、融合位、话题名。"""
+    text = open(EKF_YAML, encoding='utf-8').read()
+
+    for key in ('odom0_config', 'odom1_config'):
+        arr = _array(text, key)
+        assert len(arr) == 15, '%s 必须恰好 15 个布尔，实际 %d 个' % (key, len(arr))
+        assert all(v in ('true', 'false') for v in arr), (key, arr)
+
+    # 顺序: x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az
+    odom0 = _array(text, 'odom0_config')
+    assert odom0[6] == 'true' and odom0[7] == 'true', 'odom0 要融 vx, vy（横移只有轮速能给）'
+    assert odom0[11] == 'true', 'odom0 要融 vyaw'
+    assert odom0[0:2] == ['false', 'false'], 'odom0 不融位置（轮速位置会漂）'
+
+    odom1 = _array(text, 'odom1_config')
+    assert odom1[0] == 'true' and odom1[1] == 'true', 'odom1 要融 x, y'
+    assert odom1[5] == 'true', 'odom1 要融 yaw'
+    assert odom1[6:12] == ['false'] * 6, 'odom1 是位姿源，不再融它的速度（避免同一源重复计入）'
+
+    pnc = _array(text, 'process_noise_covariance')
+    assert len(pnc) == 225, 'process_noise_covariance 必须 225 个元素（15x15 行优先），实际 %d' % len(pnc)
+
+    assert re.search(r'odom1:\s*' + re.escape(LASER_ODOM) + r'\s*$', text, re.M), \
+        'odom1 必须指向 relay 输出 %s' % LASER_ODOM
+    assert re.search(r'odom0:\s*' + re.escape(WHEEL_ODOM) + r'\s*$', text, re.M)
+    assert re.search(r'world_frame:\s*odom', text), 'world_frame 必须是 odom（TF 归 EKF 时 map→odom 归 AMCL）'
+    assert re.search(r'publish_tf:\s*true', text)
+    assert re.search(r'odom1_differential:\s*false', text), 'rf2o 位姿是绝对位姿，不能开差分'
+
+    # 有 PyYAML 时再做一次严格解析（板卡上一定有；Windows 可用 .venv\Scripts\python.exe 跑）
+    try:
+        import yaml
+    except ImportError:
+        print('  [warn] 本机无 PyYAML，跳过严格解析（板卡上一定有）')
+    else:
+        root = yaml.safe_load(text)['ekf_filter_node']['ros__parameters']
+        assert len(root['odom0_config']) == 15 and len(root['odom1_config']) == 15
+        assert len(root['process_noise_covariance']) == 225
+        assert root['publish_tf'] is True and root['world_frame'] == 'odom'
+        assert root['odom0'] == WHEEL_ODOM and root['odom1'] == LASER_ODOM
+        print('  [ok] PyYAML %s 严格解析' % yaml.__version__)
+    print('  [ok] ekf_params.yaml 双源接线')
+
+
 def main():
     check_zero()
     check_modes()
     check_covariance()
+    check_ekf_yaml()
     check_relay()
     print('全部通过')
 

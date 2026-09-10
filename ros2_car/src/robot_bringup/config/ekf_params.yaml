@@ -1,43 +1,47 @@
-# robot_localization EKF 参数（可选，默认关闭）
-# 作用：融合底盘编码器里程计(/odom)，输出更平滑的 /odom_filtered，
-#       并发布 odom→base_link tf（此时 chassis_driver 关闭自身 tf 避免双发布）。
-# 用法：bringup.launch.py 传 use_ekf:=true（需 odom_source:=chassis）
-# 可选输入：rf2o 激光里程计(/odom_laser) 见下方注释段，需要时放开。
+# robot_localization EKF 参数：双源融合（Stage 1）
+#   输入1 底盘编码器 /odom          → 只取速度（vx, vy, vyaw）：横移速度只有轮速能给，位置会漂不取
+#   输入2 rf2o 激光里程计 /odom_laser → 取位姿（x, y, yaw）：扫描匹配结果，打滑时唯一可信的位置锚点
+# rf2o 的原始消息协方差全为 0（robot_localization 会退化成"完全信任"），故经 odom_relay
+# 补协方差 + 重打时间戳后再进 EKF。详见 docs/superpowers/specs/2026-09-10-rf2o-ekf-odom-fusion-design.md
+# 用法：ros2 launch robot_bringup odom.launch.py odom_source:=fused
+#       （此时 chassis_driver 与 rf2o 均 publish_tf=false，odom→base_link 由本 EKF 发布）
 
 ekf_filter_node:
   ros__parameters:
     use_sim_time: false
     frequency: 20.0
     two_d_mode: true
+    sensor_timeout: 0.5      # rf2o 断供 0.5s 后自动只用轮速（10Hz 下=连丢 5 帧）
+    reset_on_time_jump: true
+    print_diagnostics: true
     publish_tf: true
     map_frame: map
     odom_frame: odom
     base_link_frame: base_link
     world_frame: odom
 
-    # 输入1：底盘编码器里程计
+    # 输入1：底盘编码器里程计 —— 只融速度
+    # 顺序: x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az
     odom0: /odom
-    odom0_config: [true,  true,  false,
+    odom0_config: [false, false, false,
                    false, false, false,
-                   true,  true,  true,
+                   true,  true,  false,
                    false, false, true,
                    false, false, false]
     odom0_differential: false
     odom0_queue_size: 5
 
-    # 输入2：rf2o 激光里程计（可选，默认关闭）
-    # 启用需同时跑 rf2o 且其 odom_topic 为 /odom_laser（odom.launch.py odom_source:=rf2o 时才有数据）。
-    # 底盘模式下无 rf2o 数据，留着会在日志里持续打 waiting 告警，故注释掉；需要时放开并让 rf2o 输出 /odom_laser。
-    # odom1: /odom_laser
-    # odom1_config: [true,  true,  false,
-    #                false, false, false,
-    #                true,  true,  true,
-    #                false, false, true,
-    #                false, false, false]
-    # odom1_differential: false
-    # odom1_queue_size: 5
+    # 输入2：rf2o 激光里程计（经 odom_relay 修过协方差+时间戳）—— 只融位姿
+    odom1: /odom_laser
+    odom1_config: [true,  true,  false,
+                   false, false, true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom1_differential: false
+    odom1_queue_size: 5
 
-    # 协方差初值
+    # 过程噪声（对角线展开，225 元素行优先）
     process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
                                0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
                                0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
