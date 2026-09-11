@@ -1,0 +1,45 @@
+# 换行符统一为 LF
+#
+# 背景：2026-09-11 板上提交 97a30b6 把 32 个已跟踪文件写成了 CRLF，与远端 LF
+# 版本合并时 git 认为每一行都变了，产生"整文件冲突"（3 个文件冲突标记都在第 1 行，
+# 去掉 \r 后内容逐字节相同）。本文件用于防止同类假冲突复发。
+#
+# 规则：仓库内容一律以 LF 入库，检出到工作区也用 LF。
+# Windows 侧编辑不受影响（现代编辑器均支持 LF），但提交时不会再混入 CRLF。
+
+* text=auto eol=lf
+
+# 二进制文件：禁止任何换行符转换
+*.db      binary
+*.db-wal  binary
+*.db-shm  binary
+*.wal     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.pdf     binary
+*.pyc     binary
+*.onnx    binary
+*.pt      binary
+*.pth     binary
+*.so      binary
+
+# 明确按文本处理（被 text=auto 误判的少数类型）
+*.md       text eol=lf
+*.py       text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.launch   text eol=lf
+*.rviz     text eol=lf
+*.urdf     text eol=lf
+*.xacro    text eol=lf
+*.sh       text eol=lf
+*.c        text eol=lf
+*.h        text eol=lf
+*.srv      text eol=lf
+*.msg      text eol=lf
+
+# 例外：CubeMX 生成的 CMakeLists.txt 含孤立 CR，git 一直按二进制对待。
+# 按 stm32/control/AGENTS.md「勿动 CubeMX 文件」，保持逐字节原样、不做换行符转换。
+stm32/control/cmake/stm32cubemx/CMakeLists.txt -text
