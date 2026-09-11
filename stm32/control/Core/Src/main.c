@@ -150,11 +150,12 @@ static void single_motor_test_run(void)
   md_clear_encoder(0);
   HAL_Delay(300);
 
-  /* ② PID 闭环恒速：实测整定 Kp=6.5/Ki=2.0（用户测试验证过的参数）
-   *    积分限幅已放宽到 1000（与输出限幅一致，等效不限幅）
-   *    ⚠️ 与 motor_control.c 的 MC_PID_KP/KI 默认值保持一致 */
+  /* ② PID 闭环恒速：2026-09-11 实测整定 Kp=2/Ki=20（架空 47RPM 阶跃：超调 2.1%、
+   *    ±5% 稳定 0.5~0.6s；旧 6.5/2.0 与 13/3 都是"起步猛冲后回落、10s 级收敛"）
+   *    积分限幅 50 = OUTPUT_LIMIT/KI，积分项最多贡献满量程
+   *    ⚠️ 与 motor_control.c 的 MC_PID_KP/KI/限幅默认值保持一致 */
   mc_init();
-  mc_pid_tune(6.5f, 2.0f, 0.0f);
+  mc_pid_tune(2.0f, 20.0f, 0.0f);
   mc_set_target(way, TEST_LOOP_RPM);
 
   last_ms = HAL_GetTick();
