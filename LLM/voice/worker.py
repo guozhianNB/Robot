@@ -25,6 +25,7 @@ r"""语音后台线程：编排 采集→VAD→(KWS|流式ASR)→声纹→LLM→
 
 稳健性核心：run() 顶层 try/except 兜住初始化；主循环任何异常只记审计 + 退避重连，
 绝不向调用方（FastAPI 事件循环）抛出 → 主程序不崩。"""
+import queue
 import threading
 import time
 
@@ -35,6 +36,37 @@ from . import config
 from . import audio, vad as vad_mod, kws as kws_mod, asr as asr_mod, tts as tts_mod
 from . import speaker as spk_mod, identity as id_mod, session as session_mod
 from . import tts_buffer                 # LLM 回复分句缓冲（句级 TTS 前置）
+
+
+class _TextReplyFeed:
+    """线程安全地把文本增量转成 VoiceWorker 可消费的事件流。"""
+
+    def __init__(self):
+        self._events = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def feed(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._events.put({"type": "content", "content": delta})
+
+    def finish(self, flush_tail: bool = True) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._events.put({"type": "done", "flush_tail": bool(flush_tail)})
+
+    def __iter__(self):
+        while True:
+            event = self._events.get()
+            yield event
+            if event.get("type") == "done":
+                return
 
 
 class VoiceWorker(threading.Thread):
@@ -62,6 +94,7 @@ class VoiceWorker(threading.Thread):
         self._answering = False             # 应答线程活跃标志（防队列瞬时空误判播报结束）
         self._turn = 0                      # 应答轮次代数：_start_answer 每轮自增抢占
         self._abort = threading.Event()     # barge-in 打断应答（仅播放期语义；新轮由 _turn 接管）
+        self._text_reply_feed = None        # 当前文本回复事件流（新轮开始时关闭旧流）
 
     # ---- 状态上报 ----
     def _report(self, status: str, **kw):
@@ -381,10 +414,19 @@ class VoiceWorker(threading.Thread):
         turn = 本轮次代数：被新轮取代（self._turn != turn）或 _abort 置位时，检查点
         （循环顶 / 入队闸）立即停止后续消费/合成/入队。
         主循环异常（如设备掉线 enqueue 抛错）→ 记审计后返回已收文本，不抛穿。"""
+        consume_settings = dict(settings)
+        consume_settings["_voice_uid"] = uid
+        events = self.stream_fn(uid, user_text)
+        return self._consume_events(events, consume_settings, turn)
+
+    def _consume_events(self, events, settings, turn,
+                        publish_text=True, wake_if_idle=False):
+        """消费回复事件：按句合成入队，可关闭文字广播或从待机态唤醒播报。"""
         speak = bool(settings.get("tts_enabled", True)) and self.tts is not None
         buf = tts_buffer.SentenceBuffer()
         full = []
         started = threading.Event()        # 首句已入队（确保仅触发一次 speaking/start_speaking）
+        flush_tail = True
 
         def enqueue_sentence(sent):
             clean = tts_mod.sanitize_tts_text(sent)
@@ -417,6 +459,8 @@ class VoiceWorker(threading.Thread):
                     started.set()
                     self._speak_started = time.monotonic()
                     self._speak_ended_at = None
+                    if wake_if_idle:
+                        self.session.wake()
                     if not self.session.start_speaking():
                         return            # 状态机未在 LISTENING（已被打断）：放弃首句
                     self._publish("voice_state", state="speaking")
@@ -431,29 +475,71 @@ class VoiceWorker(threading.Thread):
         if self._turn != turn:
             return ""                     # 尚未进流即已被新轮取代：直接退出
         try:
-            for ev in self.stream_fn(uid, user_text):
+            for ev in events:
                 if self._abort.is_set() or self._turn != turn:
                     break                 # 打断 / 被新轮取代：停止后续消费与分句
                 t = ev.get("type")
                 if t == "content":
                     delta = ev.get("content") or ""
                     if delta:
-                        self._publish("chat_partial", uid=uid, delta=delta)
+                        if publish_text:
+                            self._publish("chat_partial",
+                                          uid=settings.get("_voice_uid") or self.current_uid or "elder_001",
+                                          delta=delta)
                         full.append(delta)
                         if speak:         # 仅 speak 模式分句+合成（非 speak 不逐句调 TTS）
                             for sent in buf.feed(delta):
                                 enqueue_sentence(sent)
                 elif t == "done":
+                    flush_tail = bool(ev.get("flush_tail", True))
                     break
         except Exception as e:
             # 消费异常（如设备掉线 enqueue 抛错）：记审计后带已收文本退出，不抛穿
             audit.log("voice_error", action="tts_consume", error=str(e)[:200])
             return "".join(full)
-        if speak:
+        if speak and flush_tail:
             tail = buf.flush()
             if tail:
                 enqueue_sentence(tail)
         return "".join(full)
+
+    def begin_text_reply(self, settings):
+        """启动一轮仅负责播报的增量文本回复，返回其线程安全 feed。"""
+        if self.tts is None or self.sink is None:
+            return None
+
+        self._abort.set()
+        self.sink.stop()
+        self.session.barge_in()
+        self._turn += 1
+        turn = self._turn
+        if self._text_reply_feed is not None:
+            self._text_reply_feed.finish(flush_tail=False)
+        self._abort.clear()
+        self._answering = True
+        feed = _TextReplyFeed()
+        self._text_reply_feed = feed
+        t = threading.Thread(target=self._answer_text_reply,
+                             args=(feed, dict(settings), turn),
+                             daemon=True, name="voice-answer")
+        t.start()
+        return feed
+
+    def _answer_text_reply(self, feed, settings, turn):
+        """文本播报线程体：消费事件，并把收流权留给最新轮。"""
+        try:
+            self._consume_events(feed, settings, turn,
+                                 publish_text=False, wake_if_idle=True)
+        except Exception as e:
+            audit.log("voice_error", action="tts_answer", error=str(e)[:200])
+        finally:
+            if turn == self._turn:
+                self._answering = False
+                self._abort.clear()
+                self._text_reply_feed = None
+                self.sink.end_of_stream()
+            else:
+                audit.log("voice_error", action="answer_superseded")
 
     def stop(self):
         self._stop.set()

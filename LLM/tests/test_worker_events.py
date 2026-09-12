@@ -317,3 +317,64 @@ def test_consume_exception_still_finalizes_chat_new(monkeypatch):
     assert news[0] == {"uid": "elder_001", "user": "测试问", "assistant": "前半段"}
     assert posted == [("elder_001", "测试问", "前半段")]
     assert len(sink._eos) == 1, "异常路径也要收流一次"
+
+
+def test_text_reply_stream_speaks_sentences_without_chat_events(monkeypatch):
+    """文本回复增量按完整句播报，不重复发布聊天事件，且只收流一次。"""
+    _silence_audit(monkeypatch)
+    w, events = _make_worker()
+    spoken = []
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {
+        "provider": "local",
+        "synthesize_chunks": lambda self, text: (
+            spoken.append(text) or np.zeros(160, dtype=np.float32) for _ in (1,)
+        ),
+    })()
+    w.sink = _counting_sink()
+
+    feed = w.begin_text_reply({"tts_enabled": True})
+    assert feed is not None
+    feed.feed("第一句。第二")
+    feed.feed("句！尾句")
+    feed.finish(flush_tail=True)
+    _settle_answer_threads()
+
+    assert spoken == ["第一句。", "第二句！", "尾句"]
+    assert not [ev for ev, _ in events if ev in ("chat_partial", "chat_new")]
+    assert len(w.sink._eos) == 1
+
+
+def test_new_text_reply_supersedes_old_text_reply(monkeypatch):
+    """新文本播报轮次接管后，旧轮后续文本不得合成或入队。"""
+    _silence_audit(monkeypatch)
+    w, _ = _make_worker()
+    spoken = []
+    enqueued = []
+    eos = []
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {
+        "provider": "local",
+        "synthesize_chunks": lambda self, text: (
+            spoken.append(text) or np.zeros(160, dtype=np.float32) for _ in (1,)
+        ),
+    })()
+    w.sink = type("Sink", (), {
+        "enqueue": lambda self, samples: enqueued.append(samples),
+        "stop": lambda self: None,
+        "is_done": lambda self: True,
+        "end_of_stream": lambda self: eos.append(1),
+    })()
+
+    old_feed = w.begin_text_reply({"tts_enabled": True})
+    new_feed = w.begin_text_reply({"tts_enabled": True})
+    assert old_feed is not None and new_feed is not None
+    old_feed.feed("旧轮不应播报。")
+    old_feed.finish()
+    new_feed.feed("新轮播报。")
+    new_feed.finish()
+    _settle_answer_threads()
+
+    assert spoken == ["新轮播报。"]
+    assert len(enqueued) == 1
+    assert len(eos) == 1
