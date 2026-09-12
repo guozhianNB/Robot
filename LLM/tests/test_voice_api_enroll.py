@@ -127,3 +127,65 @@ def test_list_speaker_details(monkeypatch):
     monkeypatch.setattr(voice_api._recognizer, "list_profiles", lambda: ["elder_a"])
     monkeypatch.setattr(voice_api._recognizer, "sample_count", lambda uid: 3)
     assert voice_api.list_speaker_details() == {"elder_a": {"samples": 3}}
+
+
+class FakeTextReplyHandle:
+    def __init__(self):
+        self.feed_calls = []
+        self.finish_calls = []
+
+    def feed(self, delta):
+        self.feed_calls.append(delta)
+
+    def finish(self, flush_tail=True):
+        self.finish_calls.append(flush_tail)
+
+
+class FakeTextReplyWorker:
+    def __init__(self):
+        self.settings = None
+        self.handle = FakeTextReplyHandle()
+
+    def begin_text_reply(self, settings):
+        self.settings = settings
+        return self.handle
+
+
+def test_text_reply_api_forwards_to_running_worker(monkeypatch):
+    worker = FakeTextReplyWorker()
+    settings = {"voice_enabled": True, "tts_enabled": True}
+    monkeypatch.setattr(voice_api, "_VOICE_AVAILABLE", True)
+    monkeypatch.setattr(voice_api, "_worker", worker)
+    monkeypatch.setattr(voice_api.db, "get_settings", lambda: settings)
+
+    handle = voice_api.begin_text_reply()
+    voice_api.feed_text_reply(handle, "你好")
+    voice_api.end_text_reply(handle, flush_tail=False)
+
+    assert handle is worker.handle
+    assert worker.settings is settings
+    assert handle.feed_calls == ["你好"]
+    assert handle.finish_calls == [False]
+
+
+def test_text_reply_api_returns_none_when_disabled_or_worker_missing(monkeypatch):
+    monkeypatch.setattr(voice_api, "_VOICE_AVAILABLE", True)
+    monkeypatch.setattr(voice_api.db, "get_settings", lambda: {
+        "voice_enabled": True, "tts_enabled": False,
+    })
+    worker = FakeTextReplyWorker()
+    monkeypatch.setattr(voice_api, "_worker", worker)
+
+    assert voice_api.begin_text_reply() is None
+    assert worker.settings is None
+
+    monkeypatch.setattr(voice_api, "_worker", None)
+    monkeypatch.setattr(voice_api.db, "get_settings", lambda: {
+        "voice_enabled": True, "tts_enabled": True,
+    })
+    assert voice_api.begin_text_reply() is None
+
+
+def test_text_reply_api_ignores_empty_handles(monkeypatch):
+    voice_api.feed_text_reply(None, "忽略")
+    voice_api.end_text_reply(None)

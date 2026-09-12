@@ -108,6 +108,42 @@ def _stream_fn(client, model):
     return _fn
 
 
+def begin_text_reply():
+    """开始一轮文本增量播报；语音不可用时静默降级。"""
+    if not _VOICE_AVAILABLE or _worker is None:
+        return None
+    try:
+        settings = db.get_settings()
+        if not settings.get("voice_enabled", True) or not settings.get("tts_enabled", True):
+            return None
+        return _worker.begin_text_reply(settings)
+    except Exception as e:
+        audit.log("voice_error", action="text_tts_begin", error=str(e)[:200])
+        return None
+
+
+def feed_text_reply(handle, delta):
+    """向文本增量播报句柄投递一段文本；失败时静默降级。"""
+    if handle is None or not delta:
+        return None
+    try:
+        handle.feed(delta)
+    except Exception as e:
+        audit.log("voice_error", action="text_tts_feed", error=str(e)[:200])
+    return None
+
+
+def end_text_reply(handle, flush_tail=True):
+    """结束文本增量播报；失败时静默降级。"""
+    if handle is None:
+        return None
+    try:
+        handle.finish(flush_tail=flush_tail)
+    except Exception as e:
+        audit.log("voice_error", action="text_tts_end", error=str(e)[:200])
+    return None
+
+
 def start_voice(client, model, post_turn_fn):
     global _worker
     if not _VOICE_AVAILABLE:
