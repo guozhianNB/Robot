@@ -189,3 +189,85 @@ def test_text_reply_api_returns_none_when_disabled_or_worker_missing(monkeypatch
 def test_text_reply_api_ignores_empty_handles(monkeypatch):
     voice_api.feed_text_reply(None, "忽略")
     voice_api.end_text_reply(None)
+
+
+def test_text_reply_api_begin_db_failure_survives_audit_failure(monkeypatch):
+    audit_calls = []
+
+    def broken_audit(event, **fields):
+        audit_calls.append((event, fields))
+        raise RuntimeError("audit failed")
+
+    monkeypatch.setattr(voice_api, "_VOICE_AVAILABLE", True)
+    monkeypatch.setattr(voice_api, "_worker", FakeTextReplyWorker())
+    monkeypatch.setattr(voice_api.db, "get_settings",
+                        lambda: (_ for _ in ()).throw(RuntimeError("settings failed")))
+    monkeypatch.setattr(voice_api.audit, "log", broken_audit)
+
+    assert voice_api.begin_text_reply() is None
+    assert audit_calls == [("voice_error", {
+        "action": "text_tts_begin", "error": "settings failed",
+    })]
+
+
+def test_text_reply_api_worker_failure_survives_audit_failure(monkeypatch):
+    audit_calls = []
+
+    def broken_audit(event, **fields):
+        audit_calls.append((event, fields))
+        raise RuntimeError("audit failed")
+
+    class FailingWorker:
+        def begin_text_reply(self, settings):
+            raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(voice_api, "_VOICE_AVAILABLE", True)
+    monkeypatch.setattr(voice_api, "_worker", FailingWorker())
+    monkeypatch.setattr(voice_api.db, "get_settings",
+                        lambda: {"voice_enabled": True, "tts_enabled": True})
+    monkeypatch.setattr(voice_api.audit, "log", broken_audit)
+
+    assert voice_api.begin_text_reply() is None
+    assert audit_calls == [("voice_error", {
+        "action": "text_tts_begin", "error": "worker failed",
+    })]
+
+
+def test_text_reply_api_feed_failure_survives_audit_failure(monkeypatch):
+    audit_calls = []
+
+    def broken_audit(event, **fields):
+        audit_calls.append((event, fields))
+        raise RuntimeError("audit failed")
+
+    class FailingHandle:
+        def feed(self, delta):
+            raise RuntimeError("feed failed")
+
+    monkeypatch.setattr(voice_api.audit, "log", broken_audit)
+
+    voice_api.feed_text_reply(FailingHandle(), "内容")
+
+    assert audit_calls == [("voice_error", {
+        "action": "text_tts_feed", "error": "feed failed",
+    })]
+
+
+def test_text_reply_api_end_failure_survives_audit_failure(monkeypatch):
+    audit_calls = []
+
+    def broken_audit(event, **fields):
+        audit_calls.append((event, fields))
+        raise RuntimeError("audit failed")
+
+    class FailingHandle:
+        def finish(self, flush_tail=True):
+            raise RuntimeError("end failed")
+
+    monkeypatch.setattr(voice_api.audit, "log", broken_audit)
+
+    voice_api.end_text_reply(FailingHandle(), flush_tail=False)
+
+    assert audit_calls == [("voice_error", {
+        "action": "text_tts_end", "error": "end failed",
+    })]

@@ -108,6 +108,14 @@ def _stream_fn(client, model):
     return _fn
 
 
+def _best_effort_text_tts_error(action, error):
+    """记录文本播报错误；审计故障不能反向影响聊天请求。"""
+    try:
+        audit.log("voice_error", action=action, error=str(error)[:200])
+    except Exception:
+        pass
+
+
 def begin_text_reply():
     """开始一轮文本增量播报；语音不可用时静默降级。"""
     if not _VOICE_AVAILABLE or _worker is None:
@@ -118,7 +126,7 @@ def begin_text_reply():
             return None
         return _worker.begin_text_reply(settings)
     except Exception as e:
-        audit.log("voice_error", action="text_tts_begin", error=str(e)[:200])
+        _best_effort_text_tts_error("text_tts_begin", e)
         return None
 
 
@@ -129,7 +137,7 @@ def feed_text_reply(handle, delta):
     try:
         handle.feed(delta)
     except Exception as e:
-        audit.log("voice_error", action="text_tts_feed", error=str(e)[:200])
+        _best_effort_text_tts_error("text_tts_feed", e)
     return None
 
 
@@ -140,7 +148,7 @@ def end_text_reply(handle, flush_tail=True):
     try:
         handle.finish(flush_tail=flush_tail)
     except Exception as e:
-        audit.log("voice_error", action="text_tts_end", error=str(e)[:200])
+        _best_effort_text_tts_error("text_tts_end", e)
     return None
 
 
