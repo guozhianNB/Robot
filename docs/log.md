@@ -481,3 +481,13 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 任务 0 探针（`docs/2.pre/tts2_probe.py` 尚未创建）实测定案端点鉴权——真机若 401/404 则 tts_cloud 按规格改双向 WS（/api/v3/tts/bidirection）蓝本；本机 `.env` 收尾核查已含 `VOLC_TTS_SPEAKER=zh_female_vv_uranus_bigtts`（批次内曾记「用户称已写、实测未见」，现已补齐；云端引擎初始化即依赖该值），板卡部署需随 .env 同步。
 - 用户侧跑 vue-tsc（pnpm store 残缺）+ `scripts/build_frontend.ps1`（沙箱 esbuild EPERM 已知限制）。
 - root `tests/test_unlock_switch.py` 陈旧红态为**基线既有**（voice 批次遗留，3 failed，与 LLM/tests 回归无关），迁移与否交用户定夺。
+
+## 2026-09-13 · kiosk 输入框回复逐句自动播报
+
+- `/api/chat` 新增向后兼容的 `speak=false` 请求字段；仅 kiosk 输入框发送 `speak=true`，admin 保持静音。
+- SSE content 增量经 `voice_api` 降级门面投递到 `VoiceWorker` 后台队列，复用 `SentenceBuffer`、云端失败本地回退、`AudioSink` 和原子化轮次取代，合成不阻塞文字上屏。
+- 只有 `done` flush 尾句；异常/断开丢弃未完成尾句；完成会话的 post-chat jobs 在 done 后关闭时仍恰好一次。
+- worker 未运行、TTS 关闭、合成或审计失败时只降级播报，文字聊天继续工作。
+- RED：`rg -n 'speak: true' frontend/packages/kiosk/src/App.vue` 退出码 1，无匹配。
+- GREEN/静态验证：kiosk 同一 `rg` 退出码 0、命中 1 处；admin 同一检查退出码 1、无匹配；`D:\_project\Robot\.venv\Scripts\python.exe -m py_compile LLM\server.py LLM\voice_api.py LLM\voice\worker.py` 退出码 0；`git diff --check` 退出码 0。
+- 全量验证原始摘要：`$env:DEEPSEEK_API_KEY='test-key'; D:\_project\Robot\.venv\Scripts\python.exe -m pytest LLM\tests -q --basetemp .superpowers/pytest-tmp-task4` → `97 passed in 16.48s`；`frontend/packages/kiosk` 与 `frontend/packages/admin` 均执行 `node_modules\\.bin\\vite.CMD build` → Vite 构建成功（分别 37、42 modules）。`vue-tsc` 沿用任务前已知损坏安装（`vue-tsc/index.js` 缺失），未修复、未计为本任务回归。
