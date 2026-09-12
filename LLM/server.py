@@ -140,6 +140,7 @@ class ChatRequest(BaseModel):
     uid: str = "elder_001"
     message: str
     thinking: str = "auto"          # auto / on / off
+    speak: bool = False
 
 
 class ProfileIn(BaseModel):
@@ -245,10 +246,18 @@ async def chat_route(req: ChatRequest):
 
     def gen():
         assistant = ""
-        for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking, settings):
-            if ev["type"] == "done":
-                assistant = ev.get("assistant", "")
-            yield _sse(ev)
+        speech = voice_api.begin_text_reply() if req.speak else None
+        completed = False
+        try:
+            for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking, settings):
+                if ev["type"] == "content":
+                    voice_api.feed_text_reply(speech, ev.get("content") or "")
+                elif ev["type"] == "done":
+                    assistant = ev.get("assistant", "")
+                    completed = True
+                yield _sse(ev)
+        finally:
+            voice_api.end_text_reply(speech, flush_tail=completed)
         if assistant.strip():
             _bg.submit(_post_chat_jobs, req.uid, req.message, assistant)
 
