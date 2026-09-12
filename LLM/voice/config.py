@@ -65,3 +65,26 @@ def cloud_asr_api_key():
 def cloud_asr_resource_id():
     """流式识别2.0(Seed-ASR)=volc.seedasr.sauc.duration；1.0=volc.bigasr.sauc.duration"""
     return os.getenv("VOLC_ASR_RESOURCE_ID") or "volc.seedasr.sauc.duration"
+
+
+# ---- 云端 TTS（火山豆包语音 2.0，与 ASR 同控制台 API Key；延迟读取，见模块 docstring）----
+def cloud_tts_api_key():
+    """VOLC_TTS_API_KEY 优先，未配置时回落 ASR 同一把 key（同控制台 API Key）。"""
+    return os.getenv("VOLC_TTS_API_KEY") or os.getenv("VOLC_ASR_API_KEY") or ""
+
+
+def cloud_tts_speaker():
+    """音色 ID：豆包语音控制台 → 音色库（必填，缺失时云端引擎构造抛错）。"""
+    return os.getenv("VOLC_TTS_SPEAKER") or ""
+
+
+def cloud_tts_resource_id():
+    return os.getenv("VOLC_TTS_RESOURCE_ID") or "seed-tts-2.0"
+
+
+def cloud_tts_model():
+    return os.getenv("VOLC_TTS_MODEL") or "seed-tts-2.0-standard"
+
+
+def cloud_tts_endpoint():
+    return os.getenv("VOLC_TTS_ENDPOINT") or "https://openspeech.bytedance.com/api/v3/tts/unidirectional"

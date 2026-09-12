@@ -8,6 +8,17 @@ r"""语音后台线程：编排 采集→VAD→(KWS|流式ASR)→声纹→LLM→
   - VAD 弹出一整句 → ASR finish() 收尾拿最终文本 → 走原声纹/LLM/TTS 链路
     （recognized 事件不变）；起会话失败等异常由整段一次性转写兜底（旧语义）。
   - 引擎选择：启动时读 settings.asr_provider（local|cloud），重启生效。
+  - 应答编排：recognized 后启动应答线程消费 chat_stream——content 增量逐字广播
+    chat_partial（前端上屏），完整句切出后按句合成入队播报（句级 TTS，tts_provider=cloud
+    时云端句失败自动回退本地引擎，不中断播报）；老人插话打断 = sink.stop() + _abort 置位
+    （仅播放期 barge-in 语义），应答线程停止后续合成/入队；chat_new 与 post_turn 在
+    整段流收尾后发（旧 _speak 整段合成已删，改由 _consume_reply/_answer 编排）。
+  - 轮次代数防双线程重叠：_start_answer 每轮 self._turn += 1（int 原子读写）抢占"最新轮"
+    身份，新轮无条件置位 _answering 接管；think 期老人追问新整句 → 旧轮即便阻塞在
+    chat_stream 网络读/合成中，也会在其下一检查点（循环顶/入队闸，self._turn != turn）
+    观察到被取代而静默退出——绝无第二条线程并发消费同一流、end_of_stream 不会被调两次；
+    消费异常（如设备掉线 enqueue 抛错）由 _consume_reply 吞掉记审计，_answer 仍以最新轮
+    身份把已收文本落 chat_new 历史（不丢该轮）。
   - 防自声识别：播报(Speaking)期间 VAD 会把机器人自己的 TTS 回声当语音——结束/打断时
     _flush_vad() 清掉自声段，自然播报结束再叠加 config.SPEAK_TAIL_BLANK_S 回声静音窗，
     避免"自己的话被 ASR 识别 → 自问自答"；打断式插话不套静音窗（要立即收音）。
@@ -23,14 +34,15 @@ from .. import db, log as audit
 from . import config
 from . import audio, vad as vad_mod, kws as kws_mod, asr as asr_mod, tts as tts_mod
 from . import speaker as spk_mod, identity as id_mod, session as session_mod
+from . import tts_buffer                 # LLM 回复分句缓冲（句级 TTS 前置）
 
 
 class VoiceWorker(threading.Thread):
-    def __init__(self, chat_fn, post_turn_fn, publish_fn=None):
+    def __init__(self, stream_fn, post_turn_fn=None, publish_fn=None):
         super().__init__(daemon=True, name="voice-worker")
-        self.chat_fn = chat_fn            # (uid, text) -> str
+        self.stream_fn = stream_fn      # (uid, text) -> iterable[chat_stream 事件 dict]
         self.post_turn_fn = post_turn_fn  # (uid, user_text, assistant) -> None
-        self.publish_fn = publish_fn      # 事件广播，可空
+        self.publish_fn = publish_fn    # 事件广播，可空
         self._stop = threading.Event()
         self.status = "stopped"           # running / degraded / disabled / stopped
         self.sub_status = {}
@@ -45,6 +57,11 @@ class VoiceWorker(threading.Thread):
         self._asr_tail = []          # 开口判定前的音频前沿缓冲（防丢句首）
         self._asr_active = False     # 当前是否处于一句话的 ASR 流式会话中
         self._last_partial = ""      # 最近一次广播的 partial 文本（去重）
+        # 流式问答编排状态（引擎在 _build_runtime 填充）
+        self.tts = self._local_tts = None   # 实际引擎 + 本地兜底引擎
+        self._answering = False             # 应答线程活跃标志（防队列瞬时空误判播报结束）
+        self._turn = 0                      # 应答轮次代数：_start_answer 每轮自增抢占
+        self._abort = threading.Event()     # barge-in 打断应答（仅播放期语义；新轮由 _turn 接管）
 
     # ---- 状态上报 ----
     def _report(self, status: str, **kw):
@@ -88,7 +105,20 @@ class VoiceWorker(threading.Thread):
             provider = "local"
             self.asr = asr_mod.StreamASR()
         self.sub_status["asr"] = provider          # /api/voice/status modules 显示实际引擎
-        self.tts = tts_mod.TTS()
+        # TTS：本地引擎始终构造（离线兜底）；tts_provider=cloud 时优先云端，构造失败回退本地
+        self._local_tts = tts_mod.TTS()
+        provider = db.get_settings().get("tts_provider", "cloud")
+        self.tts = self._local_tts
+        if provider == "cloud":
+            try:
+                from . import tts_cloud as cloud_tts_mod
+                self.tts = cloud_tts_mod.CloudStreamTTS()
+            except Exception as e:
+                audit.log("voice_error", action="tts_provider_fallback",
+                          provider="cloud", error=str(e))
+                self.tts = self._local_tts
+                self.sub_status["tts_fallback"] = "云端不可用，已回退本地：{}".format(str(e)[:120])
+        self.sub_status["tts"] = self.tts.provider   # 本地/云端引擎均声明 provider 类属性
         self.spk = spk_mod.SpeakerRecognizer()
         self.fusion = id_mod.VoiceprintOnlyFusion(self.spk)
 
@@ -172,14 +202,17 @@ class VoiceWorker(threading.Thread):
             if (self._speak_started is not None
                     and (time.monotonic() - self._speak_started) > config.BARGE_IN_GRACE_S
                     and self.vad.is_speech_now()):
-                self.sink.stop()
+                self._abort.set()          # 打断先行：先通知应答线程停手，再停输出流
+                self.sink.stop()           # stop() 内 join(≤2s)：期间应答线程已见 abort，不会 enqueue 续播
                 self.session.barge_in()
                 audit.log("voice_barge_in")
                 self._reset_asr()
                 self._flush_vad()          # 清掉播报期间攒的自声段
                 self._speak_ended_at = None  # 老人正在说话：立即收音，不套回声静音窗
-            if self.sink.is_done() and self.session.finish_speaking():
-                # SPEAKING → LISTENING（回到 30s 免唤醒收音窗口）；打断已切走状态则跳过
+            if self.sink.is_done() and not self._answering \
+                    and self.session.finish_speaking():
+                # 流式应答线程可能仍在收尾（无句子可播时 _answering 很快复位）；
+                # 结束判定已含 not _answering —— 见上
                 self._speak_started = None
                 self._flush_vad()              # 丢掉播报期间 VAD 攒下的自声段
                 self._speak_ended_at = time.monotonic()   # 回声尾巴静音窗起点
@@ -292,26 +325,135 @@ class VoiceWorker(threading.Thread):
             self._publish("user_changed", uid=chat_uid,
                           locked=bool(self.locked_uid), source="voiceprint")
         self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
-        reply = self.chat_fn(chat_uid, text)
-        if self.post_turn_fn:
-            try:
-                self.post_turn_fn(chat_uid, text, reply)
-            except Exception:
-                pass
-        self._publish("chat_new", uid=chat_uid, user=text, assistant=reply)
-        if reply and settings.get("tts_enabled", True):
-            self._speak(reply)
+        # 流式问答：应答线程消费 chat_stream → 逐字上屏(chat_partial) + 句级 TTS 播放
+        self._start_answer(chat_uid, text, dict(settings))
 
-    def _speak(self, text):
-        samples, sr = self.tts.synthesize(text)
-        if len(samples) == 0:
-            return   # 清洗后无内容（纯符号/表情/URL 的回复）：不播报，保持收听态
-        self._speak_started = time.monotonic()
-        self._speak_ended_at = None
-        self.session.start_speaking()
-        self.sink.play(samples, sr)
-        audit.log("voice_tts", text=text[:100], ms=len(samples) * 1000 // sr)
-        self._publish("voice_state", state="speaking", text=text)
+    # ---- 流式问答编排（句级 TTS）----
+    def _start_answer(self, uid, user_text, settings):
+        """启动应答线程（轮次代数防双线程重叠）。
+
+        每轮 self._turn += 1（int 原子读写）抢占"最新轮"身份，新轮无条件置位
+        _answering 接管；_abort 事件只保留播放期 barge-in 语义（SPEAKING 分支置位、
+        不带新轮）——打断后旧轮"收尾"（partial 文本仍落 chat_new 历史）。think 期
+        老人追问新整句 → 旧轮即便阻塞在 chat_stream 网络读 / 合成中，也会在其下一
+        检查点（循环顶 / 入队闸，self._turn != turn）观察到被取代而静默退出，
+        绝无第二条线程并发消费同一流。"""
+        self._turn += 1
+        turn = self._turn
+        self._abort.clear()          # 新轮接管：清 barge-in 残留，避免掐死新轮
+        self._answering = True       # 无条件置位（覆盖旧值，新轮接管）
+        t = threading.Thread(target=self._answer, args=(uid, user_text, settings, turn),
+                             daemon=True, name="voice-answer")
+        t.start()
+
+    def _answer(self, uid, user_text, settings, turn):
+        """应答线程体：消费 → 收尾。收尾权 = 仍是最新轮（turn == self._turn）：
+        复位 _answering / 清 abort / 收流 / 落 chat_new + post_turn（W2：消费异常
+        也带已收文本落历史）；被新轮取代的轮静默退出——不发 chat_new/post_turn/
+        end_of_stream，不复位 _answering（新轮管），仅记审计。"""
+        try:
+            assistant = self._consume_reply(uid, user_text, settings, turn)
+        except Exception as e:
+            # 消费内异常已在 _consume_reply 记过（tts_consume）；此处兜底防收尾路径异常
+            audit.log("voice_error", action="tts_answer", error=str(e)[:200])
+            assistant = ""
+        finally:
+            if turn == self._turn:
+                # 仍是最新轮：正常收尾 —— partial/全文落历史 + post_turn + 收流
+                self._answering = False
+                self._abort.clear()
+                if self.sink is not None:
+                    self.sink.end_of_stream()   # 自然播完：队列清空后收流
+                self._publish("chat_new", uid=uid, user=user_text, assistant=assistant)
+                if self.post_turn_fn:
+                    try:
+                        self.post_turn_fn(uid, user_text, assistant)
+                    except Exception:
+                        pass
+            else:
+                # 已被新轮取代：静默退出（收尾权归新轮），仅记审计
+                audit.log("voice_error", action="answer_superseded", uid=uid)
+
+    def _consume_reply(self, uid, user_text, settings, turn):
+        """同步消费 chat_stream 事件流（_answer 应答线程内调用；单测直接调用）：
+        content → 广播 chat_partial(逐字上屏) → 分句缓冲 → 完整句合成入队（仅 speak 模式）；
+        done → flush 尾句。返回完整 assistant 文本。
+        turn = 本轮次代数：被新轮取代（self._turn != turn）或 _abort 置位时，检查点
+        （循环顶 / 入队闸）立即停止后续消费/合成/入队。
+        主循环异常（如设备掉线 enqueue 抛错）→ 记审计后返回已收文本，不抛穿。"""
+        speak = bool(settings.get("tts_enabled", True)) and self.tts is not None
+        buf = tts_buffer.SentenceBuffer()
+        full = []
+        started = threading.Event()        # 首句已入队（确保仅触发一次 speaking/start_speaking）
+
+        def enqueue_sentence(sent):
+            clean = tts_mod.sanitize_tts_text(sent)
+            if not clean:
+                return
+            if speak and self.session.state != session_mod.State.SPEAKING \
+                    and (self._abort.is_set() or self._turn != turn):
+                return                    # 被打断 / 已被新轮取代：不再发声
+            chunks = []
+            try:
+                chunks = list(self.tts.synthesize_chunks(clean))
+            except Exception as e:
+                audit.log("voice_error",
+                          action="tts_cloud_sentence" if self.tts is not self._local_tts
+                          else "tts_local_sentence",
+                          error=str(e)[:160])
+                if self.tts is not self._local_tts and self._local_tts is not None:
+                    try:                  # 云端句失败 → 本地兜底，不中断播报
+                        chunks = list(self._local_tts.synthesize_chunks(clean))
+                    except Exception:
+                        chunks = []
+                else:
+                    chunks = []
+            if not chunks:
+                return
+            if speak:
+                if self._abort.is_set() or self._turn != turn:
+                    return                # abort 已置位 / 已被新轮取代：绝不入队/发声（合成期间被打断）
+                if not started.is_set():
+                    started.set()
+                    self._speak_started = time.monotonic()
+                    self._speak_ended_at = None
+                    if not self.session.start_speaking():
+                        return            # 状态机未在 LISTENING（已被打断）：放弃首句
+                    self._publish("voice_state", state="speaking")
+                if self.session.state != session_mod.State.SPEAKING \
+                        or self._turn != turn:
+                    return                # 已被打断 / 被新轮取代（后续句）：不再入队
+                self.sink.enqueue(np.concatenate(chunks))
+                audit.log("voice_tts", text=clean[:80],
+                          provider=self.tts.provider,
+                          ms=len(clean) * 250)   # 播报时长粗估（中文 ~4字/秒，仅日志参考）
+
+        if self._turn != turn:
+            return ""                     # 尚未进流即已被新轮取代：直接退出
+        try:
+            for ev in self.stream_fn(uid, user_text):
+                if self._abort.is_set() or self._turn != turn:
+                    break                 # 打断 / 被新轮取代：停止后续消费与分句
+                t = ev.get("type")
+                if t == "content":
+                    delta = ev.get("content") or ""
+                    if delta:
+                        self._publish("chat_partial", uid=uid, delta=delta)
+                        full.append(delta)
+                        if speak:         # 仅 speak 模式分句+合成（非 speak 不逐句调 TTS）
+                            for sent in buf.feed(delta):
+                                enqueue_sentence(sent)
+                elif t == "done":
+                    break
+        except Exception as e:
+            # 消费异常（如设备掉线 enqueue 抛错）：记审计后带已收文本退出，不抛穿
+            audit.log("voice_error", action="tts_consume", error=str(e)[:200])
+            return "".join(full)
+        if speak:
+            tail = buf.flush()
+            if tail:
+                enqueue_sentence(tail)
+        return "".join(full)
 
     def stop(self):
         self._stop.set()

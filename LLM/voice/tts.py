@@ -41,6 +41,8 @@ def sanitize_tts_text(text: str) -> str:
 
 
 class TTS:
+    provider = "local"
+
     def __init__(self, tts_dir=config.TTS_DIR, sid=2):
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -69,3 +71,13 @@ class TTS:
         gen.speed = 1.0
         audio = self._tts.generate(clean, gen)
         return np.asarray(audio.samples, dtype=np.float32), int(audio.sample_rate)
+
+    @property
+    def sample_rate(self):
+        return config.SAMPLE_RATE
+
+    def synthesize_chunks(self, text):
+        """流式合成接口：本地离线模型一次生成，yield 整段（句级即粒度）。"""
+        samples, _ = self.synthesize(text)
+        if len(samples) > 0:
+            yield samples

@@ -22,6 +22,7 @@ const reminder = ref<ReminderEvent | null>(null);
 const showSwitcher = ref(false);
 const showSettings = ref(false);
 const asrProvider = ref("cloud");   // local | cloud（识别引擎，重启服务后生效）
+const ttsProvider = ref("cloud");   // local | cloud（合成引擎，重启服务后生效）
 const { connected } = useBus(onEvent);
 
 async function loadSession() {
@@ -53,27 +54,64 @@ async function toggleAsrProvider() {
   alert(`识别引擎已切换为${next === "cloud" ? "云端（火山）" : "本地"}，重启服务后生效`);
 }
 
+async function loadTtsProvider() {
+  try {
+    const res = await fetch("/api/settings");
+    const body = await res.json();
+    ttsProvider.value = body.settings?.tts_provider ?? "cloud";
+  } catch { /* 忽略，保留默认 */ }
+}
+
+async function toggleTtsProvider() {
+  const next = ttsProvider.value === "cloud" ? "local" : "cloud";
+  ttsProvider.value = next;
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: { tts_provider: next } }),
+    });
+  } catch { /* 保存失败也提示 */ }
+  alert(`合成引擎已切换为${next === "cloud" ? "云端（火山）" : "本地"}，重启服务后生效`);
+}
+
 function onEvent(ev: BusEvent) {
   if (ev.type === "voice_state") {
-    // 实时识别字幕：边听边出字（状态条视觉保持 listening，不进状态机）
-    if (ev.state === "asr_partial") {
-      liveText.value = ev.text ?? "";
-      return;
-    }
+    if (ev.state === "asr_partial") { liveText.value = ev.text ?? ""; return; }
     state.value = ev.state;
     if (ev.uid) uid.value = ev.uid;
-    if (ev.state === "recognized" && ev.text) liveText.value = ev.text;  // 定格最终识别（等待回复期间可见）
-    else if (ev.state === "idle") liveText.value = "";
+    if (ev.state === "recognized" && ev.text) {
+      // 语音问答开始：老人语句入气泡 + assistant 占位（等待 chat_partial 渐进）
+      liveText.value = "";
+      messages.value.push({ role: "user", content: ev.text, uid: uid.value ?? undefined });
+      messages.value.push({ role: "assistant", content: "" });
+    } else if (ev.state === "idle") {
+      liveText.value = "";
+    }
+    return;
   }
-  if (ev.type === "voice_status" && ev.status === "degraded") {
-    // I-2：worker._report 广播的降级 → 状态条置为"语音不可用"（原本是死代码）
-    state.value = "unavailable";
-    liveText.value = "";
+  if (ev.type === "chat_partial") {
+    const last = messages.value[messages.value.length - 1];
+    if (last && last.role === "assistant") last.content += ev.delta;
+    else messages.value.push({ role: "assistant", content: ev.delta });
+    return;
   }
   if (ev.type === "chat_new") {
-    liveText.value = "";  // 已进对话区，字幕行收起
-    messages.value.push({ role: "user", content: ev.user, uid: ev.uid });
-    messages.value.push({ role: "assistant", content: ev.assistant });
+    liveText.value = "";
+    const msgs = messages.value;
+    const prev = msgs[msgs.length - 2];
+    const last = msgs[msgs.length - 1];
+    if (last?.role === "assistant" && prev?.role === "user" && prev.content === ev.user) {
+      last.content = ev.assistant;      // 渐进气泡覆盖为终稿（防 SSE 丢帧）
+    } else {
+      msgs.push({ role: "user", content: ev.user, uid: ev.uid });
+      msgs.push({ role: "assistant", content: ev.assistant });
+    }
+    return;
+  }
+  if (ev.type === "voice_status" && ev.status === "degraded") {
+    state.value = "unavailable";
+    liveText.value = "";
   }
   if (ev.type === "reminder") reminder.value = ev;
   if (ev.type === "user_changed") {
@@ -146,6 +184,7 @@ async function onConfirmReminder(rid: number) {
 onMounted(() => {
   loadSession();
   loadAsrProvider();
+  loadTtsProvider();
 });
 </script>
 
@@ -159,6 +198,9 @@ onMounted(() => {
       <SosButton @sos="onSos" />
       <button class="settings-btn asr-toggle" @click="toggleAsrProvider">
         识别：{{ asrProvider === "cloud" ? "云端" : "本地" }}
+      </button>
+      <button class="settings-btn tts-toggle" @click="toggleTtsProvider">
+        合成：{{ ttsProvider === "cloud" ? "云端" : "本地" }}
       </button>
       <button class="settings-btn" @click="showSettings = true">⚙ 设置</button>
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
@@ -183,4 +225,5 @@ body { background: #0b1220; color: #f9fafb; font-family: system-ui, sans-serif; 
 .settings-btn { background: #374151; color: #f9fafb; border: none;
   padding: 16px 24px; border-radius: 16px; font-size: 22px; }
 .asr-toggle { background: #1d4ed8; }
+.tts-toggle { background: #1d4ed8; }
 </style>

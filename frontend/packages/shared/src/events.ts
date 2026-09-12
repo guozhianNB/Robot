@@ -34,6 +34,12 @@ export interface ChatNewEvent {
   assistant: string;
 }
 
+export interface ChatPartialEvent {
+  type: "chat_partial";
+  uid: string;
+  delta: string;   // 助手回复实时增量（LLM content delta），kiosk 打字机式追加
+}
+
 export interface VoiceStateEvent {
   type: "voice_state";
   state: string;     // idle / listening / recognized / speaking / asr_partial（实时识别字幕，带 text）
@@ -60,6 +66,7 @@ export type BusEvent =
   | ReminderConfirmedEvent
   | AlarmEvent
   | ChatNewEvent
+  | ChatPartialEvent
   | VoiceStateEvent
   | UserChangedEvent
   | VoiceStatusEvent;
@@ -69,6 +76,7 @@ const KNOWN_TYPES = new Set([
   "reminder_confirmed",
   "alarm",
   "chat_new",
+  "chat_partial",
   "voice_state",
   "user_changed",
   "voice_status",
