@@ -258,8 +258,8 @@ async def chat_route(req: ChatRequest):
                 yield _sse(ev)
         finally:
             voice_api.end_text_reply(speech, flush_tail=completed)
-        if assistant.strip():
-            _bg.submit(_post_chat_jobs, req.uid, req.message, assistant)
+            if completed and assistant.strip():
+                _bg.submit(_post_chat_jobs, req.uid, req.message, assistant)
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",

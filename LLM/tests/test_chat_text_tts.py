@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -113,4 +115,55 @@ def test_chat_speak_does_not_flush_tail_when_stream_fails(monkeypatch):
     assert calls == [
         ("feed", handle, "半句话"),
         ("end", handle, False),
+    ]
+
+
+def test_chat_submits_completed_turn_when_body_closes_after_done(monkeypatch):
+    handle = object()
+    end_calls = []
+    submit_calls = []
+
+    def stream(*args, **kwargs):
+        yield {"type": "content", "content": "完整回复"}
+        yield {"type": "done", "assistant": "完整回复"}
+
+    monkeypatch.setattr(server.db, "get_settings", lambda: {})
+    monkeypatch.setattr(chat, "chat_stream", stream)
+    monkeypatch.setattr(voice_api, "begin_text_reply", lambda: handle)
+    monkeypatch.setattr(voice_api, "feed_text_reply", lambda speech, delta: None)
+    monkeypatch.setattr(
+        voice_api,
+        "end_text_reply",
+        lambda speech, flush_tail=True: end_calls.append(
+            (speech, flush_tail)
+        ),
+    )
+    monkeypatch.setattr(
+        server._bg,
+        "submit",
+        lambda *args, **kwargs: submit_calls.append((args, kwargs)),
+    )
+
+    async def consume_until_done_then_close():
+        response = await server.chat_route(
+            server.ChatRequest(
+                uid="elder_done",
+                message="请回复",
+                speak=True,
+            )
+        )
+        body = response.body_iterator
+        try:
+            while True:
+                chunk = await anext(body)
+                if '"type": "done"' in chunk:
+                    break
+        finally:
+            await body.aclose()
+
+    asyncio.run(consume_until_done_then_close())
+
+    assert end_calls == [(handle, True)]
+    assert submit_calls == [
+        ((server._post_chat_jobs, "elder_done", "请回复", "完整回复"), {})
     ]
