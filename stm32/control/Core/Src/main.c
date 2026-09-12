@@ -20,6 +20,7 @@
 #include "main.h"
 #include "i2c.h"
 #include "tim.h"
+#include "usart.h"
 #include "usb_device.h"
 #include "gpio.h"
 
@@ -30,6 +31,7 @@
 #include "motor_control.h"
 #include "usb_proto.h"
 #include "oled.h"
+#include "imu.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -50,6 +52,12 @@
 #define TEST_CALIB_MS    600      /* 方向标定转动时长 (ms) */
 #define TEST_CALIB_PWM   300      /* 标定/软启停占空比（0~1000） */
 
+/* KEY1(PE3) 兜底定义：CubeMX 的 .ioc 里没有配 PE3，重新生成 main.h 时会丢
+ * KEY1_Pin/KEY1_GPIO_Port，这里在 USER CODE 段自带一份（已定义时自动跳过）。 */
+#ifndef KEY1_Pin
+#define KEY1_Pin        GPIO_PIN_3
+#define KEY1_GPIO_Port  GPIOE
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -149,11 +157,12 @@ static void single_motor_test_run(void)
   md_clear_encoder(0);
   HAL_Delay(300);
 
-  /* ② PID 闭环恒速：实测整定 Kp=6.5/Ki=2.0（用户测试验证过的参数）
-   *    积分限幅已放宽到 1000（与输出限幅一致，等效不限幅）
-   *    ⚠️ 与 motor_control.c 的 MC_PID_KP/KI 默认值保持一致 */
+  /* ② PID 闭环恒速：2026-09-11 实测整定 Kp=4/Ki=20（架空 47RPM 阶跃：零超调、
+   *    ±5% 稳定 0.04s；旧 6.5/2.0 与 13/3 都是"起步猛冲后回落、10s 级收敛"）
+   *    积分限幅 50 = OUTPUT_LIMIT/KI，积分项最多贡献满量程
+   *    ⚠️ 与 motor_control.c 的 MC_PID_KP/KI/限幅默认值保持一致 */
   mc_init();
-  mc_pid_tune(6.5f, 2.0f, 0.0f);
+  mc_pid_tune(4.0f, 20.0f, 0.0f);
   mc_set_target(way, TEST_LOOP_RPM);
 
   last_ms = HAL_GetTick();
@@ -234,6 +243,7 @@ int main(void)
   MX_TIM8_Init();
   MX_USB_DEVICE_Init();
   MX_I2C1_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   md_init();               /* 启动 PWM + 编码器，清零方向引脚 */
   /* ⚠️ 已取消 md_enc_sign_autocal() 上电自动标定：
@@ -242,10 +252,22 @@ int main(void)
    *   已软件补偿：motor_driver.c 的 md_init() 默认 sign=-1。 */
   mc_init();               /* 清零 PID 闭环状态 */
   up_init();               /* 清零 USB 车控协议状态 */
+  IMU_Init();              /* IMU：USART3/PB10-PB11 自包含 bring-up（115200 8N1） */
 
   /* ===== 单轮测试通道：KEY1(PE3) 按下 → 电机闭环测试 =====
    * 按住 KEY1 上电即进入单电机闭环测试，用于底盘调试；
-   * 否则走正常 USB 车控主循环。 */
+   * 否则走正常 USB 车控主循环。
+   * ⚠️ KEY1(PE3) 的 GPIO 初始化必须在 USER CODE 段自己做：CubeMX 的 .ioc 里没有
+   *    PE3，重新生成会把 gpio.c 里原先那段 KEY1 初始化删掉（2026-09-12 已被删过）。
+   *    不初始化 → 引脚悬空，可能被读成"按下"→ 一上电就进测试死循环。
+   *    根治办法：CubeMX → 把 PE3 配成 GPIO_Input（上拉、标签 KEY1）。 */
+  {
+    GPIO_InitTypeDef key_init = {0};
+    key_init.Pin  = KEY1_Pin;
+    key_init.Mode = GPIO_MODE_INPUT;
+    key_init.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(KEY1_GPIO_Port, &key_init);
+  }
   if (HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_RESET)
   {
     HAL_Delay(100);                  /* 消抖 */
@@ -269,6 +291,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     up_poll();                                 /* USB 协议：命令分发 + 心跳 */
+    IMU_Process();                             /* IMU：轮询收字节 + 解析 + 无帧自愈 */
     mc_update_all();                           /* 10ms 周期闭环  */
     HAL_Delay(10);                             /* 10ms 周期      */
   }

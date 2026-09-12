@@ -307,6 +307,36 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 
 ---
 
+## 2026-09-05 · 小车端：Nav2 点 Goal 不动 实机复测与修复 + 底盘轴向标定 + Nav2 bringup 配置勘误
+
+**依据：** `/home/sunrise/小车端ROS2导航调试交接.md`。实测环境：板卡 `/home/sunrise/Robot/ros2_car`（RDK X5 / ROS2 Humble）。
+
+### 做了什么
+- **核对交接文档两处 Nav2 Bug**：文档称"已修复待上板验证"，但板上 `src/` 实际仍是未修复版（git 停在 `f81c2a9`）。
+  已在板上重新应用并 `colcon build --symlink-install` 重编译：
+  - `robot_bringup/rviz/navigation.rviz`：`rviz_default_plugins/SetGoal`(/goal_pose) → `nav2_rviz_plugins/GoalTool`("Nav2 Goal")；
+  - `robot_navigation/navigate_to_pose.py`：`args or []` → `sys.argv if args is None else args`（+`import sys`），命令行发目标不再丢参。
+- **真机 bring up 验证**：雷达 `/scan` 10Hz、底盘 `/odom` ~9Hz、TF 正常。
+- **底盘轴向标定**（需要人目测物理方向，别盲猜）：
+  - `sign_*` 只改 odom 读数不改命令；实测 odom `sign_vx=+1`（原 -1 错）/`sign_vy=-1`/`sign_wz=-1`；
+  - `chassis_driver.py` 下发命令对 `vy/wz` 取反（命令侧镜像，vx 不动）——否则命令与 odom 符号相反会致 Nav2 转向发散；改后 `+wz` 实测变左转。
+  - "旋转只执行 ~35%"是**限速/加速度限制**（非打滑），odom 准确，闭环仅慢不发散。
+- **建图并存盘** `/home/sunrise/Robot/ros2_car/maps/my_map.{pgm,yaml}`（未知格=灰205，map_saver 需重试，因 /map 为 TRANSIENT_LOCAL 按需发布）。
+- **Nav2 bringup 配置修复**（从"完全起不来"修到 定位+controller/planner/behavior 全 active）：
+  - AMCL `robot_model_type` → `nav2_amcl::DifferentialMotionModel`；
+  - 两处 `general_goal_checker` 补 `plugin`；
+  - `map_server.yaml_filename` 硬编码真实地图；**导航别走 bringup**（双层 include 丢 map 参数），改基础节点 + `navigation.launch.py` 直连。
+- **文档勘误**：`ros2_car/README.md`、`上板核对清单.md` 修正工作区路径(`~/ros2/car_ws`→`/home/sunrise/Robot/ros2_car`)、rviz 工具名("2D Goal Pose"→"Nav2 Goal")、sign 语义等；新增 `ros2_car/ROS2导航调试经验.md`。
+
+### 有什么用
+- "点 Goal 车不动"的两个真实根因已按交接文档在板上应用生效；底盘轴向已与 odom 自洽；地图已可正确保存；Nav2 定位链路打通。
+
+### 注意 / 剩余阻塞
+- **bt_navigator 未通**：nav2 无条件创建 navigate_through_poses 服务器并加载其 BT，激活时 1s 内等不到 `backup` 动作即失败（behavior_server 已 active、/back_up 已发布仍失败；去插件无效）。无 bt_navigator → 无 `/navigate_to_pose` action 接口 → GoalTool/Goal 无人接。待对照 nav2_bringup 官方默认行为/动作命名排查。
+- 全程细节见 `ros2_car/ROS2导航调试经验.md`。
+
+---
+
 ## 2026-09-06 · 记忆系统对标 MaiBot：P0-P3 全部落地
 
 **背景：** 调研 MaiBot 记忆子系统（A_memorix v2.0）与说话风格学习（learners），产出 `docs/maibot参考/2026-09-05-MaiBot记忆风格对标报告.md`，随后按其 P0-P3 路线逐批落地。参考材料：源码 `D:\_project\MaiBot\src`、文档 `D:\_project\maibot_docs\zh`。

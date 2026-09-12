@@ -5,6 +5,7 @@
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/ament_index/resource_index/packages/robot_bringup
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/package.xml
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch/navigation.launch.py
+/home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch/robot_base.launch.py
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch/lidar.launch.py
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch/bringup.launch.py
 /home/sunrise/Robot/ros2_car/install/robot_bringup/share/robot_bringup/launch/odom.launch.py

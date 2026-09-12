@@ -23,6 +23,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     chassis_share = get_package_share_directory('robot_chassis')
+    bringup_share = get_package_share_directory('robot_bringup')
 
     odom_source = LaunchConfiguration('odom_source')
     use_ekf = LaunchConfiguration('use_ekf')
@@ -34,15 +35,36 @@ def generate_launch_description():
         'use_ekf', default_value='false',
         description='是否启用 robot_localization EKF 融合（需 odom_source:=chassis，见 ekf_params.yaml）')
 
+    # use_ekf:=true 时底盘只发 /odom 原始数据、不再发 odom→base_link TF，
+    # TF 由下方 EKF 节点统一发布（world_frame=odom + publish_tf:true），避免双发布冲突
+    ekf_on = PythonExpression(
+        ["'", use_ekf, "' == 'true' and '", odom_source, "' == 'chassis'"])
+
     chassis_node = Node(
         package='robot_chassis',
         executable='chassis_driver',
         name='chassis_driver',
         output='screen',
         emulate_tty=True,
-        parameters=[os.path.join(chassis_share, 'config', 'chassis_params.yaml')],
+        parameters=[
+            os.path.join(chassis_share, 'config', 'chassis_params.yaml'),
+            {'publish_tf': PythonExpression(
+                ["'false' if (", "'", use_ekf, "' == 'true' and '", odom_source, "' == 'chassis') else 'true'"])},
+        ],
         condition=IfCondition(
             PythonExpression(["'", odom_source, "' == 'chassis'"])),
+    )
+
+    # robot_localization EKF：融合底盘 /odom（odom0），输出 /odom_filtered + odom→base_link TF
+    ekf_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        output='screen',
+        emulate_tty=True,
+        parameters=[os.path.join(bringup_share, 'config', 'ekf_params.yaml')],
+        remappings=[('odometry/filtered', '/odom_filtered')],
+        condition=IfCondition(ekf_on),
     )
 
     rf2o_node = Node(
@@ -85,6 +107,7 @@ def generate_launch_description():
         source_declare,
         ekf_declare,
         chassis_node,
+        ekf_node,
         rf2o_node,
         odom_to_tf_node,
     ])

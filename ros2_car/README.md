@@ -2,21 +2,29 @@
 
 RDK X5（Ubuntu 22.04 / ROS2 Humble）小车端：**激光雷达 + 里程计 + SLAM 建图 + Nav2 导航**。
 
+> ⚠️ **工作区路径勘误**：板卡上本仓库实际路径是 **`/home/sunrise/Robot/ros2_car`**，
+> 下文及老文档里的 `~/ros2/car_ws` / `D:\_project\Robot\ros2_car` 是 Windows/旧布局，**上板请全部替换**。
+> 详细调试经验与勘误见 `ros2_car/ROS2导航调试经验.md`。
+>
+> 📘 **要动手操作（建图 / 启动导航）请直接看 `建图与导航操作手册.md`**——里面的命令均为 2026-09-11 实机验证版，
+> 含分步流程、参数怎么传、换地图改哪里、以及 12 条已知坑清单。
+
 ## 包结构
 
 ```
 car_ws/src/
+├── robot_interfaces/   自定义服务定义（robot/move、robot/turn、robot/navigate_to，ament_cmake）
 ├── robot_chassis/      底盘驱动（cmd_vel → STM32 USB CDC 协议；STATUS 心跳 → /odom + tf）
 ├── robot_bringup/      一键启动（launch + nav2/slam 参数 + URDF + rviz 配置）
-└── robot_navigation/   导航辅助（命令行发 Nav2 目标、robot/cmd_stop 急停）
+└── robot_navigation/   大模型端对接（move/turn/navigate 服务 + exec_state/arrived 状态 + 急停）
 ```
 
 ## 环境
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ros2/yahboomcar_ws/install/setup.bash   # ydlidar 驱动、rf2o（bashrc 已自动加载）
-source ~/ros2/car_ws/install/setup.bash          # 本工作区
+source ~/ros2/yahboomcar_ws/install/setup.bash          # ydlidar 驱动、rf2o（bashrc 已自动加载）
+source /home/sunrise/Robot/ros2_car/install/setup.bash  # 本工作区
 ```
 
 硬件：YDLidar Tmini Plus（/dev/ttyUSB0，230400）｜ STM32 麦轮底盘（/dev/ttyACM0，USB CDC，按 `docs/USB车控接口.md`）。
@@ -24,20 +32,25 @@ source ~/ros2/car_ws/install/setup.bash          # 本工作区
 ## 一键启动
 
 ```bash
-# ① 建图（默认 odom_source:=rf2o，无底盘可用激光里程计兜底）
+# ① 建图（默认 odom_source:=rf2o，无底盘可用激光里程计兜底；真机推荐 odom_source:=chassis）
 ros2 launch robot_bringup bringup.launch.py mode:=mapping
 
 # ② 另开终端，键盘开小车逛房间
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 
-# ③ 逛完保存地图
-ros2 run nav2_map_server map_saver_cli -f ~/ros2/car_ws/maps/my_map
+# ③ 逛完保存地图（async slam 的 /map 按需发布，map_saver 可能报
+#    "Failed to spin map subscription"→ 重试几次即成功；仍不行见 ROS2导航调试经验.md 第三节）
+ros2 run nav2_map_server map_saver_cli -f /home/sunrise/Robot/ros2_car/maps/my_map
 
 # ④ 自主导航（加载刚存的地图）
-ros2 launch robot_bringup bringup.launch.py mode:=navigation map:=~/ros2/car_ws/maps/my_map.yaml
+# ⚠️ 已知 bug：走 bringup mode:=navigation 时 map 参数会被 nav2 双层 include 丢掉(map_server 报
+#    yaml_filename not initialized)。请改成分步：先起基础节点，再直接跑 navigation.launch.py：
+ros2 launch robot_bringup robot_base.launch.py odom_source:=chassis   # 或 lidar+odom+robot_state_publisher 分别起
+ros2 launch robot_bringup navigation.launch.py map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml
 ```
 
-导航模式在 rviz 里点 **2D Pose Estimate** 给出初始位姿（AMCL 定位），再点 **2D Goal Pose** 下发目标。
+导航模式在 rviz 里点 **2D Pose Estimate** 给出初始位姿（AMCL 定位），再点 **"Nav2 Goal"（nav2_rviz_plugins/GoalTool）** 下发目标。
+> 注意：**不要用旧的 "2D Goal Pose"（rviz_default_plugins/SetGoal，发 `/goal_pose`）**——Nav2 不订阅 `/goal_pose`，点了不会动。这个旧工具名是老文档残留。
 免 rviz 也能发目标：
 
 ```bash
@@ -51,8 +64,53 @@ ros2 run robot_navigation navigate_to_pose --x 1.0 --y 0.5 --yaw 90
 | 雷达 | `ros2 launch robot_bringup lidar.launch.py` |
 | 里程计(激光) | `ros2 launch robot_bringup odom.launch.py odom_source:=rf2o` |
 | 里程计(底盘) | `ros2 launch robot_bringup odom.launch.py odom_source:=chassis` |
+| 里程计(双源融合) | `ros2 launch robot_bringup odom.launch.py odom_source:=fused`（轮速+激光 EKF，麦轮打滑场景） |
 | SLAM 建图 | `ros2 launch robot_bringup slam.launch.py mode:=mapping` |
-| SLAM 定位 | `ros2 launch robot_bringup slam.launch.py mode:=localization map:=~/ros2/car_ws/maps/my_map.yaml` |
+| SLAM 定位 | `ros2 launch robot_bringup slam.launch.py mode:=localization map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml` |
+
+## 双源里程计融合（odom_source:=fused，麦轮打滑场景）
+
+```bash
+ros2 launch robot_bringup robot_base.launch.py odom_source:=fused
+```
+
+- 数据流：`chassis_driver`（`/odom` 轮速速度）+ `rf2o`（`/odom_laser_raw` → `odom_relay` → `/odom_laser` 激光位姿）
+  → `ekf_filter_node` → `/odom_filtered` + **odom→base_link TF**（本模式下这段 TF 只有 EKF 发）
+- 为什么需要 `odom_relay`：rf2o 的 odom 消息协方差全为 0，robot_localization 会当成"绝对可信"
+  从而退化成 rf2o 复读机，故由 relay 补协方差并重打时间戳（细节见
+  `docs/superpowers/specs/2026-09-10-rf2o-ekf-odom-fusion-design.md`）
+- 校验：
+
+  ```bash
+  ros2 topic hz /odom /odom_laser_raw /odom_laser /odom_filtered
+  # 板卡实测：约 9 / 10 / 10 / 13~15 Hz（EKF 只在拿到新测量时才发，不是恒定 20Hz）
+  python3 tools/check_tf_authors.py 6
+  # 权威判据：odom→base_link 动态变换应只有一段且 ≈ EKF 频率；
+  # 只看 `ros2 topic info /tf` 的发布者数量会误判（rf2o/chassis_driver 无条件建了广播器但没发）
+  ```
+
+- 打滑验收：车架空、四轮离地后发 `cmd_vel` 让轮子空转 → `/odom` 位置一路飞走、`/odom_laser`
+  基本不动、`/odom_filtered` 明显比 `/odom` 稳。若 filtered 仍漂太多，调小 `odom_relay` 的
+  `pose_covariance` 前两项（x, y）
+- 回退：不加 `odom_source:=fused` 即回到原来的单源模式
+
+## IMU（接 STM32，进 EKF）
+
+- 硬件：IMU 接 STM32 的 `USART3`（PB10=TX / PB11=RX，115200 8N1）；STM32 以 20Hz 上行协议帧
+  `0x83`（yaw / yaw_rate / roll / pitch），`chassis_driver` 转成 `/imu`，EKF `imu0` 只融 `vyaw`
+- IMU 未接/无数据时固件不发 `0x83`（新鲜度门控），此时 `/imu` 不存在 —— 属正常，不是故障
+- 校验：
+
+  ```bash
+  ros2 topic hz /imu                 # ≈ 20Hz
+  ros2 topic echo /imu --once        # 协方差必须非零
+  ```
+
+- 符号标定：手托车体**逆时针**转 → `/imu` 的 `orientation` 与 `angular_velocity.z` 应增大；
+  不对改 `chassis_params.yaml` 的 `imu_sign_yaw` / `imu_sign_wz`
+- 打滑验收：车架空、四轮离地发 `cmd_vel` 空转 → `/odom` 的 yaw 疯长，`/imu` 基本不动，
+  `/odom_filtered` 明显比 `/odom` 稳
+- 回退：`ekf_params.yaml` 删掉 `imu0` 四行（含 config/differential/queue_size）即回到纯 rf2o+轮速融合
 
 ## 底盘接入（STM32 接上后）
 
@@ -63,8 +121,10 @@ ros2 launch robot_bringup bringup.launch.py mode:=mapping odom_source:=chassis
 ### 标定（真机必做，按顺序）
 
 1. **轴方向**：`ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1}}"`，
-   车应**直行不偏转**；歪了改 `chassis_params.yaml` 的 `sign_vx/sign_wz`。
-   同理测 `linear.y`（横移，改 `sign_vy`）与 `angular.z`（自转，改 `sign_wz`）。
+   **真机目测**车头是否朝前；同理测 `linear.y`（横移）与 `angular.z`（自转）。
+   ⚠️ **sign 只改 odom 读数、不改下发命令**（见 `chassis_driver.py` 269–271 行）；若"车实际往哪走"错了，
+   改的是**命令侧**。当前真机定稿：odom `sign_vx=+1 / sign_vy=-1 / sign_wz=-1`，且 `chassis_driver.py`
+   下发命令对 `vy/wz` 做了镜像取反（vx 不动）。详见 `ROS2导航调试经验.md` 第二节。
 2. **轮径/旋转半径**：直行 1m 看 `/odom` 读数，偏差按比例修 `wheel_radius`；
    原地转 360° 看 yaw 读数，修 `rotate_radius`。
 3. **四轮方向**：若某轮装反，用 `wheel_signs` 单独取反。
@@ -88,6 +148,19 @@ ros2 launch robot_bringup bringup.launch.py mode:=mapping odom_source:=chassis
 
 ## 后续对接（大模型端）
 
-- 控制服务 `robot/move`、`robot/turn`、`robot/navigate_to`：见 `docs/目标文档及说明/ROS底盘接口需求.md`，
-  在 `robot_navigation` 包内基于 `navigate_to_pose.py` 扩展服务端实现。
-- 状态话题 odom / exec_state / battery / obstacle / arrived：`chassis_driver` 已发布 `/odom`，其余按契约补充。
+契约见 `docs/目标文档及说明/ROS底盘接口需求.md`。已实现（navigation 模式自动带起 `robot_actions` 节点）：
+
+```bash
+# robot/move：直线/横移，到位自动停（forward|back|left|right）
+ros2 service call /robot/move robot_interfaces/srv/Move "{direction: forward, distance_m: 1.0}"
+# robot/turn：原地转向，到位自动停（角度，正=左转）
+ros2 service call /robot/turn robot_interfaces/srv/Turn "{angle_deg: 90}"
+# robot/navigate_to：Nav2 导航到坐标（地点表后置，place 暂不支持）
+ros2 service call /robot/navigate_to robot_interfaces/srv/NavigateTo "{place: '', x: 1.0, y: 0.5, theta: 90}"
+# 状态话题：robot/exec_state（idle/moving/navigating/error）、robot/arrived（bool）
+ros2 topic echo /robot/exec_state
+# 急停
+ros2 topic pub -1 /robot/cmd_stop std_msgs/msg/Bool "{data: true}"
+```
+
+待后续（第二批）：`robot/obstacle` / `robot/battery` 状态、地点表 + 语义区域框（建图后标注坐标）。

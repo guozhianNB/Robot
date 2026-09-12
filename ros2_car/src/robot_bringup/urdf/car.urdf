@@ -42,4 +42,14 @@
     <origin xyz="0.0 0.0 0.02" rpy="0 0 0"/>
   </joint>
 
+  <!-- IMU（接 STM32 USART3，装配假设：平放、轴向与车体对齐、位置可忽略 → 与 base_link 重合）
+       实际装歪了只改这一行 origin（rpy 用弧度） -->
+  <link name="imu_link"/>
+
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0 0 0"/>
+  </joint>
+
 </robot>

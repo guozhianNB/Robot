@@ -28,24 +28,35 @@
 #define MC_CONTROL_PERIOD_MS  10U
 
 /* ---------------- PID 默认参数（全局共享一组） ----------------
- * 实测整定（2026-08，CPR=28202 轮子每圈脉冲）：
- *   KP=6.5  用户测试验证过的参数：err=100 时起步 650 PWM，响应快
- *   KI=2.0  积分快速消除稳态误差
- *   KD=0    低速量化噪声大，微分会放大噪声
- * ⚠️ 与 control_test 单轮闭环测试的 mc_pid_tune(6.5,2.0) 保持一致
+ * 2026-09-11 实测整定（架空 47RPM 阶跃，stm32/control_test 用 0x84 诊断帧量测、可重复）：
+ *   最初 KP=13/KI=3    → 超调 19.1%、±5% 稳定 10~12s、末段误差 −8.1%
+ *   KP=2/KI=20         → 超调 2.1%、稳定 0.56s
+ *   + 静摩擦前馈 KP=2  → 超调 2.1%、稳定 0.12s
+ *   + 静摩擦前馈 KP=4  → 超调 0.0%、稳定 0.04s   ← 本次采用（命令下去第 1 拍
+ *                        就给 174~265 PWM，轮子立刻起转，不再"慢悠悠"）
+ *   机理：维持 47RPM 只需 ~120 PWM，而静摩擦死区就有 ~100 PWM；老代码无前馈
+ *   且 KI=3，起步只能靠积分慢慢爬 → 启动慢/顿挫，也是"自转只执行约 35%"之源。
  * 调参方向：
- *   KP 太小 → 速度跟不上目标（稳态误差大）；KP 太大 → 振荡/啸叫
+ *   KP 太小 → 速度跟不上目标（稳态误差大）；KP 太大 → 起步饱和/振荡/啸叫
  *   KI 消除稳态误差，太大 → 超调/震荡
- *   KD 抑制超调，但会放大编码器量化噪声（低速时建议保持 0）        */
-#define MC_PID_KP             13.0f
-#define MC_PID_KI             3.0f
+ *   KD 抑制超调，但会放大编码器量化噪声（低速时建议保持 0）
+ * ⚠️ 积分限幅必须与 KI 解耦：旧值 1000 会让 KI×∫ 最大到 20000 ≫ 输出 1000，
+ *    "条件积分"抗饱和彻底失效；统一取 OUTPUT_LIMIT/KI，即积分项最多贡献满量程。 */
+#define MC_PID_KP             4.0f
+#define MC_PID_KI             20.0f
 #define MC_PID_KD             0.0f
-#define MC_PID_INTEGRAL_LIMIT 1000.0f /* 积分项上限：放宽到与输出限幅一致（等效不限幅）。
-                                          防饱和由"条件积分+输出限幅"双保险兜底：
-                                          输出饱和时积分冻结，输出顶死在 ±1000。
-                                          ⚠️ 原 150/600 会把输出封顶 → 速度升不上去
-                                          （实测 150→pwm卡42，600→pwm卡214）*/
-#define MC_PID_OUTPUT_LIMIT   1000.0f /* 输出限幅（±1000 = 满量程）       */
+#define MC_PID_OUTPUT_LIMIT   1000.0f /* 输出限幅（±1000 = 满量程）        */
+#define MC_PID_INTEGRAL_LIMIT 50.0f   /* = OUTPUT_LIMIT/KI：积分项最多贡献满量程 */
+
+/* ---------------- 死区/静摩擦前馈（2026-09-11 实测加装） ----------------
+ * 实测：轮子要 ~100 PWM 才开始转（多组参数下测到 93~106），而 KP 首拍输出
+ * 往往还不到死区 → 得靠积分爬 ~100ms 才动，这就是"启动慢悠悠"的物理来源。
+ * 加前馈后第一个控制周期（11ms）就把 ~100 PWM 打给电机，PID 只做修正
+ * （稳态时 ff≈100 已够，积分几乎不出力）。方向按 target 符号给（摩擦永远
+ * 阻碍运动，与误差符号无关，避免在 0 附近抖动）；幅值随 |target| 线性引入，
+ * 防止极低速命令时一顿一冲。 */
+#define MC_FF_DEADZONE   100.0f /* 起步占空比实测值（换电机/调压后可再标定）*/
+#define MC_FF_FULL_RPM   5.0f   /* |target| ≥ 5 RPM 时前馈给满 */
 
 /* 每电机闭环状态（按 way 索引，互不串扰） */
 typedef struct {
@@ -187,6 +198,14 @@ void mc_update_all(void)
         m->last_error = err;
 
         float output = g_pid_kp * err + g_pid_ki * m->integral + g_pid_kd * der;
+
+        /* 死区前馈：克服静摩擦的固定占空比（实测 ~100 PWM），让电机第一个控制
+         * 周期就起步，不必等积分爬过死区；放在抗饱和判断之前，让冻结条件看到
+         * 含前馈的真实总输出。 */
+        float tgt_f = (float)m->target;
+        if (tgt_f >=  MC_FF_FULL_RPM) output +=  MC_FF_DEADZONE;
+        else if (tgt_f <= -MC_FF_FULL_RPM) output += -MC_FF_DEADZONE;
+        else output += MC_FF_DEADZONE * tgt_f / MC_FF_FULL_RPM;  /* 低速线性引入 */
 
         /* 条件积分（抗饱和）：输出已到限幅且误差同向时冻结积分 */
         if (!(output >=  MC_PID_OUTPUT_LIMIT && err > 0.0f) &&

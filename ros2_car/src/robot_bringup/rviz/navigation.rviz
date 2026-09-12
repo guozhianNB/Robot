@@ -73,10 +73,8 @@ Visualization Manager:
       Name: 2D Pose Estimate
       Topic:
         Value: /initialpose
-    - Class: rviz_default_plugins/SetGoal
-      Name: 2D Goal Pose
-      Topic:
-        Value: /goal_pose
+    - Class: nav2_rviz_plugins/GoalTool
+      Name: Nav2 Goal
   Views:
     Current:
       Class: rviz_default_plugins/Orbit

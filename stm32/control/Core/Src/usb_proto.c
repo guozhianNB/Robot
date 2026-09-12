@@ -1,6 +1,7 @@
 #include "usb_proto.h"
 #include "motor_control.h"
 #include "motor_driver.h"
+#include "imu.h"
 #include "usbd_cdc_if.h"
 #include <string.h>
 
@@ -26,6 +27,13 @@ static uint16_t s_buf_len = 0U;
 static uint8_t s_seq = 0U;
 /* 上次心跳上报时间戳 */
 static uint32_t s_last_sts = 0U;
+
+/* IMU 上报周期 (ms) */
+#define UP_IMU_PERIOD_MS   50u
+
+/* 上次 IMU 上报时刻 / 上次上报时的解析帧数（新鲜度门控） */
+static uint32_t s_last_imu        = 0U;
+static uint32_t s_last_imu_frames = 0U;
 
 /* ---------------- 发送 ---------------- */
 
@@ -75,6 +83,43 @@ static void up_send_status(void)
     p[idx++] = 0x00u;                         /* flags    :uint8（预留） */
 
     up_send(UP_CMD_STATUS, p, (uint8_t)idx);
+}
+
+/* 浮点 × 比例 → int16，四舍五入 + 饱和（不用 libm，避免链接 -lm） */
+static int16_t up_imu_round_i16(float v, float scale)
+{
+    float s = v * scale;
+    s += (s >= 0.0f) ? 0.5f : -0.5f;
+    if (s >  32767.0f) s =  32767.0f;
+    if (s < -32768.0f) s = -32768.0f;
+    return (int16_t)s;
+}
+
+/* 封装并发送一帧 IMU（yaw / yaw_rate / roll / pitch，小端） */
+static void up_send_imu(void)
+{
+    uint32_t frames = IMU_UART_GetFrameCount();
+    if (frames == s_last_imu_frames)
+        return;                     /* IMU 无新数据（未接/无帧）→ 不发，避免发零值骗 EKF */
+    s_last_imu_frames = frames;
+
+    float euler[3] = {0.0f, 0.0f, 0.0f};
+    float gyro[3]  = {0.0f, 0.0f, 0.0f};
+    IMU_GetEuler(euler);            /* {roll, pitch, yaw} 度 */
+    IMU_GetGyro(gyro);              /* {gx, gy, gz} rad/s */
+
+    int16_t yaw   = up_imu_round_i16(euler[2], 100.0f);              /* 0.01°  */
+    int16_t rate  = up_imu_round_i16(gyro[2], 57.2957795f * 10.0f);  /* 0.1°/s */
+    int16_t roll  = up_imu_round_i16(euler[0], 100.0f);
+    int16_t pitch = up_imu_round_i16(euler[1], 100.0f);
+
+    uint8_t p[8];
+    p[0] = (uint8_t)(yaw & 0xFF);        p[1] = (uint8_t)((yaw >> 8) & 0xFF);
+    p[2] = (uint8_t)(rate & 0xFF);       p[3] = (uint8_t)((rate >> 8) & 0xFF);
+    p[4] = (uint8_t)(roll & 0xFF);       p[5] = (uint8_t)((roll >> 8) & 0xFF);
+    p[6] = (uint8_t)(pitch & 0xFF);      p[7] = (uint8_t)((pitch >> 8) & 0xFF);
+
+    up_send(UP_CMD_IMU, p, (uint8_t)sizeof(p));
 }
 
 /* ---------------- 命令处理 ---------------- */
@@ -185,11 +230,19 @@ void up_on_rx(const uint8_t *buf, uint32_t len)
 
 void up_poll(void)
 {
-    /* 心跳状态上报 */
     uint32_t now = HAL_GetTick();
+
+    /* 心跳状态上报（100ms） */
     if (now - s_last_sts >= UP_STS_PERIOD_MS)
     {
         s_last_sts = now;
         up_send_status();
+    }
+
+    /* IMU 上报（50ms，仅当 IMU 有新解析帧） */
+    if (now - s_last_imu >= UP_IMU_PERIOD_MS)
+    {
+        s_last_imu = now;
+        up_send_imu();
     }
 }

@@ -1,0 +1,6 @@
+string direction   # forward | back | left | right
+float32 distance_m # 移动距离（米），正数
+
+---
+bool success
+string message

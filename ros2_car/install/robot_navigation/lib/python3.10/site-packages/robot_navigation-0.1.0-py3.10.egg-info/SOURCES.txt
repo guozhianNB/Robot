@@ -12,3 +12,4 @@ resource/robot_navigation
 robot_navigation/__init__.py
 robot_navigation/cmd_stop.py
 robot_navigation/navigate_to_pose.py
+robot_navigation/robot_actions.py

@@ -15,12 +15,13 @@ setup(
     zip_safe=True,
     maintainer='sunrise',
     maintainer_email='sunrise@localhost',
-    description='导航辅助节点',
+    description='导航辅助节点：命令行发 Nav2 目标、robot/cmd_stop 急停、move/turn/navigate 服务（对接大模型端契约）',
     license='MIT',
     entry_points={
         'console_scripts': [
             'navigate_to_pose = robot_navigation.navigate_to_pose:main',
             'cmd_stop = robot_navigation.cmd_stop:main',
+            'robot_actions = robot_navigation.robot_actions:main',
         ],
     },
 )

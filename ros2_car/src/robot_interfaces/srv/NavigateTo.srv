@@ -1,0 +1,8 @@
+string place       # 地点名（优先；空则用 x/y/theta）
+float32 x
+float32 y
+float32 theta      # 朝向（度）
+
+---
+bool success
+string message

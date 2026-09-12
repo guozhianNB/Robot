@@ -40,6 +40,9 @@
 /* ---------------- 上行命令（STM32 → 地瓜派） ---------------- */
 #define UP_CMD_ACK         0x81u  /* 2B：reply:uint8 code:uint8        */
 #define UP_CMD_STATUS      0x82u  /* 状态帧：见 up_send_status()       */
+#define UP_CMD_IMU         0x83u  /* 8B：yaw:int16(0.01°) yaw_rate:int16(0.1°/s)
+                                   *     roll:int16(0.01°) pitch:int16(0.01°)
+                                   * 周期 50ms，仅当 IMU 有新解析帧时发送 */
 
 /* ---------------- 应答码 ---------------- */
 #define UP_ACK_OK          0x00u

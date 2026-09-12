@@ -1,6 +1,6 @@
 # USB 车控接口（地瓜派 ↔ STM32）
 
-> 版本：v1.0 ｜ 日期：2026-08-19 ｜ 适用：`stm32/control`（STM32F103ZETX，麦克纳姆 X 型四轮底盘）
+> 版本：v1.1 ｜ 日期：2026-09-10 ｜ 适用：`stm32/control`（STM32F103ZETX，麦克纳姆 X 型四轮底盘）
 
 ## 1. 概述
 
@@ -62,6 +62,7 @@ STM32 端代码位置：`Core/Inc/usb_proto.h`、`Core/Src/usb_proto.c`。
 | 下行 | `0x05` | `GET_STATUS` | 0 | 按需立即回一帧 `STATUS` |
 | 上行 | `0x81` | `ACK` | 2 | 命令应答 |
 | 上行 | `0x82` | `STATUS` | 26 | 周期心跳状态（默认 100ms） |
+| 上行 | `0x83` | `IMU` | 8 | IMU 姿态/角速度（周期 50ms，仅当 IMU 有新帧时发送） |
 
 > 约定：对 `STOP` / `SET_CAR_VEL` / `TUNE_PID` 均回 `ACK`；`GET_STATUS` 不回 ACK，直接回 `STATUS`。
 
@@ -123,6 +124,23 @@ STM32 端代码位置：`Core/Inc/usb_proto.h`、`Core/Src/usb_proto.c`。
 - 默认每 **100ms** 自动上报一帧（STM32 端 `UP_STS_PERIOD_MS`，改 `usb_proto.c` 即可）。
 - `rpm` 顺序 = 电机编号 1~4：左前 / 右前 / 左后 / 右后。
 - `enc` 可作里程计（换算见 §9 标定）。
+
+### 6.3 IMU `0x83`
+
+`payload` 8 字节，小端：
+
+| 偏移 | 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|---|
+| 0-1 | `yaw` | int16 | 0.01° | 偏航角（正=逆时针/左转，待台架标定符号） |
+| 2-3 | `yaw_rate` | int16 | 0.1°/s | 绕 Z 轴角速度（正=逆时针） |
+| 4-5 | `roll` | int16 | 0.01° | 仅诊断用 |
+| 6-7 | `pitch` | int16 | 0.01° | 仅诊断用 |
+
+- 周期 50ms（20Hz）。**仅当 STM32 已解析到新的 IMU 帧时才发送**：IMU 未接/无数据时不会有
+  `0x83` 帧，地瓜派侧据此判定「无 IMU」。
+- 与 `STATUS` 相互独立，不参与 ACK / 不需应答。
+- IMU 物理接口：STM32 **USART3（PB10=TX / PB11=RX），115200 8N1**，模块协议帧头 `0x7E 0x23`
+  （与 USB 帧格式无关，是 IMU 自己那一层）。
 
 ## 7. 整车速度解算（STM32 端内部）
 
