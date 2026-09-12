@@ -31,10 +31,14 @@ ekf_filter_node:
     odom0_differential: false
     odom0_queue_size: 5
 
-    # 输入2：rf2o 激光里程计（经 odom_relay 修过协方差+时间戳）—— 只融位姿
+    # 输入2：rf2o 激光里程计（经 odom_relay 修过协方差+时间戳）—— 只融 x,y 平移
+    # 2026-09-12 夜板卡实测：rf2o 静止时有 0.15~0.25°/s 的假漂，而它的 pose_covariance
+    # 里 yaw 方差(0.02)与 IMU 同量级 → EKF 航向会被它带着走（/odom_filtered 逐秒贴合 rf2o）；
+    # 只要 odom1 融 yaw，即便 imu0 也融 yaw 差分量，实测仍漂 0.148°/s。故**航向交给 IMU**，
+    # 激光只贡献平移。关掉 yaw 位后复验：静止漂移 0.0000°/s（tools/ekf_drift_probe.py）。
     odom1: /odom_laser
     odom1_config: [true,  true,  false,
-                   false, false, true,
+                   false, false, false,
                    false, false, false,
                    false, false, false,
                    false, false, false]
