@@ -95,6 +95,7 @@ class VoiceWorker(threading.Thread):
         self._turn = 0                      # 应答轮次代数：_start_answer 每轮自增抢占
         self._abort = threading.Event()     # barge-in 打断应答（仅播放期语义；新轮由 _turn 接管）
         self._text_reply_feed = None        # 当前文本回复事件流（新轮开始时关闭旧流）
+        self._answer_lock = threading.Lock()  # 轮次交接与最新轮收尾必须原子化
 
     # ---- 状态上报 ----
     def _report(self, status: str, **kw):
@@ -371,10 +372,11 @@ class VoiceWorker(threading.Thread):
         老人追问新整句 → 旧轮即便阻塞在 chat_stream 网络读 / 合成中，也会在其下一
         检查点（循环顶 / 入队闸，self._turn != turn）观察到被取代而静默退出，
         绝无第二条线程并发消费同一流。"""
-        self._turn += 1
-        turn = self._turn
-        self._abort.clear()          # 新轮接管：清 barge-in 残留，避免掐死新轮
-        self._answering = True       # 无条件置位（覆盖旧值，新轮接管）
+        with self._answer_lock:
+            self._turn += 1
+            turn = self._turn
+            self._abort.clear()      # 新轮接管：清 barge-in 残留，避免掐死新轮
+            self._answering = True   # 无条件置位（覆盖旧值，新轮接管）
         t = threading.Thread(target=self._answer, args=(uid, user_text, settings, turn),
                              daemon=True, name="voice-answer")
         t.start()
@@ -391,12 +393,16 @@ class VoiceWorker(threading.Thread):
             audit.log("voice_error", action="tts_answer", error=str(e)[:200])
             assistant = ""
         finally:
-            if turn == self._turn:
-                # 仍是最新轮：正常收尾 —— partial/全文落历史 + post_turn + 收流
-                self._answering = False
-                self._abort.clear()
-                if self.sink is not None:
-                    self.sink.end_of_stream()   # 自然播完：队列清空后收流
+            with self._answer_lock:
+                latest = turn == self._turn
+                if latest:
+                    # 检查与状态收尾原子化，防旧轮越过检查后清掉并发新轮状态
+                    self._answering = False
+                    self._abort.clear()
+                    if self.sink is not None:
+                        self.sink.end_of_stream()   # 自然播完：队列清空后收流
+            if latest:
+                # 仍是最新轮：partial/全文落历史 + post_turn
                 self._publish("chat_new", uid=uid, user=user_text, assistant=assistant)
                 if self.post_turn_fn:
                     try:
@@ -508,17 +514,18 @@ class VoiceWorker(threading.Thread):
         if self.tts is None or self.sink is None:
             return None
 
-        self._abort.set()
-        self.sink.stop()
-        self.session.barge_in()
-        self._turn += 1
-        turn = self._turn
-        if self._text_reply_feed is not None:
-            self._text_reply_feed.finish(flush_tail=False)
-        self._abort.clear()
-        self._answering = True
-        feed = _TextReplyFeed()
-        self._text_reply_feed = feed
+        with self._answer_lock:
+            self._abort.set()
+            self.sink.stop()
+            self.session.barge_in()
+            self._turn += 1
+            turn = self._turn
+            if self._text_reply_feed is not None:
+                self._text_reply_feed.finish(flush_tail=False)
+            self._abort.clear()
+            self._answering = True
+            feed = _TextReplyFeed()
+            self._text_reply_feed = feed
         t = threading.Thread(target=self._answer_text_reply,
                              args=(feed, dict(settings), turn),
                              daemon=True, name="voice-answer")
@@ -533,12 +540,14 @@ class VoiceWorker(threading.Thread):
         except Exception as e:
             audit.log("voice_error", action="tts_answer", error=str(e)[:200])
         finally:
-            if turn == self._turn:
-                self._answering = False
-                self._abort.clear()
-                self._text_reply_feed = None
-                self.sink.end_of_stream()
-            else:
+            with self._answer_lock:
+                latest = turn == self._turn
+                if latest:
+                    self._answering = False
+                    self._abort.clear()
+                    self._text_reply_feed = None
+                    self.sink.end_of_stream()
+            if not latest:
                 audit.log("voice_error", action="answer_superseded")
 
     def stop(self):

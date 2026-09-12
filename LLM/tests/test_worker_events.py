@@ -378,3 +378,88 @@ def test_new_text_reply_supersedes_old_text_reply(monkeypatch):
     assert spoken == ["新轮播报。"]
     assert len(enqueued) == 1
     assert len(eos) == 1
+
+
+def test_text_reply_handoff_keeps_new_turn_state_atomic(monkeypatch):
+    """旧轮通过收尾检查后遇到新轮交接，也不得清理新轮状态或提前收流。"""
+    _silence_audit(monkeypatch)
+    old_consuming = threading.Event()
+    allow_old_return = threading.Event()
+    old_checked_turn = threading.Event()
+    allow_old_cleanup = threading.Event()
+    turn_two_assigned = threading.Event()
+    new_consuming = threading.Event()
+    allow_new_return = threading.Event()
+    second_returned = threading.Event()
+    eos_called = threading.Event()
+    eos = []
+
+    class ControlledTurn:
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, increment):
+            result = ControlledTurn(self.value + increment)
+            if result.value == 2:
+                turn_two_assigned.set()
+            return result
+
+        def __eq__(self, other):
+            other_value = getattr(other, "value", other)
+            if self.value == 1 and allow_old_return.is_set():
+                old_checked_turn.set()
+                assert allow_old_cleanup.wait(5), "旧轮收尾检查未获准继续"
+            return self.value == other_value
+
+        def __ne__(self, other):
+            return not self == other
+
+    w, _ = _make_worker()
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {"provider": "local"})()
+    w.sink = type("Sink", (), {
+        "stop": lambda self: None,
+        "end_of_stream": lambda self: (eos.append(1), eos_called.set()),
+    })()
+    w._turn = ControlledTurn(0)
+
+    def consume(events, settings, turn, publish_text=True, wake_if_idle=False):
+        if turn.value == 1:
+            old_consuming.set()
+            assert allow_old_return.wait(5), "旧轮消费未获准返回"
+        else:
+            new_consuming.set()
+            assert allow_new_return.wait(5), "新轮消费未获准返回"
+        return ""
+
+    monkeypatch.setattr(w, "_consume_events", consume)
+    first_feed = w.begin_text_reply({"tts_enabled": True})
+    assert first_feed is not None
+    assert old_consuming.wait(5), "旧轮未进入消费"
+    allow_old_return.set()
+    assert old_checked_turn.wait(5), "旧轮未停在轮次检查"
+
+    second = {}
+
+    def begin_second():
+        second["feed"] = w.begin_text_reply({"tts_enabled": True})
+        second_returned.set()
+
+    starter = threading.Thread(target=begin_second, daemon=True)
+    starter.start()
+    # 无同步时第二轮会越过旧轮的收尾检查；有同步时会在入口等待旧轮完成临界区。
+    turn_two_assigned.wait(0.2)
+    allow_old_cleanup.set()
+    assert second_returned.wait(5), "第二轮入口未返回"
+    assert new_consuming.wait(5), "第二轮未进入消费"
+    assert eos_called.wait(5), "旧轮未完成收流"
+    starter.join(5)
+    assert not starter.is_alive()
+
+    snapshot = (w._turn.value, w._answering,
+                w._text_reply_feed is second["feed"], len(eos))
+    allow_new_return.set()
+    _settle_answer_threads()
+
+    assert snapshot == (2, True, True, 1)
+    assert len(eos) == 2
