@@ -54,6 +54,10 @@ case "$cmd" in
     start nav "ros2 launch robot_bringup navigation.launch.py map:=$WS/maps/my_map.yaml rviz:=false autostart:=false" ;;
   lat)
     start lat "ros2 launch rosbridge_server rosbridge_websocket_launch.xml" ;;
+  teleop)
+    # 键盘遥控（改键位：i/, 前后，j/l 左右转，k 停；--repeat 10Hz 持续重发，
+    # 对抗 0.5s 看门狗 + SSH 输入延迟）。用法：screen -r teleop，退出按 Ctrl-A 再按 D
+    start teleop "ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args --repeat 10.0 -r cmd_vel:=/cmd_vel" ;;
   save)
     [ -z "${2:-}" ] && { echo "用法: nav_screen.sh save <前缀路径>"; exit 1; }
     ros2_cmd="ros2 run nav2_map_server map_saver_cli -f $2"

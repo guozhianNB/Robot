@@ -42,15 +42,17 @@ ekf_filter_node:
     odom1_queue_size: 5
 
     # 输入3：IMU（接 STM32 USART3，经 USB 帧 0x83 转发到 /imu，见 docs/目标文档及说明/USB车控接口.md v1.1）
-    # 只融 vyaw：麦轮原地转打滑时，陀螺仪测的角速度仍然可信；绝对 yaw 不融
-    # （rf2o 位姿已在提供朝向，两个朝向源协方差不准时会互相打架）
+    # 融 vyaw + yaw（yaw 走差分量）：麦轮打滑/悬空时轮速航向不可信，陀螺仪仍然可信；
+    # 而 rf2o 静止时存在小幅假漂（实测 0.15~0.25°/s），只融 vyaw 压不住它——实测
+    # /odom_filtered 会逐秒贴着 rf2o 同步漂，而 /imu 一动不动。故补差分量 yaw 作为
+    # "相对转角"约束。2026-09-12 夜改动，配 tools/ekf_drift_probe.py 复验静止漂移。
     imu0: /imu
     imu0_config: [false, false, false,
-                  false, false, false,
+                  false, false, true,
                   false, false, false,
                   false, false, true,
                   false, false, false]
-    imu0_differential: false
+    imu0_differential: true
     imu0_queue_size: 10
 
     # 过程噪声（15x15 行优先，全为浮点写法：YAML 里裸 0 是 integer，

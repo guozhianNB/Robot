@@ -36,7 +36,8 @@ def set_car_vel(vx, vy, wz):
 
 
 def parse(buf: bytearray):
-    """实测帧格式：AA 55 | LEN | CMD | PAYLOAD(LEN-1)，帧长 = 3 + LEN（无校验字节）。"""
+    """板卡实测口径（XOR 校验自动判定）：帧 = AA 55 | LEN | CMD | payload(LEN) | XOR，
+    帧长 = LEN + 5，payload = buf[4 : 4+LEN]。"""
     out = []
     while True:
         i = buf.find(HEAD)
@@ -48,11 +49,10 @@ def parse(buf: bytearray):
         if len(buf) < 3:
             break
         ln = buf[2]
-        if len(buf) < 3 + ln:
+        if len(buf) < ln + 5:
             break
-        body = bytes(buf[3:3 + ln])
-        out.append((body[0], body[1:]))
-        del buf[:3 + ln]
+        out.append((buf[3], bytes(buf[4:4 + ln])))
+        del buf[:ln + 5]
     return out
 
 
@@ -101,7 +101,7 @@ def main():
         for cmd, p in parse(buf):
             if cmd == CMD_STATUS and len(p) >= 25:
                 phases[phase[0]].append(
-                    (p[0], struct.unpack_from('<4h', p, 1), struct.unpack_from('<4i', p, 9)))
+                    (p[0], struct.unpack_from('<4h', p, 1), struct.unpack_from('<4h', p, 9)))
     stop.set()
     ser.close()
 

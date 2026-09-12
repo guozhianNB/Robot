@@ -5,6 +5,9 @@ RDK X5（Ubuntu 22.04 / ROS2 Humble）小车端：**激光雷达 + 里程计 + S
 > ⚠️ **工作区路径勘误**：板卡上本仓库实际路径是 **`/home/sunrise/Robot/ros2_car`**，
 > 下文及老文档里的 `~/ros2/car_ws` / `D:\_project\Robot\ros2_car` 是 Windows/旧布局，**上板请全部替换**。
 > 详细调试经验与勘误见 `ros2_car/ROS2导航调试经验.md`。
+>
+> 📘 **要动手操作（建图 / 启动导航）请直接看 `建图与导航操作手册.md`**——里面的命令均为 2026-09-11 实机验证版，
+> 含分步流程、参数怎么传、换地图改哪里、以及 12 条已知坑清单。
 
 ## 包结构
 
@@ -29,7 +32,7 @@ source /home/sunrise/Robot/ros2_car/install/setup.bash  # 本工作区
 ## 一键启动
 
 ```bash
-# ① 建图（默认 odom_source:=rf2o，无底盘可用激光里程计兜底）
+# ① 建图（默认 odom_source:=rf2o，无底盘可用激光里程计兜底；真机推荐 odom_source:=chassis）
 ros2 launch robot_bringup bringup.launch.py mode:=mapping
 
 # ② 另开终端，键盘开小车逛房间
