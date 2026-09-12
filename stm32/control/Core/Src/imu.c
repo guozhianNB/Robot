@@ -21,7 +21,8 @@
 /* ===================== 移植配置（自包含，不依赖 usart.c / huart3） =========
  * 本工程没有 usart.c（一个 USART 都没初始化过），故 UART 由本文件自行 bring-up：
  *   - 时钟/引脚/波特率：寄存器级 IMU_UART_Init()
- *   - 收字节：主循环轮询 IMU_UART_PollRx()（不用中断，不碰 10ms 硬约束）
+ *   - 收字节：USART3 RXNE 中断驱动（USART3_IRQHandler → IMU_UART_IRQHandler），
+ *            主循环轮询 IMU_UART_PollRx() 仅作兜底
  *   - 发字节：寄存器级 TXE 写 IMU_UART_SendByte()
  * 移植到其它串口只需改下面 5 个宏（保持 USART3 默认映射，PD8/PD9 留给电机方向脚）。 */
 #define IMU_PORT_UART_INSTANCE  USART3        /* 寄存器实例（默认映射 PB10=TX / PB11=RX） */
@@ -314,10 +315,25 @@ void IMU_UART_Init(void)
     IMU_PORT_UART_INSTANCE->BRR =
         (uint16_t)((HAL_RCC_GetPCLK1Freq() + IMU_PORT_BAUD / 2u) / IMU_PORT_BAUD);
 
-    /* ④ 8N1、收发使能、开串口；不开中断（主循环轮询收字节） */
+    /* ④ 8N1、收发使能、开串口 */
     IMU_PORT_UART_INSTANCE->CR2 = 0u;
     IMU_PORT_UART_INSTANCE->CR3 = 0u;
-    IMU_PORT_UART_INSTANCE->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+
+    /* 清残留标志（先读 SR 再读 DR 清 ORE），避免一开中断就误触发 */
+    (void)IMU_PORT_UART_INSTANCE->SR;
+    (void)IMU_PORT_UART_INSTANCE->DR;
+
+    /* ⑤ 使能 RXNE 中断 + NVIC。⚠️ 必须走中断：STM32F1 的 USART 只有 1 字节 DR、
+     *    无 FIFO，115200 下每字节仅 ~86.8us，而主循环 10ms 才轮询一次 DR →
+     *    一帧（11~20B，<2ms 内连续到达）最多只能读到 1 字节，其余全部 ORE 丢弃，
+     *    状态机永远拼不出完整帧 → up_send_imu() 新鲜度门控判定"无新帧"→ 不发。
+     *    中断里只读 1 字节入环形缓冲（~µs），不影响 10ms 闭环。
+     *    优先级取 6：低于 USB/PCD(0)，USB 通信不受影响。 */
+    HAL_NVIC_SetPriority(USART3_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(USART3_IRQn);
+
+    IMU_PORT_UART_INSTANCE->CR1 = USART_CR1_TE | USART_CR1_RE
+                                | USART_CR1_UE | USART_CR1_RXNEIE;
 
     s_seen_frames   = IMU_UART_GetFrameCount();
     s_last_progress = HAL_GetTick();
@@ -326,8 +342,19 @@ void IMU_UART_Init(void)
 
 /* ===================== 直接中断接收 ======================== */
 /**
+  * @brief USART3 中断向量入口（强符号覆盖 startup 里的弱符号）
+  * @note  本工程 stm32f1xx_it.c 未生成 USART3_IRQHandler，故在此定义。
+  *        ⚠️ 勿在 CubeMX 里勾选 USART3 全局中断，否则重新生成 it.c 时会再生成
+  *        一个同名函数 → 重复定义链接错误。
+  */
+void USART3_IRQHandler(void)
+{
+    IMU_UART_IRQHandler();
+}
+
+/**
   * @brief USART3 中断处理（直接寄存器操作，绕过 HAL）
-  *        由 stm32f1xx_it.c 中的 USART3_IRQHandler 调用
+  *        只做「读 DR + 入环形缓冲」，~µs 级，不阻塞主循环
   */
 void IMU_UART_IRQHandler(void)
 {

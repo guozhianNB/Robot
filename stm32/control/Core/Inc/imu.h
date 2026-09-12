@@ -71,8 +71,8 @@ int IMU_GetEuler(float out[3]);
 void IMU_UART_Init(void);
 
 /** @brief USART3 中断处理（直接寄存器操作）。
- *  @note  当前采用主循环轮询模式：不注册 NVIC、本函数不会被调用。
- *         若改回中断方式，需在 stm32f1xx_it.c 的 USER CODE 段加 USART3_IRQHandler 调它。 */
+ *  @note  采用 RXNE 中断模式：IMU_UART_Init() 里已配 NVIC 并使能 RXNEIE。
+ *         中断入口 USART3_IRQHandler 定义在 imu.c（it.c 未生成该函数）。 */
 void IMU_UART_IRQHandler(void);
 
 /** @brief 轮询 USART3 已到达字节并推入环形缓冲（主循环调用，绝不阻塞） */
