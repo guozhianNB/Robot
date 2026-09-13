@@ -6,8 +6,8 @@ RDK X5（Ubuntu 22.04 / ROS2 Humble）小车端：**激光雷达 + 里程计 + S
 > 下文及老文档里的 `~/ros2/car_ws` / `D:\_project\Robot\ros2_car` 是 Windows/旧布局，**上板请全部替换**。
 > 详细调试经验与勘误见 `ros2_car/ROS2导航调试经验.md`。
 >
-> 📘 **要动手操作（建图 / 启动导航）请直接看 `建图与导航操作手册.md`**——里面的命令均为 2026-09-11 实机验证版，
-> 含分步流程、参数怎么传、换地图改哪里、以及 12 条已知坑清单。
+> 📘 **要动手操作（建图 / 启动导航）请直接看 `建图与导航操作手册.md`**——里面的命令为 2026-09-11 实机验证、2026-09-13 复核定稿版，
+> 含 30 秒速查、上机前代码对齐与重建、分步流程、参数怎么传、换地图改哪里、以及 18 条已知坑清单。
 
 ## 包结构
 
@@ -47,6 +47,9 @@ ros2 run nav2_map_server map_saver_cli -f /home/sunrise/Robot/ros2_car/maps/my_m
 #    yaml_filename not initialized)。请改成分步：先起基础节点，再直接跑 navigation.launch.py：
 ros2 launch robot_bringup robot_base.launch.py odom_source:=chassis   # 或 lidar+odom+robot_state_publisher 分别起
 ros2 launch robot_bringup navigation.launch.py map:=/home/sunrise/Robot/ros2_car/maps/my_map.yaml
+# ↑ 换图只改这一个 map:=（2026-09-13 实测：它经 RewrittenYaml 改写 yaml_filename，
+#   nav2_params.yaml 里那行 yaml_filename 走 launch 时【不生效】；反过来不漏传 map:= 就加载不到图）
+#   板卡上更省事：~/tools/nav_screen.sh nav [地图名]（默认 my_map，启动前校验地图存在）
 ```
 
 导航模式在 rviz 里点 **2D Pose Estimate** 给出初始位姿（AMCL 定位），再点 **"Nav2 Goal"（nav2_rviz_plugins/GoalTool）** 下发目标。
