@@ -491,3 +491,4 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - RED：`rg -n 'speak: true' frontend/packages/kiosk/src/App.vue` 退出码 1，无匹配。
 - GREEN/静态验证：kiosk 同一 `rg` 退出码 0、命中 1 处；admin 同一检查退出码 1、无匹配；`D:\_project\Robot\.venv\Scripts\python.exe -m py_compile LLM\server.py LLM\voice_api.py LLM\voice\worker.py` 退出码 0；`git diff --check` 退出码 0。
 - 全量验证原始摘要：`$env:DEEPSEEK_API_KEY='test-key'; D:\_project\Robot\.venv\Scripts\python.exe -m pytest LLM\tests -q --basetemp .superpowers/pytest-tmp-task4` → `97 passed in 16.48s`；`frontend/packages/kiosk` 与 `frontend/packages/admin` 均执行 `node_modules\\.bin\\vite.CMD build` → Vite 构建成功（分别 37、42 modules）。`vue-tsc` 沿用任务前已知损坏安装（`vue-tsc/index.js` 缺失），未修复、未计为本任务回归。
+- 合并前审查修复：文本播报入口不再同步等待 `AudioSink.stop()`；后台交接锁串行停止旧播放，首句通过 `AudioSink.play()` 复位停止标志后再入队，避免新轮被旧声卡停止状态吞掉。新增声卡重启与首包不阻塞回归测试；修复后全量 `pytest LLM/tests -q` → `99 passed`。使用临时 `vue-tsc@2.0.29` 仅检查 kiosk `src` → 通过；仓库原始配置包含的 `vite.config.ts` 仍因缺 `@types/node` 报 `node:url`，未纳入本次改动。
