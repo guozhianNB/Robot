@@ -463,3 +463,38 @@ def test_text_reply_handoff_keeps_new_turn_state_atomic(monkeypatch):
 
     assert snapshot == (2, True, True, 1)
     assert len(eos) == 2
+
+
+def test_begin_text_reply_does_not_wait_for_sink_stop(monkeypatch):
+    """文本播报入口不应让 SSE 首包同步等待旧声卡停止。"""
+    _silence_audit(monkeypatch)
+    stop_entered = threading.Event()
+    allow_stop = threading.Event()
+
+    class BlockingSink:
+        def stop(self):
+            stop_entered.set()
+            allow_stop.wait(5)
+
+        def enqueue(self, samples):
+            pass
+
+        def end_of_stream(self):
+            pass
+
+        def is_done(self):
+            return True
+
+    w, _ = _make_worker()
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {"provider": "local"})()
+    w.sink = BlockingSink()
+    started = time.monotonic()
+    feed = w.begin_text_reply({"tts_enabled": True})
+    elapsed = time.monotonic() - started
+    assert feed is not None
+    assert elapsed < 0.2
+    assert stop_entered.wait(2)
+    allow_stop.set()
+    feed.finish()
+    _settle_answer_threads()

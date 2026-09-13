@@ -96,6 +96,7 @@ class VoiceWorker(threading.Thread):
         self._abort = threading.Event()     # barge-in 打断应答（仅播放期语义；新轮由 _turn 接管）
         self._text_reply_feed = None        # 当前文本回复事件流（新轮开始时关闭旧流）
         self._answer_lock = threading.Lock()  # 轮次交接与最新轮收尾必须原子化
+        self._sink_handoff_lock = threading.Lock()  # 后台串行停止旧播放；HTTP 入口不等待声卡
 
     # ---- 状态上报 ----
     def _report(self, status: str, **kw):
@@ -461,7 +462,8 @@ class VoiceWorker(threading.Thread):
             if speak:
                 if self._abort.is_set() or self._turn != turn:
                     return                # abort 已置位 / 已被新轮取代：绝不入队/发声（合成期间被打断）
-                if not started.is_set():
+                first_sentence = not started.is_set()
+                if first_sentence:
                     started.set()
                     self._speak_started = time.monotonic()
                     self._speak_ended_at = None
@@ -473,7 +475,13 @@ class VoiceWorker(threading.Thread):
                 if self.session.state != session_mod.State.SPEAKING \
                         or self._turn != turn:
                     return                # 已被打断 / 被新轮取代（后续句）：不再入队
-                self.sink.enqueue(np.concatenate(chunks))
+                samples = np.concatenate(chunks)
+                # 首句使用 play 的 stop+复位语义，确保被旧轮 stop 置位的播放线程
+                # 不会吞掉新一轮；后续句沿用队列追加以保持句间连续。
+                if first_sentence and hasattr(self.sink, "play"):
+                    self.sink.play(samples, config.SAMPLE_RATE)
+                else:
+                    self.sink.enqueue(samples)
                 audit.log("voice_tts", text=clean[:80],
                           provider=self.tts.provider,
                           ms=len(clean) * 250)   # 播报时长粗估（中文 ~4字/秒，仅日志参考）
@@ -515,9 +523,6 @@ class VoiceWorker(threading.Thread):
             return None
 
         with self._answer_lock:
-            self._abort.set()
-            self.sink.stop()
-            self.session.barge_in()
             self._turn += 1
             turn = self._turn
             if self._text_reply_feed is not None:
@@ -535,6 +540,18 @@ class VoiceWorker(threading.Thread):
     def _answer_text_reply(self, feed, settings, turn):
         """文本播报线程体：消费事件，并把收流权留给最新轮。"""
         try:
+            # stop() 最长可能等待声卡写线程 2 秒，只能在后台执行。单独的交接锁
+            # 保证旧轮不会在新轮开始播放后才反向 stop；锁内前后两次轮次检查
+            # 则让等待期间被取代的线程在碰声卡前/后立即退出。
+            with self._sink_handoff_lock:
+                with self._answer_lock:
+                    if turn != self._turn:
+                        return
+                self.sink.stop()
+                with self._answer_lock:
+                    if turn != self._turn:
+                        return
+                    self.session.barge_in()
             self._consume_events(feed, settings, turn,
                                  publish_text=False, wake_if_idle=True)
         except Exception as e:
