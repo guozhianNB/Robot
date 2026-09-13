@@ -28,6 +28,7 @@ LLM/data/*.log
 
 # 子代理驱动开发的临时工作产物（进度账本/简报/审查包，不入库）
 .superpowers/
+/.worktrees/
 
 # ROS2 工作区构建产物（不入库，板卡上保留即可）
 ros2_car/build/

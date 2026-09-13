@@ -128,7 +128,12 @@ async function sendText(text: string) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ uid: uid.value ?? "elder_001", message: text, thinking: "auto" }),
+      body: JSON.stringify({
+        uid: uid.value ?? "elder_001",
+        message: text,
+        thinking: "auto",
+        speak: true,
+      }),
     });
     if (!res.ok || !res.body) throw new Error("chat failed");
     const reader = res.body.getReader();

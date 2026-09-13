@@ -317,3 +317,184 @@ def test_consume_exception_still_finalizes_chat_new(monkeypatch):
     assert news[0] == {"uid": "elder_001", "user": "测试问", "assistant": "前半段"}
     assert posted == [("elder_001", "测试问", "前半段")]
     assert len(sink._eos) == 1, "异常路径也要收流一次"
+
+
+def test_text_reply_stream_speaks_sentences_without_chat_events(monkeypatch):
+    """文本回复增量按完整句播报，不重复发布聊天事件，且只收流一次。"""
+    _silence_audit(monkeypatch)
+    w, events = _make_worker()
+    spoken = []
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {
+        "provider": "local",
+        "synthesize_chunks": lambda self, text: (
+            spoken.append(text) or np.zeros(160, dtype=np.float32) for _ in (1,)
+        ),
+    })()
+    w.sink = _counting_sink()
+
+    feed = w.begin_text_reply({"tts_enabled": True})
+    assert feed is not None
+    feed.feed("第一句。第二")
+    feed.feed("句！尾句")
+    feed.finish(flush_tail=True)
+    _settle_answer_threads()
+
+    assert spoken == ["第一句。", "第二句！", "尾句"]
+    assert not [ev for ev, _ in events if ev in ("chat_partial", "chat_new")]
+    assert len(w.sink._eos) == 1
+
+
+def test_new_text_reply_supersedes_old_text_reply(monkeypatch):
+    """新文本播报轮次接管后，旧轮后续文本不得合成或入队。"""
+    _silence_audit(monkeypatch)
+    w, _ = _make_worker()
+    spoken = []
+    enqueued = []
+    eos = []
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {
+        "provider": "local",
+        "synthesize_chunks": lambda self, text: (
+            spoken.append(text) or np.zeros(160, dtype=np.float32) for _ in (1,)
+        ),
+    })()
+    w.sink = type("Sink", (), {
+        "enqueue": lambda self, samples: enqueued.append(samples),
+        "stop": lambda self: None,
+        "is_done": lambda self: True,
+        "end_of_stream": lambda self: eos.append(1),
+    })()
+
+    old_feed = w.begin_text_reply({"tts_enabled": True})
+    new_feed = w.begin_text_reply({"tts_enabled": True})
+    assert old_feed is not None and new_feed is not None
+    old_feed.feed("旧轮不应播报。")
+    old_feed.finish()
+    new_feed.feed("新轮播报。")
+    new_feed.finish()
+    _settle_answer_threads()
+
+    assert spoken == ["新轮播报。"]
+    assert len(enqueued) == 1
+    assert len(eos) == 1
+
+
+def test_text_reply_handoff_keeps_new_turn_state_atomic(monkeypatch):
+    """旧轮通过收尾检查后遇到新轮交接，也不得清理新轮状态或提前收流。"""
+    _silence_audit(monkeypatch)
+    old_consuming = threading.Event()
+    allow_old_return = threading.Event()
+    old_checked_turn = threading.Event()
+    allow_old_cleanup = threading.Event()
+    turn_two_assigned = threading.Event()
+    new_consuming = threading.Event()
+    allow_new_return = threading.Event()
+    second_returned = threading.Event()
+    eos_called = threading.Event()
+    eos = []
+
+    class ControlledTurn:
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, increment):
+            result = ControlledTurn(self.value + increment)
+            if result.value == 2:
+                turn_two_assigned.set()
+            return result
+
+        def __eq__(self, other):
+            other_value = getattr(other, "value", other)
+            if self.value == 1 and allow_old_return.is_set():
+                old_checked_turn.set()
+                assert allow_old_cleanup.wait(5), "旧轮收尾检查未获准继续"
+            return self.value == other_value
+
+        def __ne__(self, other):
+            return not self == other
+
+    w, _ = _make_worker()
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {"provider": "local"})()
+    w.sink = type("Sink", (), {
+        "stop": lambda self: None,
+        "end_of_stream": lambda self: (eos.append(1), eos_called.set()),
+    })()
+    w._turn = ControlledTurn(0)
+
+    def consume(events, settings, turn, publish_text=True, wake_if_idle=False):
+        if turn.value == 1:
+            old_consuming.set()
+            assert allow_old_return.wait(5), "旧轮消费未获准返回"
+        else:
+            new_consuming.set()
+            assert allow_new_return.wait(5), "新轮消费未获准返回"
+        return ""
+
+    monkeypatch.setattr(w, "_consume_events", consume)
+    first_feed = w.begin_text_reply({"tts_enabled": True})
+    assert first_feed is not None
+    assert old_consuming.wait(5), "旧轮未进入消费"
+    allow_old_return.set()
+    assert old_checked_turn.wait(5), "旧轮未停在轮次检查"
+
+    second = {}
+
+    def begin_second():
+        second["feed"] = w.begin_text_reply({"tts_enabled": True})
+        second_returned.set()
+
+    starter = threading.Thread(target=begin_second, daemon=True)
+    starter.start()
+    # 无同步时第二轮会越过旧轮的收尾检查；有同步时会在入口等待旧轮完成临界区。
+    turn_two_assigned.wait(0.2)
+    allow_old_cleanup.set()
+    assert second_returned.wait(5), "第二轮入口未返回"
+    assert new_consuming.wait(5), "第二轮未进入消费"
+    assert eos_called.wait(5), "旧轮未完成收流"
+    starter.join(5)
+    assert not starter.is_alive()
+
+    snapshot = (w._turn.value, w._answering,
+                w._text_reply_feed is second["feed"], len(eos))
+    allow_new_return.set()
+    _settle_answer_threads()
+
+    assert snapshot == (2, True, True, 1)
+    assert len(eos) == 2
+
+
+def test_begin_text_reply_does_not_wait_for_sink_stop(monkeypatch):
+    """文本播报入口不应让 SSE 首包同步等待旧声卡停止。"""
+    _silence_audit(monkeypatch)
+    stop_entered = threading.Event()
+    allow_stop = threading.Event()
+
+    class BlockingSink:
+        def stop(self):
+            stop_entered.set()
+            allow_stop.wait(5)
+
+        def enqueue(self, samples):
+            pass
+
+        def end_of_stream(self):
+            pass
+
+        def is_done(self):
+            return True
+
+    w, _ = _make_worker()
+    w.session = session_mod.Session()
+    w._local_tts = w.tts = type("Tts", (), {"provider": "local"})()
+    w.sink = BlockingSink()
+    started = time.monotonic()
+    feed = w.begin_text_reply({"tts_enabled": True})
+    elapsed = time.monotonic() - started
+    assert feed is not None
+    assert elapsed < 0.2
+    assert stop_entered.wait(2)
+    allow_stop.set()
+    feed.finish()
+    _settle_answer_threads()

@@ -86,3 +86,17 @@ def test_play_compat(monkeypatch):
     sink.end_of_stream()
     assert _wait_done(sink)
     assert fake.streams and fake.streams[0].writes
+
+
+def test_stop_then_enqueue_restarts_output(monkeypatch):
+    """文本回复新轮先打断旧音频后，首段 enqueue 仍必须创建并写入新流。"""
+    fake = _patch_sd(monkeypatch)
+    sink = audio_mod.AudioSink()
+    sink.enqueue(np.zeros(1600, dtype=np.float32))
+    sink.stop()
+    sink.enqueue(np.ones(1600, dtype=np.float32))
+    sink.end_of_stream()
+    assert _wait_done(sink)
+    assert len(fake.streams) == 2
+    assert fake.streams[1].writes
+    assert np.any(np.concatenate(fake.streams[1].writes) == 1.0)
