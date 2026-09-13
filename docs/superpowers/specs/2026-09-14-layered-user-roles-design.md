@@ -26,7 +26,7 @@
 | 层 | 角色 | 本期状态 |
 |---|---|---|
 | 管理层 | `admin` | **本期实现**（口令登录；口令可在 UI 直接改、也可整体关闭；护士站/家属用） |
-| 集体层 | `ward` | **本期实现**（**同一个病房的老人打包成一个「病房用户」**，uid 形如 `ward_101`；小车进病房与"大家"打招呼、公布消息；未识别/未登录时的默认态也是它） |
+| 集体层 | `ward` | **本期实现**（**同一个病房的老人打包成一个「病房用户」**，uid 形如 `ward_101`；小车进病房与"大家"打招呼、公布消息；**按小车位置自动切到所在病房**，见 §4.5；未识别/未登录时的默认态也是它） |
 | 老人层 | `elder` | **本期实现**（声纹识别 + 手动选人；可读取**本病房**集体层的消息上下文） |
 
 用户原话（2026-09-14）：
@@ -68,7 +68,9 @@
 | D13 | 口令可维护性 | 口令**可在 UI 直接修改**（`POST /api/session/password`，需旧口令），也可**整体关闭**（`admin_auth_required=False`）：关闭后从层级栏选「管理层」即直接进入 admin，UI 显式警示「当前无口令保护」+ 审计 `session_login source=auth_disabled`。默认 `True`（有保护） |
 | D14 | 集体层 ↔ 老人层上下文 | **单向可读**（红线 R5）：老人可读**本病房**集体层最近 N 条；私聊不回灌集体层；跨病房不可读。老人→病房归属由 `profiles.ward_id` 决定 |
 | D15 | 前端层级切换 | 「换人」按钮 → **左侧层级栏**列出 管理层 / 集体层 / 老人层 及其主体；前端只传主体 uid，**role 由后端推导**（守住 R1） |
-| D16 | 本轮范围 | 用户 2026-09-14 明确「**先不管 mcp，先完成用户系统**」：本轮只做 §10 的 P0（角色地基 + 集体层 + 提示词分层 + 层级 UI）；依赖 car MCP 的**地点白名单 / `robot_goto` / 二次确认**（原 P1）**暂缓**，待 MCP 线重启再做 |
+| D16 | 本轮范围 | 用户 2026-09-14 明确「**先不管 mcp，先完成用户系统**」：本轮只做 §10 的 P0（角色地基 + 集体层 + 提示词分层 + 层级 UI + 病房自动切换）；依赖 car MCP 的**地点白名单 / `robot_goto` / 二次确认**（原 P1）**暂缓**，待 MCP 线重启再做 |
+| D17 | 「当前在哪个病房」 | **按小车位置自动切**（用户 2026-09-14 选定 B）：`LLM/locator.py` 取小车在当前地图中的位姿 → 命中病房 zone 即为当前病房 → 跨病房自动切集体层。位置源走 **rosbridge（websocket，非 MCP）**，与 D16 不冲突；拿不到位姿则自动切换停用、退回手动，绝不阻塞对话 |
+| D18 | 自动切换的克制规则 | 位置只驱动**「当前病房」这个背景变量**；仅当 kiosk 槽为 `ward` 且未锁定才真正改会话主体——**正在老人私聊时绝不抢会话**；声纹认出老人时把当前病房**跟随**到该老人的病房（用户 2026-09-14 选定 A）；手动切病房后 10 分钟内位置判定不覆盖 |
 
 ## 3. 核心模型
 
@@ -92,6 +94,7 @@ Principal = {
 - 老人通过 `profiles.ward_id`（新增字段，指向病房 uid）归属病房；**一个老人只属于一个病房**。
 - 归属建议：注册向导里按 `bed`（床位号）自动建议病房号（如 `bed="101-2"` → 建议 `ward_101`，可改），也可手动指定。
 - 声纹识别到某位老人 → 从集体层切到该老人的 `elder` 会话（现有声纹链路，§4.3）。
+- 每个病房用户还有一个**地图区域** `zone_json`（P0 只支持圆：`{"frame":"map","type":"circle","x":…,"y":…,"r":2.5}`），用于"小车在哪个病房"的位置判定（§4.5）。
 
 ### 3.2 角色策略包（Policy）
 
@@ -191,6 +194,31 @@ def derive_role(uid, *, slot, admin_logged_in=False) -> str:
 - **权威判定查 `profiles.kind`**，不靠 uid 前缀——否则有人把老人 uid 起成 `ward_` 开头就能骗过判定。
 - `admin` 的 uid 是字面量 `"admin"`，**不写进 `profiles`**，因此永远不会出现在换人/层级列表里被误选（也不会被声纹匹配到）。
 - 前端只能提交 uid；任何带 `role` 的请求按 400 拒绝（R1）。
+
+### 4.5 「当前病房」的确定与自动切换（D17/D18）
+
+**一句话**：小车在哪个病房，集体层就是哪个病房；但**绝不打断正在进行的私聊**。
+
+「当前病房」有三个来源，优先级从高到低：
+
+1. **跟随老人**（Q2 选 A）：声纹认出 `elder_102_1` → 当前病房 := 该老人的 `ward_id`（`ward_102`）——他属于哪个病房，集体层就跟到哪个，避免"在 102 认出了 102 的老人，切回集体层还停在 101"。
+2. **位置自动**（Q1 选 B）：`LLM/locator.py` 取小车位姿 → 命中的病房 zone。
+3. **手动覆盖**：层级栏里手动点某个病房 → 当前病房 := 该病房，并带 `manual_override_until`（默认 10 分钟），期间位置判定不覆盖，避免"刚设好就被抢回去"。
+
+切换规则（防误切、防打断）：
+
+- **防抖**：连续 3 次 tick（≈3s）落在同一病房才认；离开病房区（进走廊/未知区域）**不切**，保持上一病房。
+- **不抢私聊**：仅当 kiosk 槽 `role == "ward"` 且 `locked == False` 时，自动切换才真正改会话主体（切到新病房的集体层）。若正处在 `elder` 私聊中或已锁定 → **只更新"当前病房"背景变量**并广播 `ward_changed`，会话主体不动；退出私聊/解锁回集体层时自然用上新病房。
+- 任何来源的切换都广播 `ward_changed`（含 `source = location|manual|follow`）并落审计 `ward_change`。
+
+位姿来源与降级（`LLM/locator.py`）：
+
+- 首选 **rosbridge**（`ws://<板卡>:9090`，即板卡上 `~/tools/nav_screen.sh lat` 起的那个会话）订阅 `/amcl_pose`（map 系；AMCL 只在位移 ≥0.25m 或转角 ≥0.2rad 时发布，判"进没进病房"足够）。**这是 websocket，不是 MCP**，与 D16「先不管 MCP」不冲突；依赖 `websocket-client`（`asr_cloud.py` 已在用，**不新增外部依赖**）。
+- 备选（可选加固，非 P0 必须）：订阅 `/tf` 自己串 `map→base_link` 拿连续位姿。
+- **拿不到位姿**（rosbridge 没起 / 未定位 / 超时）→ 自动切换**自动停用**，UI 显示「位置未知 · 手动切病房」，会话保持当前病房不变；**不报错、不阻断对话**（沿用降级原则）。
+- locator **必须可注入假位姿**（`locator.set_pose_for_test()` 或构造注入），使本机无 ROS 环境也能跑单测与验收（§11.13-15）。
+
+病房 zone 的录入：管理员在「病房管理」页点「记录当前房间为病房区域」→ 取 locator 当前位姿作圆心 + 默认半径 `ward_zone_default_r`（3m，可调），落库前校验该点在地图有效范围内（复用 `ros2_car/tools/where_am_i.py` 的边界余量口径）。拿不到位姿时 → 提示先起定位/rosbridge，或手填坐标。
 
 ## 5. 提示词分层（D9）
 
@@ -323,7 +351,7 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 - **「换人/切换」按钮 → 左侧层级栏**（D15，用户明确要求）：抽屉从左侧滑出，三组分区自上而下——
   - 🛡 **管理层**：单条「管理员」。已登录显示「当前（剩 4:32）」+「退出」；未登录显示「输入口令进入」；口令门关闭时显示「直接进入（无口令保护⚠️）」。
-  - 🏠 **集体层**：病房用户列表（`ward_101 101病房` …），当前项打勾。切换即把会话 uid 设为该病房用户 → role=ward。
+  - 🏠 **集体层**：病房用户列表（`ward_101 101病房` …），当前项打勾并标注来源——`📍自动`（按位置）/ `✋手动`（覆盖中，显示剩余时间）/ `跟随老人`；位置源不可用时顶部提示「位置未知 · 手动切病房」。切换即把会话 uid 设为该病房用户 → role=ward。
   - 👴 **老人层**：仅显示**当前病房**的老人（默认按 `ward_id` 过滤，可切「全部病房」），显示昵称/床位；当前项打勾。
 - 状态条（`VoiceStatusBar.vue`）：按角色换徽标——`🏠 101病房`（集体层）/ `👴 张奶奶 🔒`（老人层）/ `🛡 管理员 4:32`（管理层，倒计时来自 `ttl_remain`）。
 - 管理员态额外显示：「退出管理员」「口令设置」（改口令 / 开关口令门，调 `/api/session/password` 与 `/api/session/admin-auth`）。
@@ -335,12 +363,13 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 - **登录门**：`admin_auth_required=True` 且未登录时整站只显示登录卡（口令）；关闭口令门时直接进入，但顶部常驻红条警示「当前无口令保护」。
 - Header：当前身份 + 剩余时间 + 「退出」。
 - 新增页签「身份与权限」：策略矩阵只读展示（来自 `GET /api/policy/roles`）+ 口令设置（**改口令 / 开关口令门**，D13）+ 可调项（`admin_session_ttl_s`、`ward_context_window`）。
-- 新增页签「病房管理」（集体层）：病房用户列表 + 新建病房 + 把老人归入病房（写 `profiles.ward_id`），并在现有「老人注册」页签的向导里加一个「病房」下拉（按床位号自动建议）。
+- 新增页签「病房管理」（集体层）：病房用户列表 + 新建病房 + **「记录当前房间为病房区域」**（取 locator 当前位姿作圆心 + 半径，§4.5）+ 把老人归入病房（写 `profiles.ward_id`），并在现有「老人注册」页签的向导里加一个「病房」下拉（按床位号自动建议）。
 - 「地点白名单」页签**本轮不做**（随 §7 暂缓）。
 
 ## 9. 数据与审计
 
-- **`profiles` 表扩展**（集体层的全部数据基础）：新增 `kind`（`'elder'|'ward'`，默认 `'elder'`）与 `ward_id`（老人所属病房 uid，可空）；病房用户即 `kind='ward'` 的一条 profile（`uid=ward_101`、`bed` 留空、不录声纹）。旧数据迁移：现有 profiles 全部置 `kind='elder'`。
+- **`profiles` 表扩展**（集体层的全部数据基础）：新增 `kind`（`'elder'|'ward'`，默认 `'elder'`）、`ward_id`（老人所属病房 uid，可空）与 `zone_json`（仅 `kind='ward'` 用：病房在地图上的圆形区域，§4.5）；病房用户即 `kind='ward'` 的一条 profile（`uid=ward_101`、`bed` 留空、不录声纹）。旧数据迁移：现有 profiles 全部置 `kind='elder'`。
+- **新增设置项**：`admin_auth_required`（口令门，默认 True）、`admin_session_ttl_s`（默认 300）、`ward_context_window`（默认 10）、`rosbridge_url`（默认 `ws://100.65.82.93:9090`，空=停用自动切病房）、`ward_switch_debounce`（默认 3 次 tick）、`ward_zone_default_r`（默认 3.0m）、`manual_override_sec`（默认 600s）。
 - **新表**：`destinations`（§7.1）——**随 §7 暂缓，本轮不建**。
 - **不建 `accounts` 表**（D1 轻量口径）；口令哈希放 `settings` 表（`admin_password_hash` / `admin_password_salt` / `admin_auth_required`），将来扩多账号时再建表并迁移。
 - **审计事件**（`log.py::log` 的 `event`）：`session_login`（含 `source=password|auth_disabled`）/ `session_login_fail` / `session_logout` / `session_expired` / `admin_password_generated` / `admin_password_changed` / `admin_auth_changed` / `ward_change` / `policy_deny` / `prompt_role_missing`；暂缓项对应的 `policy_confirm` / `policy_allow_dangerous` / `destination_change` 留待 §7 落地。
@@ -351,7 +380,7 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 | 阶段 | 内容 | 交付物 | 预估 |
 |---|---|---|---|
-| **P0（本轮，用户指定优先）** 用户系统 | `profiles.kind/ward_id` 迁移 + `ward` 病房用户 CRUD + `session.py` 双槽主体与 TTL + 口令登录/登出/**改口令/开关口令门** + `derive_role` + 提示词分层（4 个 md + `_load_role_prompt`）+ `@tool(roles=)` 与 `effective_tools/run_tool` 校验 + 集体层上下文注入（含 R5 单向规则）+ 前端左侧层级栏/登录门/病房管理页签 + 审计 | 三层可切：管理层（口令可开可关）、集体层（病房用户）、老人层（声纹/手选）；越权请求被拒且有审计；老人能读到本病房集体上下文 | ~1.5 天 |
+| **P0（本轮，用户指定优先）** 用户系统 | `profiles.kind/ward_id/zone_json` 迁移 + `ward` 病房用户 CRUD + `session.py` 双槽主体与 TTL + 口令登录/登出/**改口令/开关口令门** + `derive_role` + **`locator.py` 位置源（rosbridge `/amcl_pose` + 可注入假位姿）与病房自动切换** + 提示词分层（4 个 md + `_load_role_prompt`）+ `@tool(roles=)` 与 `effective_tools/run_tool` 校验 + 集体层上下文注入（含 R5 单向规则）+ 前端左侧层级栏/登录门/病房管理页签 + 审计 | 三层可切：管理层（口令可开可关）、集体层（病房用户，**按位置自动切**）、老人层（声纹/手选）；越权请求被拒且有审计；老人能读到本病房集体上下文 | ~2 天 |
 | **P1（暂缓，D16）** 动作约束 | car MCP 新增 `robot_goto`（§7.2）+ `destinations` 表与接口 + 地点白名单解析 + 风险分级 + 二次确认状态机 + admin「地点白名单」页签 | 老人说「去护士站」能走通，说「去停车场」被拒 | ~1.5 天（MCP 线重启后） |
 | **P2** 预留 | 集体层能力扩展（进病房自动打招呼/广播）、`accounts` 表多账号、老人动作审批流、权限矩阵细化到「谁能看哪段记忆」 | 另立 spec | — |
 
@@ -371,6 +400,10 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 10. **管理员语音**：管理员在车前（kiosk 槽）登录后说话 → 按 `admin` 角色的提示词与权限处理；期间声纹识别到老人**不降权**（审计 `ignored_in_admin`）。
 11. **未识别默认态**：完全没有声纹匹配时说话 → 走集体层（`🏠 当前病房`），不注入任何老人档案。
 12. **不破坏现有链路**：SOS（`/api/alarm`）在任何角色下都成功（R3）；缺依赖时后端仍能启动（降级运行）。
+13. **按位置自动切病房**：给 locator 注入落在 `ward_102` zone 内的位姿 → kiosk 槽（当前为集体层、未锁定）在防抖窗口后自动切到 `ward_102`，广播 `ward_changed source=location`、审计 `ward_change`；位姿回到病房外（走廊）→ 不切、保持原病房。
+14. **不打断私聊（D18）**：老人私聊中（kiosk 槽 role=elder）注入"换到 102 病房"的位姿 → 会话主体不变，仅"当前病房"更新；退出私聊回集体层时已是 `ward_102`。
+15. **位置源不可用即降级**：停掉 rosbridge（或把 `rosbridge_url` 置空）→ 自动切换停用，UI 显示「位置未知 · 手动切病房」，对话链路照常、无报错、无卡顿。
+16. **手动覆盖生效**：手动把当前病房设为 `ward_101` 后，注入指向 `ward_102` 的位姿 → `manual_override_sec` 内不抢（仍为 `ward_101`），超时后恢复位置判定。
 
 ## 12. 测试与红线清单
 
@@ -380,6 +413,8 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 - `test_prompt_layers.py`：四层装配正确（含 ward 的"不含个人档案"断言）、缺文件降级不崩。
 - `test_ward_context.py`：集体上下文注入单向性（elder 看得到 ward、ward 看不到 elder 私聊）、跨病房不串。
 - `test_policy_tools.py`：`effective_tools` 角色白名单 ∩ 全局开关；`run_tool` 二次校验（§11.4）。
+- `test_ward_autoswitch.py`（**全部用注入假位姿，不需要 ROS**）：跨 zone 切/不切、防抖窗口、私聊期间不抢、手动覆盖期内不抢、locator 拿不到位姿时整体停用且不改会话。
+- `test_ward_follow.py`：认出 `elder_102_1` → 当前病房跟到 `ward_102`；该老人无 `ward_id` 时不改变当前病房。
 - 暂缓项的单测（`test_destination_resolve.py` / `test_confirm_flow.py`）随 §7 一起做。
 
 **端到端**：§11 的 12 条全部在**本机后端**可验（集体层/老人层用 `/api/chat` + `X-Surface` 模拟），**不需要动车、不需要板卡**。
@@ -397,12 +432,13 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 | 文件 | 改动 | 轮次 |
 |---|---|---|
-| `LLM/session.py` | **新增**：双槽 Principal、`set_subject`/`derive_role`、登录/登出/改口令/开关口令门、TTL tick | P0 |
+| `LLM/locator.py` | **新增**：位置源（rosbridge 订阅 `/amcl_pose`，websocket 非 MCP）+ 可注入假位姿 + 拿不到即停用 | P0 |
+| `LLM/session.py` | **新增**：双槽 Principal、`set_subject`/`derive_role`、登录/登出/改口令/开关口令门、TTL tick、**当前病房与自动切换判定（含防抖/手动覆盖）** | P0 |
 | `LLM/policy.py` | **新增**：`POLICY_DEFAULTS` 三角色策略、`allowed_tools`/`data_scope`/`ward_context`、`check_action` 骨架 | P0（`check_action` 动作分级随 P1 补全） |
 | `LLM/prompt/ward.md` `elder.md` `admin.md` | **新增**：角色提示词片段 | P0 |
 | `LLM/prompt.md` | 不动（共用 base） | — |
-| `LLM/conf.py` | 新增设置项（`admin_session_ttl_s` / `admin_auth_required` / `ward_context_window`；P1 再加地点与确认项） | P0 |
-| `LLM/db.py` | `profiles` 加 `kind`/`ward_id` + 迁移；病房用户 CRUD；口令哈希读写 | P0 |
+| `LLM/conf.py` | 新增设置项（`admin_session_ttl_s` / `admin_auth_required` / `ward_context_window` / `rosbridge_url` / `ward_switch_debounce` / `ward_zone_default_r` / `manual_override_sec`；P1 再加地点与确认项） | P0 |
+| `LLM/db.py` | `profiles` 加 `kind`/`ward_id`/`zone_json` + 迁移；病房用户 CRUD；口令哈希读写 | P0 |
 | `LLM/chat.py` | `build_system/build_messages/chat_stream` 接 `principal`；`_load_role_prompt`；集体上下文注入 | P0 |
 | `LLM/tools.py` | `@tool(roles=)`、`effective_tools(settings, principal)`、`run_tool(name, args, principal)` | P0 |
 | `LLM/memory.py` | `note_turn()` 对 `role=ward` 不沉淀 | P0 |
