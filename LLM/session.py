@@ -19,8 +19,11 @@ r"""
 """
 import time
 
+from . import bus
 from . import db
+from . import locator
 from . import log as audit
+from . import zonegeo
 
 SLOTS = ("kiosk", "admin")
 ADMIN_UID = "admin"
@@ -36,9 +39,11 @@ def _now_ts() -> float:
 
 
 def reset_for_test() -> None:
-    """单测用：清空全部会话状态。"""
+    """单测用：清空全部会话状态与病房判定缓存。"""
     _shared.update({"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0})
     _state.clear()
+    _candidate.clear()
+    _map_cache.update({"name": "", "at": 0.0, "reason": ""})
 
 
 def _slot(slot: str) -> dict:
@@ -228,3 +233,147 @@ def ensure_admin_password() -> str | None:
     pw = "".join(secrets.choice("0123456789") for _ in range(6))
     db.set_admin_password(pw)
     return pw
+
+
+# ---------------------------------------------------------------------------
+# 当前病房 + 位置自动切换（D17/D18）
+# ---------------------------------------------------------------------------
+_MAP_CACHE_S = 10.0                     # 「车在跑哪张图」的缓存时长（避免每秒打网络/SSH）
+_map_cache: dict = {"name": "", "at": 0.0, "reason": ""}
+_candidate: dict[str, int] = {}         # ward_uid -> 连续命中次数（防抖）
+
+
+def running_map_name() -> tuple[str, str]:
+    """车**此刻在跑哪张图** → `(地图名, 不可用原因)`；认不出返回 `("", reason)`。
+
+    为什么不能拿病房自己存的 `ward_map` 当判据：位姿是**当前地图坐标系**里的数，而三张图
+    坐标系不通用；若拿位姿去比"旧图上的病房多边形"，会**静默切错病房**（D17 明令禁止）。
+
+    取值口径（`settings.ward_map_source`）：
+      * `"auto"`（默认）：`locator.current_map()` 的 `/map` 四项指纹反查，唯一命中才认；
+      * `"setting"`：用 `settings.current_map`（一期语义="下次启导航用哪张图"）——
+        给"指纹识别不可用但现场自己知道在跑哪张图"留一条手动阀。
+    结果缓存 `_MAP_CACHE_S` 秒：`current_map()` 会列地图 + 逐图读元数据，`MAPS_IO=ssh` 下很贵。
+    """
+    st = _settings()
+    now = _now_ts()
+    if now - _map_cache["at"] < _MAP_CACHE_S:
+        return _map_cache["name"], _map_cache["reason"]
+
+    name, reason = "", ""
+    if str(st.get("ward_map_source") or "auto") == "setting":
+        name = str(st.get("current_map") or "").strip()
+        if not name:
+            reason = "no_current_map"
+    else:
+        try:
+            got = locator.current_map()
+        except Exception:               # noqa: BLE001  识别失败=不可用，绝不炸 tick
+            got = {}
+        if got.get("source") == "map_topic" and got.get("name"):
+            name = str(got["name"])
+        else:
+            reason = "map_unknown"
+    _map_cache.update({"name": name, "at": now, "reason": reason})
+    return name, reason
+
+
+def _zone_hit(ward: dict, map_name: str, pose: dict) -> bool:
+    """当前位姿是否落在这间病房关联的区域里（几何判定在 zonegeo）。
+
+    降级（fail-safe）：病房没关联区域 / 关联的是别的地图 / 缓存里查不到该区域 → False。
+    """
+    zone_uid = str(ward.get("ward_zone") or "")
+    if not zone_uid or str(ward.get("ward_map") or "") != map_name:
+        return False
+    zone = db.get_zone(zone_uid, map_name)
+    if not zone:
+        return False
+    return zonegeo.zone_hit(zone, float(pose["x"]), float(pose["y"]))
+
+
+def current_ward() -> str:
+    """当前病房（集体层主体）的 uid；空串 = 还不知道在哪个病房。"""
+    return _shared.get("ward_uid") or ""
+
+
+def manual_set_ward(ward_uid: str) -> dict:
+    """手动切病房：带 `manual_until`，期间位置判定不覆盖（D18）。
+
+    只在 kiosk 为集体层且未锁定时改会话主体——正在老人私聊时手动切病房只更新背景变量。
+    """
+    _shared["ward_uid"] = ward_uid
+    _shared["manual_until"] = _now_ts() + float(_settings().get("manual_override_sec", 600))
+    s = _slot("kiosk")
+    if s["role"] == "ward" and not _shared["locked"]:
+        _shared["uid"] = ward_uid
+    audit.log("ward_change", source="manual", ward=ward_uid)
+    bus.publish("ward_changed", uid=ward_uid, action="manual")
+    return get_principal("kiosk")
+
+
+def autoswitch_state() -> dict:
+    """给前端/诊断用：位置自动切换**当前为什么没生效**。"""
+    st = _settings()
+    if not st.get("ward_autoswitch_enabled", True):
+        return {"enabled": False, "reason": "disabled"}
+    if locator.get_pose() is None:
+        return {"enabled": False, "reason": "no_pose"}
+    if _now_ts() < (_shared.get("manual_until") or 0.0):
+        return {"enabled": False, "reason": "manual_override"}
+    name, reason = running_map_name()
+    if not name:
+        return {"enabled": False, "reason": reason or "map_unknown"}
+    if _slot("kiosk")["role"] == "elder" or _shared["locked"]:
+        return {"enabled": True, "reason": "holding_session"}
+    return {"enabled": True, "reason": "active"}
+
+
+def _ward_tick() -> None:
+    """一次位置判定（由 tick() 每秒调用一次）。"""
+    st = _settings()
+    if not st.get("ward_autoswitch_enabled", True):
+        return
+    if _now_ts() < (_shared.get("manual_until") or 0.0):
+        return
+    pose = locator.get_pose()
+    if pose is None or pose.get("x") is None:
+        _candidate.clear()
+        return
+    map_name, _why = running_map_name()
+    if not map_name:
+        _candidate.clear()
+        return
+
+    hit = ""
+    for w in db.list_wards():               # 只读本地缓存（不走 maptags，见模块头性能约束）
+        if _zone_hit(w, map_name, pose):
+            hit = w["uid"]
+            break
+    if not hit:                             # 离开病房区（走廊/未知区域）→ 不切
+        _candidate.clear()
+        return
+
+    _candidate[hit] = _candidate.get(hit, 0) + 1
+    for k in list(_candidate):
+        if k != hit:
+            _candidate.pop(k, None)         # 换目标就重新数
+    debounce = max(1, int(st.get("ward_switch_debounce", 3)))
+    if _candidate[hit] < debounce or _shared.get("ward_uid") == hit:
+        return
+
+    _shared["ward_uid"] = hit
+    audit.log("ward_change", source="location", ward=hit)
+    bus.publish("ward_changed", uid=hit, action="location")
+    # D18：只在集体层且未锁定时才真正改会话主体（正在私聊/已锁定 → 只更新背景变量）
+    s = _slot("kiosk")
+    if s["role"] == "ward" and not _shared["locked"]:
+        _shared["uid"] = hit
+        s["source"] = "location"
+
+
+def tick() -> None:
+    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。"""
+    for slot in SLOTS:
+        _expire_if_needed(slot)
+    _ward_tick()
