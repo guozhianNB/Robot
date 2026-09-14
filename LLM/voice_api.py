@@ -59,12 +59,17 @@ def _ensure_schema() -> None:
     记忆化：生产上 lifespan 已建过表，这里只是一次字符串比较。
 
     记忆化的洞：库文件**被删/被换**（路径没变）时，短路会让这个端点一直 500。
-    故 `sqlite3.OperationalError` 时清掉记忆化**重试一次**；仍失败就抛出去
+    故命中缓存时也要做一次**廉价探活**（`db.get_profile_kind()` 读一下 `profiles` 表）：
+    表在就返回，读失败说明库文件被删/被换 → 清掉记忆化重试一次；仍失败就抛出去
     （不吞真实错误——比如目录不可写，重试也没用，必须让调用方看到）。
     """
     global _schema_path
     if _schema_path == db.DB_PATH:
-        return
+        try:
+            db.get_profile_kind("__schema_probe__")     # 廉价探活：表在就返回 ""
+            return
+        except Exception:                              # noqa: BLE001  库文件被删/换 → 失效重试
+            _schema_path = None
     try:
         db.init_db()
     except sqlite3.OperationalError:
@@ -80,11 +85,21 @@ def set_session_uid(uid: str, locked: bool) -> dict:
     现有调用点（server 路由 / worker）不变；同时同步 worker 的锁定用户。
     语音不可用时仍返回 ok —— 会话状态独立于语音能力。
 
+    **解锁语义（规格 §4.5）**：`locked=False` = 回集体层、恢复声纹自动判定，
+    故**忽略传进来的 uid**（老前端发的是 `setSessionUser(uid ?? "elder_001", false)`；
+    若把那个兜底 uid 钉成主体，`_holds_session()` 恒 False，位置自动切换直接停摆）。
+    这里做后端 fail-safe，不依赖前端先改。
+
     返回体在 principal 之上补 `ok`：老接口形状（`{"ok": True, "uid", "locked"}`）
     有既有调用点与用例依赖，不能少。"""
-    from . import session as session_mod
+    from . import session as role_session
     _ensure_schema()
-    res = dict(session_mod.set_subject(uid, bool(locked), slot="kiosk", source="manual"))
+    if locked:
+        res = dict(role_session.set_subject(uid, True, slot="kiosk", source="manual"))
+    else:
+        # 解锁 = 回到集体层、恢复声纹自动判定（规格 §4.5）：不许把传进来的 uid 钉成主体
+        res = dict(role_session.set_subject(role_session.current_ward() or "", False,
+                                            slot="kiosk", source="manual"))
     res["ok"] = True
     if _worker is not None:
         try:

@@ -342,7 +342,9 @@ class VoiceWorker(threading.Thread):
         """按当前角色决定这次说话算谁说的（规格 §4.3）。
 
         * kiosk 槽是 admin → 按 admin 走，声纹认到谁都不降权（D8）；
-        * 否则：认到老人 → 切到该老人（elder）；没认出来 → 留在集体层（当前病房）。
+        * 认出老人 → 切到该老人（elder，source=voiceprint）；
+        * **没认出来 → 主体不动**（集体层已由位置/手动维持，这里不许回写、更不许把旧主体
+          当成"刚认出来的"——那会把位置自动切换的结果回退掉）。
 
         注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
         语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
@@ -357,10 +359,10 @@ class VoiceWorker(threading.Thread):
             principal = role_session.get_principal("kiosk")
             if principal["role"] == "admin":
                 return
-            uid = recognized_uid or principal["uid"] or role_session.current_ward()
-            if uid:
-                role_session.set_subject(uid, bool(self.locked_uid), slot="kiosk",
-                                         source="voiceprint")
+            if not recognized_uid:
+                return
+            role_session.set_subject(recognized_uid, bool(self.locked_uid), slot="kiosk",
+                                     source="voiceprint")
         except Exception as e:              # noqa: BLE001  DB/会话层异常不许掐掉整句应答
             audit.log("voice_error", action="role_subject", uid=recognized_uid, error=str(e))
 
@@ -369,7 +371,10 @@ class VoiceWorker(threading.Thread):
         audit.log("voice_asr", text=text[:200])
 
         vote = self.fusion.resolve(seg)
-        recognized = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
+        # 只认**真正的识别结果**：`effective_uid()` 在没认出来时会回落到 `current_uid`
+        # （内存里的旧主体），那是"本轮用谁应答"的兜底，不是"认出谁了"。把它当识别结果
+        # 喂给 `_apply_role_subject` 会把位置自动切换（D17/D18）刚切好的主体回退掉。
+        candidate = vote.candidate_uid or self.locked_uid
         # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
         if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
             audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
@@ -378,14 +383,28 @@ class VoiceWorker(threading.Thread):
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
         from LLM import session as role_session
-        prev = role_session.get_principal("kiosk")
-        self._apply_role_subject(recognized)                 # 谁说的：按角色决定（含 D8）
-        principal = role_session.get_principal("kiosk")
+        # 读会话层（= 读库）异常（`database is locked` 等）不许从 try 之外抛穿到 `run()` 的
+        # except —— 那会 `_reconnect()` 掉这一整句：没有应答、没有 TTS。出问题只记审计，
+        # 并用"上一次已知主体"（取 prev 失败时用空主体）继续把这一句答完。
+        empty_principal = {"uid": "", "locked": False, "source": "", "ward_uid": "",
+                           "role": "ward"}
+        try:
+            prev = role_session.get_principal("kiosk")
+        except Exception as e:              # noqa: BLE001
+            audit.log("voice_error", action="role_principal", step="prev", error=str(e))
+            prev = empty_principal
+        self._apply_role_subject(candidate)                  # 谁说的：按角色决定（含 D8）
+        try:
+            principal = role_session.get_principal("kiosk")
+        except Exception as e:              # noqa: BLE001
+            audit.log("voice_error", action="role_principal", step="principal", error=str(e))
+            principal = prev
         # 只把**权威主体**写回内存态；兜底常量只用于本轮应答 uid。
         # 反例（本行曾写错）：无条件 `self.current_uid = chat_uid` 会把 "elder_001"
-        # 回灌成内存态，而 `id_mod.effective_uid()` 在未识别时返回 current_uid ——
-        # 第二轮就被当成"声纹认出了 elder_001"：冒充演示档案、把集体层对话沉淀进
-        # 该老人的记忆、`session._holds_session()` 变 False 让位置自动切换停摆。
+        # 回灌成内存态——那既是"内存里有个假主体"，也是当年"未识别被当成认出了
+        # elder_001"的源头（`_apply_role_subject` 曾吃 `effective_uid()` 在本轮无候选时
+        # 回落 `current_uid` 的结果）：冒充演示档案、把集体层对话沉淀进该老人的记忆、
+        # `session._holds_session()` 变 False 让位置自动切换停摆。
         subject = principal["uid"] or principal["ward_uid"]
         if subject:
             self.current_uid = subject

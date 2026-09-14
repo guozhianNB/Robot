@@ -151,8 +151,16 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
     对话当成老人的话沉淀下去。`/api/chat` 路由由任务 11 显式传 `principal["role"]`。"""
     if role is None:
         # 语音等老调用点没传角色：按当前主体现取（会话层是角色的唯一权威，R1）
-        from . import session as role_session
-        role = role_session.get_principal("kiosk")["role"]
+        # 取不到（`database is locked` 等读库异常）**不许抛出**：本函数跑在线程池里，
+        # 异常会被 future 吞成静默失败 → 整条 post-chat 管线（记忆沉淀/摘要）一起丢。
+        # fail-closed：取不到就按最保守的集体层（ward）处理——宁可不沉淀。
+        try:
+            from . import session as role_session
+            role = role_session.get_principal("kiosk")["role"]
+        except Exception as e:
+            from . import log as audit
+            audit.log("memory_change", action="role_lookup_failed", uid=uid, error=str(e))
+            role = "ward"
     settings = db.get_settings()
     try:
         rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)

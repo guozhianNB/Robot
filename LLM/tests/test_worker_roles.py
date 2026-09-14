@@ -24,6 +24,9 @@ def d():
 
 
 def test_voice_api_session_roundtrips_through_session(d):
+    # 先有"当前病房"（位置自动切换/手动切病房后的常态）：解锁 = 回集体层（§4.5），
+    # 主体取当前病房而不是传进来的 uid —— 见 test_unlock_returns_to_collective_layer
+    session.set_subject("ward_101", False, slot="kiosk", source="location")
     res = voice_api.set_session_uid("ward_101", False)
     assert res["uid"] == "ward_101" and res["role"] == "ward"
     got = voice_api.get_session_uid()
@@ -126,3 +129,22 @@ def test_role_subject_degrades_on_db_error(d, monkeypatch):
         session.set_subject = original
     assert any(ev == "voice_error" for ev, _ in seen)          # 出问题只记审计
     assert session.get_principal("kiosk")["uid"] == ""         # 退回上一主体（未改内存态）
+
+
+def test_unidentified_speech_does_not_revert_subject(d):
+    """**回归**：没认出人来时，不许把"旧主体"当声纹结果回写（否则位置自动切换会被回退）。"""
+    from LLM.voice import worker as worker_mod
+    session.set_subject("ward_102", slot="kiosk")          # 位置自动切换后的主体
+    w = worker_mod.VoiceWorker(stream_fn=lambda uid, text: iter(()))
+    w.current_uid = "ward_101"                             # 内存里的旧主体
+    w._apply_role_subject(None)                            # 没认出来
+    assert session.get_principal("kiosk")["uid"] == "ward_102"   # 主体不动
+    assert session.get_principal("kiosk")["source"] != "voiceprint"
+
+
+def test_unlock_returns_to_collective_layer(d):
+    """**回归**：解锁 = 回集体层（不许把传进来的 uid 钉成主体，否则位置自动切换停摆）。"""
+    session.set_subject("ward_101", slot="kiosk")
+    res = voice_api.set_session_uid("elder_001", False)    # 老前端会传兜底 uid
+    assert res["locked"] is False
+    assert res["role"] == "ward" and res["uid"] == "ward_101"
