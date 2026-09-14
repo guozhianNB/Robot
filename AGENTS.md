@@ -108,3 +108,5 @@ docs/      需求/教程/接口契约/开发日志
 - `requirement.txt` 声明的语音依赖（numpy / sherpa-onnx / sounddevice / modelscope 等）在目标环境可能未装齐：新依赖记得固化进去，且后端必须容忍缺失、降级运行（见「系统稳健性」）。
 - 后端 run 用包方式 `LLM.server:app`（`server.py` 里路径基于 `Path(__file__).parent.parent` 定位 `.env`）。
 - **前端已在 2026-08-27 从 `UI/` 单文件迁至 `frontend/`**：改前端先看 `docs/superpowers/specs/2026-08-27-frontend-multi-end-design.md` 与 shared 的 events.ts；`UI(old)/`（git 跟踪）为旧实现参考；根目录 `UI/`、`Front/` 是空残留目录，勿当现役前端。
+- **后端运行位置（2026-09-14 起）**：LLM 后端**默认跑在 PC 上**（板卡 RDK X5 性能有限，重活不下放板卡）。地图文件的真相仍在板卡 `ros2_car/maps/`，经 `MAPS_IO=ssh` 读写；板卡上跑后端时用 `MAPS_IO=local`。相关规格：`docs/superpowers/specs/2026-09-14-mapeditor-pixel-edit-design.md`。
+- **地图像素修图入口**：`/mapeditor/pixel-editor.html`（第三期，改造自 GyroPalm/ROS-SLAM-Map-Editor，MIT）。保存前自动备份到 `maps/.backup/`（故 `GET /api/map/list` 必须排除该目录）；改完地图**必须重启导航才生效**（`~/tools/nav_screen.sh nav <地图名>`）。

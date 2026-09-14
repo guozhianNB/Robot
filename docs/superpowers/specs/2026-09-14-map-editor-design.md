@@ -4,7 +4,22 @@
 > **状态：** 设计定稿待评审（未开工）。
 > **日期：** 2026-09-14
 > **用户决策（2026-09-14，原话）：** 「后续再设计第三个前端"地图编辑器"用于编辑地图文件和位置划线」→ 后改为「那本轮还是做个地图编辑器吧。」
-> **顺序：** 本文档是**第一期**；第二期《语音"指哪到哪"》见 `2026-09-14-robot-navigate-by-name-design.md`，它复用本文档的 `destinations` 表与位姿源。
+> **顺序：** 本文档是**第一期**；第二期《语音"指哪到哪"》见 `2026-09-14-robot-navigate-by-name-design.md`，它复用本文档的 `destinations` 表与位姿源；第三期《像素修图加装项》见 `2026-09-14-mapeditor-pixel-edit-design.md`。
+
+---
+
+## 〇、口径变更与加装项（2026-09-14 追加，开工前必读）
+
+> 本节是**唯一的口径台账**：正文未逐处改写，凡与本节冲突的以本节为准。
+
+| # | 变更 | 影响与去向 |
+|---|---|---|
+| 1 | 本文档**尚未开工**；其「像素级修图」已单独立为**第三期** `2026-09-14-mapeditor-pixel-edit-design.md`（原文「若将来确实要，作为独立加装项」已兑现） | §2.2 该行已就地标注 |
+| 2 | **后端主跑在 PC 上**（用户 2026-09-14：「我想了想，还是把地图工作放到PC上吧，因为板卡性能不是很好」）。`MAPS_IO` 默认 `ssh`，地图文件经 SSH 读写板卡 `ros2_car/maps/`；`local`（后端跑板卡）退为备用 | 影响 §3 部署口径、§5.1 地图文件接口、§7.4 的算力落点（PGM 解码 / PNG 编码 / 未知率统计现在都归 PC，板卡只留串口与 ROS 本职） |
+| 3 | 新增前端静态资源与接口（第三期） | `frontend/packages/mapeditor/public/{pixel-editor.html, pixel-netio.js, vendor/}`；`POST /api/map/{name}/save`、`GET /api/mapeditor/io`、`POST /api/mapeditor/io/test` |
+| 4 | `GET /api/map/list` 必须**排除 `maps/.backup/`**（第三期保存前的自动备份目录），否则备份会被当成地图列出来 | 影响 §5.1 |
+| 5 | **✅ 已拍板（2026-09-14，用户原话：「病房区域按 zones 表（多边形、唯一真相）走」）**：病房区域几何一律归本文档 `zones` 表（`kind='ward'`，多边形/矩形、米坐标），`profiles` **只存 `zone_id` 引用、不复制几何**。《分层用户体系》原有的 `profiles.zone_json`（存圆）及其 P0 实现计划已同步改写为 `zone_id` + `zones` 最小集；其便捷入口「记录当前房间为病房区域」改为以当前位姿为圆心**采样 16 边形**写入本文档的 `zones` 表 | 已回填《2026-09-14-layered-user-roles-design.md》与其 P0 计划 |
+| 6 | 第三期把**像素修图默认「另存为新图」**（`<原名>_edited`），而 `destinations`/`zones` 按 `map_name` 绑定、不随新图复制 | 先用第三期修图存新图、再在新图上划区域 → 原图上的区域在新图里不存在。**建议的作业顺序：先在最终要用的那张图上划区域，或修图时改用「覆盖原图」（有自动备份）。** |
 
 ---
 
@@ -44,7 +59,7 @@
 
 | 不做 | 理由 |
 |---|---|
-| **像素级修图**（擦噪点 / 补墙 / 裁剪 / 改分辨率后重存） | 三张图未知率 60.7%~85.1% 是"**没扫到**"而不是"**画错了**"，修图救不了；且改 `resolution`/`origin` 会让本图已标地点全部失效。重扫一张远比修图有效。若将来确实要，作为独立加装项 |
+| **像素级修图**（擦噪点 / 补墙 / 裁剪 / 改分辨率后重存） | 三张图未知率 60.7%~85.1% 是"**没扫到**"而不是"**画错了**"，修图救不了；且改 `resolution`/`origin` 会让本图已标地点全部失效。重扫一张远比修图有效。~~若将来确实要，作为独立加装项~~ → **2026-09-14 用户改变主意，已由第三期加装项《2026-09-14-mapeditor-pixel-edit-design.md》实现；该加装项只改像素、不动 `resolution`/`origin`，故"改元数据使地点失效"这一顾虑不适用。** |
 | 上传地图文件 | 板卡上 `scp` 或 `nav_screen.sh save` 更实际；上传要处理任意文件与配对校验，收益低 |
 | 从 SLAM 直接存图 | 已有 `nav_screen.sh save <前缀>`，编辑器只给命令提示 |
 | 后端远程启停 Nav2 / 建图 | 启停一律走 `nav_screen.sh`（串口独占，手动起第二份会抢 `/dev/ttyACM0` 并让雷达驱动崩）；后端 SSH 去杀/起 screen 会话风险大 |
@@ -65,7 +80,7 @@
 ```
 
 - 第三个前端包：`frontend/packages/mapeditor`，dev `:5175`，生产 `base: "/mapeditor/"`，由 `server.py` 静态挂载到 `/mapeditor`（与 admin/kiosk 同一套做法）。
-- 地图文件真相在**板卡** `ros2_car/maps/`（`conf.MAPS_DIR = BASE_DIR / "ros2_car" / "maps"`），后端在板卡上跑时自然指向正确目录；Windows 端用仓库里的副本开发。
+- 地图文件真相在**板卡** `ros2_car/maps/`（`conf.MAPS_DIR = BASE_DIR / "ros2_car" / "maps"`）。**2026-09-14 口径变更（详见 §〇 第 2 条）：后端主跑在 PC 上、`MAPS_IO` 默认 `ssh`，地图文件经 SSH 读写；仓库里的 `ros2_car/maps/` 只作离线样本与开发期的 `MAPS_DIR` 替代，不再是开发期真相。**
 - 位姿真相在 ROS 侧；后端只经 rosbridge 只读订阅，**不引入 rclpy 依赖**（Windows 开发机无 ROS 也能跑）。
 
 ---
@@ -112,7 +127,7 @@ CREATE TABLE IF NOT EXISTS zones (
 
 **为什么几何存米坐标而不是像素：** 像素坐标会随 `resolution` 变化而失效；米坐标只与地图 `origin`/`resolution` 绑定，改分辨率时能统一换算或统一告警（§7.2）。区域支持多层级（`parent_id`），因为陪护场景是"2 号病房 / 2 号病房 13 号床"两级。
 
-> 与《分层用户体系》规格 D17 的关系：D17 计划用 `profiles.zone_json` 承载病房范围。本设计**以 `zones` 表为此类几何的唯一真相**，`profiles` 若需要关联只存 `zone_id` 引用，不复制几何，避免两处几何不一致（见 §10 回填项）。
+> 与《分层用户体系》规格 D17 的关系：D17 原计划用 `profiles.zone_json` 承载病房范围。本设计**以 `zones` 表为此类几何的唯一真相**，`profiles` 若需要关联只存 `zone_id` 引用，不复制几何，避免两处几何不一致（见 §10 回填项）。**2026-09-14 已按本设计拍板**：用户定「病房区域按 zones 表（多边形、唯一真相）走」，《分层用户体系》的 `zone_json` 已改为 `zone_id`。
 
 ### 4.3 设置项（`conf.DEFAULT_SETTINGS`）
 
@@ -281,7 +296,7 @@ py  = H - 1 - (y_m - origin_y) / resolution
 | 既有文档 | 回填内容 |
 |---|---|
 | `2026-09-14-layered-user-roles-design.md` §7.1 | `destinations` 增加 `map_name` / `aliases`；`goal_json` 拆成 `x/y/yaw_deg` |
-| 同上 D17 | 病房/床位几何的真相改在 `zones` 表；`profiles.zone_json` 只存 `zone_id` 引用（不复制几何） |
+| 同上 D17 | 病房/床位几何的真相改在 `zones` 表；`profiles.zone_json` 只存 `zone_id` 引用（不复制几何）**✅ 已回填（2026-09-14，用户拍板「按 zones 表走」）** |
 | `2026-08-27-frontend-multi-end-design.md` | 登记第三个前端包 `mapeditor`（dev 5175、生产 `/mapeditor`、与 admin/kiosk 并列） |
 | `ros2_car/建图与导航操作手册.md` | 补一节"地图与位置语义在哪标"（指向 `/mapeditor`）+ 换图命令提示 |
 

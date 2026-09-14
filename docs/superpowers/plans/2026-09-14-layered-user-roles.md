@@ -5,7 +5,7 @@
 
 **目标：** 让系统同时存在**管理层 / 集体层 / 老人层**三个层级，各自有独立提示词与权限；集体层以"病房用户"落地并**按小车位置自动切换**；管理员口令可改、可关。
 
-**架构：** 新增 `LLM/session.py`（双槽会话主体 + 角色推导 + 当前病房自动切换）与 `LLM/policy.py`（角色策略包）；`profiles` 表扩 `kind/ward_id/zone_json` 承载病房用户；位姿由新增 `LLM/locator.py` 经 **rosbridge（websocket，非 MCP）** 读取并**可注入假位姿**以便无 ROS 环境测试；提示词在 `LLM/prompt.md`（共用 base）之上拼 `LLM/prompt/<role>.md`。
+**架构：** 新增 `LLM/session.py`（双槽会话主体 + 角色推导 + 当前病房自动切换）与 `LLM/policy.py`（角色策略包）；`profiles` 表扩 `kind/ward_id/zone_id` 承载病房用户（病房区域几何归 `zones` 表——一期《地图编辑器》规格 `docs/superpowers/specs/2026-09-14-map-editor-design.md` §4.2 定义其唯一真相，`profiles` 只存 `zone_id` 引用、不复制几何）；位姿由新增 `LLM/locator.py` 经 **rosbridge（websocket，非 MCP）** 读取并**可注入假位姿**以便无 ROS 环境测试；提示词在 `LLM/prompt.md`（共用 base）之上拼 `LLM/prompt/<role>.md`。
 
 **技术栈：** Python 3 / FastAPI / SQLite / pytest / websocket-client（已有依赖）；前端 Vue3 + Vite + TS（pnpm monorepo）。
 
@@ -57,13 +57,47 @@ def test_existing_profile_defaults_to_elder(d):
     assert d.get_profile("elder_001")["ward_id"] == ""
 
 
-def test_upsert_ward_and_list_wards(d):
-    d.upsert_ward("ward_101", name="101 病房",
-                  zone={"frame": "map", "type": "circle", "x": 1.0, "y": 2.0, "r": 3.0})
+def test_upsert_ward_with_zone_id(d):
+    zid = d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
+                     polygon_json=[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+    d.upsert_ward("ward_101", name="101 病房", zone_id=zid)
     wards = d.list_profiles(kind="ward")
     assert [w["uid"] for w in wards] == ["ward_101"]
     assert d.get_profile_kind("ward_101") == "ward"
-    assert d.get_zone("ward_101")["r"] == 3.0
+    assert d.get_ward_zone("ward_101")["id"] == zid      # 经 profiles.zone_id 反查 zones
+    assert d.get_zone(zid)["name"] == "101"              # 按主键查 zones
+    assert d.list_wards_with_zone() == [
+        {"uid": "ward_101", "name": "101 病房", "zone_id": zid, "zone": d.get_zone(zid)}]
+
+
+def test_ward_without_zone_id_returns_none(d):
+    d.upsert_ward("ward_102", name="102 病房")           # zone_id 默认 0 = 未关联
+    assert d.get_profile("ward_102")["zone_id"] == 0
+    assert d.get_ward_zone("ward_102") is None
+    assert d.list_wards_with_zone() == []
+
+
+def test_zone_contains_point_hits_polygon(d):
+    d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
+               polygon_json=[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+    assert [z["name"] for z in d.zone_contains_point("101", 1.0, 1.0, kind="ward")] == ["101"]
+    assert d.zone_contains_point("101", 9.0, 9.0, kind="ward") == []
+
+
+def test_zone_contains_point_uses_bbox_for_rect(d):
+    d.add_zone(map_name="101", name="101", kind="ward", shape="rect",
+               polygon_json=[[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]])
+    assert [z["name"] for z in d.zone_contains_point("101", 3.9, 1.9, kind="ward")] == ["101"]
+    assert d.zone_contains_point("101", 5.0, 1.0, kind="ward") == []
+
+
+def test_zone_lookup_degrades_safely(d):
+    assert d.list_zones(map_name="不存在的地图") == []                  # 无区域 → []
+    assert d.zone_contains_point("101", 0.0, 0.0, kind="ward") == []    # 还没建任何区域 → []
+    d.add_zone(map_name="101", name="走廊", kind="other",
+               polygon_json=[[0.0, 0.0], [9.0, 0.0], [9.0, 9.0], [0.0, 9.0]])
+    assert d.zone_contains_point("101", 1.0, 1.0, kind="ward") == []    # kind 过滤：other 不算病房
+    assert d.get_zone(99999) is None                                    # 主键不存在 → None
 
 
 def test_set_elder_ward(d):
@@ -99,12 +133,37 @@ def test_admin_password_hash_roundtrip(d):
             _ensure_columns(conn, "profiles", {
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
-                # 分层用户体系：kind=elder|ward；ward_id=老人所属病房；zone_json=病房地图区域
+                # 分层用户体系：kind=elder|ward；ward_id=老人所属病房；zone_id=关联的 zones.id（0=未关联）
                 "kind": "kind TEXT DEFAULT 'elder'",
                 "ward_id": "ward_id TEXT DEFAULT ''",
-                "zone_json": "zone_json TEXT DEFAULT ''",
+                "zone_id": "zone_id INTEGER DEFAULT 0",
             })
 ```
+
+**注意：`profiles` 不保存病房区域几何。** 病房区域几何的**唯一真相**是 `zones` 表（一期《地图编辑器》规格 §4.2），`profiles` 只存 `zone_id` 引用，绝不复制几何。P0 尚未执行、`profiles` 目前连 `kind`/`ward_id` 都没有（已 grep 确认），所以**没有迁移负担**，直接按新设计建列即可，**不要**写"列改名迁移"。
+
+在 `init_db()` 的建表 SQL（`SCHEMA`）里新增 `zones` 表——照抄一期《地图编辑器》规格 §4.2 的 DDL，字段不改：
+
+```sql
+CREATE TABLE IF NOT EXISTS zones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  map_name TEXT NOT NULL,               -- 地点绑定的地图名（三张图坐标系不通用，必须绑）
+  name TEXT NOT NULL,                   -- 标准名，如 "101"
+  kind TEXT DEFAULT 'room',             -- room | ward | bed | other
+  shape TEXT DEFAULT 'polygon',         -- polygon | rect
+  polygon_json TEXT DEFAULT '[]',       -- [[x,y], ...] 米坐标（世界系，非像素）
+  parent_id INTEGER DEFAULT 0,          -- 上级区域（病房→床位）；0=无
+  note TEXT DEFAULT '',
+  created_at TEXT, updated_at TEXT,
+  UNIQUE(map_name, name)
+);
+```
+
+> **与一期《地图编辑器》任务 1 的依赖关系：** `zones` 表原属一期任务 1，但 P0 可能先开工，所以 P0 的 db 任务里**自带这份最小 `zones` 支持**。它与一期任务 1 是**同一份实现**：先落地者建表，后落地者复用（`CREATE TABLE IF NOT EXISTS` 幂等）；与 `locator.py`/`mapserver.py` 采用同一约定——**以先开工者为准，后开工者复用**，不要各写一套。
+>
+> **病房区域的定义：** 病房区域 = `zones` 表里 `map_name=<当前地图>` + `kind='ward'` + `name=<病房名>` 的一条记录。「小车在哪个病房」= 取 `zones` 中 `kind='ward'` 的多边形做**点在多边形内**判定；`shape='rect'` 时用其 `polygon_json` 的外接矩形判定。
+>
+> **降级（fail-safe，沿用 D17 口径）：** `zones` 表不存在、该地图没有 `kind='ward'` 区域、或病房的 `zone_id=0` → **不自动切换**，保持手动选病房，绝不误判、绝不阻塞对话（下列函数与 `session._zone_hit` 均按此实现）。
 
 在 `settings` 区块前新增（`profiles` 区块的 `list_profiles` 需支持 `kind` 过滤）：
 
@@ -139,9 +198,9 @@ def get_profile_kind(uid: str) -> str:
         conn.close()
 
 
-def upsert_ward(uid: str, name: str = "", zone: dict | None = None) -> dict:
-    upsert_profile(uid, name=name, kind="ward",
-                   zone_json=json.dumps(zone or {}, ensure_ascii=False))
+def upsert_ward(uid: str, name: str = "", zone_id: int = 0) -> dict:
+    """新建/更新病房 profile；病房几何不在这里存，只存关联的 zones.id（唯一真相在 zones）。"""
+    upsert_profile(uid, name=name, kind="ward", zone_id=int(zone_id or 0))
     return get_profile(uid) or {}
 
 
@@ -156,21 +215,131 @@ def set_profile_ward(uid: str, ward_id: str) -> None:
             conn.close()
 
 
-def get_zone(ward_uid: str) -> dict:
-    p = get_profile(ward_uid)
-    return json.loads(p.get("zone_json") or "{}") if p else {}
+# ---- 病房区域最小集（zones 表 = 唯一真相；与一期《地图编辑器》任务 1 同一份实现）----
+# 依赖说明：一期任务 1 也会实现这些函数，先落地者建表、后落地者复用
+# （CREATE TABLE IF NOT EXISTS 幂等）；与 locator.py / mapserver.py 同一约定。
+# 降级（D17 fail-safe）：表不存在 / 无 kind='ward' 区域 / zone_id=0 → 一律返回空，绝不抛异常。
+
+def add_zone(map_name: str, name: str, kind: str = "room", shape: str = "polygon",
+             polygon_json: list | None = None, parent_id: int = 0, note: str = "") -> int:
+    """写入一条区域记录并返回其 id；同 (map_name, name) 已存在则覆盖几何（幂等，适配 UNIQUE）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            ts = now_iso()
+            cur = conn.execute(
+                "INSERT INTO zones (map_name,name,kind,shape,polygon_json,parent_id,note,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(map_name, name) DO UPDATE SET kind=excluded.kind, "
+                "shape=excluded.shape, polygon_json=excluded.polygon_json, "
+                "parent_id=excluded.parent_id, note=excluded.note, updated_at=excluded.updated_at",
+                (map_name, name, kind, shape,
+                 json.dumps(polygon_json or [], ensure_ascii=False),
+                 int(parent_id or 0), note or "", ts, ts))
+            conn.commit()
+            if cur.lastrowid:
+                return int(cur.lastrowid)
+            row = conn.execute("SELECT id FROM zones WHERE map_name=? AND name=?",
+                               (map_name, name)).fetchone()
+            return int(row["id"]) if row else 0
+        finally:
+            conn.close()
+
+
+def get_zone(zone_id: int) -> dict | None:
+    """按主键查 zones 行（唯一真相）；不存在或表未建 → None。"""
+    try:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM zones WHERE id=?", (int(zone_id or 0),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:                        # 表不存在等 → 降级
+        return None
+
+
+def list_zones(map_name: str | None = None, kind: str | None = None) -> list[dict]:
+    """按地图名 / 类型列出区域；表未建 → []（降级）。"""
+    conds, args = [], []
+    if map_name:
+        conds.append("map_name=?")
+        args.append(map_name)
+    if kind:
+        conds.append("kind=?")
+        args.append(kind)
+    sql = "SELECT * FROM zones"
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY id"
+    try:
+        conn = _conn()
+        try:
+            return [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
+        finally:
+            conn.close()
+    except Exception:                        # 表不存在等 → 降级
+        return []
+
+
+def _point_in_polygon(x: float, y: float, poly: list) -> bool:
+    """射线法：点是否在多边形内（poly=[[x,y], ...] 米坐标）。"""
+    inside, n = False, len(poly)
+    for i in range(n):
+        x1, y1 = float(poly[i][0]), float(poly[i][1])
+        x2, y2 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
+        if (y1 > y) != (y2 > y):
+            if x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+
+def zone_contains_point(map_name: str, x: float, y: float, kind: str | None = None) -> list[dict]:
+    """点落在哪些区域里：polygon 用射线法；rect 用 polygon_json 的**外接矩形**。
+
+    降级（D17）：表不存在 / 该地图没有区域 / polygon_json 为空 → []，
+    调用方据此保持手动选病房，绝不误判、绝不阻塞对话。
+    """
+    out = []
+    for z in list_zones(map_name=map_name, kind=kind):
+        try:
+            poly = json.loads(z.get("polygon_json") or "[]")
+        except (TypeError, ValueError):
+            poly = []
+        if not poly:
+            continue
+        if str(z.get("shape") or "polygon") == "rect":
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+            if min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys):
+                out.append(z)
+        elif _point_in_polygon(x, y, poly):
+            out.append(z)
+    return out
+
+
+def get_ward_zone(ward_uid: str) -> dict | None:
+    """取该病房 profile 的 zone_id，再查 zones 表（病房几何的唯一真相在 zones）。
+
+    zone_id=0（未关联）或 zones 行缺失 → None，调用方按"拿不到病房区域"降级处理。
+    """
+    p = get_profile(ward_uid) or {}
+    zid = int(p.get("zone_id") or 0)
+    return get_zone(zid) if zid else None
 
 
 def list_wards_with_zone() -> list[dict]:
+    """列出**已关联区域**的病房：{"uid","name","zone_id","zone"}；未关联的病房不返回。"""
     out = []
     for w in list_profiles(kind="ward"):
-        zone = json.loads(w.get("zone_json") or "{}")
+        zid = int(w.get("zone_id") or 0)
+        zone = get_zone(zid) if zid else None
         if zone:
-            out.append({"uid": w["uid"], "name": w.get("name", ""), "zone": zone})
+            out.append({"uid": w["uid"], "name": w.get("name", ""), "zone_id": zid, "zone": zone})
     return out
 ```
 
-`upsert_profile` 签名追加 `kind="elder"`、`zone_json=""` 两个参数，并在 INSERT/UPDATE 的列与值里带上（`kind` 用 `excluded.kind`，注意 `ON CONFLICT` 更新时**不要**覆盖已有 kind——用 `kind=COALESCE(profiles.kind, excluded.kind)`）。
+`upsert_profile` 签名追加 `kind="elder"`、`zone_id=0` 两个参数，并在 INSERT/UPDATE 的列与值里带上（`kind` 用 `excluded.kind`，注意 `ON CONFLICT` 更新时**不要**覆盖已有 kind——用 `kind=COALESCE(profiles.kind, excluded.kind)`）。
 
 管理员口令（放在 `settings` 区块末尾，**不走 `set_settings`**——它只接受 `DEFAULT_SETTINGS|TOOL_DEFAULTS` 的白名单 key）：
 
@@ -240,14 +409,14 @@ def set_admin_auth_required(required: bool) -> None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_db.py -q`
-预期：5 passed
+预期：9 passed
 
 - [ ] **步骤 5：跑全量回归 + Commit**
 
 ```bash
 .venv\Scripts\python.exe -m pytest LLM/tests -q
 git add LLM/db.py LLM/tests/test_ward_db.py
-git commit -m "feat(llm): profiles 扩 kind/ward_id/zone_json + 病房与管理员口令数据层"
+git commit -m "feat(llm): profiles 扩 kind/ward_id/zone_id + zones 表最小集 + 病房与管理员口令数据层"
 ```
 
 ---
@@ -274,6 +443,8 @@ def test_role_settings_have_defaults():
     assert DEFAULT_SETTINGS["ward_zone_default_r"] == 3.0
     assert DEFAULT_SETTINGS["manual_override_sec"] == 600
     assert DEFAULT_SETTINGS["rosbridge_url"] == "ws://100.65.82.93:9090"
+    # 一期 §4.3 的同名设置项：P0 先落地则先建，一期落地后复用（不能省——病房自动切换靠它）
+    assert DEFAULT_SETTINGS["current_map"] == "my_map"
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -292,8 +463,11 @@ def test_role_settings_have_defaults():
     "ward_context_window": 10,      # 集体层上下文注入条数（老人可见本病房的这 N 条）
     "rosbridge_url": "ws://100.65.82.93:9090",  # 位置源（空=停用病房自动切换）
     "ward_switch_debounce": 3,      # 自动切病房防抖：连续 N 次 tick 同病房才认
-    "ward_zone_default_r": 3.0,     # 病房区域默认半径（米）
+    "ward_zone_default_r": 3.0,     # 便捷录入病房区域的默认半径（米）：以当前位姿为中心采样 16 边形
     "manual_override_sec": 600,     # 手动切病房后位置判定不覆盖的秒数
+    # 车此刻在跑哪张图（**一期 §4.3 的同名设置项**；P0 先落地则先建，一期落地后复用）。
+    # 病房位置自动切换只认"当前地图"上的病房区域；便捷录入也按它写 zones.map_name。
+    "current_map": "my_map",
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
@@ -940,8 +1114,11 @@ from LLM import db
 from LLM import locator
 from LLM import session
 
+_MAP = "101"      # 单测用的"当前地图"名：病房区域都建在这张图上；_zone_hit 只认当前地图
+
 _SETTINGS = {"rosbridge_url": "ws://x:9090", "ward_switch_debounce": 3,
-             "manual_override_sec": 600, "admin_session_ttl_s": 300}
+             "manual_override_sec": 600, "admin_session_ttl_s": 300,
+             "current_map": _MAP}
 
 
 @pytest.fixture()
@@ -951,10 +1128,12 @@ def d(monkeypatch):
     db.DB_PATH = os.path.join(tmp, "t.db")
     db.init_db()
     session.reset_for_test()
-    db.upsert_ward("ward_101", name="101", zone={"frame": "map", "type": "circle",
-                                                "x": 0.0, "y": 0.0, "r": 3.0})
-    db.upsert_ward("ward_102", name="102", zone={"frame": "map", "type": "circle",
-                                                "x": 20.0, "y": 0.0, "r": 3.0})
+    zid_101 = db.add_zone(map_name=_MAP, name="101", kind="ward", shape="polygon",
+                          polygon_json=[[-3.0, -3.0], [3.0, -3.0], [3.0, 3.0], [-3.0, 3.0]])
+    zid_102 = db.add_zone(map_name=_MAP, name="102", kind="ward", shape="polygon",
+                          polygon_json=[[17.0, -3.0], [23.0, -3.0], [23.0, 3.0], [17.0, 3.0]])
+    db.upsert_ward("ward_101", name="101", zone_id=zid_101)
+    db.upsert_ward("ward_102", name="102", zone_id=zid_102)
     db.upsert_profile("elder_101_1", name="李爷爷")
     db.set_profile_ward("elder_101_1", "ward_101")
     monkeypatch.setattr(session, "_settings", lambda: dict(_SETTINGS))
@@ -975,7 +1154,30 @@ def test_debounce_requires_repeated_ticks(d):
 
 
 def test_leaving_zone_does_not_switch(d):
-    locator.set_pose_for_test(99.0, 99.0, 0.0)     # 走廊：不在任何 zone
+    locator.set_pose_for_test(99.0, 99.0, 0.0)     # 走廊：不在任何 zone 多边形里
+    for _ in range(5):
+        session.tick()
+    assert session.get_principal("kiosk")["uid"] == "ward_101"
+
+
+def test_ward_without_zone_id_never_switches(d):
+    """病房 zone_id=0（未关联 zones）→ 位置判定不命中，保持当前病房（D17 fail-safe）。"""
+    db.upsert_ward("ward_102", name="102", zone_id=0)
+    locator.set_pose_for_test(20.0, 0.0, 0.0)      # 位姿落在 102 的多边形里，但没有 zone_id
+    for _ in range(5):
+        session.tick()
+    assert session.get_principal("kiosk")["uid"] == "ward_101"
+
+
+def test_ward_zone_on_other_map_never_switches(d):
+    """病房区域建在**别的地图**上 → 不判命中，保持当前病房。
+
+    防止"换图后位姿恰好落进旧图的病房多边形"导致静默切错病房（D17 fail-safe）。
+    """
+    zid = db.add_zone(map_name="other_map", name="102", kind="ward", shape="polygon",
+                      polygon_json=[[17.0, -3.0], [23.0, -3.0], [23.0, 3.0], [17.0, 3.0]])
+    db.upsert_ward("ward_102", name="102", zone_id=zid)
+    locator.set_pose_for_test(20.0, 0.0, 0.0)      # 数值上落在 other_map 的 102 多边形里
     for _ in range(5):
         session.tick()
     assert session.get_principal("kiosk")["uid"] == "ward_101"
@@ -1013,7 +1215,7 @@ def test_manual_override_blocks_location(d):
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py -q`
 预期：FAIL（AttributeError: module 'LLM.session' has no attribute 'tick'）
 
-- [ ] **步骤 3：实现**（追加到 `session.py`；`import math` 加到文件头）
+- [ ] **步骤 3：实现**（追加到 `session.py`；`_zone_hit` 只做判定、不需要 `math`，多边形几何计算都在 `db.zone_contains_point` 里）
 
 ```python
 from . import locator
@@ -1021,12 +1223,35 @@ from . import locator
 _candidate: dict[str, int] = {}      # ward_uid -> 连续命中次数（防抖）
 
 
+def _running_map_name() -> str:
+    """车**此刻在跑哪张图**——位置自动切换只认"当前地图"上的病房区域。
+
+    为什么不能拿病房 zone 行自己的 `map_name` 去判定：位姿是**当前地图坐标系**里的数，
+    而三张图坐标系不通用（一期 §4.2）。若按 zone 行的 map_name 判，车换到另一张图后，
+    它的位姿可能"恰好"落进旧图上的病房多边形 → **静默切错病房**（D17 明令禁止的误判）。
+
+    取值口径与便捷录入端点 `POST /api/wards/{uid}/zone` 一致，都用 `settings.current_map`；
+    一期 §5.3 的「当前地图指纹识别」（订阅 `/map` 元数据反查是哪张 yaml）落地后，
+    此处应改为**优先用识别结果**、识别不到再退回 `current_map`。
+    取不到 → `""`，调用方据此不判命中（fail-safe）。
+    """
+    return str(_settings().get("current_map") or "")
+
+
 def _zone_hit(ward_uid: str, pose: dict) -> bool:
-    z = db.get_zone(ward_uid)
-    if not z or z.get("type") != "circle":
+    """当前位姿是否落在这间病房的 zones 区域里（多边形判定；rect 用外接矩形）。
+
+    降级（D17）：病房 `zone_id=0` / 该病房区域不在**当前地图**上 / `zones` 里查不到 /
+    表不存在 / `current_map` 取不到 → False（不切病房）。
+    """
+    z = db.get_ward_zone(ward_uid)
+    if not z:
         return False
-    dx, dy = pose["x"] - float(z.get("x", 0)), pose["y"] - float(z.get("y", 0))
-    return (dx * dx + dy * dy) ** 0.5 <= float(z.get("r", 0))
+    map_name = _running_map_name()
+    if not map_name or str(z.get("map_name") or "") != map_name:
+        return False
+    hits = db.zone_contains_point(map_name, float(pose["x"]), float(pose["y"]), kind="ward")
+    return any(h["id"] == z["id"] for h in hits)
 
 
 def current_ward() -> str:
@@ -1101,7 +1326,7 @@ def tick() -> None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py -q`
-预期：5 passed
+预期：7 passed
 
 - [ ] **步骤 5：全量回归 + Commit**
 
@@ -1721,7 +1946,7 @@ class AdminAuthIn(BaseModel):
 class WardIn(BaseModel):
     uid: str
     name: str = ""
-    zone: dict | None = None
+    zone_id: int = 0            # 关联的 zones.id（0=未关联；几何的唯一真相在 zones 表）
 ```
 
 会话状态区块替换为：
@@ -1787,10 +2012,16 @@ async def admin_auth_set(body: AdminAuthIn, x_surface: str = Header(default="kio
     return res
 
 
+def _ward_zone_payload(ward_uid: str) -> dict | None:
+    """病房关联的 zones 行（唯一真相）；zone_id=0 或 zones 行缺失 → null。"""
+    return db.get_ward_zone(ward_uid)
+
+
 @app.get("/api/wards")
 async def wards_list(x_surface: str = Header(default="kiosk")):
     return {"wards": [{"uid": w["uid"], "name": w.get("name", ""),
-                       "zone": json.loads(w.get("zone_json") or "{}"),
+                       "zone_id": int(w.get("zone_id") or 0),
+                       "zone": _ward_zone_payload(w["uid"]),
                        "elders": [p["uid"] for p in db.list_profiles(kind="elder")
                                   if p.get("ward_id") == w["uid"]]}
                       for w in db.list_profiles(kind="ward")]}
@@ -1800,25 +2031,42 @@ async def wards_list(x_surface: str = Header(default="kiosk")):
 async def wards_upsert(w: WardIn, x_surface: str = Header(default="kiosk")):
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
-    db.upsert_ward(w.uid, name=w.name, zone=w.zone)
+    db.upsert_ward(w.uid, name=w.name, zone_id=w.zone_id)
     audit.log("ward_change", source="admin", ward=w.uid)
     bus.publish("ward_changed", uid=w.uid, action="upsert")
     return {"ok": True, "ward": db.get_profile(w.uid)}
 
 
+def _sample_16gon(x: float, y: float, r: float) -> list[list[float]]:
+    """以 (x, y) 为圆心、r 为半径采样 16 边形（顶点落在圆周上，近似圆）。"""
+    import math
+    return [[round(x + r * math.cos(2 * math.pi * i / 16), 3),
+             round(y + r * math.sin(2 * math.pi * i / 16), 3)] for i in range(16)]
+
+
 @app.post("/api/wards/{ward_uid}/zone")
 async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk")):
-    """把 locator 当前位姿记为该病房区域（圆心 + 默认半径）。"""
+    """便捷录入：以 locator 当前位姿为中心、`ward_zone_default_r` 为半径采样 16 边形写入 zones 表。
+
+    精确形状请到地图编辑器里画多边形（`/mapeditor`），本接口只负责快速建一个近似区域并把
+    新的 `zones.id` 关联到 `profiles.zone_id`。`ward_zone_default_r` 仍是"半径"语义（米）。
+    """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
     pose = locator.get_pose()
     if pose is None:
-        return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪），可改为手填坐标"}
+        return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪），可到地图编辑器手绘区域"}
+    map_name = str(db.get_settings().get("current_map") or "").strip()
+    if not map_name:
+        return {"ok": False, "error": "未设置当前地图（settings.current_map），请先在设置里选定地图"}
     r = float(db.get_settings().get("ward_zone_default_r", 3.0))
-    zone = {"frame": "map", "type": "circle", "x": pose["x"], "y": pose["y"], "r": r}
-    db.upsert_ward(ward_uid, name=(db.get_profile(ward_uid) or {}).get("name", ""), zone=zone)
+    ward = db.get_profile(ward_uid) or {}
+    ward_name = ward.get("name") or ward_uid
+    zid = db.add_zone(map_name=map_name, name=ward_name, kind="ward", shape="polygon",
+                      polygon_json=_sample_16gon(float(pose["x"]), float(pose["y"]), r))
+    db.upsert_ward(ward_uid, name=ward.get("name", ""), zone_id=zid)
     bus.publish("ward_changed", uid=ward_uid, action="zone")
-    return {"ok": True, "zone": zone}
+    return {"ok": True, "zone_id": zid, "zone": db.get_zone(zid)}
 
 
 @app.get("/api/policy/roles")
@@ -1937,7 +2185,9 @@ export interface SessionUser {
 export interface Ward {
   uid: string;
   name: string;
-  zone: Record<string, unknown>;
+  zone_id: number;
+  /** 解析出的病房区域（zones 表行，几何的唯一真相）；未关联时为 null */
+  zone: Record<string, unknown> | null;
   elders: string[];
 }
 
@@ -1979,7 +2229,8 @@ export function upsertWard(uid: string, name: string, surface: Surface) {
 }
 
 export function recordWardZone(wardUid: string, surface: Surface) {
-  return apiPost<{ ok: boolean; error?: string; zone?: Record<string, unknown> }>(
+  return apiPost<{ ok: boolean; error?: string; zone_id?: number;
+                   zone?: Record<string, unknown> | null }>(
     `/api/wards/${wardUid}/zone`, {}, surface);
 }
 ```
@@ -2065,7 +2316,7 @@ git commit -m "feat(kiosk): 左侧层级栏（管理层/集体层/老人层）+ 
 - [ ] **步骤 1：实现**
   - `App.vue`：`onMounted` 调 `getSession("admin")`；`role !== "admin"` 且 `auth_required` → 只渲染登录卡；`auth_required === false` → 直接进入并在顶部渲染红条「当前无口令保护」。
   - `RolesPage.vue`：`GET /api/policy/roles` 渲染三行（角色/提示词文件/工具白名单/数据范围/是否读病房上下文）；口令区两个按钮：改口令（旧+新）、开关口令门（`setAdminAuth`）。
-  - `WardsPage.vue`：`GET /api/wards` 列表；「新建病房」输入 uid/名称调 `POST /api/wards`；「记录当前房间为病房区域」调 `POST /api/wards/{uid}/zone`，失败时展示后端返回的 `error`（拿不到位姿）。
+  - `WardsPage.vue`：`GET /api/wards` 列表；「新建病房」输入 uid/名称调 `POST /api/wards`；「记录当前房间为病房区域」调 `POST /api/wards/{uid}/zone`，失败时展示后端返回的 `error`（拿不到位姿/未设当前地图）。便捷入口生成的是以当前位置为中心、半径 `ward_zone_default_r` 的 **16 边形近似区域**（写入 `zones` 表 `kind='ward'`，并回填 `profiles.zone_id`）；**精确形状请到地图编辑器里画多边形**（`/mapeditor`），本页只做关联。
 
 - [ ] **步骤 2：构建验证**
 

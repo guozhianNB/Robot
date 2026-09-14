@@ -41,6 +41,8 @@ ros2_car/log/
 # 外部教程项目（自带独立 .git 的嵌套仓库，不入库）
 /localization-with-ROS/
 /linorobot2/
+# 外部开源工程：第三期地图编辑器像素修图的改造上游（GyroPalm/ROS-SLAM-Map-Editor，MIT）
+/ROS-SLAM-Map-Editor/
 
 # Python
 ros2_car/**/__pycache__/
