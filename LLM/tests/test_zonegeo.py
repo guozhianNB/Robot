@@ -22,6 +22,8 @@ def test_degenerate_input_is_false_never_raises():
     assert zonegeo.point_in_polygon(0.0, 0.0, [[0.0, 0.0], [1.0, 1.0]]) is False
     assert zonegeo.point_in_polygon(0.0, 0.0, []) is False
     assert zonegeo.point_in_polygon(0.0, 0.0, None) is False
+    assert zonegeo.point_in_polygon(0.0, 0.0, 5) is False          # 不可迭代入参
+    assert zonegeo.in_bbox(0.0, 0.0, "坏了") is False              # 非列表入参
 
 
 def test_broken_points_are_dropped_not_fatal():

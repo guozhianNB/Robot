@@ -15,7 +15,7 @@ import json
 def _points(poly) -> list[tuple[float, float]]:
     """[[x, y], ...] → [(x, y), ...]；坏点直接丢弃（不抛异常）。"""
     out = []
-    for pt in poly or []:
+    for pt in (poly if isinstance(poly, (list, tuple)) else []):
         try:
             out.append((float(pt[0]), float(pt[1])))
         except (TypeError, ValueError, IndexError, KeyError):
