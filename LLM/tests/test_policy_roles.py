@@ -6,11 +6,21 @@ def test_policy_keys_cover_three_roles():
     assert set(policy.POLICY_DEFAULTS) == {"admin", "ward", "elder"}
 
 
-def test_ward_reads_own_ward_but_no_personal_scope():
+def test_ward_has_only_safety_tools_and_no_personal_scope():
     p = policy.POLICY_DEFAULTS["ward"]
     assert p["data_scope"] == "none"        # 不注入任何老人档案/私人记忆
     assert p["ward_context"] is True        # 但读得到本病房的集体上下文
-    assert p["allowed_tools"] == []         # 集体层无任何工具
+    # 集体层只接"安全 + 只读"：急停（R3 永远允许）+ 状态只读播报（规格 §3.3 矩阵）。
+    # 未识别的说话人会回落到这一层，所以这里**不能**是空列表。
+    assert p["allowed_tools"] == ["robot_status", "robot_stop"]
+
+
+def test_role_policy_returns_copy_not_the_shared_table():
+    """策略表是模块级共享常量：调用方原地 append 会污染全局白名单（往低权限角色里长工具）。"""
+    a, b = policy.role_policy("ward"), policy.role_policy("ward")
+    a["allowed_tools"].append("__注入__")
+    assert b["allowed_tools"] == ["robot_status", "robot_stop"]
+    assert policy.POLICY_DEFAULTS["ward"]["allowed_tools"] == ["robot_status", "robot_stop"]
 
 
 def test_elder_reads_self_plus_ward_context():
