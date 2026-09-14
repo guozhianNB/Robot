@@ -28,8 +28,13 @@ from . import mcp_client   # MCP 桥（可选能力，内部自行降级，impor
 _TOOL_REGISTRY: dict[str, dict] = {}
 
 
-def tool(name: str, description: str, parameters: dict, enabled: bool = True):
-    """注册一个工具：OpenAI function-calling schema 与实现写在一起，run_tool 自动分发。"""
+def tool(name: str, description: str, parameters: dict, enabled: bool = True,
+         roles: set[str] | None = None):
+    """注册一个工具。`roles=None` = 不限角色（现有工具保持兼容）；空集 = 谁都不给。
+
+    角色白名单只是**闸门 2**（与全局 per-tool 开关取交集）；动作风险分级属 P1 的
+    `policy.check_action()`（闸门 3），本函数不做。
+    """
     def deco(fn):
         _TOOL_REGISTRY[name] = {
             "schema": {
@@ -38,6 +43,7 @@ def tool(name: str, description: str, parameters: dict, enabled: bool = True):
             },
             "fn": fn,
             "enabled": enabled,
+            "roles": None if roles is None else set(roles),
         }
         return fn
     return deco
@@ -80,16 +86,36 @@ TOOL_ENABLED_KEYS = [f"{n}_enabled" for n in _TOOL_REGISTRY]
 TOOL_DEFAULTS = {f"{n}_enabled": reg["enabled"] for n, reg in _TOOL_REGISTRY.items()}
 
 
-def effective_tools(settings: dict) -> list[dict]:
-    """按 per-tool 开关（`<工具名>_enabled`）过滤，返回要传给模型的 schema 列表。
-    MCP 工具在 `mcp_enabled` 开启时合并进来；与本地工具重名时本地优先。"""
-    local_names = set(_TOOL_REGISTRY)
-    tools = [reg["schema"] for name, reg in _TOOL_REGISTRY.items()
-             if settings.get(f"{name}_enabled", reg["enabled"])]
+def _mcp_tools_for(settings: dict, role: str) -> list[dict]:
+    """MCP 工具按 `conf.MCP_SERVERS[server]["roles"]` 过滤；未声明视为 {"admin"}（从严）。"""
+    from .conf import MCP_SERVERS
+    out = []
+    for name, entry in mcp_client.tools().items():
+        if name in _TOOL_REGISTRY:
+            continue                        # 与本地重名时本地优先（沿用旧口径）
+        roles = MCP_SERVERS.get(entry.get("server", ""), {}).get("roles") or {"admin"}
+        if role in roles:
+            out.append(entry["schema"])
+    return out
+
+
+def effective_tools(settings: dict, principal: dict | None = None) -> list[dict]:
+    """闸门 2：per-tool 开关 ∩ 角色白名单。`principal` 缺省 → 集体层（R2 fail-closed）。"""
+    from .policy import role_policy
+    role = (principal or {}).get("role")
+    allow = role_policy(role)["allowed_tools"]      # None = 不按角色裁剪；[] = 一个都不给
+    out = []
+    for name, reg in _TOOL_REGISTRY.items():
+        if not settings.get(f"{name}_enabled", reg["enabled"]):
+            continue
+        if allow is not None and name not in allow:
+            continue
+        if reg.get("roles") is not None and (role or "") not in reg["roles"]:
+            continue
+        out.append(reg["schema"])
     if settings.get("mcp_enabled"):
-        tools += [s for name, s in ((n, e["schema"]) for n, e in mcp_client.tools().items())
-                  if name not in local_names]
-    return tools
+        out += _mcp_tools_for(settings, role or "")
+    return out
 
 
 def tools_with_state(settings: dict) -> list[dict]:
@@ -115,8 +141,21 @@ def tools_with_state(settings: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- 调度入口
-def run_tool(name: str, args: dict) -> dict:
+def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
+    """统一分发。**执行前再校验一次角色白名单**（闸门 2 第二道）。"""
+    from .policy import role_policy
+    from . import log as audit
+    p = principal or {}
+    allow = role_policy(p.get("role"))["allowed_tools"]
     reg = _TOOL_REGISTRY.get(name)
+    if allow is not None and name not in allow:
+        audit.log("policy_deny", tool=name, role=p.get("role"), uid=p.get("uid"),
+                  slot=p.get("slot"), reason="out_of_role_whitelist")
+        return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
+    if reg is not None and reg.get("roles") is not None and (p.get("role") or "") not in reg["roles"]:
+        audit.log("policy_deny", tool=name, role=p.get("role"), uid=p.get("uid"),
+                  slot=p.get("slot"), reason="tool_roles_mismatch")
+        return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not reg:
         # 不在本地注册表 → 尝试 MCP 工具（未注册/未连接时 mcp_client 返回 ok=False）
         if name in mcp_client.tools():

@@ -400,8 +400,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method, "uid": uid}}
 
     messages = build_messages(uid, user_text, thinking_on, settings, principal=principal)
-    # TODO(任务 9)：改成 tool_mod.effective_tools(settings, principal) —— 待 tools.py 支持角色白名单
-    tools = tool_mod.effective_tools(settings)
+    tools = tool_mod.effective_tools(settings, principal)
 
     full_assistant = ""
     try:
@@ -470,7 +469,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     name = slot["name"]
                     yield {"type": "tool_start", "tool": name, "args": args}
                     t0 = time.time()
-                    result = tool_mod.run_tool(name, args)
+                    result = tool_mod.run_tool(name, args, principal)
                     latency = int((time.time() - t0) * 1000)
                     snippet = result.get("result", result.get("message", ""))[:500]
                     db.log_tool(uid, name, args, snippet,
