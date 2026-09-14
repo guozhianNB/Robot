@@ -42,13 +42,21 @@ def reset_for_test() -> None:
 
 
 def _slot(slot: str) -> dict:
+    """取槽位状态。**槽位名非法直接抛 ValueError**——绝不静默回落到 kiosk：那会让
+    `X-Surface: TABLET` 这种笔误把"管理台的口令登录"写到车前屏上，顺带把车前屏提权，
+    而且返回体/审计里的 slot 还是那个错名（追溯性也被破坏）。"""
     if slot not in SLOTS:
-        slot = "kiosk"
+        raise ValueError(f"未知槽位 {slot!r}（只允许 {SLOTS}）")
     return _state.setdefault(slot, {"role": "ward", "source": "default", "until": None})
 
 
 def derive_role(uid: str | None) -> str:
-    """uid → 角色（**R1 的唯一入口**）。权威依据是 `profiles.kind`，不靠 uid 前缀。"""
+    """uid → 角色（**R1 的唯一入口**）。权威依据是 `profiles.kind`，不靠 uid 前缀。
+
+    `uid == "admin"` 短路返回 `"admin"` 只表达"这个主体属于管理员层"；**拿到 admin 权限
+    必须经 `login_admin()`（口令）**——`set_subject()` 会拒绝任何把槽位角色变成 admin 的调用，
+    所以这里的短路不会变成免口令后门。
+    """
     if not uid:
         return "ward"                       # R2
     if uid == ADMIN_UID:
@@ -67,23 +75,40 @@ def _settings() -> dict:
 
 def set_subject(uid: str, locked: bool = False, slot: str = "kiosk",
                 source: str = "manual") -> dict:
-    """切换会话主体：写 uid，role 由 uid 推导（R1）。"""
+    """切换会话主体：写 uid，role 由 uid 推导（R1）。
+
+    **提权只走 `login_admin()`（口令）**：主体切换一律不许把槽位角色变成 admin ——
+    否则 `POST /api/session/user {"uid": "admin"}` 就是一个免口令后门（R1 明令
+    "要拿 admin 只能走 /api/session/login"。CORS 全开 + 该端点只拒绝 role 字段，
+    这条后门是真实可利用的）。命中就拒绝并落审计，当前主体保持不变。
+    """
     s = _slot(slot)
+    _expire_if_needed(slot)          # 先让"已过期但还没被 tick 到"的 admin 会话降权，
+                                     # 否则守卫会吞掉一次声纹认人并写一条误导性审计
     if s["role"] == "admin" and source != "manual":
-        # D8 提权只升不降：管理员会话期间声纹认人不改主体，只留痕
-        audit.log("session_login", action="voiceprint_ignored_in_admin", uid=uid, slot=slot)
+        # D8 提权只升不降：管理员会话期间声纹认人不改主体，只留痕（事件名按规格 §4.1 = voice_spk）
+        audit.log("voice_spk", action="ignored_in_admin", uid=uid, slot=slot)
         return get_principal(slot)
+
+    role = derive_role(uid)
+    if role == "admin":
+        # 免口令提权通道：拒绝，保持当前主体（fail-closed）
+        audit.log("policy_deny", action="admin_grant_denied", uid=uid, slot=slot, source=source)
+        return get_principal(slot)
+
     _shared["uid"] = uid or ""
     _shared["locked"] = bool(locked)
-    s["role"] = derive_role(uid)
+    s["role"] = role
     s["source"] = source
     s["until"] = None
-    if s["role"] == "elder":
+    if role == "elder":
         p = db.get_profile(uid) or {}
         if p.get("ward_id"):
             _shared["ward_uid"] = p["ward_id"]      # D18：认出老人 → 当前病房跟着他
-    elif s["role"] == "ward":
-        _shared["ward_uid"] = uid or ""
+    elif role == "ward" and db.get_profile_kind(uid) == "ward":
+        # 只有"真的是病房档案"的 uid 才更新当前病房；未知 uid 一律 fail-closed 判 ward，
+        # 但不许把它写进"当前病房"（否则一个幽灵 uid 会把当前病房顶掉）
+        _shared["ward_uid"] = uid
     return get_principal(slot)
 
 

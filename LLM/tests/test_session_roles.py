@@ -99,3 +99,58 @@ def test_logout_returns_to_ward_layer(d):
     session.logout("kiosk")
     p = session.get_principal("kiosk")
     assert p["role"] == "ward" and p["uid"] == "ward_101" and p["locked"] is False
+
+
+def test_manual_switch_to_admin_uid_is_denied(d):
+    """**R1 红线回归**：提权只能走 login_admin（口令）。
+
+    主体切换若能把角色变成 admin，`POST /api/session/user {"uid":"admin"}` 就是免口令后门
+    （该端点只拒绝 role 字段、CORS 全开）。
+    """
+    session.set_subject("admin", slot="kiosk", source="manual")
+    p = session.get_principal("kiosk")
+    assert p["role"] == "ward" and p["uid"] != "admin"
+
+
+def test_expired_admin_slot_does_not_swallow_voiceprint(d, monkeypatch):
+    """过期的 admin 槽不许吞掉一次声纹认人（D8 守卫只对"有效期内"的管理员会话生效）。"""
+    session.set_subject("ward_101", slot="kiosk")
+    session.login_admin("111111", slot="kiosk", ttl_s=1)
+    base = session._now_ts()
+    monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    p = session.get_principal("kiosk")
+    assert p["role"] == "elder" and p["uid"] == "elder_101_1"
+
+
+def test_unknown_slot_is_rejected(d):
+    """槽位名非法必须报错，绝不静默回落到 kiosk（否则会把车前屏提权、审计也失真）。"""
+    with pytest.raises(ValueError):
+        session.get_principal("TABLET")
+    with pytest.raises(ValueError):
+        session.login_admin("111111", slot="TABLET")
+
+
+def test_admin_ignored_voiceprint_is_audited(d, monkeypatch):
+    calls = []
+    monkeypatch.setattr(session.audit, "log", lambda ev, **kw: calls.append((ev, kw)))
+    session.login_admin("111111", slot="kiosk")
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    assert calls and calls[-1][0] == "voice_spk"
+    assert calls[-1][1]["action"] == "ignored_in_admin"
+    assert calls[-1][1]["slot"] == "kiosk"
+
+
+def test_auth_disabled_login_needs_no_password(d):
+    """口令门关着时：无需口令直接进 admin，且**不再自动降权**（D13）。"""
+    d.set_admin_auth_required(False)
+    r = session.login_admin(password=None, slot="kiosk")
+    assert r["ok"] is True and r["source"] == "auth_disabled" and r["until"] is None
+    assert session.get_principal("kiosk")["role"] == "admin"
+
+
+def test_unknown_uid_does_not_hijack_current_ward(d):
+    """fail-closed 判成 ward，但不许把"当前病房"顶成那个不存在的 uid。"""
+    session.set_subject("ward_101", slot="kiosk")
+    session.set_subject("ghost_9", slot="kiosk", source="voiceprint")
+    assert session.get_principal("kiosk")["ward_uid"] == "ward_101"
