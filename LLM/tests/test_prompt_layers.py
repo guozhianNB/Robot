@@ -67,9 +67,11 @@ def test_cross_ward_isolation(d):
     assert "病房消息2" not in sys_p and "102 病房的消息" in sys_p
 
 
-def test_admin_gets_no_ward_context(d):
-    sys_p = chat.build_system("admin", {}, "", principal=_p("admin", "admin"))
-    assert "病房消息2" not in sys_p
+def test_admin_gets_no_ward_context_even_with_ward_uid(d):
+    """admin 即使有 ward_uid 也不注入集体上下文（原用例用空 ward_uid，判据是假的）。"""
+    p = _p("admin", "admin", "ward_101")
+    sys_p = chat.build_system("admin", {}, "", principal=p)
+    assert "病房消息2" not in sys_p and "病房里刚说过的事" not in sys_p
 
 
 def test_missing_role_file_degrades(d, monkeypatch):
@@ -81,3 +83,28 @@ def test_missing_role_file_degrades(d, monkeypatch):
 def test_unknown_role_falls_back_to_ward_fragment(d):
     sys_p = chat.build_system("ward_101", {}, "", principal=_p("??", "ward_101", "ward_101"))
     assert "病房里" in sys_p
+
+
+def test_ward_context_denied_when_ward_uid_is_not_a_ward(d):
+    """**R5 回归**：`ward_uid` 必须真的是病房档案；否则会把某位老人的私聊当"病房里刚说过的事"注入。"""
+    d.upsert_profile("elder_102_1", name="王奶奶")
+    db.append_history("elder_101_1", "user", "我昨晚没睡好")        # 这是私聊，不是集体层
+    p = _p("elder", "elder_102_1", "elder_101_1")                  # ward_id 被误设成一位老人
+    sys_p = chat.build_system("elder_102_1", {}, "", principal=p)
+    assert "我昨晚没睡好" not in sys_p
+
+
+def test_principal_uid_wins_over_request_uid(d):
+    """**回归**：principal 给了就以它的 uid 为数据目标——客户端传过期 uid 不许注入别人的档案。"""
+    d.upsert_profile("elder_101_1", name="张奶奶", notes="糖尿病")
+    p = _p("elder", "elder_102_1", "ward_102")
+    sys_p = chat.build_system("elder_101_1", {}, "", principal=p)   # 入参与 principal 不一致
+    assert "糖尿病" not in sys_p
+
+
+def test_broken_ward_context_window_does_not_crash(d):
+    """设置被写坏时降级成默认 10，不许把整条对话炸掉。"""
+    p = _p("elder", "elder_101_1", "ward_101")
+    for bad in (None, "abc"):
+        sys_p = chat.build_system("elder_101_1", {"ward_context_window": bad}, "", principal=p)
+        assert "小护" in sys_p                                       # 没抛异常，base 仍在

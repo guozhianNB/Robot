@@ -137,10 +137,13 @@ def _load_role_prompt(role: str) -> str:
 def _ward_context(ward_uid: str, limit: int) -> str:
     """本病房集体层最近 N 条（R5 单向：**只从这里往外读**，绝不把私聊灌进来）。
 
-    取数来源只有 `ward_uid` 这一个 uid（= principal["ward_uid"]，由 session 层推导/校验），
-    不读任何老人 uid 的历史，也不做跨病房聚合 —— 病房之间互不可见。
+    `ward_uid` **必须真的是病房档案**：`profiles.ward_id` 一旦被误设成某位老人的 uid，
+    这里就会把那位的**私聊**当"病房里刚说过的事"注入给别人（R5 的反方向）。所以 fail-closed。
     """
     if not ward_uid:
+        return ""
+    if db.get_profile_kind(ward_uid) != "ward":
+        audit.log("chat", action="ward_context_denied", ward_uid=ward_uid)
         return ""
     rows = db.load_history(ward_uid, limit=limit)
     lines = [f"{r['role']}: {r['content']}" for r in rows if (r.get("content") or "").strip()]
@@ -250,6 +253,9 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
     p = principal or session_mod.get_principal("kiosk")
     pol = role_policy(p.get("role"))
     scope = pol["data_scope"]
+    # 数据注入口径必须与权限口径同源：principal 给了就以它为准 —— 客户端传来的 uid 可能过期/伪造，
+    # 拿它去取档案会把**另一位老人**的画像注入当前会话（R5 同族的互泄）。
+    data_uid = (p.get("uid") or uid) if principal is not None else uid
 
     parts = [_load_prompt_base()]
     role_txt = _load_role_prompt(p.get("role"))
@@ -257,21 +263,24 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
         parts.append("\n" + role_txt)
 
     if scope == "self":                      # 老人层：本人档案/记忆/画像
-        recall_ctx = _recall_cached(uid, query) if query else rag.recall_v3(uid, "")["context"]
+        recall_ctx = _recall_cached(data_uid, query) if query else rag.recall_v3(data_uid, "")["context"]
         parts.append("\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n"
                      + recall_ctx)
 
     if pol["ward_context"]:                  # 老人层：本病房集体上下文（只读、单向）
-        ward_txt = _ward_context(p.get("ward_uid", ""),
-                                 int(settings.get("ward_context_window", 10)))
+        try:
+            limit = int(settings.get("ward_context_window", 10))
+        except (TypeError, ValueError):
+            limit = 10                       # 设置被写坏也不许炸掉整条对话（降级原则）
+        ward_txt = _ward_context(p.get("ward_uid", ""), limit)
         if ward_txt:
             parts.append("\n" + ward_txt)
 
     if scope == "self":
-        summary = db.get_summary(uid)
+        summary = db.get_summary(data_uid)
         if summary:
             parts.append(f"\n【更早对话的历史摘要】\n{summary}")
-        expr_hint = _expression_hint(uid)
+        expr_hint = _expression_hint(data_uid)
         if expr_hint:
             parts.append("\n" + expr_hint)
 
