@@ -531,3 +531,130 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 真实 `vite build` 复验、真实浏览器联调（`scripts/e2e_smoke.mjs` 在沙箱里跑不起来，正常机器上可用）、板卡真机验收。
 - 规格 §十二 / §B十四 的前置仍成立：需重扫一张地图、对齐 AMCL 初始位姿、板卡可达（实测不通）。
 - 文档回填：`AGENTS.md`、规格 `2026-09-14-map-editor-design.md`（文首状态 + 文末「实现台账与偏差」）、`ros2_car/建图与导航操作手册.md`（补「改完必须重启导航」+ 浏览器入口 + 备份位置）、`2026-08-27-frontend-multi-end-design.md`（补 vendor 静态资源一句）本轮已做；**板卡上那份操作手册副本（`/home/sunrise/Robot/ros2_car/建图与导航操作手册.md`）因 ssh 不通未同步，需另行同步**。
+
+---
+
+## 2026-09-14（续）—— 摄像头共享服务（vision/）审查与加固
+
+### 背景
+
+用户问"摄像头调用代码是否完善"。审查 `vision/`（2026-08-27 提交，此后未改动）后确认：协议设计与进程隔离思路是对的，但存在 **4 处确定性缺陷**，且该模块**零测试、零消费方**（`LLM/`、`frontend/` 全局 grep `vision|CameraClient|9540` 无命中）。
+
+### 修复（不动架构）
+
+1. **`get_next_frame` 永久挂死**（最严重）：原实现 `settimeout(None)`，服务端在新帧到达前不发任何字节，"对端已死"与"仍在等待"无法区分。实测传大 `last_id` 后**永久阻塞**，且卡死后同一连接上 `info()` 也超时（client 实例报废），`_io_timeout=10.0` 形同虚设。
+   - 新增构造参数 `wait_timeout` 与单次 `timeout=` 覆盖；超时抛新异常 `CameraTimeout`。
+   - **关键**：`CameraTimeout` **不继承** `ConnectionError`（别被当成断线吞掉）；超时后丢弃连接（服务端那笔迟到应答无法撤回，复用会串话——实测 `info()` 会读到帧头），下次调用自动重连；**游标仅在真正取到帧后推进，故不丢帧**。
+2. **JPEG 帧头宽高与实际编码尺寸不符**：payload 是 16 对齐后编码的，帧头却写通道原始尺寸。默认 1920x1080 → 实际编码 **1920x1072**，帧头报 1080，消费方按帧头建 buffer 必错位。改为记录 `_jpeg_size`（编码器真实输出）并写进帧头，同时 `info()` 暴露 `jpeg_size`。
+3. **`frames()` 连接泄漏**：`try` 从 `sendall` 才开始，连接建立后若 `setsockopt`/`sendall` 抛错则永不释放。改为 `try/finally` 覆盖建连后的全部步骤。
+4. **`--status` 与 `--bind` 语义冲突**：`--status` 拿**监听**地址当**连接**地址，服务以 `--bind 0.0.0.0` 启动时查不到。新增独立 `--host`（`0.0.0.0`/`::` 自动换回环）。
+
+### 新增：HTTP 桥（`vision/webbridge.py`）—— 上位机可达
+
+裸 TCP 浏览器说不了，故桥成 HTTP，**后端跑在 PC 上即可用浏览器看板卡画面**：
+
+- `GET /api/vision/status`：不可用时 `ok:True` + `status:"unavailable"`（遵「系统稳健性」：服务健康 ≠ 功能可用）
+- `GET /api/vision/snapshot?channel=&quality=`：单帧 JPEG（不可用 → 503 `ok:False`）
+- `GET /api/vision/stream?channel=&fps=`：MJPEG（不可用 → **直接结束流**，不无限空转）
+
+**零新增第三方依赖**：服务端开了 `--enable-jpeg` 走硬件编码；否则退回自写的**纯 stdlib 基线 JPEG 编码器**，响应头 `X-Vision-Source: hardware|software` 标明路径。
+
+> 软件编码器实现时踩了 3 个坑，均为"结构合法但 Pillow 报 broken data stream"，值得记录：
+> ① **DQT 必须按 zigzag 顺序存**（内部量化表是自然顺序，须重排）；
+> ② **SOF0 分量字节错位**（`struct` 打包把分量描述串了位）；
+> ③ **位写入器 `acc` 无界膨胀**（拼接长码字后未屏蔽已写出字节，导致比特流与熵编码器预期不符）。
+> 定位手法：先与 Pillow 产出的同尺寸参考图**逐段 diff**（这一步直接暴露 ①②），再对小块（8x8 灰）核对熵编码字节（`2803`）确认 ③ 以外部分正确。最终以 Pillow 真解码 + 像素梯度单调性断言验收。
+> 另注：`vision/webbridge.py` 对 `LLM.log` 的导入做成可选（`vision/` 需能独立使用）。
+
+### 测试
+
+新增 `tests/test_vision.py`，**51 项全过**，全程 `--mock`，不依赖板卡/摄像头/opencv（`numpy`/`Pillow` 用 `importorskip`）。覆盖协议往返、错误恢复（ERR 后同连接不串话）、**超时不再挂死且自动重连**、`frames()` 释放连接、**JPEG 帧头尺寸回归**、软件编码器可解码 + 像素正确性、`/api/vision/*` 降级行为、并发多客户端。
+
+全量 `pytest tests -q` → **151 passed / 4 failed**；4 个红态与上一条日志（2026-09-14）记录的**同一批既有基线漂移**完全一致（`test_modules_status` 1 例 + `test_unlock_switch` 3 例 `VoiceWorker` 签名漂移），frozenset 未变，本轮未修（非本任务范围）。
+
+### 未做 / 已知限制
+
+- **板卡真机未验收**：`--enable-jpeg`（JPU 硬件编码）路径与真实 MIPI 摄像头取帧**均未在板卡上实测**，仅在 Windows + `--mock` 下验证。硬件编码分支的帧头尺寸改动是按代码逻辑 + 替身编码器测的，需真机确认。
+- 前端未接：`/api/vision/*` 目前只有后端接口，admin/kiosk 里**没有摄像头页面**（用户当前目标是"多程序共享摄像头"，故未强加 UI）。
+- 未接真实消费方（目标检测/拍照/LLM 视觉）——仍是"能力就绪、无人使用"状态。
+- 沙箱里 `TestClient(app)` 会卡在 lifespan（MCP/voice 启动），故路由层测试改为**直接 await 路由函数**；真机/正常环境下不受此限。
+
+---
+
+## 2026-09-14（续二）—— 摄像头来源可选：板卡 MIPI / Windows USB（`--source auto`）
+
+### 背景与用户原话
+
+> 「我希望摄像头不仅可以用板卡的，还能用Windows电脑的，方便调试。」
+> 「我的意思就是说优先用板卡的摄像头，如果不行，说明在windows系统中，用windows的摄像头」
+
+即：不是两路同时接入，而是**自动判断当前在哪、能用哪个就用哪个，优先板卡**。
+规格：`docs/superpowers/specs/2026-09-14-vision-webcam-source-design.md`（commit `bbfcb8b`）。
+
+### 实现
+
+**新增 `vision/webcam.py`**（OpenCV 后端，**进程内**）：
+
+- `bgr_to_nv12(frame, w, h)`：纯 numpy 函数，BT.601 **limited range**（与 `Frame.bgr()` 用的
+  `COLOR_YUV2BGR_NV12` 口径配套，改一个必须改另一个，否则整体偏色）；色度按 **2x2 平均**
+  下采样（不是取左上角，否则块状色噪）；UV 交织顺序为 U 在前 V 在后（与 I420 不同）。
+- `WebcamBackend`：实现既有后端契约 `open()/next_frame()/close()`。**cv2 惰性导入**（守住
+  「可选依赖不进导入链」红线）。Windows 优先 `CAP_DSHOW`（MSMF 慢且对不存在设备会卡）。
+- `list_cameras()`：逐个**试读一帧**确认设备号。设计理由：注册表/设备管理器会把"曾经装过
+  的"设备也列出来（用户既有教训），据此判"有没有摄像头"会误判。
+
+**改 `vision/camera_server.py`**：
+
+- `--source auto|mipi|webcam|mock`（默认 `auto`）、`--device N`、`--list-cameras`；
+  `--mock` 保留为 `--source mock` 别名。
+- `source_candidates()`：板卡（Linux 且有 `hobot_vio`）→ `[mipi, webcam]`，其余 → `[webcam]`。
+  **`hobot_vio` 不可用时不在 auto 里列 mipi** —— 它不可能成功，试它只会白起一个子进程
+  再等超时（实测很拖沓）；显式 `--source mipi` 时仍会尝试，以便报出真实原因。
+- `make_backend()`：逐个候选尝试，**全部失败时把所有原因逐条汇总**（对齐项目"缺多个依赖
+  时别只报第一个"口径）。构造与 `open()` 都包在 `try/except Exception` 里（子进程/队列
+  权限、缺依赖、设备占用都可能失败）。
+- `info()`：`mode` 由 `real|mock` 细化为 **`mipi|webcam|mock`**，并加 `source`/`device`。
+
+**改 `LLM/conf.py` + `vision/webbridge.py`**：
+
+- 新增 `VISION_HOST`/`VISION_PORT`（env 可覆盖，默认 `127.0.0.1:9540`）。`webbridge` 原先
+  **硬编码** `P.DEFAULT_HOST/DEFAULT_PORT`，导致「后端在 PC、摄像头在板卡」这一形态根本
+  跑不通 —— 这是用户"优先板卡"能落地的前提。
+- 默认取**本机**而非板卡（与 `ROSBRIDGE_URL` 默认指向板卡不同）：摄像头服务在 PC（USB）
+  和板卡（MIPI）上都可能跑，默认本机才不会让"PC 调试"先要改配置。
+- `/api/vision/status` 增加 `target` 字段回显实际连的地址，排查时不用猜配置。
+
+### 关键决策
+
+- **D1 一律归一化成 NV12**：cv2 给 BGR，但下游（client/webbridge/软件 JPEG 编码器）全按
+  NV12 处理。归一化让下游**一行都不用改**。
+- **D3 WebcamBackend 先做进程内**：板卡那边隔离子进程是因为 `libsrcampy.get_img()` 长时间
+  占 GIL 饿死分发线程；`cv2.read()` 在 C 层通常释放 GIL，无此问题。**留了验证步骤**：若
+  实测 PING 延迟劣化（>100ms）再挪进子进程（接口一致，改动局部）。
+- **设备不支持请求分辨率时按实际尺寸产帧**：设备只给 640x480 而请求 1920x1080 时，产
+  640x480 并把真实尺寸写进帧头/`info()`。这是刻意选择 —— 强行按请求尺寸声明会让 NV12
+  长度与帧头不符，**正是 2026-09-14 早些时候修掉的同类 bug**。
+- **多通道从同一次读帧缩放**：一个物理摄像头不可能同时以两种分辨率出图。
+
+### 测试
+
+`tests/test_vision.py` 扩到 **86 passed / 1 skipped**（skip 的是 cv2 往返用例，本机没装 cv2）。
+新增覆盖：NV12 已知色值/UV 交织顺序/2x2 平均（并断言**不等于**只取左上角）/尺寸校验；
+**假 cv2** 驱动 `WebcamBackend`（协议形状、frame_id 递增、open·close 幂等、失败即释放句柄、
+持久读失败抛错、设备能力收窄、多通道单次读）；`--source` 与 auto 候选顺序（monkeypatch
+平台与 hobot_vio）；**汇总错误含全部候选原因**；失败回退到第二候选；`list_cameras` 只报
+可读设备；**cv2 缺失时 `vision.*` 仍可导入**（红线）；端到端 webcam→client→webbridge JPEG
+可解码。
+
+全量 `pytest tests -q` → **186 passed / 4 failed / 1 skipped**；4 个红态仍是既有基线漂移
+（`test_modules_status` 1 例 + `test_unlock_switch` 3 例），**与本次改动无关**（改动前即存在）。
+
+### 已知限制（重要）
+
+- **本机装不了 opencv**：到 `pypi.org`/清华/阿里云 PyPI 的 SSL 全部失败、`pip download`
+  超时，全盘也没有已装 cv2 的 Python 环境。故**真实"读 Windows 摄像头"这一跳未经验证**，
+  需要用户执行 `pip install opencv-python` 后共同验收。
+- **本机是否有可用摄像头未确认**：注册表有 `Camera`/`USB\Class_0e` 多条记录，正属"历史设备
+  也会列出来"的情形；`Get-PnpDevice` 在本机报 CIM 不可用。这正是加 `--list-cameras` 的原因。
+- **板卡 MIPI 路径未回归**：改动不应影响 mipi，但本机无 MIPI 硬件、ssh 也不通，未实测。
+- **GIL 风险未实测**：见 D3，需在装好 cv2 的真机上量 PING 延迟。

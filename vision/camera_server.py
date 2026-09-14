@@ -266,6 +266,7 @@ class CameraServer:
         self._jpeg_enabled = jpeg
         self._jpeg_lock = threading.Lock()
         self._encoder = None
+        self._jpeg_size = None               # JPEG 编码器真实输出尺寸
 
         self._latest = {}                    # channel -> bytes
         self._meta = {}                      # channel -> (frame_id, ts_us)
@@ -375,11 +376,15 @@ class CameraServer:
             if ret != 0:
                 raise RuntimeError("encode init ret=%d" % ret)
             self._encoder = enc
+            # 记下编码器真实的输出尺寸：JPEG 帧头必须报这个尺寸，
+            # 而不是通道原始尺寸（1920x1080 会被对齐成 1920x1072）。
+            self._jpeg_size = (w, h)
             print("[camera-server] JPEG 编码器已启用（%dx%d）" % (w, h))
         except Exception as e:
             print("[camera-server] 警告：JPEG 编码器初始化失败，仅提供原始"
                   "NV12 帧：%s" % e, file=sys.stderr)
             self._encoder = None
+            self._jpeg_size = None
 
     # ------------------------------------------------------------------
     # 协议处理
@@ -420,9 +425,12 @@ class CameraServer:
                 self._send_err(conn, "jpeg encode failed")
                 return
             payload, fmt, cmd = bytes(jpg), P.FMT_JPEG, P.CMD_JPEG_FRAME
+            # JPEG 的宽高必须报编码器实际输出尺寸（可能已 16 对齐），
+            # 否则消费方按帧头建 buffer 会解码失败。
+            w, h = self._jpeg_size
         else:
             payload, fmt, cmd = data, P.FMT_NV12, P.CMD_FRAME
-        w, h = self._channels[channel - 1]
+            w, h = self._channels[channel - 1]
         header = P.pack_frame_header(cmd, channel, fmt, w, h, fid, ts,
                                      len(payload))
         self._send_all(conn, header + payload)
@@ -524,9 +532,13 @@ class CameraServer:
             "ok": True,
             "service": SERVICE_NAME,
             "protocol_version": P.PROTOCOL_VERSION,
-            "mode": "mock" if isinstance(self._backend, MockBackend) else "real",
+            # mode 取值随摄像头来源变化（2026-09-14 起）：mock / mipi（板卡）/ webcam（PC）
+            "mode": backend_kind(self._backend),
+            "source": backend_kind(self._backend),
+            "device": getattr(self._backend, "_device", None),
             "fps": self._fps,
             "jpeg": self._encoder is not None,
+            "jpeg_size": ("%dx%d" % self._jpeg_size) if self._jpeg_size else None,
             "channels": chans,
             "uptime_s": round(time.time() - self._started, 2),
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S",
@@ -563,42 +575,172 @@ def parse_channels(spec):
     return channels
 
 
+def backend_kind(backend):
+    """后端 -> 来源标识（`mock` / `mipi` / `webcam`）。
+
+    历史上只有 `real|mock` 两种取值；现在有两种真实来源，必须区分，
+    故 `real` 细化为 `mipi`（板卡）与 `webcam`（PC/USB）。
+    """
+    if isinstance(backend, MockBackend):
+        return "mock"
+    if isinstance(backend, CameraBackend):
+        return "mipi"
+    return "webcam"
+
+
+def _board_hobot_vio_available():
+    """板卡 MIPI 依赖是否可用（hobot_vio 能导入）。"""
+    try:
+        from hobot_vio import libsrcampy  # noqa: F401
+        return True
+    except Exception:                        # noqa: BLE001
+        return False
+
+
+def source_candidates(source="auto"):
+    """返回该 --source 下应依次尝试的后端名列表。
+
+    `auto` 按平台偏好排序：板卡（Linux 且有 hobot_vio）优先 mipi，其余优先
+    webcam；失败原因**全部**收集后统一报告（不只报第一个）。
+
+    注意：`hobot_vio` 不可用时 **不把 mipi 列入 auto 候选** —— 它在该环境
+    下不可能成功，试它只会白起一个子进程再等超时（实测在 PC 上很拖沓）。
+    显式 `--source mipi` 时仍会尝试，以便把真实失败原因报给用户。
+    """
+    if source == "auto":
+        has_mipi = _board_hobot_vio_available()
+        order = ["mipi", "webcam"] if (sys.platform.startswith("linux") and has_mipi) \
+            else ["webcam", "mipi"]
+        if not has_mipi:
+            order = [k for k in order if k != "mipi"]
+        return order or ["webcam"]
+    return [source]
+
+
+def make_backend(source, device, fps, channels):
+    """按来源构造并**打开**后端，返回 (backend, effective_channels)。
+
+    auto 会依次尝试候选来源，全部失败时抛出一条汇总错误，把每个候选的失败
+    原因逐条列出——不允许只报第一个（对齐项目"缺多个依赖时别只报第一个"口径）。
+    返回的 effective_channels 可能与请求不同：摄像头可能只支持较小分辨率，
+    此时必须按**实际尺寸**产帧，否则 NV12 长度与帧头声明不符，下游必错位。
+    """
+    from .webcam import WebcamBackend
+
+    if source == "mock":
+        backend = MockBackend(fps, channels)
+        backend.open()
+        return backend, list(channels)
+
+    failures = []
+    for kind in source_candidates(source):
+        backend = None
+        try:
+            if kind == "mock":
+                backend = MockBackend(fps, channels)
+            elif kind == "mipi":
+                backend = CameraBackend(pipe_id=0, fps=fps, channels=channels)
+            elif kind == "webcam":
+                backend = WebcamBackend(device=device, fps=fps, channels=channels)
+            else:
+                raise ValueError("未知摄像头来源：%r" % kind)
+            backend.open()
+        except Exception as e:                   # noqa: BLE001
+            # 构造与打开都可能失败（子进程/队列权限、缺依赖、设备占用…），
+            # 一律收集原因后继续试下一个候选，最后统一报告。
+            failures.append((kind, "%s: %s" % (type(e).__name__, e)))
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:            # noqa: BLE001
+                    pass
+            continue
+        # WebcamBackend 会把请求尺寸收窄到设备真实能力，据此对齐通道表
+        effective = list(getattr(backend, "channels", channels))
+        return backend, effective
+
+    lines = ["所有摄像头来源都不可用（--source %s）：" % source]
+    for kind, why in failures:
+        lines.append("  - %s：%s" % (kind, why))
+    lines.append("  - 可试：--list-cameras 查可用设备号；--mock 用合成帧自测")
+    raise RuntimeError("\n".join(lines))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="MIPI 摄像头共享服务：一个进程持有摄像头，多程序取帧",
+        description="摄像头共享服务：一个进程持有摄像头，多程序取帧"
+                    "（板卡 MIPI / Windows USB / 合成帧）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--bind", default=P.DEFAULT_HOST,
                         help="监听地址（默认本机；跨机共享可设 0.0.0.0）")
+    parser.add_argument("--host", default=None,
+                        help="--status 查询的目标地址（默认取 --bind，"
+                             "故服务以 0.0.0.0 启动时应显式指定本项）")
     parser.add_argument("--port", type=int, default=P.DEFAULT_PORT,
                         help="监听端口")
     parser.add_argument("--fps", type=int, default=30, help="采集帧率")
     parser.add_argument("--channels", type=parse_channels,
                         default="1920x1080,512x512",
                         help="输出通道分辨率（逗号分隔 WxH），通道号从 1 开始")
+    parser.add_argument("--source", choices=("auto", "mipi", "webcam", "mock"),
+                        default="auto",
+                        help="摄像头来源：auto=按平台自动选（板卡优先 mipi，"
+                             "PC 优先 webcam）；mipi=板卡 MIPI；"
+                             "webcam=Windows/USB 摄像头（需 opencv-python）")
+    parser.add_argument("--device", type=int, default=0,
+                        help="--source webcam 的设备号（0 起）")
+    parser.add_argument("--list-cameras", action="store_true",
+                        help="列出真能读出画面的摄像头设备号后退出")
     parser.add_argument("--enable-jpeg", action="store_true",
                         help="启用硬件 JPEG 编码（J 命令；依赖 JPU）")
     parser.add_argument("--mock", action="store_true",
-                        help="无摄像头自测模式：生成合成帧")
+                        help="等价于 --source mock（无摄像头自测，保留兼容）")
     parser.add_argument("--status", action="store_true",
                         help="不启动服务，仅查询运行中的服务状态")
     args = parser.parse_args(argv)
 
     if args.status:
         from .camera_client import CameraClient
+        # 0.0.0.0 是监听地址、不是可连接地址，查询时统一换成回环
+        host = args.host or args.bind
+        if host in ("0.0.0.0", "::"):
+            host = P.DEFAULT_HOST
         try:
-            with CameraClient(args.bind, args.port, connect_timeout=3) as c:
+            with CameraClient(host, args.port, connect_timeout=3) as c:
                 print(json.dumps(c.info(), ensure_ascii=False, indent=2))
         except OSError as e:
             print("无法连接 %s:%d：%s（服务未运行？）"
-                  % (args.bind, args.port, e), file=sys.stderr)
+                  % (host, args.port, e), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.list_cameras:
+        from .webcam import list_cameras
+        try:
+            found = list_cameras()
+        except RuntimeError as e:
+            print("[camera-server] %s" % e, file=sys.stderr)
+            return 2
+        if found:
+            print("可真出画面的摄像头设备号：%s"
+                  % ", ".join(str(i) for i in found))
+            print("用法：python3 -m vision.camera_server --source webcam --device %d"
+                  % found[0])
+        else:
+            print("没有探测到可用的摄像头设备（试了 0~5 号）。"
+                  "\n  - 摄像头没插好 / 被其它程序占用 / 驱动缺失？"
+                  "\n  - 确认可用后仍不行，可先用 --mock 自测协议链路。",
+                  file=sys.stderr)
             return 1
         return 0
 
     channels = args.channels
-    if args.mock:
-        backend = MockBackend(args.fps, channels)
-    else:
-        backend = CameraBackend(pipe_id=0, fps=args.fps, channels=channels)
+    source = "mock" if args.mock else args.source
+    try:
+        backend, channels = make_backend(source, args.device, args.fps, channels)
+    except RuntimeError as e:
+        print("[camera-server] 摄像头打开失败：\n%s" % e, file=sys.stderr)
+        return 2
 
     server = CameraServer(backend, channels, args.fps, jpeg=args.enable_jpeg,
                           bind_host=args.bind, bind_port=args.port)

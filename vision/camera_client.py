@@ -40,6 +40,15 @@ class CameraNotRunning(CameraServerError, ConnectionError):
     """连不上服务（服务未启动或地址不对）。"""
 
 
+class CameraTimeout(CameraServerError):
+    """等待服务端应答超时。
+
+    注意：本类**不是** ConnectionError 子类——超时后连接本身仍然可用
+    （游标语义完好），调用方重试或换用 get_frame() 即可，不要当成断线
+    去重建客户端。
+    """
+
+
 @dataclass
 class Frame:
     """一帧图像及其元信息。
@@ -88,11 +97,18 @@ class CameraClient:
     """摄像头共享服务客户端。"""
 
     def __init__(self, host=P.DEFAULT_HOST, port=P.DEFAULT_PORT,
-                 connect_timeout=5.0, io_timeout=10.0):
+                 connect_timeout=5.0, io_timeout=10.0, wait_timeout=None):
+        """wait_timeout：get_next_frame 等待新帧的上限（秒）。
+
+        None 表示不限制（旧行为：服务端有新帧才应答，可能永久阻塞）。
+        服务端在新帧到达前不会发任何字节，因此阻塞期间无法区分"还在等"
+        与"对端已死"，建议显式设置本项；超时抛 CameraTimeout。
+        """
         self.host = host
         self.port = port
         self._connect_timeout = connect_timeout
         self._io_timeout = io_timeout
+        self._wait_timeout = wait_timeout
         self._conn = None
         self._next_cursor = {}  # channel -> 上次 get_next_frame 返回的 frame_id
 
@@ -119,6 +135,15 @@ class CameraClient:
                 pass
             self._conn = None
 
+    def _discard_conn(self):
+        """丢弃当前连接（下次调用自动重连）。
+
+        用于超时等"流状态不确定"的场景：服务端的应答仍在路上，若继续
+        复用同一连接，后续命令会把那笔迟到应答误读成自己的结果，导致
+        帧错位/串话（实测 get_next_frame 超时后 info() 会读到帧头）。
+        """
+        self.close()
+
     def __enter__(self):
         self._connect()
         return self
@@ -133,7 +158,12 @@ class CameraClient:
     def _recv_exact(self, conn, n):
         buf = b""
         while len(buf) < n:
-            chunk = conn.recv(n - len(buf))
+            try:
+                chunk = conn.recv(n - len(buf))
+            except socket.timeout as e:
+                # 超时不代表连接损坏：已读到的部分作废，但 socket 仍可用。
+                raise CameraTimeout(
+                    "等待服务端应答超时（已收 %d/%d 字节）" % (len(buf), n)) from e
             if not chunk:
                 raise CameraServerError("连接被服务端关闭（服务可能已退出）")
             buf += chunk
@@ -211,41 +241,64 @@ class CameraClient:
         self._conn.sendall(P.CMD_JPEG + bytes([channel]))
         return self._read_frame(self._conn)
 
-    def get_next_frame(self, channel=1, last_id=None):
+    def get_next_frame(self, channel=1, last_id=None, timeout="default"):
         """阻塞等待并返回该通道"下一帧"（frame_id 严格递增）。
 
         - last_id=None：从客户端内部游标继续（首次调用等任意一帧）；
         - last_id=N：等 frame_id > N 的第一帧（可用于断线续传）。
         适合"逐帧处理"型消费者（每帧只消费一次，不重复不丢序）。
+
+        timeout：等待上限（秒）。
+        - "default"（默认）：用构造函数的 wait_timeout（可能为 None=不限）；
+        - None：本次调用不限时；
+        - 正数：本次调用最多等这么久，超时抛 CameraTimeout。
+
+        超时后抛 CameraTimeout。此时该连接已丢弃（服务端那笔迟到应答无法
+        撤回），下次调用会自动重连；游标只在真正取到帧后才推进，因此不会
+        丢帧，直接重试即可。
         """
         if channel < 1 or channel > 255:
             raise ValueError("channel 应在 1~255")
+        if timeout == "default":
+            timeout = self._wait_timeout
         if last_id is None:
             last_id = self._next_cursor.get(channel, 0)
         self._connect()
-        self._conn.settimeout(None)  # 服务端会等到新帧再应答
-        self._conn.sendall(P.CMD_NEXT + bytes([channel])
-                           + struct.pack(">Q", last_id))
-        frame = self._read_frame(self._conn)
+        # 注意：timeout=None 时服务端等到新帧才应答，期间可能永久阻塞
+        # （对端已死也察觉不到），故默认由上层的 wait_timeout 约束。
+        self._conn.settimeout(timeout)
+        try:
+            self._conn.sendall(P.CMD_NEXT + bytes([channel])
+                               + struct.pack(">Q", last_id))
+            frame = self._read_frame(self._conn)
+        except CameraTimeout:
+            self._discard_conn()
+            raise
+        else:
+            # 单次等待不应污染后续命令的超时设置
+            self._conn.settimeout(self._io_timeout)
         self._next_cursor[channel] = frame.frame_id
         return frame
 
     def frames(self, channel=1):
         """订阅指定通道的连续帧流，返回生成器，逐帧产出 Frame。
 
-        使用独立连接；生成器结束或客户端 close 时自动断开。
+        使用独立连接；生成器结束、被 close 或抛错时都会关闭该连接
+        （生成器提前 break 后若迟迟不被 GC，连接会一直占用，故建议显式
+        close() 或放进 with 语句）。
         """
         if channel < 1 or channel > 255:
             raise ValueError("channel 应在 1~255")
         conn = socket.create_connection((self.host, self.port),
                                         self._connect_timeout)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn.settimeout(None)
         try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.settimeout(None)
             conn.sendall(P.CMD_SUB + bytes([channel]))
             while True:
                 yield self._read_frame(conn)
         finally:
+            # finally 覆盖上面所有步骤：任一步抛错都不会漏掉连接
             try:
                 conn.close()
             except OSError:

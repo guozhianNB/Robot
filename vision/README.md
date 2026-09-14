@@ -36,18 +36,93 @@ vision/
 ├── protocol.py           # 两端共享的协议定义（命令字/帧头格式）
 ├── camera_server.py      # 服务端守护进程（python3 -m vision.camera_server）
 ├── camera_client.py      # 客户端库（CameraClient / Frame）
+├── webcam.py             # Windows/USB 摄像头后端（OpenCV，可选依赖）
+├── webbridge.py          # HTTP 桥：给上位机浏览器看画面（/api/vision/*）
 ├── __init__.py           # 包入口，导出 CameraClient、Frame
 └── examples/
     └── grab_and_save.py  # 示例：取一帧保存 + 订阅几帧
 ```
+
+## 摄像头从哪来（三种来源）
+
+| 来源 | 说明 | 依赖 |
+| --- | --- | --- |
+| `mipi` | 板卡 MIPI（RDK X5），采集跑在**独立子进程** | `hobot_vio`（板卡自带） |
+| `webcam` | Windows/USB 摄像头，进程内采集 | `opencv-python`（**可选**） |
+| `mock` | 合成帧，协议完全一致 | 无 |
+
+`--source auto`（**默认**）会按平台挑：**板卡优先 `mipi`，PC 优先 `webcam`**，
+失败则自动试下一个，全失败再把每个原因逐条报出来。所以：
+
+```bash
+python3 -m vision.camera_server                       # 板卡上=MIPI；PC 上=USB 摄像头
+python3 -m vision.camera_server --source webcam        # 明确要 Windows 摄像头
+python3 -m vision.camera_server --list-cameras         # 先查哪些设备号真能出画面
+python3 -m vision.camera_server --source webcam --device 1 --channels 1280x720
+```
+
+> **PC 上装 opencv**：`pip install opencv-python`。没装时 `webcam` 来源会以
+> 清晰提示失败（`--source auto` 会继续试其它来源），**后端照常启动**——
+> `cv2` 是惰性导入的，不参与后端导入链。
+
+### Windows 上注意
+
+- 摄像头可能是 **640x480 而非你请求的 1920x1080**。此时服务按**设备实际尺寸**
+  产帧，并把真实尺寸写进帧头与 `info()`（否则 NV12 长度与帧头不符，下游错位）。
+- **无法同时被两个程序独占**：先关掉「相机」应用 / 其它占用摄像头的程序。
+- 一个物理摄像头**不可能同时以两种分辨率出图**：多通道是从同一次读帧缩放来的。
+- 设备号不确定就用 `--list-cameras` —— 它**逐个试读一帧**，这是"到底有没有
+  摄像头"的可靠判据（设备管理器/注册表会把**曾经装过的**设备也列出来，会误判）。
+
+## 在 PC 浏览器里看画面（上位机可达）
+
+裸 TCP 协议浏览器说不了，所以后端（`LLM/server.py`）把本服务桥成了 HTTP：
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/vision/status` | 服务状态（通道/帧计数/模式/连的是哪台），含 `status: running\|unavailable` |
+| `GET /api/vision/snapshot?channel=1&quality=80` | 单帧 JPEG，`<img src="...">` 可直接显示 |
+| `GET /api/vision/stream?channel=1&fps=10` | MJPEG 连续流，`<img src="...">` 即动态画面 |
+
+最快验证：
+
+```
+http://127.0.0.1:8000/api/vision/snapshot?channel=1
+http://127.0.0.1:8000/api/vision/stream?channel=1&fps=10
+```
+
+**摄像头服务在哪台机器？** 由 `LLM/conf.py` 的 `VISION_HOST`/`VISION_PORT`
+决定（可用同名环境变量覆盖），默认 `127.0.0.1:9540`：
+
+- 后端与摄像头服务**同机**（PC 上用 webcam，或板卡上用 MIPI）→ 默认值就对。
+- **后端在 PC、摄像头在板卡** → 设 `VISION_HOST=<板卡地址>`（同 `MAPS_SSH_HOST`），
+  并在板卡上以 `--bind 0.0.0.0` 启动服务。
+- `/api/vision/status` 的 `target` 字段会回显实际连的地址，排查时不用猜配置。
+
+设计要点：
+- **自动选择编码路径**：服务端开了 `--enable-jpeg` 就走板卡硬件编码（省 CPU）；
+  否则退回 `webbridge.py` 里的**纯 stdlib 基线 JPEG 编码器**，任何环境都有画面。
+  响应头 `X-Vision-Source: hardware|software` 会告诉你走了哪条。
+- **降级不崩**：摄像头服务没起时，`/status` 返回 `ok: True, status: "unavailable"`
+  （服务健康 ≠ 功能可用），`/snapshot` 返回 503 JSON，`/stream` **直接结束流**
+  而不是无限空转挂住请求。
+- **HTTP 桥零新增第三方依赖**：软件编码器只用 stdlib（不依赖 opencv/Pillow）。
+  opencv 只被 `webcam` 来源用到，且惰性导入。
+
+> 实测（mock 后端）：快照 320x240 约 4KB、软件编码单帧约 20ms；
+> MJPEG 15fps 稳定输出。软件编码器会按 `max_width=640` 自动整数倍下采样
+> 控制体积，需要全分辨率时用 `--enable-jpeg` 走硬件。
 
 ## 快速开始
 
 ### 1. 启动服务（在仓库根目录 Robot/ 下）
 
 ```bash
-# 真实摄像头（默认输出两路：通道1=1920x1080 全分辨率，通道2=512x512 小图）
+# 板卡：走 MIPI（默认两路：通道1=1920x1080 全分辨率，通道2=512x512 小图）
 python3 -m vision.camera_server --fps 30
+
+# PC：走 Windows/USB 摄像头（需先 pip install opencv-python）
+python3 -m vision.camera_server --source webcam --fps 15
 
 # 只输出一路，或自定义分辨率（宽高须为偶数）
 python3 -m vision.camera_server --channels 1920x1080 --fps 30
@@ -63,17 +138,24 @@ nohup python3 -m vision.camera_server --fps 30 > /tmp/cam_server.log 2>&1 &
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `--source` | `auto` | 摄像头来源：`auto`（按平台自动选）/ `mipi` / `webcam` / `mock` |
+| `--device` | `0` | `--source webcam` 的设备号（0 起；用 `--list-cameras` 查） |
+| `--list-cameras` | 关 | 列出真能读出画面的设备号后退出 |
 | `--bind` | `127.0.0.1` | 监听地址；跨机共享设 `0.0.0.0` |
+| `--host` | 取 `--bind` | `--status` 查询的目标地址（`0.0.0.0` 会自动换成回环） |
 | `--port` | `9540` | 监听端口 |
 | `--fps` | `30` | 采集帧率 |
 | `--channels` | `1920x1080,512x512` | 输出通道（逗号分隔 `WxH`，宽高须为偶数），通道号从 1 开始 |
 | `--enable-jpeg` | 关 | 启用硬件 JPEG 编码（`J` 命令，依赖 JPU 驱动） |
-| `--mock` | 关 | 合成帧自测模式 |
+| `--mock` | 关 | 等价于 `--source mock`（保留兼容） |
 | `--status` | 关 | 不启动服务，只查询运行中的服务状态（JSON） |
 
 > 注：板卡 VSE 支持 1920x1080 等非 16 对齐分辨率（官方 cdev 示例
 > `/app/cdev_demo/vio2display` 与 YOLO 示例均直接用 1080）；16 对齐
 > 仅 JPU 编码要求，开启 `--enable-jpeg` 时服务端会内部对齐。
+
+> `info()` 的 `mode` 取值：`mock` / `mipi` / `webcam`（2026-09-14 起；
+> 旧的 `real` 已细化为 `mipi` 与 `webcam`，因为现在有两种真实来源）。
 
 ### 2. 客户端取帧
 
@@ -106,15 +188,36 @@ python3 vision/examples/grab_and_save.py
 
 | 方法 | 说明 |
 | --- | --- |
-| `info()` | 服务状态 dict：mode/fps/jpeg/每通道分辨率与帧计数 |
+| `info()` | 服务状态 dict：mode/fps/jpeg/jpeg_size/每通道分辨率与帧计数 |
 | `ping()` | 服务是否存活 |
 | `get_frame(channel=1)` | 取该通道最新一帧（可能重复，适合"最新画面"） |
-| `get_next_frame(channel, last_id=None)` | 阻塞等待下一新帧（frame_id 递增；断线续传传 last_id） |
+| `get_next_frame(channel, last_id=None, timeout="default")` | 阻塞等待下一新帧（frame_id 递增；断线续传传 last_id） |
 | `frames(channel=1)` | 订阅连续帧流生成器 |
 | `get_jpeg(channel=1)` | 最新一帧的 JPEG（服务端需 `--enable-jpeg`） |
 
 `Frame` 字段：`frame_id / ts_us / channel / width / height / fmt("NV12"|"JPEG") / data`。
 方法：`nv12_array()`（numpy）、`bgr()` / `rgb()`（cv2）、`save(path)`。
+
+**超时与取消（重要）**：`get_next_frame` 在服务端有新帧前不会返回任何字节，
+所以"对端已死"和"还在等"从字节层面无法区分。构造时用 `wait_timeout` 设上限，
+或单次调用传 `timeout="<秒>"`：
+
+```python
+cam = CameraClient(wait_timeout=5.0)      # 所有 get_next_frame 最多等 5s
+try:
+    f = cam.get_next_frame(channel=1)
+except CameraTimeout:
+    ...                                   # 超时；客户端会自动重连，直接重试即可
+```
+
+- 超时抛 `CameraTimeout`（**不是** `ConnectionError` 子类，别当成断线）。
+- 超时后该连接被丢弃（服务端那笔迟到应答无法撤回），下次调用自动重连；
+  **游标只在真正取到帧后推进，因此不丢帧**。
+- `wait_timeout=None` 表示不限制（旧行为，可能永久阻塞）——只在确定服务端
+  一定会持续出帧时使用。
+
+异常体系：`CameraServerError`（基类）/ `CameraNotRunning`（连不上，
+是 `OSError` 子类）/ `CameraTimeout`（等待超时）。
 
 线程说明：同一 `CameraClient` 实例不保证线程安全，多线程各建一个实例即可。
 
@@ -132,6 +235,29 @@ frame_id、ts_us、size）。错误响应为一行文本，前缀 `ERR `。
 
 - **启动报 "Address already in use"**：已有一个实例在跑，先查
   `python3 -m vision.camera_server --status`，或换 `--port`。
+- **PC 上报"未安装 opencv-python"**：`--source webcam`（或 `auto` 落到 webcam）
+  需要它：`pip install opencv-python`。没装时其它来源仍可用，**后端也照常启动**
+  （`cv2` 惰性导入，不在导入链上）。
+- **PC 上报"设备 N 打不开"**：摄像头没插好、被别的程序占用（先关掉「相机」应用），
+  或设备号不对 —— 用 `--list-cameras` 逐个试读确认。
+- **PC 上的画面分辨率比请求的小**：设备只支持到那个尺寸（常见 640x480）。服务按
+  **设备实际尺寸**产帧并如实写进帧头/`info()`，这是刻意的 —— 强行按请求尺寸声明
+  会让 NV12 长度与帧头不符、下游错位。
+- **想确认"到底有没有摄像头"**：别信设备管理器/注册表（会把**曾经装过的**设备也
+  列出来），用 `--list-cameras`，它逐个试读一帧。
+- **`--status` 查不到服务**：`--bind` 是**监听**地址、不能当连接地址用。
+  服务以 `--bind 0.0.0.0` 启动时，查询请显式给目标：
+  `python3 -m vision.camera_server --status --host 127.0.0.1`
+  （传 `--bind 0.0.0.0` 时也会自动换成回环，但显式写 `--host` 最清楚）。
+- **`get_next_frame` 一直不返回**：它要等到"比 last_id 更新的一帧"才应答。
+  若传了过大的 `last_id`（例如断线后拿了过期游标），旧版本会**永久挂死**。
+  现在构造 `CameraClient(wait_timeout=5.0)` 即可超时；超时抛 `CameraTimeout`，
+  客户端自动重连，直接重试。
+- **浏览器看不了画面**：本服务是裸 TCP，浏览器要用后端的 HTTP 桥
+  （见上文「在 PC 浏览器里看画面」），端口是 **8000**（后端），不是 9540。
+- **`X-Vision-Source: software` 且画面比预期小**：说明没开板卡硬件 JPEG，
+  走了 stdlib 软件编码并按 `max_width=640` 下采样。要全分辨率就加
+  `--enable-jpeg` 重启服务端。
 - **启动报 "No camera sensor found / open_cam 失败"**：摄像头没被检测到。
   检查接线与供电；确认没有其他进程占用摄像头；VIO 传感器探测依赖
   i2c 总线与 GPIO 复位（部分环境 /sys 只读或权限受限时探测会失败，

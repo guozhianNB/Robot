@@ -99,6 +99,15 @@ ROSBRIDGE_POSE_TTL_S = 10.0             # 位姿超过这么久没更新 → 视
 ROSBRIDGE_MOCK_POSE = os.environ.get("ROSBRIDGE_MOCK_POSE", "")  # "x,y,yaw" 注入假位姿（无 ROS 开发/测试）
 MAP_CURRENT_CACHE_TTL_S = 5.0           # 大于前端轮询周期；从扫描完成时计，避免慢 SSH 吞掉 TTL
 
+# 摄像头共享服务（vision/camera_server.py，裸 TCP）—— webbridge 连它的地址
+# 默认**本机**：摄像头服务与后端通常一起跑（PC 上用 webcam 调试、板卡上用 MIPI）。
+#   - 与 ROSBRIDGE_URL 默认指向板卡不同：那里板卡是唯一来源；而摄像头服务在
+#     PC（usb 摄像头）和板卡（MIPI）上都可能跑，默认本机才不会让"PC 调试"要先改配置。
+# 「后端跑在 PC、摄像头在板卡」时：把 VISION_HOST 设成板卡地址（同 MAPS_SSH_HOST），
+# 并在板卡上以 `--bind 0.0.0.0` 启动服务。
+VISION_HOST = os.environ.get("VISION_HOST", "127.0.0.1")
+VISION_PORT = int(os.environ.get("VISION_PORT", "9540"))
+
 
 # 声纹录制
 VOICE_ENROLL_SECONDS = 15        # 注册/追加默认录制秒数

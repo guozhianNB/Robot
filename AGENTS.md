@@ -46,6 +46,7 @@ docs/      需求/教程/接口契约/开发日志
 - `roslink.py` — rosbridge(websocket) 连接层：`available()/status()`、订阅 `/amcl_pose` 与 `/map`、`call_service()`、连不上只降级不崩、假数据注入。
 - `locator.py` — 位姿与当前地图：`pose_payload()`（降级保持 `ok: True`）、`set_pose_for_test()/clear_injection()`、`current_map()`（用 `/map` 元数据指纹反查在跑哪张 yaml）、`status()`。
 - `voice/` + `voice_api.py` — 语音链路（唤醒/识别/播报/声纹，**可选能力**）：外部依赖缺失时整体降级，后端照常启动，见「系统稳健性」。
+- `../vision/` — **摄像头共享服务**（`protocol.py` 协议 / `camera_server.py` 裸 TCP 守护进程 / `camera_client.py` 客户端 / `webcam.py` Windows·USB 后端 / `webbridge.py` HTTP 桥）：摄像头同一时刻只能被一个进程独占，故由守护进程持有并按通道向多客户端分发最新帧。**三种来源**：`--source auto`（默认）——板卡优先 `mipi`（`hobot_vio`，采集在子进程）、PC 优先 `webcam`（OpenCV，**可选依赖**，惰性导入，进程内），另有 `mock` 合成帧；`--list-cameras` 逐个试读确认设备号。**所有后端统一产出 NV12**，故 client/webbridge 零改动。`webbridge` 把裸 TCP 桥成 `/api/vision/*`，让 **PC 浏览器直接看画面**（硬件 JPEG 不可用时退回纯 stdlib 基线编码器）；摄像头服务地址由 `conf.VISION_HOST/VISION_PORT` 决定（默认本机；摄像头在板卡时指向板卡）。协议/API 见 `vision/README.md`，测试 `tests/test_vision.py`。
 
 ## API 端点（server.py）
 
@@ -66,6 +67,9 @@ docs/      需求/教程/接口契约/开发日志
   - `/api/zones*`：`GET`（`?map=`）｜ `POST`｜ `POST {uid}` ｜ `DELETE {uid}`（`?map=`）
   - `/api/robot/pose`（位姿，降级 `ok: True`）
   - `/api/mapeditor/*`：`GET /status` ｜ `GET /io` ｜ `POST /io/test` ｜ `POST /pose/inject`（假位姿/假地图注入，无 ROS 开发用）
+- **摄像头**（`vision/`，摄像头共享服务 + HTTP 桥；来源 `auto`/`mipi`/`webcam`/`mock`）：
+  - `/api/vision/status`（状态，含 `target` 回显连的地址；不可用时 `ok:True` + `status:"unavailable"`）｜ `GET /snapshot?channel=&quality=`（单帧 JPEG）｜ `GET /stream?channel=&fps=`（MJPEG，`<img src>` 直接可看）
+  - 裸 TCP 服务：`python3 -m vision.camera_server`（默认 `127.0.0.1:9540`；板卡走 mipi、PC 走 webcam，`--mock` 合成帧，`--list-cameras` 查设备号）；客户端 `vision.CameraClient`。摄像头服务地址由 `conf.VISION_HOST/VISION_PORT` 指定。详见 `vision/README.md`。
 
 ## 关键约定（改动前必读）
 
