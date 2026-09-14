@@ -728,8 +728,11 @@ def test_role_settings_have_defaults():
     assert DEFAULT_SETTINGS["ward_map_source"] == "auto"
 
 
-def test_new_float_setting_roundtrips_as_float(d):
-    """新增的 float 键要能真的存进去并读回 float（任务 2 已给 get_settings 补 float 分支）。"""
+def test_new_float_setting_roundtrips_as_float():
+    """新增的 float 键要能真的存进去并读回 float（任务 2 已给 get_settings 补 float 分支）。
+
+    本用例自带临时库，不用 `d` fixture（`LLM/tests/` 没有 conftest.py，fixture 都是各文件自己定义的）。
+    """
     from LLM import db
     import os, tempfile
     tmp = tempfile.mkdtemp()
