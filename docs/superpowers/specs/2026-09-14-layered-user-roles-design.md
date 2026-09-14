@@ -466,7 +466,7 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 | `frontend/packages/shared/src/{api/client.ts,api/session.ts,events.ts}` + `tests/` | **扩展现有文件**（**不要**新建 `src/session.ts`——session API 在 `src/api/session.ts`）：client 加 `X-Surface`；session 加登录/登出/口令/口令门/病房 API；events 事件 +3 与 `user_changed` 载荷扩展；vitest 补用例 | P0 |
 | `frontend/packages/kiosk/src/{components/UserSwitcher.vue,components/VoiceStatusBar.vue,App.vue}` | **左侧层级栏**（管理层/集体层/老人层）+ 状态条角色徽标/倒计时 + 管理员登录与口令设置 + 监听 `ward_changed`/`session_expired` | P0 |
 | `frontend/packages/admin/src/{App.vue,pages/RolesPage.vue,pages/WardsPage.vue,pages/RegisterPage.vue}` | 登录门 + Header 身份/退出 + 页签数组加「身份与权限」「病房管理」+ 注册向导加病房归属下拉 | P0 |
-| `LLM/tests/*` + `tests/`（既有） | 10 个新测试文件（§12）；既有基线 191 passed / 4 failed 的红态**不动** | P0 |
+| `LLM/tests/*` + `tests/`（既有） | 11 个新测试文件（§12）；既有基线 191 passed / 4 failed 的红态**不动** | P0 |
 | `LLM/car_mcp/car_server.py` / `car_controller.py` | 新增 `robot_goto` + 按地图点导航路径 | **P1（暂缓）** |
 | `ros2_car/` | 不改代码（沿用 `robot/navigate_to` 的 x/y/theta 分支；`place` 仍拒绝） | P1（暂缓） |
 | `docs/log.md` | 追加实现日志 | P0 |

@@ -148,3 +148,61 @@ def test_unlock_returns_to_collective_layer(d):
     res = voice_api.set_session_uid("elder_001", False)    # 老前端会传兜底 uid
     assert res["locked"] is False
     assert res["role"] == "ward" and res["uid"] == "ward_101"
+
+
+def _fusion_for(candidate, score=0.9):
+    """构造返回指定 candidate 的 fake 融合层。"""
+    return type("Fusion", (), {
+        "resolve": lambda self, seg: type(
+            "Vote", (), {"candidate_uid": candidate, "confidence": score})()})()
+
+
+def _speech_worker(d, candidate):
+    """一个最小可用的 worker（绕过音频/引擎，只走主体判定与广播）。"""
+    from LLM.voice import worker as worker_mod
+    from LLM.voice import session as voice_session_mod
+    w = worker_mod.VoiceWorker(stream_fn=lambda uid, text: iter(()))
+    w.session = voice_session_mod.Session()
+    w.fusion = _fusion_for(candidate)
+    w._start_answer = lambda uid, text, settings: None
+    return w
+
+
+def test_lock_follows_session_not_stale_mirror(d, monkeypatch):
+    """**回归（重要 4）**：锁定判定以**会话层**为唯一真相，不许读 worker 的陈旧镜像。
+
+    `voice_api.set_session_uid` 只在语音可用（`_worker is not None`）时才同步
+    `worker.locked_uid`；语音降级或从 admin 槽登出后镜像会永久粘住。这里让镜像与会话层
+    **刻意不一致**，断言判定跟着会话层走（两个方向各一次）。
+    """
+    from LLM.voice import worker as worker_mod
+    monkeypatch.setattr(worker_mod.audit, "log", lambda event, **kw: None)
+
+    # 方向 1：会话层已锁定 elder_101_1，镜像却是 None（语音降级期间从未同步过）
+    session.set_subject("elder_101_1", True, slot="kiosk", source="manual")
+    w = _speech_worker(d, "elder_102_1")             # 声纹认到**锁定外**的人
+    assert w.locked_uid is None                      # 陈旧镜像
+    w._handle_speech("seg", "第一句", {"tts_enabled": True})
+    p = session.get_principal("kiosk")
+    assert p["uid"] == "elder_101_1"                 # 锁定时按锁定的人走（不切换）
+    assert p["locked"] is True
+
+    # 方向 2：会话层已解锁（回集体层），镜像却还钉着 elder_101_1 → 不许被镜像重新钉回去
+    session.set_subject("ward_101", False, slot="kiosk", source="location")
+    w2 = _speech_worker(d, None)                     # 没认出来（宁问勿猜）
+    w2.locked_uid = "elder_101_1"
+    w2._handle_speech("seg", "第二句", {"tts_enabled": True})
+    p = session.get_principal("kiosk")
+    assert p["locked"] is False and p["uid"] == "ward_101"
+    assert p["source"] != "voiceprint"
+
+
+def test_apply_role_subject_uses_session_lock(d, monkeypatch):
+    """**回归（重要 4）**：`_apply_role_subject` 的 locked 也取自会话层（不读镜像）。"""
+    from LLM.voice import worker as worker_mod
+    monkeypatch.setattr(worker_mod.audit, "log", lambda event, **kw: None)
+    session.set_subject("elder_101_1", True, slot="kiosk", source="manual")
+    w = worker_mod.VoiceWorker(stream_fn=lambda uid, text: iter(()))
+    w.locked_uid = None                              # 镜像陈旧
+    w._apply_role_subject("elder_101_1")
+    assert session.get_principal("kiosk")["locked"] is True   # 不许被镜像解除锁定

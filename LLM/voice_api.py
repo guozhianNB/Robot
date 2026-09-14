@@ -103,6 +103,9 @@ def set_session_uid(uid: str, locked: bool) -> dict:
     res["ok"] = True
     if _worker is not None:
         try:
+            # **兼容镜像，不参与判定**：worker 的锁定语义一律读会话层（`principal["locked"]`）。
+            # 这里的同步只在语音可用时发生，语音降级/管理台登出后镜像会陈旧 —— 所以它
+            # 绝不能再当"是否锁定"的依据（规格 §4.5/D11）。
             _worker.locked_uid = uid if locked else None
         except Exception:
             pass

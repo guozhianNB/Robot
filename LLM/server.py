@@ -145,10 +145,16 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
     2. 上下文窗口已满时立即整理（不等到空闲）
     3. 滚动窗口历史摘要
 
-    `role` 透传给 `rag.note_turn`：collective 层（role="ward"）的话**不沉淀成任何老人
-    的记忆**（规格 §5.3）。`role=None`（语音等老调用点只传 3 个参数）时**从会话层现取**
-    —— 会话层是角色的唯一权威（R1）。语音是集体层的主入口，漏了这一步就会把病房公开
-    对话当成老人的话沉淀下去。`/api/chat` 路由由任务 11 显式传 `principal["role"]`。"""
+    `role` 决定本管线是否对**老人的私有记忆**生效：collective 层（role="ward"）的话**不沉淀成
+    任何老人的记忆**（规格 §5.3）。`role=None`（语音等老调用点只传 3 个参数）时**从会话层
+    现取** —— 会话层是角色的唯一权威（R1）。语音是集体层的主入口，漏了这一步就会把病房公开
+    对话当成老人的话沉淀下去。`/api/chat` 路由显式传 `principal["role"]`。
+
+    **非 elder/admin 一律整条管线早退**（与 `rag.note_turn` 的守卫同口径、fail-closed）：
+    只早退 `note_turn` 不够 —— 同管线里的 `rag.correct_instant()` **无条件执行**，病房里的
+    "不对/错了"这类话会覆盖那位老人的**核心记忆**；`summarize_old()`/`consolidate()` 同属
+    "以某位老人为数据主体"的写操作。集体层（及任何未知取值）只作集体上下文：不沉淀、
+    不纠错、不写摘要（规格 §5.3 / R5）。"""
     if role is None:
         # 语音等老调用点没传角色：按当前主体现取（会话层是角色的唯一权威，R1）
         # 取不到（`database is locked` 等读库异常）**不许抛出**：本函数跑在线程池里，
@@ -161,6 +167,10 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
             from . import log as audit
             audit.log("memory_change", action="role_lookup_failed", uid=uid, error=str(e))
             role = "ward"
+    if str(role or "").strip().lower() not in ("elder", "admin"):
+        # 集体层（及任何未知取值）只作集体上下文：既不沉淀、也不纠错、也不写摘要（规格 §5.3/R5）。
+        # 归一化后 fail-closed，与 `memory.note_turn` 的守卫同口径。
+        return
     settings = db.get_settings()
     try:
         rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
@@ -417,8 +427,12 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
         finally:
             voice_api.end_text_reply(speech, flush_tail=completed)
             if completed and assistant.strip():
-                # 角色随本轮的 principal 一起带给沉淀任务（集体层不沉淀，规格 §5.3）
-                _bg.submit(_post_chat_jobs, req.uid, req.message, assistant, principal["role"])
+                # 角色随本轮的 principal 一起带给沉淀任务（集体层不沉淀，规格 §5.3）。
+                # uid 也必须同源：客户端传来的 uid 不可信（R1），否则管理台/别人槽位的这一轮
+                # 会被沉淀进**另一位老人**的历史与记忆（R5 的旁路）。
+                # admin 槽的 principal["uid"] == "admin"（管理层自己的会话），不回落到 req.uid。
+                _bg.submit(_post_chat_jobs, principal["uid"] or req.uid, req.message, assistant,
+                           principal["role"])
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",
@@ -764,10 +778,27 @@ async def settings_get():
 
 
 @app.post("/api/settings")
-async def settings_set(body: dict):
-    patch = body.get("settings") or body
+async def settings_set(body: dict, x_surface: str = Header(default="kiosk")):
+    """改设置。**特权键（口令门/TTL/MCP/病房自动切换）只有管理员能改**。
+
+    否则一个未认证的 `POST /api/settings {"admin_auth_required": false}` 就能把口令门关掉、
+    整套角色保护归零（`admin_auth_required` 是 `DEFAULT_SETTINGS` 白名单键，`db.set_settings`
+    照单全收），随后 `POST /api/session/login {}` 即得 `source=auth_disabled` 的 admin。
+    非特权键（`asr_provider`/`tts_provider`、音量亮度等）**保持现状**：kiosk 端要能改。
+    """
+    patch = (body.get("settings") or body) if isinstance(body, dict) else {}
+    if not isinstance(patch, dict):
+        patch = {}
+    privileged = {"admin_auth_required", "admin_session_ttl_s",
+                  "mcp_enabled", "ward_autoswitch_enabled"}
+    hit = privileged & set(patch)
+    if hit:
+        slot = _surface(x_surface)                 # 顺带兜底建表 + 非法端槽位显式 400
+        if session.get_principal(slot)["role"] != "admin":
+            audit.log("policy_deny", action="settings_privileged", slot=slot,
+                      keys=sorted(hit), decision="deny")
+            raise HTTPException(status_code=403, detail="仅管理员可修改特权设置")
     cur = db.set_settings(patch)
-    from . import log as audit
     audit.log("settings", change=json.dumps(patch, ensure_ascii=False), by="nurse")
     return {"ok": True, "settings": cur}
 

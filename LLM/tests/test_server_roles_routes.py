@@ -190,3 +190,57 @@ def test_chat_takes_principal_from_surface(c, monkeypatch):
     assert seen["principal"]["role"] == "ward"      # 双槽隔离：管理台登录不提权车前屏
     assert c.post("/api/chat", json={"uid": "elder_101_1", "message": "你好"},
                   headers={"X-Surface": "bogus"}).status_code == 400
+
+
+def test_non_admin_cannot_disable_password_gate(c):
+    """**回归（关键）**：未认证/非管理员不许经 /api/settings 关掉口令门。
+
+    `admin_auth_required` 是 `DEFAULT_SETTINGS` 白名单键，`db.set_settings` 照单全收 ——
+    没有这道守卫时，一个未认证的 POST 就能关掉口令门，随后 `POST /api/session/login {}`
+    拿到 `source=auth_disabled` 的 admin，整套角色保护归零。
+    """
+    r = c.post("/api/settings", json={"admin_auth_required": False}, headers=K)
+    assert r.status_code == 403
+    assert c.get("/api/session/admin-auth", headers=K).json()["required"] is True
+    assert c.get("/api/settings").json()["settings"]["admin_auth_required"] is True
+    # 未认证的 kiosk 槽也不能把自己提权（login 仍要口令）
+    assert c.post("/api/session/login", json={}, headers=K).json()["ok"] is False
+    assert c.get("/api/session/user", headers=K).json()["role"] == "ward"
+    # 管理员可以改
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    assert c.post("/api/settings", json={"admin_auth_required": False},
+                  headers=A).status_code == 200
+
+
+def test_privileged_settings_are_all_guarded(c):
+    """**回归（关键）**：特权键不止口令门一个 —— TTL 与病房自动切换同样只给管理员。"""
+    for key, val in (("admin_session_ttl_s", 99999), ("ward_autoswitch_enabled", False),
+                     ("mcp_enabled", True), ("admin_auth_required", False)):
+        assert c.post("/api/settings", json={"settings": {key: val}},
+                      headers=K).status_code == 403
+    s = c.get("/api/settings").json()["settings"]
+    assert s["admin_session_ttl_s"] == 300 and s["ward_autoswitch_enabled"] is True
+
+
+def test_kiosk_can_still_write_engine_switches(c):
+    """**回归（关键 1 的反面）**：非特权键保持现状 —— kiosk 必须还能切识别/合成引擎。"""
+    r = c.post("/api/settings", json={"settings": {"asr_provider": "local"}}, headers=K)
+    assert r.status_code == 200 and r.json()["settings"]["asr_provider"] == "local"
+    r = c.post("/api/settings", json={"tts_provider": "local"}, headers=K)   # 裸体（无 settings 包）
+    assert r.status_code == 200 and r.json()["settings"]["tts_provider"] == "local"
+
+
+def test_ward_turn_does_not_touch_core_memory(c, monkeypatch):
+    """**回归（关键）**：集体层话语不许纠错/改写老人的核心记忆。"""
+    from LLM import server
+    calls = []
+    monkeypatch.setattr(server.rag, "note_turn", lambda *a, **k: calls.append("note_turn"))
+    monkeypatch.setattr(server.rag, "correct_instant", lambda *a, **k: calls.append("correct"))
+    monkeypatch.setattr(server.rag, "consolidate", lambda *a, **k: None)
+    monkeypatch.setattr(server.chat, "summarize_old", lambda *a, **k: None)
+    # 病房里的"不对/错了"这类话：既不沉淀、也不纠错、也不写摘要
+    server._post_chat_jobs("elder_101_1", "不对，我不住101", "好的", "ward")
+    assert calls == []
+    # 对照组：老人本人的轮次仍然走完整管线（否则"整条早退"会被误判成通过）
+    server._post_chat_jobs("elder_101_1", "我今天有点闷", "我陪您说说话", "elder")
+    assert calls == ["note_turn", "correct"]

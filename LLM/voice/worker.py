@@ -79,7 +79,11 @@ class VoiceWorker(threading.Thread):
         self.status = "stopped"           # running / degraded / disabled / stopped
         self.sub_status = {}
         self.current_uid = None
-        self.locked_uid = None       # 手动锁定用户（None=未锁定，规格 D11）
+        # 手动锁定用户（规格 D11）——**兼容属性，不参与任何判定**：锁定语义的唯一真相是
+        # 会话层 `LLM/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
+        # 语音可用时被 `voice_api.set_session_uid` 同步，语音降级/管理台登出后会永久粘住，
+        # 拿它判定就等于"陈旧的锁定一直带下去、只能重启恢复"。判定处一律读会话层。
+        self.locked_uid = None
         self.src = self.sink = None
         self.vad = self.kws = self.asr = self.tts = self.spk = self.fusion = None
         self.session = session_mod.Session()
@@ -349,6 +353,9 @@ class VoiceWorker(threading.Thread):
         注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
         语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
 
+        **锁定语义读会话层**（不读 `self.locked_uid` 镜像）：镜像只在语音可用时被
+        `voice_api.set_session_uid` 同步，语音降级/管理台登出后就会陈旧，会让"锁定"永久粘住。
+
         **降级**：`set_subject()` 内部会 `derive_role()` → `db.get_profile_kind()` 读库，
         库路径错/文件被换/锁都会抛异常；这里绝不能让它抛穿到 `run()` 的 except
         （那会 `_reconnect()` 掉这一整句——没有应答、没有 TTS）。出问题只记审计并
@@ -361,7 +368,7 @@ class VoiceWorker(threading.Thread):
                 return
             if not recognized_uid:
                 return
-            role_session.set_subject(recognized_uid, bool(self.locked_uid), slot="kiosk",
+            role_session.set_subject(recognized_uid, bool(principal["locked"]), slot="kiosk",
                                      source="voiceprint")
         except Exception as e:              # noqa: BLE001  DB/会话层异常不许掐掉整句应答
             audit.log("voice_error", action="role_subject", uid=recognized_uid, error=str(e))
@@ -369,18 +376,6 @@ class VoiceWorker(threading.Thread):
     def _handle_speech(self, seg, text, settings):
         self.session.note_speech()
         audit.log("voice_asr", text=text[:200])
-
-        vote = self.fusion.resolve(seg)
-        # 只认**真正的识别结果**：`effective_uid()` 在没认出来时会回落到 `current_uid`
-        # （内存里的旧主体），那是"本轮用谁应答"的兜底，不是"认出谁了"。把它当识别结果
-        # 喂给 `_apply_role_subject` 会把位置自动切换（D17/D18）刚切好的主体回退掉。
-        candidate = vote.candidate_uid or self.locked_uid
-        # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
-        if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
-            audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
-                      detected=vote.candidate_uid, score=round(vote.confidence, 3))
-        audit.log("voice_spk", identified=(vote.candidate_uid is not None),
-                  uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
         from LLM import session as role_session
         # 读会话层（= 读库）异常（`database is locked` 等）不许从 try 之外抛穿到 `run()` 的
@@ -393,6 +388,24 @@ class VoiceWorker(threading.Thread):
         except Exception as e:              # noqa: BLE001
             audit.log("voice_error", action="role_principal", step="prev", error=str(e))
             prev = empty_principal
+
+        vote = self.fusion.resolve(seg)
+        # 只认**真正的识别结果**：`effective_uid()` 在没认出来时会回落到 `current_uid`
+        # （内存里的旧主体），那是"本轮用谁应答"的兜底，不是"认出谁了"。把它当识别结果
+        # 喂给 `_apply_role_subject` 会把位置自动切换（D17/D18）刚切好的主体回退掉。
+        #
+        # 锁定语义读**会话层**（不读 `self.locked_uid` 镜像：镜像只在语音可用时同步，
+        # 语音降级/管理台登出后会永久粘住）。锁定时按锁定的人走（声纹只提示不切换，
+        # 规格 D11/§8.2 行为矩阵）；解锁时宁问勿猜 —— 认不出来就不带 candidate。
+        locked_uid = (prev["uid"] or None) if prev["locked"] else None
+        candidate = locked_uid if locked_uid else vote.candidate_uid
+        # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
+        if locked_uid and vote.candidate_uid and vote.candidate_uid != locked_uid:
+            audit.log("voice_spk", action="locked_ignored", locked=locked_uid,
+                      detected=vote.candidate_uid, score=round(vote.confidence, 3))
+        audit.log("voice_spk", identified=(vote.candidate_uid is not None),
+                  uid=vote.candidate_uid, score=round(vote.confidence, 3))
+
         self._apply_role_subject(candidate)                  # 谁说的：按角色决定（含 D8）
         try:
             principal = role_session.get_principal("kiosk")

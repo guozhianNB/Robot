@@ -293,9 +293,15 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
 
 def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict,
                    principal: dict | None = None) -> list[dict]:
-    """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。"""
-    history = db.load_history(uid, limit=HISTORY_WINDOW)
-    system = build_system(uid, settings, query=_build_query(user_text, history),
+    """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。
+
+    滚动历史的读写 uid **必须与权限/数据口径同源**（与 `build_system` 里同一句）：
+    客户端传来的 uid 不可信（R1），拿它去读历史会把**另一位老人的私聊原文**当 history
+    注入当前会话（R5 的旁路）。
+    """
+    data_uid = (principal.get("uid") or uid) if principal is not None else uid
+    history = db.load_history(data_uid, limit=HISTORY_WINDOW)
+    system = build_system(data_uid, settings, query=_build_query(user_text, history),
                           principal=principal)
     if thinking_on:
         system += "\n" + ROUTER_HIT
@@ -397,9 +403,15 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     elif thinking == "off":
         thinking_on, reason, method = False, "用户手动关闭", "manual"
 
-    yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method, "uid": uid}}
+    # 历史读写也必须与权限口径同源：客户端传来的 uid 不可信（R1），否则会把别人的私聊注入
+    # 当前会话、并把回答写进别人的历史（R5 的旁路）。`meta` 里报的也是这个**实际生效**的
+    # 数据主体（前端若与入参比对，能看出伪造/过期的 uid 已被忽略）。
+    data_uid = (principal.get("uid") or uid) if principal is not None else uid
 
-    messages = build_messages(uid, user_text, thinking_on, settings, principal=principal)
+    yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method,
+                                      "uid": data_uid}}
+
+    messages = build_messages(data_uid, user_text, thinking_on, settings, principal=principal)
     tools = tool_mod.effective_tools(settings, principal)
 
     full_assistant = ""
@@ -419,7 +431,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 # thinking+工具冲突等：降级重试一次（去掉 thinking 或去掉工具）
                 if thinking_on:
                     thinking_on = False
-                    yield {"type": "meta", "router": {"on": False, "reason": f"重试降级：{e}", "uid": uid}}
+                    yield {"type": "meta", "router": {"on": False, "reason": f"重试降级：{e}",
+                                                      "uid": data_uid}}
                     extra = {"thinking": {"type": "disabled"}}
                     stream = client.chat.completions.create(
                         model=model, messages=messages, stream=True,
@@ -473,9 +486,9 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     latency = int((time.time() - t0) * 1000)
                     snippet = (result.get("result") or result.get("message")
                                or result.get("error") or "")[:500]
-                    db.log_tool(uid, name, args, snippet,
+                    db.log_tool(data_uid, name, args, snippet,
                                 status="ok" if result.get("ok") else "error", latency_ms=latency)
-                    audit.log("tool", uid=uid, tool=name, args=args,
+                    audit.log("tool", uid=data_uid, tool=name, args=args,
                               ok=result.get("ok"), latency_ms=latency)
                     yield {"type": "tool_result", "tool": name, "ok": result.get("ok"),
                            "snippet": snippet}
@@ -485,13 +498,14 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
 
             break  # 正常结束
     except Exception as e:
-        audit.log("chat", action="error", uid=uid, error=str(e))
+        audit.log("chat", action="error", uid=data_uid, error=str(e))
         yield {"type": "error", "content": f"对话服务出错：{e}"}
         return
 
-    # 落库：对话历史 + 审计
-    db.append_history(uid, "user", user_text)
+    # 落库：对话历史 + 审计（按实际生效的数据主体落，不许落到入参 uid 上）
+    db.append_history(data_uid, "user", user_text)
     if full_assistant.strip():
-        db.append_history(uid, "assistant", full_assistant)
-    audit.log("chat", action="turn", uid=uid, user=user_text[:200], assistant=full_assistant[:200])
+        db.append_history(data_uid, "assistant", full_assistant)
+    audit.log("chat", action="turn", uid=data_uid, user=user_text[:200],
+              assistant=full_assistant[:200])
     yield {"type": "done", "assistant": full_assistant}

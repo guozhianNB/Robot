@@ -147,6 +147,40 @@ def test_policy_deny_audit_has_decision_field(monkeypatch, probe):
     assert seen and seen[-1][0] == "policy_deny"
     assert seen[-1][1]["decision"] == "deny"
     assert seen[-1][1]["tool"] == "__probe__" and seen[-1][1]["role"] == "ward"
+    # Minor：原始 role 与归一后的 resolved_role 一起记（否则 fail-closed 的兜底会被算成
+    # "集体层越权"）。未知取值：role 保留原样，resolved_role 归一成 ward。
+    seen.clear()
+    tools.run_tool("__probe__", {}, {"role": "??"})
+    assert seen[-1][1]["role"] == "??" and seen[-1][1]["resolved_role"] == "ward"
+    seen.clear()
+    tools.run_tool("__probe__", {}, None)
+    assert seen[-1][1]["role"] is None and seen[-1][1]["resolved_role"] == "ward"
+
+
+def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
+    """**回归（Minor）**：白名单**内** + 服务器 roles 排除该角色 → 仍拒。
+
+    与 `test_run_tool_denies_mcp_outside_server_roles` 的差别：那条用的 `mcp_probe` 不在任何
+    角色白名单里，拒因落在**白名单**（`allow_ok=False`）而非服务器 roles，判别力弱。
+    这里用 **elder 白名单内**的 `robot_stop`，只有"服务器 roles 也参与判定"才会被拒。
+    """
+    from LLM import policy
+    called = []
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "robot_stop": {"server": "srv", "schema": {"type": "function",
+                       "function": {"name": "robot_stop", "description": "", "parameters": {}}}}})
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr(tools.mcp_client, "call_tool",
+                        lambda name, args: called.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    assert "robot_stop" in policy.role_policy("elder")["allowed_tools"]   # 前提：白名单内
+    assert "robot_stop" not in _names({"mcp_enabled": True}, _p("elder"))  # 看不见
+    res = tools.run_tool("robot_stop", {}, _p("elder"))                   # 也调不到
+    assert res["ok"] is False and called == []
+    assert seen[-1][1]["reason"] == "tool_roles_mismatch"                 # 拒因 = 服务器 roles
+    assert tools.run_tool("robot_stop", {}, _p("admin"))["ok"] is True
+    assert called == ["robot_stop"]
 
 
 def test_unknown_tool_is_not_counted_as_denied(monkeypatch):

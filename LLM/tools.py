@@ -177,7 +177,11 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     else:
         roles_ok = resolved in _mcp_roles(mcp_client.tools()[name].get("server", ""))
     if not (allow_ok and roles_ok):
-        audit.log("policy_deny", tool=name, role=role, uid=p.get("uid"), slot=p.get("slot"),
+        # 同时记 `role`（原始，可能缺省/未知/带大小写）与 `resolved_role`（归一后真正参与判定的
+        # 那个角色）：只记原始值时，`role=None`/`"??"` 的拒绝记录与 `"ward"` 混在一起，按 role
+        # 聚合的越权统计会把 fail-closed 的兜底算成"集体层越权"。
+        audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
+                  uid=p.get("uid"), slot=p.get("slot"),
                   decision="deny", args=args or {},
                   reason="out_of_role_whitelist" if not allow_ok else "tool_roles_mismatch")
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}

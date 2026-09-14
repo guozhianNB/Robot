@@ -108,3 +108,52 @@ def test_broken_ward_context_window_does_not_crash(d):
     for bad in (None, "abc"):
         sys_p = chat.build_system("elder_101_1", {"ward_context_window": bad}, "", principal=p)
         assert "小护" in sys_p                                       # 没抛异常，base 仍在
+
+
+def test_chat_history_uses_principal_uid_not_request_uid(d):
+    """**回归（关键）**：入参 uid 与 principal 不一致时，滚动历史的读写以 principal 为准。
+
+    旧实现里 `build_messages` 用入参 `uid` 取历史（`build_system` 已改用 principal）——于是
+    主体是 elder_102_1、请求体传 `uid="elder_101_1"` 时，E101 的**私聊原文**会被当作 history
+    注入当前上下文，回答也会被写进 E101 的历史（R5 的旁路）。
+    """
+    db.append_history("elder_101_1", "user", "E101 的秘密")
+    p = _p("elder", "elder_102_1", "ward_102")
+    msgs = chat.build_messages("elder_101_1", "在吗", False, {}, principal=p)
+    joined = "\n".join(m["content"] for m in msgs)
+    assert "E101 的秘密" not in joined
+    # 反向确认：principal 自己的历史仍在（不是"整条 history 被吞掉"式的假通过）
+    db.append_history("elder_102_1", "user", "E102 的私事")
+    msgs = chat.build_messages("elder_101_1", "在吗", False, {}, principal=p)
+    joined = "\n".join(m["content"] for m in msgs)
+    assert "E102 的私事" in joined and "E101 的秘密" not in joined
+
+
+def test_chat_stream_writes_history_to_principal_uid(d):
+    """**回归（关键）**：落库也认 principal —— 回答不许写进入参 uid 的历史。"""
+    class _Delta:
+        content = "好的"
+        reasoning_content = None
+        tool_calls = None
+
+    class _Choice:
+        delta = _Delta()
+        finish_reason = "stop"
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kw):
+            return [_Chunk()]
+
+    class _Client:
+        chat = type("C", (), {"completions": _Completions()})()
+
+    p = _p("elder", "elder_102_1", "ward_102")
+    events = list(chat.chat_stream(_Client(), "m", "elder_101_1", "在吗", "off", {},
+                                   principal=p))
+    # meta 报的是**实际生效**的数据主体（伪造/过期的入参 uid 被忽略）
+    assert any(e["type"] == "meta" and e["router"]["uid"] == "elder_102_1" for e in events)
+    assert [r["content"] for r in db.load_history("elder_102_1")] == ["在吗", "好的"]
+    assert db.load_history("elder_101_1") == []

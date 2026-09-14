@@ -11,7 +11,9 @@ const text = ref("");
 const sending = ref(false);
 
 async function loadHistory() {
-  const res = await fetch(`/api/chat/history?uid=${uid.value}&limit=200`);
+  // 必须带 X-Surface：后端按端槽位取 principal，缺头按 kiosk 槽 → 管理台会以集体层身份说话
+  const res = await fetch(`/api/chat/history?uid=${uid.value}&limit=200`,
+    { headers: { "X-Surface": "admin" } });
   const body = await res.json();
   messages.value = (body.history ?? []).map((h: any) => ({
     role: h.role, content: h.content,
@@ -31,7 +33,9 @@ async function send() {
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // X-Surface: admin —— 管理台说的话是**管理层**的话；缺头会被后端按 kiosk 槽
+      // 取 principal，降级成集体层（且这一轮会被按集体层口径处理）
+      headers: { "Content-Type": "application/json", "X-Surface": "admin" },
       body: JSON.stringify({ uid: uid.value, message: t, thinking: "auto" }),
     });
     if (!res.body) throw new Error("no body");
@@ -60,7 +64,8 @@ async function send() {
 }
 
 async function clearHistory() {
-  await fetch(`/api/chat/history?uid=${uid.value}`, { method: "DELETE" });
+  await fetch(`/api/chat/history?uid=${uid.value}`,
+    { method: "DELETE", headers: { "X-Surface": "admin" } });
   messages.value = [];
 }
 
