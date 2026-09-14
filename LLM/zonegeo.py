@@ -8,6 +8,10 @@ r"""
   * shape == "polygon"：射线法（顶点顺序不限，凸凹多边形都行）；
   * shape == "rect"   ：用 polygon 的**外接矩形**判定（矩形区域只存 4 个角，容差更稳）；
   * 顶点数 < 3 / 数据损坏 → False —— fail-safe：宁可判"不在"，也不抛异常打断对话。
+
+注：**含坏点时的处理为有意偏离**——coords.ts 对 falsy 顶点是 `continue`（顶点总数不重算，
+坏点经 `Number()` 变成 NaN 参与后续边判断），本实现是丢弃坏点后**重排顶点**再判。
+两者仅在数据已损坏时结果可能不同，健康数据下口径一致；勿据此认为本文件逐字同源。
 """
 import json
 
@@ -18,7 +22,7 @@ def _points(poly) -> list[tuple[float, float]]:
     for pt in (poly if isinstance(poly, (list, tuple)) else []):
         try:
             out.append((float(pt[0]), float(pt[1])))
-        except (TypeError, ValueError, IndexError, KeyError):
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
             continue
     return out
 
@@ -65,7 +69,7 @@ def _as_poly(zone: dict) -> list:
 
 def zone_hit(zone: dict, x: float, y: float) -> bool:
     """点是否落在这个区域行里（`zone` = `db.list_zones()` 返回的行，含 `shape`/`polygon`）。"""
-    if not zone:
+    if not isinstance(zone, dict):
         return False
     poly = _as_poly(zone)
     if str(zone.get("shape") or "polygon") == "rect":
