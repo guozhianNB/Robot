@@ -173,3 +173,45 @@ def ttl_remain(slot: str = "kiosk") -> int | None:
     if s["role"] != "admin" or not s["until"]:
         return None
     return max(0, int(s["until"] - _now_ts()))
+
+
+# ---------------------------------------------------------------------------
+# 口令维护（D12/D13）：可改、可整体关闭、首启自动生成 6 位随机口令
+# ---------------------------------------------------------------------------
+def change_admin_password(old: str, new: str) -> dict:
+    """改口令（需旧口令）。口令门关着时允许直接设新口令（此时无旧口令可验）。"""
+    auth = db.get_admin_auth()
+    if auth["required"] and not db.verify_admin_password(old or ""):
+        audit.log("admin_password_changed", ok=False, reason="old_mismatch")
+        return {"ok": False, "error": "旧口令错误"}
+    if len(new or "") < 4:
+        return {"ok": False, "error": "新口令太短（至少 4 位）"}
+    db.set_admin_password(new)
+    audit.log("admin_password_changed", ok=True)
+    return {"ok": True}
+
+
+def set_admin_auth(required: bool) -> dict:
+    """开关口令门（D13）。
+
+    重新**开启**时把两个槽的 admin 会话立即作废：否则"先关掉门进来、再开回门"的人会
+    一直留在管理员态，等于门白开了。
+    """
+    required = bool(required)
+    db.set_admin_auth_required(required)
+    audit.log("admin_auth_changed", required=required)
+    if required:
+        for slot in SLOTS:
+            if _slot(slot)["role"] == "admin":
+                _slot(slot).update({"role": "ward", "until": None, "source": "auth_reenabled"})
+    return {"required": required}
+
+
+def ensure_admin_password() -> str | None:
+    """首启：库里没有口令哈希就生成 6 位随机口令，返回明文（调用方打印 + 审计，D12）。"""
+    if db.get_admin_auth()["hash"]:
+        return None
+    import secrets
+    pw = "".join(secrets.choice("0123456789") for _ in range(6))
+    db.set_admin_password(pw)
+    return pw

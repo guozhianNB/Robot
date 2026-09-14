@@ -154,3 +154,42 @@ def test_unknown_uid_does_not_hijack_current_ward(d):
     session.set_subject("ward_101", slot="kiosk")
     session.set_subject("ghost_9", slot="kiosk", source="voiceprint")
     assert session.get_principal("kiosk")["ward_uid"] == "ward_101"
+
+
+def test_change_password_requires_old(d):
+    d.set_admin_password("111111")
+    assert session.change_admin_password("wrong", "222222")["ok"] is False
+    assert session.change_admin_password("111111", "222222")["ok"] is True
+    assert d.verify_admin_password("222222") is True
+    assert d.verify_admin_password("111111") is False
+
+
+def test_change_password_rejects_too_short(d):
+    assert session.change_admin_password("111111", "12")["ok"] is False
+    assert d.verify_admin_password("111111") is True          # 失败不改动原口令
+
+
+def test_toggle_auth_required_and_login_without_password(d):
+    assert session.set_admin_auth(False)["required"] is False
+    r = session.login_admin(password=None, slot="kiosk")
+    assert r["ok"] is True and r["source"] == "auth_disabled"
+    assert r["ttl_remain"] is None                            # 无口令保护时不再自动降权
+    assert session.set_admin_auth(True)["required"] is True
+
+
+def test_re_enabling_lock_kills_existing_admin_sessions(d):
+    """重新开启口令门 = 现有 admin 会话立即作废（强制下次要口令）。"""
+    session.login_admin("111111", slot="admin", ttl_s=600)
+    session.set_admin_auth(False)
+    session.login_admin(password=None, slot="admin")          # 无保护状态下进的管理员
+    session.set_admin_auth(True)
+    assert session.get_principal("admin")["role"] == "ward"    # 已被踢回
+
+
+def test_first_boot_generates_random_password(d):
+    d._set_setting_raw("admin_password_hash", "")
+    d._set_setting_raw("admin_password_salt", "")
+    pw = session.ensure_admin_password()
+    assert isinstance(pw, str) and len(pw) == 6 and pw.isdigit()
+    assert d.verify_admin_password(pw) is True
+    assert session.ensure_admin_password() is None             # 已有口令 → 不再生成
