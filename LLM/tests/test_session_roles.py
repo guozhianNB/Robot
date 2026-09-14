@@ -237,3 +237,14 @@ def test_ensure_password_never_overwrites(d):
     d.set_admin_password("111111")
     assert session.ensure_admin_password() is None
     assert d.verify_admin_password("111111") is True
+
+
+def test_ttl_expiry_broadcasts_session_expired(d, monkeypatch):
+    """**回归**：TTL 到期除了落审计，还要广播 session_expired（前端靠它提示）。"""
+    seen = []
+    monkeypatch.setattr(session.bus, "publish", lambda ev, **kw: seen.append((ev, kw)))
+    session.login_admin("111111", slot="kiosk", ttl_s=1)
+    base = session._now_ts()
+    monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
+    session.get_principal("kiosk")                      # 触发懒 tick 过期
+    assert ("session_expired", {"slot": "kiosk"}) in seen

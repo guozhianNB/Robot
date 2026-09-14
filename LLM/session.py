@@ -152,6 +152,7 @@ def _expire_if_needed(slot: str) -> None:
     if s["role"] == "admin" and s["until"] and _now_ts() >= s["until"]:
         s.update({"role": "ward", "source": "expired", "until": None})
         audit.log("session_expired", slot=slot)
+        bus.publish("session_expired", slot=slot)   # 前端靠它提示"管理员会话已超时"（规格 §4.1）
 
 
 def get_principal(slot: str = "kiosk") -> dict:
