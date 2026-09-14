@@ -55,3 +55,28 @@ describe("parseBusPayload（EventSource msg.data 场景，已剥离 data: 前缀
     expect(parseBusPayload('{"type":"unknown_event"}')).toBeNull();
   });
 });
+
+describe("分层用户体系新增事件", () => {
+  it("session_expired", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "session_expired", slot: "kiosk" }));
+    expect(ev?.type).toBe("session_expired");
+  });
+
+  it("admin_auth_changed", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "admin_auth_changed", required: false }));
+    expect(ev?.type).toBe("admin_auth_changed");
+  });
+
+  it("ward_changed", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "ward_changed", uid: "ward_101", action: "location" }));
+    expect(ev?.type).toBe("ward_changed");
+  });
+
+  it("user_changed 载荷扩了 role/slot/ward_uid 也不再被丢弃", () => {
+    const ev = parseBusPayload(JSON.stringify({
+      type: "user_changed", uid: "elder_101_1", locked: false,
+      source: "voiceprint", role: "elder", slot: "kiosk", ward_uid: "ward_101",
+    }));
+    expect(ev?.type).toBe("user_changed");
+  });
+});
