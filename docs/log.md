@@ -492,3 +492,42 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - GREEN/静态验证：kiosk 同一 `rg` 退出码 0、命中 1 处；admin 同一检查退出码 1、无匹配；`D:\_project\Robot\.venv\Scripts\python.exe -m py_compile LLM\server.py LLM\voice_api.py LLM\voice\worker.py` 退出码 0；`git diff --check` 退出码 0。
 - 全量验证原始摘要：`$env:DEEPSEEK_API_KEY='test-key'; D:\_project\Robot\.venv\Scripts\python.exe -m pytest LLM\tests -q --basetemp .superpowers/pytest-tmp-task4` → `97 passed in 16.48s`；`frontend/packages/kiosk` 与 `frontend/packages/admin` 均执行 `node_modules\\.bin\\vite.CMD build` → Vite 构建成功（分别 37、42 modules）。`vue-tsc` 沿用任务前已知损坏安装（`vue-tsc/index.js` 缺失），未修复、未计为本任务回归。
 - 合并前审查修复：文本播报入口不再同步等待 `AudioSink.stop()`；后台交接锁串行停止旧播放，首句通过 `AudioSink.play()` 复位停止标志后再入队，避免新轮被旧声卡停止状态吞掉。新增声卡重启与首包不阻塞回归测试；修复后全量 `pytest LLM/tests -q` → `99 passed`。使用临时 `vue-tsc@2.0.29` 仅检查 kiosk `src` → 通过；仓库原始配置包含的 `vite.config.ts` 仍因缺 `@types/node` 报 `node:url`，未纳入本次改动。
+
+---
+
+## 2026-09-14 · 地图编辑器落地（第三个前端 `/mapeditor` + 地图标记唯一真相 + 地图文件 SSH 读写）
+
+- 规格：`docs/superpowers/specs/2026-09-14-map-editor-design.md`（A 篇看图/标地点/划区域/管地图文件，B 篇像素修图）。本轮把规格落到代码，文档回填见文末「已知限制 / 未做」。
+
+### 后端（`LLM/`，新增 5 个模块 + 改动 4 个文件）
+
+- `LLM/mapstore.py`（新）：`MapStore` 协议 / `LocalMapStore`（纯 stdlib）/ `SshMapStore`（主形态，paramiko 优先、退回 `ssh.exe` 子进程）/ `MapCache` 离线缓存（`DATA_DIR/mapcache/`，键 = `sha1(io_mode+root+name+ext)`）/ `get_store()/reset_store()/io_status()/io_test()` / 名字白名单 `check_name()` / `backup()` + `_prune_backups()`（备份到 `maps/.backup/<名>.<YYYYmmdd-HHMMSS>.{pgm,yaml}`，只按自己的命名规则删，保留最近 `MAPS_BACKUP_KEEP`=10 组）。
+- `LLM/maptags.py`（新）：`<图名>.tags.json` 唯一真相的读写（`resolve`/原子 `save`/`replace_all`）、单向刷索引缓存 `sync_map()`、`fingerprint_check()`、地点/区域增删改、`learn_here()`、`record_room_polygon()`、`reindex()/reindex_all()`。
+- `LLM/mapserver.py`（新）：PGM(P2/P5) 解析、灰度 PNG 编码（纯 stdlib 手写 zlib + struct）、未知率三分、`meters_to_pixel()/pixel_to_meters()`、`validate_point()`、`map_info()`。
+- `LLM/roslink.py`（新）：rosbridge(websocket) 连接层、降级、假数据注入。
+- `LLM/locator.py`（新）：位姿 `pose_payload()`、`set_pose_for_test()`、当前地图指纹识别 `current_map()`。
+- `LLM/db.py`：新增三张**只读索引缓存**表 `map_tags_manifest` / `destinations` / `zones`，主键 `(map_name, uid)`，加一组访问函数（业务代码不得直接写这三张表，唯一写入口是 `maptags.sync_map()`）。
+- `LLM/conf.py`：新增 `MAPS_IO`(默认 `ssh`) / `MAPS_DIR` / `MAPS_SSH_*` / `MAPS_MAX_PGM_BYTES` / `MAPS_MAX_YAML_BYTES` / `MAPS_BACKUP_KEEP` / `MAP_RE_NAME_RE` / `ROSBRIDGE_*`，以及 `DEFAULT_SETTINGS` 的 `current_map` / `map_boundary_margin_m` / `map_topic_fingerprint_enabled` / `mapeditor_auto_switch_map`。
+- `LLM/server.py`：新增地图编辑器全部路由（源码里有注释锚点 `# 地图编辑器（第三个前端 /mapeditor）`）；`lifespan` 新增一行 `audit.log("map_io_change", ...)`（不新增任何启动步骤）；静态挂载新增 `/mapeditor`（优先 dist，未构建则回退 `public/`）。
+
+### 前端（`frontend/packages/mapeditor/`，新包）
+
+- `public/pixel-editor.html`：上游 `ROS-SLAM-Map-Editor/editor.html` 的副本，**LF**；实测 `git diff --no-index` 对上游 git blob（43165 字节）只有 **7 增 5 删**（＝5 条 CDN URL 换本地 vendor + 1 行 `<script src="./pixel-netio.js">`），文件 43178 字节。
+- `public/pixel-netio.js`：接线层（读注入 + 写截获 + 状态条）。
+- `public/vendor/`：5 个自托管资源（jQuery 3.4.1 / js-yaml 4.1.0 / Bootstrap 4.4.1 CSS+JS / Font Awesome 4.7.0 含 webfonts）+ `ROS-SLAM-Map-Editor.LICENSE`（上游 MIT 原文）。
+- `src/`：Vue3 应用（`App.vue` / `pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue` / `lib/{coords,colorize,api,types}.ts`）。
+- `frontend/package.json` 加 `dev:mapeditor`；`vite.config.ts` 为 base `/mapeditor/`、端口 5175、proxy `/api`→8000（可用 `VITE_API_TARGET` 指向板卡后端）。
+- 仓库根 `scripts/vendor_mapeditor_assets.py`（幂等下载/落盘 5 个 vendor 资源）、`scripts/e2e_smoke.mjs`（无头浏览器冒烟脚本）。
+
+### 验证
+
+- 后端测试：`D:\_project\Robot\.venv\Scripts\python.exe -m pytest tests/test_mapeditor.py -q` → **46 passed**（单跑该文件）。
+- 全量 `pytest tests -q` → **91 passed / 4 failed**，4 个红态**均在 `test_mapeditor.py` 之外**且属既有基线漂移：`tests/test_modules_status.py::test_modules_status_shape`（断言模块集合）、`tests/test_unlock_switch.py` 3 例（`VoiceWorker.__init__() got an unexpected keyword argument 'chat_fn'`，测试与 `voice/worker.py` 签名漂移）。本轮未修（非本任务范围）。
+- 前端构建：`frontend/packages/mapeditor/dist/` 产物存在，但**本开发沙箱（DSH workspace-write）里 `vite build` 跑不起来**：① 浏览器进程无法启动（headless Edge 直接被沙箱杀掉），② Node 子进程不能用管道 stdio（`spawn EPERM`，esbuild 服务进程起不来）。为此 `packages/mapeditor/scripts/build.mjs` 用文件句柄 stdio 起子进程跑真正的 `vite build`（正常机器上与 admin 等价）；撞上 EPERM 时**不静默兜底**，明确失败并提示改用 `pnpm --filter mapeditor build:sandbox`（= `scripts/verify-build.mjs`，同一份 `vite.config.ts` 的等价构建，实测产物与 `vite build` 逐字节相同）。**因此产物尚未在真实开发机上用 `vite build` 复验过，也没做过真实浏览器联调**。Linux/正常 Windows 开发机上应直接 `cd frontend && pnpm install && pnpm --filter mapeditor build`。
+- 板卡：`ssh sunrise@100.65.82.93` **实测连接超时**，故板卡真机验收（规格 §九 7~10、§B11.3 16~19）与 `MAPS_IO=ssh` 真机读写**均未做**。
+
+### 已知限制 / 未做
+
+- 真实 `vite build` 复验、真实浏览器联调（`scripts/e2e_smoke.mjs` 在沙箱里跑不起来，正常机器上可用）、板卡真机验收。
+- 规格 §十二 / §B十四 的前置仍成立：需重扫一张地图、对齐 AMCL 初始位姿、板卡可达（实测不通）。
+- 文档回填：`AGENTS.md`、规格 `2026-09-14-map-editor-design.md`（文首状态 + 文末「实现台账与偏差」）、`ros2_car/建图与导航操作手册.md`（补「改完必须重启导航」+ 浏览器入口 + 备份位置）、`2026-08-27-frontend-multi-end-design.md`（补 vendor 静态资源一句）本轮已做；**板卡上那份操作手册副本（`/home/sunrise/Robot/ros2_car/建图与导航操作手册.md`）因 ssh 不通未同步，需另行同步**。

@@ -85,6 +85,48 @@ CREATE TABLE IF NOT EXISTS expressions (
   authority TEXT DEFAULT 'llm',   -- llm(自动学) | nurse(人工维护)
   source TEXT DEFAULT '', ts TEXT, updated_at TEXT
 );
+-- ===== 地图标记的**只读索引缓存**（规格 §4.2 红线）=====
+-- 唯一真相是地图文件夹里的 <图名>.tags.json；这三张表可随时清空、由 maptags.sync_map() 重建。
+-- 业务代码**不允许**直接 INSERT/UPDATE/DELETE 下面三张表 —— 唯一写入口是 maptags.sync_map()。
+CREATE TABLE IF NOT EXISTS map_tags_manifest (
+  map_name TEXT PRIMARY KEY,
+  file_mtime REAL DEFAULT 0,            -- tags.json 的 mtime
+  file_size INTEGER DEFAULT 0,          -- tags.json 的 size
+  sha1 TEXT DEFAULT '',                 -- 内容指纹（mtime/size 相同但内容变了也能发现）
+  resolution REAL,                      -- 指纹：抄自 tags.json，用于与 yaml 实际值比对
+  origin_json TEXT DEFAULT '',          -- 指纹
+  synced_at TEXT, warnings_json TEXT DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS destinations (
+  -- ⚠️ 主键必须是 (map_name, uid)：**同一个 uid（d1）在三张图里各有一份**，因为 uid 只在
+  -- 单张图的 tags.json 内稳定。用 uid 单主键会让 my_map2 的 d1 覆盖 my_map 的 d1。
+  uid TEXT NOT NULL,
+  map_name TEXT NOT NULL,               -- 绑图（三张图坐标系不通用）
+  name TEXT NOT NULL,
+  aliases TEXT DEFAULT '',              -- 逗号分隔（冗余自 JSON 数组，便于 LIKE 查询）
+  x REAL DEFAULT 0, y REAL DEFAULT 0,   -- 米，map 坐标系
+  yaw_deg REAL DEFAULT 0,               -- 到达朝向（度，逆时针为正）
+  risk TEXT DEFAULT 'low',              -- low | high
+  elder_allowed INTEGER DEFAULT 1,      -- 第二期「说去哪」的唯一闸门
+  note TEXT DEFAULT '',
+  learned_by TEXT DEFAULT '',           -- editor | learn_button | manual
+  created_at TEXT, updated_at TEXT,
+  PRIMARY KEY (map_name, uid),
+  UNIQUE(map_name, name)
+);
+CREATE TABLE IF NOT EXISTS zones (
+  uid TEXT NOT NULL,
+  map_name TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT DEFAULT 'room',             -- room | ward | bed | other
+  shape TEXT DEFAULT 'polygon',         -- polygon | rect
+  polygon_json TEXT DEFAULT '[]',       -- [[x,y], ...] 米坐标（世界系，非像素）
+  parent TEXT DEFAULT '',               -- 上级区域的 uid（同一张图内）
+  note TEXT DEFAULT '',
+  created_at TEXT, updated_at TEXT,
+  PRIMARY KEY (map_name, uid),
+  UNIQUE(map_name, name)
+);
 """
 
 
@@ -124,9 +166,47 @@ def init_db():
             # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
             _ensure_columns(conn, "core_memories", {"pinned": "pinned INTEGER DEFAULT 0"})
             conn.commit()
-            conn.commit()
+            _migrate_map_tags_cache(conn)
         finally:
             conn.close()
+
+
+def _migrate_map_tags_cache(conn) -> None:
+    """把地图标记缓存表迁到「主键 = (map_name, uid)」的形态（幂等，每次启动跑）。
+
+    为什么必须迁：**uid 只在单张图的 ``tags.json`` 内稳定**，三张图各有自己的 ``d1``。
+    早期版本把 ``uid`` 当单列主键，于是 ``my_map`` 复制成 ``my_map2`` 后再刷缓存就会
+    ``UNIQUE constraint failed: destinations.uid``（实测踩过）。
+
+    ``CREATE TABLE IF NOT EXISTS`` 不会改已存在的表，所以这里显式"重建 + 尽量搬数据"。
+    表里只是索引缓存，坏了大不了重建，因此搬运失败/有重也能安全降级。
+    """
+    for table in ("destinations", "zones"):
+        try:
+            info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not info:
+                continue
+            pk = [r["name"] for r in sorted((r for r in info if r["pk"]), key=lambda r: r["pk"])]
+            if pk == ["map_name", "uid"]:
+                continue                       # 已是新形态
+            cols = [r["name"] for r in info]
+            old = f"{table}__old"
+            conn.execute(f"ALTER TABLE {table} RENAME TO {old}")
+            conn.executescript(SCHEMA)         # 以新定义重建（IF NOT EXISTS 现在会真的建）
+            # 旧表里 (map_name, uid) 可能重复（uid 单主键造成的跨图冲突）→ 每组只搬一行
+            keep = "MAX(updated_at)" if "updated_at" in cols else "MIN(rowid)"
+            conn.execute(
+                f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) "
+                f"SELECT {', '.join(cols)} FROM {old} "
+                f"WHERE rowid IN (SELECT rowid FROM {old} GROUP BY map_name, uid HAVING {keep})")
+            conn.execute(f"DROP TABLE {old}")
+            conn.commit()
+        except Exception as e:      # noqa: BLE001  迁移失败不许拖垮启动（缓存而已）
+            try:
+                conn.rollback()
+            except Exception:       # noqa: BLE001
+                pass
+            print(f"[WARN] 地图标记缓存表 {table} 迁移失败（不影响启动）：{e}")
 
 
 def now_iso():
@@ -1014,3 +1094,180 @@ def set_settings(patch: dict) -> dict:
         finally:
             conn.close()
     return cur
+
+
+# ---------------------------------------------------------------- 地图标记索引缓存
+# ⚠️ 红线（规格 §4 第 2 条）：本组函数**只服务于单向同步（文件 → SQLite）**。
+# 业务代码不允许绕过 maptags.sync_map() 直接改 destinations/zones —— 那会重演"两套真相"事故。
+def get_map_tags_manifest(map_name: str) -> dict | None:
+    """读某图的缓存清单（含文件 mtime/size/sha1 与指纹）。"""
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM map_tags_manifest WHERE map_name=?",
+                         (map_name,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["warnings"] = json.loads(d.pop("warnings_json") or "[]")
+        try:
+            d["origin"] = json.loads(d.pop("origin_json") or "null")
+        except ValueError:
+            d["origin"] = None
+        return d
+    finally:
+        conn.close()
+
+
+def replace_map_tags(map_name: str, manifest: dict, destinations: list[dict],
+                     zones: list[dict]) -> None:
+    """**一个事务内**整图重建缓存：DELETE 本图所有行 + 批量 INSERT + upsert 清单。
+
+    这是 maptags.sync_map() 的落库出口；失败则整图回滚，绝不留下半套缓存。
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM destinations WHERE map_name=?", (map_name,))
+            conn.execute("DELETE FROM zones WHERE map_name=?", (map_name,))
+            for d in destinations:
+                conn.execute(
+                    "INSERT INTO destinations (uid,map_name,name,aliases,x,y,yaw_deg,risk,"
+                    "elder_allowed,note,learned_by,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (d.get("uid", ""), map_name, d.get("name", ""), d.get("aliases", ""),
+                     float(d.get("x") or 0), float(d.get("y") or 0),
+                     # ★ yaw_deg 必须保留 None：JSON 里"没有该字段"= 不限制朝向，
+                     #   写成 0 会让前端显示"0°"并画出一条朝正 x 的箭头（会误导操作）。
+                     None if d.get("yaw_deg") is None else float(d["yaw_deg"]),
+                     d.get("risk", "low"), int(d.get("elder_allowed", 1) or 0),
+                     d.get("note", ""), d.get("learned_by", ""),
+                     d.get("created_at", ""), d.get("updated_at", "")))
+            for z in zones:
+                conn.execute(
+                    "INSERT INTO zones (uid,map_name,name,kind,shape,polygon_json,parent,note,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (z.get("uid", ""), map_name, z.get("name", ""), z.get("kind", "room"),
+                     z.get("shape", "polygon"), z.get("polygon_json", "[]"),
+                     z.get("parent", ""), z.get("note", ""),
+                     z.get("created_at", ""), z.get("updated_at", "")))
+            conn.execute(
+                "INSERT INTO map_tags_manifest (map_name,file_mtime,file_size,sha1,resolution,"
+                "origin_json,synced_at,warnings_json) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(map_name) DO UPDATE SET file_mtime=excluded.file_mtime,"
+                "file_size=excluded.file_size,sha1=excluded.sha1,resolution=excluded.resolution,"
+                "origin_json=excluded.origin_json,synced_at=excluded.synced_at,"
+                "warnings_json=excluded.warnings_json",
+                (map_name, float(manifest.get("file_mtime") or 0),
+                 int(manifest.get("file_size") or 0), manifest.get("sha1", ""),
+                 manifest.get("resolution"),
+                 json.dumps(manifest.get("origin"), ensure_ascii=False),
+                 now_iso(), json.dumps(manifest.get("warnings") or [], ensure_ascii=False)))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def drop_map_tags(map_name: str) -> None:
+    """清空某图的缓存（geo 文件被删时用；缓存丢了不影响任何数据）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("DELETE FROM destinations WHERE map_name=?", (map_name,))
+            conn.execute("DELETE FROM zones WHERE map_name=?", (map_name,))
+            conn.execute("DELETE FROM map_tags_manifest WHERE map_name=?", (map_name,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def clear_all_map_tags() -> int:
+    """清空全部标记缓存并返回被清行数 —— 验收「红线 3：缓存可丢弃可重建」用。"""
+    with _lock:
+        conn = _conn()
+        try:
+            n = 0
+            for t in ("destinations", "zones", "map_tags_manifest"):
+                n += conn.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()["c"]
+                conn.execute(f"DELETE FROM {t}")
+            conn.commit()
+            return n
+        finally:
+            conn.close()
+
+
+def list_destinations(map_name: str = "", uid: str = "") -> list[dict]:
+    """查缓存里的地点（只读；权威结论仍以 tags.json 为准，调用方应先 sync）。"""
+    sql = "SELECT * FROM destinations"
+    where, args = [], []
+    if map_name:
+        where.append("map_name=?")
+        args.append(map_name)
+    if uid:
+        where.append("uid=?")
+        args.append(uid)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY name"
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_destination(uid: str) -> dict | None:
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM destinations WHERE uid=?", (uid,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def list_zones(map_name: str = "", uid: str = "") -> list[dict]:
+    sql = "SELECT * FROM zones"
+    where, args = [], []
+    if map_name:
+        where.append("map_name=?")
+        args.append(map_name)
+    if uid:
+        where.append("uid=?")
+        args.append(uid)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY name"
+    conn = _conn()
+    try:
+        out = []
+        for r in conn.execute(sql, args).fetchall():
+            d = dict(r)
+            try:
+                d["polygon"] = json.loads(d.pop("polygon_json") or "[]")
+            except ValueError:
+                d["polygon"] = []
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_zone(uid: str) -> dict | None:
+    rows = list_zones(uid=uid)
+    return rows[0] if rows else None
+
+
+def count_map_tags(map_name: str) -> dict:
+    """某图的地点/区域数量（列表页用；只读缓存）。"""
+    conn = _conn()
+    try:
+        d = conn.execute("SELECT COUNT(*) AS c FROM destinations WHERE map_name=?",
+                         (map_name,)).fetchone()["c"]
+        z = conn.execute("SELECT COUNT(*) AS c FROM zones WHERE map_name=?",
+                         (map_name,)).fetchone()["c"]
+        return {"destinations": d, "zones": z}
+    finally:
+        conn.close()
