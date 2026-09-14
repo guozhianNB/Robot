@@ -43,6 +43,15 @@ DEFAULT_SETTINGS = {
     "map_boundary_margin_m": 0.3,       # 标点校验：距地图各边缩进（沿用 where_am_i.py 口径）
     "map_topic_fingerprint_enabled": True,  # 是否用 /map 元数据指纹反查"车此刻在跑哪张图"
     "mapeditor_auto_switch_map": False, # 打开编辑器时是否自动跳到指纹识别出的那张图
+    # ---- 分层用户体系（2026-09-14，规格 docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）----
+    "admin_auth_required": True,     # 管理员口令门开关（D13：可在 UI 直接关掉，界面须警示）
+    "admin_session_ttl_s": 300,      # 管理员提权后无操作自动降权秒数（D8）
+    "ward_context_window": 10,       # 集体层上下文注入条数（老人可读本病房最近 N 条，R5）
+    "ward_autoswitch_enabled": True, # 病房位置自动切换总开关（关掉=退回手动；rosbridge 地址在 conf.ROSBRIDGE_URL）
+    "ward_switch_debounce": 3,       # 自动切病房防抖：连续 N 次 tick 同病房才认（D18）
+    "ward_zone_default_r": 3.0,      # 便捷录入病房区域的半径（米），以当前位姿为圆心采样 16 边形
+    "manual_override_sec": 600,      # 手动切病房后，位置判定不覆盖的秒数（D18）
+    "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=/map 指纹反查（默认）；setting=用 current_map
 }
 
 # ---------------------------------------------------------------------------
@@ -51,13 +60,19 @@ DEFAULT_SETTINGS = {
 # 运行位置口径（2026-09-14 用户拍板「还是把地图工作放到PC上吧，因为板卡性能不是很好」）：
 #   后端默认跑在 PC 上 → MAPS_IO="ssh"，地图真相仍在板卡 ros2_car/maps/，经 SSH 读写；
 #   后端跑在板卡上时用 "local"。开发期板卡不可达可 `MAPS_IO=local` + 仓库副本目录。
+#   ⚠️ 2026-09-14 起这只是**内置 ssh 源的种子**；编辑器实际读哪个源由 maps_sources.json
+#   的命名源决定（见 MAPS_SOURCES_FILE）。ROS 端与编辑器解耦：改这里不影响 ROS 在跑的图。
 MAPS_IO = os.environ.get("MAPS_IO", "ssh")            # ssh（默认）| local
 MAPS_DIR = Path(os.environ.get("MAPS_DIR", str(BASE_DIR / "ros2_car" / "maps")))  # local 模式根目录
 MAPS_CACHE_DIR = DATA_DIR / "mapcache"                # ssh 模式本地缓存（离线看图 + 断连降级）
 MAPS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAPS_BACKUP_DIRNAME = ".backup"                       # 与地图同级；list() 必须排除它
+# 地图源注册表（命名源：一组"地图文件在哪"的具名配置）——运行时数据，不进 git。
+# 首次运行由下面的环境变量种入两个内置源（board / pc），此后以文件为准、改了即时生效。
+MAPS_SOURCES_FILE = DATA_DIR / "maps_sources.json"
+MAPS_SOURCE_LABEL = os.environ.get("MAPS_SOURCE_LABEL", "")   # 内置 ssh 源的显示名（空=自动生成）
 
-MAPS_SSH_HOST = os.environ.get("MAPS_SSH_HOST", "100.65.82.93")   # 板卡（Tailscale）
+MAPS_SSH_HOST = os.environ.get("MAPS_SSH_HOST") or os.environ.get("ROBOT_IP", "100.65.82.93")  # 板卡（Tailscale）
 MAPS_SSH_USER = os.environ.get("MAPS_SSH_USER", "sunrise")
 MAPS_SSH_PORT = int(os.environ.get("MAPS_SSH_PORT", "22"))
 MAPS_SSH_ROOT = os.environ.get("MAPS_SSH_ROOT", "/home/sunrise/Robot/ros2_car/maps")
