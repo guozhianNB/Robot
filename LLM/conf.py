@@ -38,7 +38,52 @@ DEFAULT_SETTINGS = {
     "confirm_timeout_min": 30,      # 提醒送达后多少分钟未确认 → 升级"未确认"
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
     "mcp_enabled": False,          # MCP 外部工具总开关（开启后在启动时拉起 MCP_SERVERS）
+    # ---- 地图编辑器（第三个前端 /mapeditor，见 docs/superpowers/specs/2026-09-14-map-editor-design.md）----
+    "current_map": "my_map",            # 目标地图名（下次启动导航用；≠"车此刻在跑哪张图"，后者靠指纹自动识别）
+    "map_boundary_margin_m": 0.3,       # 标点校验：距地图各边缩进（沿用 where_am_i.py 口径）
+    "map_topic_fingerprint_enabled": True,  # 是否用 /map 元数据指纹反查"车此刻在跑哪张图"
+    "mapeditor_auto_switch_map": False, # 打开编辑器时是否自动跳到指纹识别出的那张图
 }
+
+# ---------------------------------------------------------------------------
+# 地图文件（规格 §B十）：MarkStore / maptags / locator 共用的路径与远程 IO 配置
+# ---------------------------------------------------------------------------
+# 运行位置口径（2026-09-14 用户拍板「还是把地图工作放到PC上吧，因为板卡性能不是很好」）：
+#   后端默认跑在 PC 上 → MAPS_IO="ssh"，地图真相仍在板卡 ros2_car/maps/，经 SSH 读写；
+#   后端跑在板卡上时用 "local"。开发期板卡不可达可 `MAPS_IO=local` + 仓库副本目录。
+MAPS_IO = os.environ.get("MAPS_IO", "ssh")            # ssh（默认）| local
+MAPS_DIR = Path(os.environ.get("MAPS_DIR", str(BASE_DIR / "ros2_car" / "maps")))  # local 模式根目录
+MAPS_CACHE_DIR = DATA_DIR / "mapcache"                # ssh 模式本地缓存（离线看图 + 断连降级）
+MAPS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MAPS_BACKUP_DIRNAME = ".backup"                       # 与地图同级；list() 必须排除它
+
+MAPS_SSH_HOST = os.environ.get("MAPS_SSH_HOST", "100.65.82.93")   # 板卡（Tailscale）
+MAPS_SSH_USER = os.environ.get("MAPS_SSH_USER", "sunrise")
+MAPS_SSH_PORT = int(os.environ.get("MAPS_SSH_PORT", "22"))
+MAPS_SSH_ROOT = os.environ.get("MAPS_SSH_ROOT", "/home/sunrise/Robot/ros2_car/maps")
+MAPS_SSH_KEY = os.environ.get("MAPS_SSH_KEY", "")      # 私钥路径（空=用 ~/.ssh/id_* 默认）
+MAPS_SSH_PASSWORD = os.environ.get("MAPS_SSH_PASSWORD", "")  # 仅 paramiko 通道；从 .env 读，不入 git
+MAPS_SSH_TRANSPORT = os.environ.get("MAPS_SSH_TRANSPORT", "auto")  # auto | paramiko | cli
+MAPS_SSH_TIMEOUT = float(os.environ.get("MAPS_SSH_TIMEOUT", "10"))  # 单次连接/命令超时（秒）
+
+MAPS_MAX_PGM_BYTES = 10 * 1024 * 1024   # 上传 pgm（解码后）上限
+MAPS_MAX_YAML_BYTES = 64 * 1024         # 上传 yaml 上限
+MAPS_MAX_BODY_BYTES = 16 * 1024 * 1024  # 请求体上限
+MAPS_BACKUP_KEEP = 10                   # maps/.backup/ 保留组数
+
+# 地图名白名单（规格 §B7.1 红线）：防路径穿越，且是 ssh 子进程模式**唯一的**命令注入防线。
+# 另：不得含 keepout（上游编辑器会把它当掩膜文件，编辑到另一张画布上）。
+MAP_RE_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
+MAP_RE_NAME_BANNED = ("keepout",)
+
+# 位姿/当前地图识别（rosbridge，websocket 只读；不引入 rclpy —— Windows 开发机无 ROS）
+ROSBRIDGE_URL = os.environ.get("ROSBRIDGE_URL", f"ws://{MAPS_SSH_HOST}:9090")
+ROSBRIDGE_TIMEOUT = float(os.environ.get("ROSBRIDGE_TIMEOUT", "5"))
+ROSBRIDGE_RETRY_S = float(os.environ.get("ROSBRIDGE_RETRY_S", "5"))
+ROSBRIDGE_POSE_TTL_S = 10.0             # 位姿超过这么久没更新 → 视为不可用
+ROSBRIDGE_MOCK_POSE = os.environ.get("ROSBRIDGE_MOCK_POSE", "")  # "x,y,yaw" 注入假位姿（无 ROS 开发/测试）
+MAP_CURRENT_CACHE_TTL_S = 5.0           # 大于前端轮询周期；从扫描完成时计，避免慢 SSH 吞掉 TTL
+
 
 # 声纹录制
 VOICE_ENROLL_SECONDS = 15        # 注册/追加默认录制秒数

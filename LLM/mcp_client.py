@@ -119,14 +119,23 @@ def status() -> dict:
       - errors      : 连接失败原因（dict[str, str]）
       - tools       : 已注册工具名（排序后的 list[str]）
     """
+    pending = _connect_future is not None and not _connect_future.done()
+    names = set(MCP_SERVERS) | set(_sessions) | set(_errors)
+    server_states = {}
+    for name in names:
+        if name in _errors:
+            server_states[name] = "error"
+        elif name in _sessions:
+            server_states[name] = "connected"
+        elif pending and MCP_SERVERS.get(name, {}).get("enabled", True):
+            server_states[name] = "connecting"
+        else:
+            server_states[name] = "disconnected"
     return {
         "available": _MCP_AVAILABLE,                 # 依赖层可用性
         "missing_deps": list(_MISSING_DEPS),         # 缺失依赖原因（拷一份，避免外部改到内部表）
         "started": _started,                         # 是否已有可用工具
-        # 遍历 配置里的服务器 ∪ 报错过的服务器：在配置里且没报错 = connected，否则 error。
-        # 用并集是为了把"连上了但后来被移除配置"的残留也如实展示出来。
-        "servers": {n: ("error" if n in _errors else "connected")
-                    for n in (set(MCP_SERVERS) | set(_errors))},
+        "servers": server_states,
         "errors": dict(_errors),                     # 各服务器连接失败原因
         "tools": sorted(_tools),                     # 已注册工具名（排序便于阅读）
     }
@@ -182,13 +191,31 @@ async def _connect_one(name: str, params: dict):
     #    注意：这里是手动调用 __aenter__()（而非 async with），因为返回的 ctx 需要
     #    存进 _sessions，供 stop() 时 __aexit__ 优雅关闭。
     ctx = stdio_client(server_params)
-    read_stream, write_stream = await ctx.__aenter__()
-    # 3) 用读写流创建会话并建立连接。
-    session = ClientSession(read_stream, write_stream)
-    await session.__aenter__()                  # 打开会话（内部建立 JSON-RPC 通道）
-    await session.initialize()                  # 与服务器握手（能力协商、协议版本对齐）
-    # 4) 拉取服务器支持的工具清单（MCP 协议：tools/list）。
-    listed = await session.list_tools()
+    session = None
+    ctx_entered = session_entered = False
+    try:
+        read_stream, write_stream = await ctx.__aenter__()
+        ctx_entered = True
+        # 3) 用读写流创建会话并建立连接。
+        session = ClientSession(read_stream, write_stream)
+        await session.__aenter__()              # 打开会话（内部建立 JSON-RPC 通道）
+        session_entered = True
+        await session.initialize()              # 与服务器握手（能力协商、协议版本对齐）
+        # 4) 拉取服务器支持的工具清单（MCP 协议：tools/list）。
+        listed = await session.list_tools()
+    except BaseException as exc:
+        # 手动进入的上下文也必须在握手失败/任务取消时逆序退出，否则会遗留子进程。
+        if session_entered:
+            try:
+                await session.__aexit__(type(exc), exc, exc.__traceback__)
+            except BaseException:
+                pass
+        if ctx_entered:
+            try:
+                await ctx.__aexit__(type(exc), exc, exc.__traceback__)
+            except BaseException:
+                pass
+        raise
     # 5) 把每个 MCP 工具转成 OpenAI function-calling 的 schema，注册进全局 _tools。
     for t in listed.tools:
         # mcp SDK 不同版本字段名不统一：新版本用 input_schema（snake_case），

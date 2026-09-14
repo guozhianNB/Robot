@@ -1,3 +1,6 @@
 node_modules/
 dist/
 *.local
+
+# pnpm 本地 store（离线安装时会落在仓库内，勿入库）
+.pnpm-store/
