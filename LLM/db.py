@@ -153,6 +153,12 @@ def init_db():
             _ensure_columns(conn, "profiles", {
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
+                # 分层用户体系（规格 §9）：kind=elder|ward；ward_id=老人所属病房 uid；
+                # ward_map/ward_zone=病房关联的「地图名 + 区域 uid」（几何真相在 <图名>.tags.json）
+                "kind": "kind TEXT DEFAULT 'elder'",
+                "ward_id": "ward_id TEXT DEFAULT ''",
+                "ward_map": "ward_map TEXT DEFAULT ''",
+                "ward_zone": "ward_zone TEXT DEFAULT ''",
             })
             # 软删 / 幂等列（跨表统一补齐，兼容旧库）
             for table in ("memories", "core_memories", "rag_memories", "expressions"):
@@ -228,10 +234,15 @@ def get_profile(uid: str) -> dict | None:
         conn.close()
 
 
-def list_profiles() -> list[dict]:
+def list_profiles(kind: str = "") -> list[dict]:
     conn = _conn()
     try:
-        rows = conn.execute("SELECT * FROM profiles ORDER BY uid").fetchall()
+        sql = "SELECT * FROM profiles"
+        args: tuple = ()
+        if kind:
+            sql += " WHERE kind=?"
+            args = (kind,)
+        rows = conn.execute(sql + " ORDER BY uid", args).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -241,6 +252,74 @@ def list_profiles() -> list[dict]:
         return out
     finally:
         conn.close()
+
+
+def get_profile_kind(uid: str) -> str:
+    """角色判定的**唯一权威依据**（R1）：admin 不写进 profiles → 返回 ""。
+
+    注意：调用方（session.derive_role）必须把 "" 当"未知"并按集体层兜底（R2），
+    绝不按 uid 前缀猜。
+    """
+    if not uid:
+        return ""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT kind FROM profiles WHERE uid=?", (uid,)).fetchone()
+        return (row["kind"] or "elder") if row else ""
+    finally:
+        conn.close()
+
+
+def list_wards() -> list[dict]:
+    """全部病房用户（kind='ward'）。"""
+    return list_profiles(kind="ward")
+
+
+def upsert_ward(uid: str, name: str = "", ward_map: str = "", ward_zone: str = "") -> dict:
+    """新建/更新一条病房用户。
+
+    **只由本函数与 set_ward_zone 写 kind/ward_map/ward_zone**：upsert_profile 不碰这三列，
+    否则管理台编辑老人档案时会静默清掉病房关联（见 git f6f6e54）。
+    传空串 = 保持原值（避免"只改个名字"把关联清掉）。
+    """
+    upsert_profile(uid, name=name)          # 先保证行存在（用现有签名，不加参数）
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE profiles SET kind='ward', "
+                "ward_map=CASE WHEN ?<>'' THEN ? ELSE ward_map END, "
+                "ward_zone=CASE WHEN ?<>'' THEN ? ELSE ward_zone END, "
+                "updated_at=? WHERE uid=?",
+                (ward_map, ward_map, ward_zone, ward_zone, now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_profile(uid) or {}
+
+
+def set_ward_zone(uid: str, map_name: str, zone_uid: str) -> None:
+    """把病房关联到「某张图上的某个区域 uid」（几何真相在 <图名>.tags.json，这里只存引用）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE profiles SET ward_map=?, ward_zone=?, updated_at=? WHERE uid=?",
+                         (map_name or "", zone_uid or "", now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_profile_ward(uid: str, ward_id: str) -> None:
+    """老人归入病房（写 profiles.ward_id；空串 = 移出病房）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE profiles SET ward_id=?, updated_at=? WHERE uid=?",
+                         (ward_id or "", now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
@@ -1070,6 +1149,11 @@ def get_settings() -> dict:
                     v = int(v)
                 except ValueError:
                     v = out[r["key"]]
+            elif isinstance(out.get(r["key"]), float):
+                try:
+                    v = float(v)
+                except ValueError:
+                    v = out[r["key"]]
             out[r["key"]] = v
         return out
     finally:
@@ -1094,6 +1178,63 @@ def set_settings(patch: dict) -> dict:
         finally:
             conn.close()
     return cur
+
+
+# ---------------------------------------------------------------- 管理员口令（规格 D12/D13）
+# 为什么不用 set_settings：它只接受 DEFAULT_SETTINGS|TOOL_DEFAULTS 白名单里的 key，
+# 而口令必须有自己的 key（且绝不落明文、绝不进前端设置页）。
+def _get_setting_raw(key: str, default: str = "") -> str:
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def _set_setting_raw(key: str, value: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("INSERT INTO settings (key,value) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _hash_pw(pw: str, salt: str) -> str:
+    import hashlib
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def get_admin_auth() -> dict:
+    """口令门状态 + 盐/哈希（哈希为空 = 还没设过口令）。"""
+    return {
+        "required": _get_setting_raw("admin_auth_required", "1").lower() in ("1", "true", "yes"),
+        "hash": _get_setting_raw("admin_password_hash"),
+        "salt": _get_setting_raw("admin_password_salt"),
+    }
+
+
+def set_admin_password(pw: str) -> None:
+    """设/改口令：随机盐 + PBKDF2-SHA256 20 万轮，**不落明文**。"""
+    import os as _os
+    salt = _os.urandom(16).hex()
+    _set_setting_raw("admin_password_salt", salt)
+    _set_setting_raw("admin_password_hash", _hash_pw(pw, salt))
+
+
+def verify_admin_password(pw: str) -> bool:
+    a = get_admin_auth()
+    if not a["hash"] or not a["salt"]:
+        return False
+    return _hash_pw(pw, a["salt"]) == a["hash"]
+
+
+def set_admin_auth_required(required: bool) -> None:
+    """开关口令门（D13）。关掉之后任何人点「管理层」都能进，UI 必须显示警示。"""
+    _set_setting_raw("admin_auth_required", "1" if required else "0")
 
 
 # ---------------------------------------------------------------- 地图标记索引缓存
@@ -1228,7 +1369,7 @@ def get_destination(uid: str) -> dict | None:
         conn.close()
 
 
-def list_zones(map_name: str = "", uid: str = "") -> list[dict]:
+def list_zones(map_name: str = "", uid: str = "", kind: str = "") -> list[dict]:
     sql = "SELECT * FROM zones"
     where, args = [], []
     if map_name:
@@ -1237,6 +1378,9 @@ def list_zones(map_name: str = "", uid: str = "") -> list[dict]:
     if uid:
         where.append("uid=?")
         args.append(uid)
+    if kind:
+        where.append("kind=?")
+        args.append(kind)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY name"
@@ -1255,8 +1399,13 @@ def list_zones(map_name: str = "", uid: str = "") -> list[dict]:
         conn.close()
 
 
-def get_zone(uid: str) -> dict | None:
-    rows = list_zones(uid=uid)
+def get_zone(uid: str, map_name: str = "") -> dict | None:
+    """按 uid（+ 可选地图名）取区域行。
+
+    **强烈建议带上 map_name**：uid（`z1`）只在单张图内稳定，三张图各有自己的 `z1`，
+    只按 uid 查会跨图串（复合主键是 `(map_name, uid)`）。
+    """
+    rows = list_zones(map_name=map_name, uid=uid)
     return rows[0] if rows else None
 
 
