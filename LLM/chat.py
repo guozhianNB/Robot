@@ -471,7 +471,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     t0 = time.time()
                     result = tool_mod.run_tool(name, args, principal)
                     latency = int((time.time() - t0) * 1000)
-                    snippet = result.get("result", result.get("message", ""))[:500]
+                    snippet = (result.get("result") or result.get("message")
+                               or result.get("error") or "")[:500]
                     db.log_tool(uid, name, args, snippet,
                                 status="ok" if result.get("ok") else "error", latency_ms=latency)
                     audit.log("tool", uid=uid, tool=name, args=args,

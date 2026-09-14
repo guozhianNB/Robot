@@ -103,3 +103,56 @@ def test_mcp_tools_default_to_admin_only(monkeypatch):
     assert "fetch_html" in _names({"mcp_enabled": True}, _p("admin"))
     assert "fetch_html" not in _names({"mcp_enabled": True}, _p("ward"))
     assert "fetch_html" not in _names({"mcp_enabled": True}, _p("elder"))
+
+
+def test_mcp_tools_intersect_role_whitelist(monkeypatch):
+    """**回归（重要 1）**：白名单是天花板 —— 服务器 roles 不能把白名单外的工具送给某角色。"""
+    def fake_tools():
+        return {
+            # 名字不在任何角色白名单里、服务器只允许 elder
+            "mcp_probe": {"server": "srv", "schema": {"type": "function",
+                          "function": {"name": "mcp_probe", "description": "", "parameters": {}}}},
+            # 名字**在** elder 白名单里、服务器只允许 elder → 两侧都满足才该可见
+            "robot_stop": {"server": "srv", "schema": {"type": "function",
+                           "function": {"name": "robot_stop", "description": "", "parameters": {}}}},
+        }
+    monkeypatch.setattr(tools.mcp_client, "tools", fake_tools)
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"elder"})
+    names_elder = _names({"mcp_enabled": True}, _p("elder"))
+    assert "mcp_probe" not in names_elder          # 白名单外 → 不许可见（旧实现在此会红）
+    assert "robot_stop" in names_elder             # 白名单内 + 服务器 roles 命中 → 可见
+    assert "mcp_probe" not in _names({"mcp_enabled": True}, _p("admin"))   # admin 不在服务器 roles 里
+    assert "mcp_probe" not in _names({"mcp_enabled": True}, _p("ward"))
+
+
+def test_run_tool_denies_mcp_outside_server_roles(monkeypatch):
+    """**回归（重要 2）**：看不见的 MCP 工具也不许调到（可见性与可调用性对称）。"""
+    called = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "mcp_probe": {"server": "srv", "schema": {"type": "function",
+                      "function": {"name": "mcp_probe", "description": "", "parameters": {}}}}})
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr(tools.mcp_client, "call_tool",
+                        lambda name, args: called.append(name) or {"ok": True})
+    res = tools.run_tool("mcp_probe", {}, _p("elder"))
+    assert res["ok"] is False and called == []
+    assert tools.run_tool("mcp_probe", {}, _p("admin"))["ok"] is True and called == ["mcp_probe"]
+
+
+def test_policy_deny_audit_has_decision_field(monkeypatch, probe):
+    """规格 §9：策略判定至少要带 decision 字段（否则下游按 decision 聚合会漏统计）。"""
+    seen = []
+    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    tools.run_tool("__probe__", {"a": 1}, _p("ward"))
+    assert seen and seen[-1][0] == "policy_deny"
+    assert seen[-1][1]["decision"] == "deny"
+    assert seen[-1][1]["tool"] == "__probe__" and seen[-1][1]["role"] == "ward"
+
+
+def test_unknown_tool_is_not_counted_as_denied(monkeypatch):
+    """未知工具名不该落 policy_deny（别把模型拼错算成越权）。"""
+    seen = []
+    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    res = tools.run_tool("__nope__", {}, _p("ward"))
+    assert res["ok"] is False and "未知工具" in (res.get("message") or "")
+    assert [ev for ev, _ in seen if ev == "policy_deny"] == []
