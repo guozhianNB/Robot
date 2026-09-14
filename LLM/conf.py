@@ -38,10 +38,6 @@ DEFAULT_SETTINGS = {
     "confirm_timeout_min": 30,      # 提醒送达后多少分钟未确认 → 升级"未确认"
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
     "mcp_enabled": False,          # MCP 外部工具总开关（开启后在启动时拉起 MCP_SERVERS）
-    # ---- 分层用户体系（2026-09-14，规格 docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）----
-    # 注：仅本行由 P0 任务 1 先行落地（其 test_float_setting_roundtrip 需 key 已在白名单内）；
-    # 其余配置项（口令门/TTL/病房上下文/位置源/防抖/override/current_map）在任务 2 追加。
-    "ward_zone_default_r": 3.0,     # 便捷录入病房区域的默认半径（米）：以当前位姿为中心采样 16 边形
 }
 
 # 声纹录制
