@@ -1,37 +1,251 @@
-# 分层用户体系（P0：用户系统）实现计划
+# 分层用户体系（P0：用户系统）实现计划 · v2（2026-09-14 复审修订版）
 
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
-> **规格：** `docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（commit `98a7e6c`）
+> **规格：** `docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（2026-09-14 **二次修订版**；冲突清单与处置见其 **§14 复审结论**——本计划已按 §14 全部改正，读规格时以 §14 为准）
 
-**目标：** 让系统同时存在**管理层 / 集体层 / 老人层**三个层级，各自有独立提示词与权限；集体层以"病房用户"落地并**按小车位置自动切换**；管理员口令可改、可关。
+**目标：** 让系统同时存在**管理层 / 集体层 / 老人层**三个层级，各有独立提示词与权限；集体层以"病房用户"落地并按小车位置自动切换；管理员口令可改、可关。
 
-**架构：** 新增 `LLM/session.py`（双槽会话主体 + 角色推导 + 当前病房自动切换）与 `LLM/policy.py`（角色策略包）；`profiles` 表扩 `kind/ward_id/zone_id` 承载病房用户（病房区域几何归 `zones` 表——一期《地图编辑器》规格 `docs/superpowers/specs/2026-09-14-map-editor-design.md` §4.2 定义其唯一真相，`profiles` 只存 `zone_id` 引用、不复制几何）；位姿由新增 `LLM/locator.py` 经 **rosbridge（websocket，非 MCP）** 读取并**可注入假位姿**以便无 ROS 环境测试；提示词在 `LLM/prompt.md`（共用 base）之上拼 `LLM/prompt/<role>.md`。
+**架构：** 新增 `LLM/session.py`（双槽会话主体 + 角色推导 + 当前病房自动切换）与 `LLM/policy.py`（角色策略包）与 `LLM/zonegeo.py`（点是否在区域内，纯几何）；`profiles` 加 `kind`/`ward_id`/`ward_map`/`ward_zone` 承载病房用户——**病房区域几何的唯一真相是地图文件夹里的 `<图名>.tags.json`**（`LLM/maptags.py`，一期已落地），`profiles` 只记「地图名 + 区域 uid」，`brain.db.zones` 只是只读索引缓存；位姿与当前地图**复用一期已落地的** `LLM/locator.py` + `LLM/roslink.py`；提示词在 `LLM/prompt.md`（共用 base）之上拼 `LLM/prompt/<role>.md`。
 
-**技术栈：** Python 3 / FastAPI / SQLite / pytest / websocket-client（已有依赖）；前端 Vue3 + Vite + TS（pnpm monorepo）。
+**技术栈：** Python 3 / FastAPI / SQLite / pytest / websocket-client（已有依赖，不新增）；前端 Vue3 + Vite + TS（pnpm monorepo）+ vitest（`shared` 包已有）。
 
-**红线（贯穿全程）：** R1 前端 role 不可信；R2 fail-closed（未知=集体层最小能力）；R3 急停/呼救永远放行；R4 医疗写入红线不受角色影响；R5 层级上下文单向（集体→老人可读、反向与跨病房不可读）。
+**红线（贯穿全程，规格 §1.3）：** R1 前端 role 不可信；R2 fail-closed（未知=集体层最小能力）；R3 急停/呼救永远放行；R4 医疗写入红线不受角色影响；R5 层级上下文单向（集体→老人可读、反向与跨病房不可读）。
+
+---
+
+## v2 修订说明（相对旧版计划 `cc23e3b` / `8e64fa7`）
+
+旧版计划写于 2026-09-14 白天，之后有三件事变了，**照旧版写会撞车**：
+
+| # | 旧版写法 | 已核实的事实 | v2 改法 |
+|---|---|---|---|
+| 1 | 任务 1 要**新建 `zones` 表**（自增 `id`）+ `profiles.zone_id`；新区间函数 `add_zone`/`get_zone(int)`/`list_zones(map, kind)` | `zones` 表**一期已建**（`db.py:117-129`，复合主键 `(map_name, uid)`，**只读缓存**）；`db.get_zone(uid)`/`db.list_zones(map_name, uid)` 已存在且签名不同；几何真相是 `<图名>.tags.json` | 任务 2 改为**加列 + 向后兼容扩参**，不建表、不加 `add_zone`；病房关联改为 `ward_map` + `ward_zone`（`z<N>`） |
+| 2 | 任务 6 要**新增 `locator.py`**（自写 rosbridge 订阅 + `available(settings) -> bool`） | `locator.py`（240 行）与 `roslink.py`（255 行）**一期已落地**；`available()` 返回 `(bool, reason)`；`get_pose()` 拿不到返回 `None`；已有 `current_map()`/`set_pose_for_test()` | 任务 7 直接**复用**，不重写；删除自写订阅线程那段 |
+| 3 | 任务 2 加设置项 `rosbridge_url` | 它不是 settings 项（`conf.ROSBRIDGE_URL` 模块级常量），`set_settings` 白名单会拒收；`current_map` 已存在 | 改为 `ward_autoswitch_enabled` + `ward_map_source`；`current_map` 不重复添加 |
+| 4 | 任务 7 用 `settings.current_map` 当判定地图 | 一期已有 `/map` 指纹反查 `locator.current_map()`；用设置值会在换图后静默切错病房（D17 禁止） | 默认用指纹反查，认不出**不判命中**；`ward_map_source="setting"` 才用设置值 |
+| 5 | 任务 12 要"新建 `shared/src/session.ts`" | 实际是 `shared/src/api/session.ts`（已存在）；前端 `X-Surface` 零实现 | 改为**扩展现有文件**并写清真实落点（kiosk 换人入口 `VoiceStatusBar.vue:34`、admin 页签数组在 `App.vue:14-23`） |
+| 6 | 各任务"预期：全 passed（既有 83 项不回归）"；测试里用 `db.add_history` | 实测基线 **`4 failed, 191 passed`**（红态在 `tests/test_modules_status.py` 与 `tests/test_unlock_switch.py`，与本次无关）；历史函数叫 **`append_history`** | 全篇改成真实基线与真实函数名，并声明"4 个红态不许修" |
+| 7 | （旧版没有）热路径性能 | `maptags.get_zones()` 会触发 `_ensure_fresh → sync_map`（`MAPS_IO=ssh` 下可能秒级阻塞）；`locator.current_map()` 会列图 + 逐图读元数据 | tick **只读本地 `db.zones` 缓存**；`current_map()` 结果做 10s TTL 缓存 |
+| 8 | （旧版没有）档案编辑清病房关联的坑 | git 历史 `f6f6e54` 专门修过这个 bug | `ward_id`/`ward_map`/`ward_zone` **只由 `upsert_ward`/`set_ward_zone`/`set_profile_ward` 写**，`upsert_profile` 不碰 |
+| 9 | （旧版没有）两条被 revert 版本暴露的历史隐患 | ① `kind=COALESCE(...)` 兜底永不触发 → 把已有 uid 提升成病房会静默失败；② `list_profiles()` 不过滤 kind → 病房行混进"老人列表" | 任务 2 用 `SET kind='ward'` 直写并加回归用例；任务 11 把 `GET /api/profiles` 默认改成只列 `kind='elder'` 并加回归用例 |
 
 **测试命令（Windows 本机，项目根目录）：**
 ```
 .venv\Scripts\python.exe -m pytest LLM/tests -q
 ```
 
+**测试基线（必须先认下来，改代码前先跑一次）：**
+```
+.venv\Scripts\python.exe -m pytest LLM/tests tests -q
+→ 4 failed, 191 passed in ~78s
+```
+4 个红态是**既有基线漂移，与本次无关**：`tests/test_modules_status.py::test_modules_status_shape`（模块集合没算 `mcp`）与 `tests/test_unlock_switch.py` 3 例（`VoiceWorker` 旧签名 `chat_fn`，现签名是 `stream_fn`）。**不要去修，也不要当成自己打坏的。**
+
 **测试隔离铁律：** 一律沿用仓内既有模式（`LLM/tests/test_memory_v4.py` 的 `d` fixture）——**只改 `db.DB_PATH` 指向临时库并在结束时还原**，不要 `importlib.reload(db)`（reload 会把 `DB_PATH` 重置回真实路径，测试会污染 `LLM/data/brain.db`）。
 
 ---
 
-### 任务 1：`profiles` 表扩展与数据层支撑
+## 文件结构（先锁定职责，再拆任务）
+
+| 文件 | 状态 | 职责 |
+|---|---|---|
+| `LLM/zonegeo.py` | **新增**（~70 行） | 纯几何：点是否在区域内（多边形射线法 / `rect` 用外接矩形）。零 IO、零外部依赖、不抛异常 |
+| `LLM/session.py` | **新增**（~330 行） | 会话层：双槽角色、`derive_role`、管理员登录/登出/TTL、当前病房与位置自动切换 |
+| `LLM/policy.py` | **新增**（~60 行） | 纯数据 + 纯函数：三角色策略包（提示词文件 / 工具白名单 / 数据可见范围 / 是否读病房上下文） |
+| `LLM/prompt/{ward,elder,admin}.md` | **新增** | 角色提示词片段（`prompt.md` 继续作共用 base，不动） |
+| `LLM/db.py` | 修改 | `profiles` 加 4 列；病房 CRUD；口令哈希 raw-key 读写；`list_zones`/`get_zone` 向后兼容扩参 |
+| `LLM/conf.py` | 修改 | 8 个新设置项 |
+| `LLM/chat.py` | 修改 | `principal` 透传；`_load_role_prompt`；集体层上下文注入 |
+| `LLM/tools.py` | 修改 | `@tool(roles=)`；`effective_tools`/`run_tool` 角色白名单（闸门 2） |
+| `LLM/memory.py` | 修改 | `note_turn(..., role=)`：集体层不沉淀 |
+| `LLM/voice_api.py` | 修改 | 会话持有权移交 `session.py`（同名函数转发，调用点不变） |
+| `LLM/voice/worker.py` | 修改 | `_handle_speech` 按角色分支（规格 §4.3） |
+| `LLM/server.py` | 修改 | 新增 session/wards/policy 路由；业务接口按 `X-Surface` 取 principal；`lifespan` 挂 tick |
+| `LLM/locator.py` `LLM/roslink.py` `LLM/maptags.py` `LLM/mapstore.py` | **不改** | 一期已落地，本计划只调用 |
+| `frontend/packages/shared/src/{api/client.ts,api/session.ts,events.ts}` + `tests/events.test.ts` | 修改 | `X-Surface`、会话/病房 API、3 个新事件 |
+| `frontend/packages/kiosk/src/{components/UserSwitcher.vue,components/VoiceStatusBar.vue,App.vue}` | 修改 | 左侧层级栏 + 角色徽标 + 管理员登录/口令设置 |
+| `frontend/packages/admin/src/{App.vue,pages/RolesPage.vue,pages/WardsPage.vue,pages/RegisterPage.vue}` | 修改/新增 | 登录门 + 「身份与权限」「病房管理」页签 + 注册向导加病房归属 |
+
+> ⚠️ **两个 `session` 不要搞混**：`LLM/session.py`（本计划**新增**，角色会话层）与 `LLM/voice/session.py`
+> （**早已存在**，语音状态机 IDLE/LISTENING/SPEAKING，worker 里 import 为 `session_mod`）。新代码
+> 一律用 `role_session` 别名引用角色会话层。
+
+---
+
+### 任务 1：`zonegeo.py` —— 点是否在区域内（纯几何，无依赖）
 
 **文件：**
-- 修改：`LLM/db.py`（`init_db()` 第 111-127 行区块；`profiles` 区块第 136-200 行；`settings` 区块第 977-1015 行）
+- 创建：`LLM/zonegeo.py`
+- 测试：`LLM/tests/test_zonegeo.py`（新建）
+
+先做这一件：它零依赖、可独立测试，任务 7 的病房判定要用它。**为什么单独一个模块**：这个判定有两处使用者（本设计的"小车在哪个病房"、将来地图编辑器的"点位回读"），且**只吃数据不吃 IO**；塞进 `db.py` 会脏化 SQLite 层，塞进 `session.py` 则无法独立单测。口径照抄前端既有实现 `frontend/packages/mapeditor/src/lib/coords.ts:44 pointInPolygon()`（射线法），保证前后端对"点是否在区域内"给出一致答案。
+
+- [ ] **步骤 1：编写失败的测试**
+
+```python
+# LLM/tests/test_zonegeo.py
+# -*- coding: utf-8 -*-
+"""区域几何判定测试（纯函数，无 DB、无 IO、无 ROS）。"""
+from LLM import zonegeo
+
+
+def test_point_inside_and_outside_square():
+    poly = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]
+    assert zonegeo.point_in_polygon(1.0, 1.0, poly) is True
+    assert zonegeo.point_in_polygon(3.0, 1.0, poly) is False
+    assert zonegeo.point_in_polygon(-1.0, -1.0, poly) is False
+
+
+def test_concave_polygon_notch_is_outside():
+    """L 形：缺口里那点必须判在外（射线法要能处理凹多边形）。"""
+    poly = [[0.0, 0.0], [4.0, 0.0], [4.0, 1.0], [1.0, 1.0], [1.0, 4.0], [0.0, 4.0]]
+    assert zonegeo.point_in_polygon(0.5, 3.0, poly) is True
+    assert zonegeo.point_in_polygon(2.0, 2.0, poly) is False
+
+
+def test_degenerate_input_is_false_never_raises():
+    """点数 <3 / 空 / None 一律 False（fail-safe：判"不在"，不抛异常打断对话）。"""
+    assert zonegeo.point_in_polygon(0.0, 0.0, [[0.0, 0.0], [1.0, 1.0]]) is False
+    assert zonegeo.point_in_polygon(0.0, 0.0, []) is False
+    assert zonegeo.point_in_polygon(0.0, 0.0, None) is False
+
+
+def test_broken_points_are_dropped_not_fatal():
+    poly = [[0.0, 0.0], ["x", "y"], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]
+    assert zonegeo.point_in_polygon(1.0, 1.0, poly) is True
+
+
+def test_rect_shape_uses_bbox():
+    zone = {"shape": "rect", "polygon": [[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]]}
+    assert zonegeo.zone_hit(zone, 3.9, 1.9) is True
+    assert zonegeo.zone_hit(zone, 5.0, 1.0) is False
+
+
+def test_zone_hit_accepts_cache_row_with_polygon_json_string():
+    """db.list_zones 会给 polygon（已解析），但表里存的是字符串；两种都得能吃。"""
+    zone = {"shape": "polygon", "polygon_json": "[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]"}
+    assert zonegeo.zone_hit(zone, 1.0, 1.0) is True
+    assert zonegeo.zone_hit({"shape": "polygon", "polygon_json": "坏了"}, 1.0, 1.0) is False
+    assert zonegeo.zone_hit(None, 1.0, 1.0) is False
+```
+
+- [ ] **步骤 2：运行测试验证失败**
+
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_zonegeo.py -q`
+预期：FAIL（`ModuleNotFoundError: No module named 'LLM.zonegeo'`）
+
+- [ ] **步骤 3：编写实现**
+
+```python
+# LLM/zonegeo.py
+# -*- coding: utf-8 -*-
+r"""
+区域几何判定（点在不在某个区域内）—— 纯 stdlib、无 IO、无外部依赖、不抛异常。
+
+规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md §4.5
+口径照抄前端既有实现 frontend/packages/mapeditor/src/lib/coords.ts:44 pointInPolygon()
+（射线法），保证前后端对"点是否在区域内"给出一致答案：
+  * shape == "polygon"：射线法（顶点顺序不限，凸凹多边形都行）；
+  * shape == "rect"   ：用 polygon 的**外接矩形**判定（矩形区域只存 4 个角，容差更稳）；
+  * 顶点数 < 3 / 数据损坏 → False —— fail-safe：宁可判"不在"，也不抛异常打断对话。
+"""
+import json
+
+
+def _points(poly) -> list[tuple[float, float]]:
+    """[[x, y], ...] → [(x, y), ...]；坏点直接丢弃（不抛异常）。"""
+    out = []
+    for pt in poly or []:
+        try:
+            out.append((float(pt[0]), float(pt[1])))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+    return out
+
+
+def point_in_polygon(x: float, y: float, poly) -> bool:
+    """射线法：点 `(x, y)` 是否在多边形 `poly`（`[[x, y], ...]`，**米坐标**）内。"""
+    pts = _points(poly)
+    n = len(pts)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def in_bbox(x: float, y: float, poly) -> bool:
+    """点是否落在 `poly` 的外接矩形内（`shape='rect'` 的判定口径）。"""
+    pts = _points(poly)
+    if not pts:
+        return False
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys)
+
+
+def _as_poly(zone: dict) -> list:
+    """从区域行里取几何：优先已解析的 `polygon`，退回 `polygon_json` 字符串。"""
+    poly = zone.get("polygon")
+    if poly is None:
+        poly = zone.get("polygon_json") or []
+    if isinstance(poly, str):
+        try:
+            poly = json.loads(poly or "[]")
+        except ValueError:
+            poly = []
+    return poly if isinstance(poly, list) else []
+
+
+def zone_hit(zone: dict, x: float, y: float) -> bool:
+    """点是否落在这个区域行里（`zone` = `db.list_zones()` 返回的行，含 `shape`/`polygon`）。"""
+    if not zone:
+        return False
+    poly = _as_poly(zone)
+    if str(zone.get("shape") or "polygon") == "rect":
+        return in_bbox(x, y, poly)
+    return point_in_polygon(x, y, poly)
+```
+
+- [ ] **步骤 4：运行测试验证通过**
+
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_zonegeo.py -q`
+预期：`6 passed`
+
+- [ ] **步骤 5：Commit**
+
+```bash
+git add LLM/zonegeo.py LLM/tests/test_zonegeo.py
+git commit -m "feat(llm): 新增 zonegeo.py（点是否在区域内，纯几何，照抄前端 coords.ts 口径）"
+```
+
+---
+
+### 任务 2：`profiles` 扩列 + 病房 CRUD + 管理员口令数据层
+
+**文件：**
+- 修改：`LLM/db.py`（`init_db()` 的 `_ensure_columns(conn, "profiles", …)` 第 153-156 行；`list_profiles` 第 231 行；`list_zones` 第 1231 行；`get_zone` 第 1258 行；`settings` 区块尾部）
 - 测试：`LLM/tests/test_ward_db.py`（新建）
+
+**四条硬约束（每条都有实测依据）：**
+1. **不建表**：`zones`/`destinations`/`map_tags_manifest` 三张缓存表一期已建（`db.py:91-129`，复合主键 `(map_name, uid)`），唯一写入口是 `maptags.sync_map()`；本任务只读。
+2. **病房区域几何不在这层**：几何真相是 `<图名>.tags.json`；`profiles` 只记 `ward_map` + `ward_zone`。
+3. **`upsert_profile` 一个参数都不加**：`ward_id`/`ward_map`/`ward_zone` 只允许专用函数写，否则管理台编辑老人档案时会静默清掉病房关联（git 历史 `f6f6e54` 就是修这个 bug）。
+4. **口令哈希不走 `set_settings`**：它只接受 `DEFAULT_SETTINGS | TOOL_DEFAULTS` 白名单 key，`admin_password_hash` 不在其中 → 用 raw key 读写。
 
 - [ ] **步骤 1：编写失败的测试**
 
 ```python
 # LLM/tests/test_ward_db.py
 # -*- coding: utf-8 -*-
-"""病房用户与管理员口令数据层测试（临时库隔离，沿用 test_memory_v4.py 模式）。"""
+"""病房用户 / 管理员口令 / 区域缓存的数据层测试（临时库隔离，沿用 test_memory_v4.py 模式）。"""
+import json
 import os
 import tempfile
 
@@ -42,82 +256,152 @@ from LLM import db
 
 @pytest.fixture()
 def d():
-    from LLM import db as _db
     tmp = tempfile.mkdtemp()
-    old = _db.DB_PATH
-    _db.DB_PATH = os.path.join(tmp, "t.db")
-    _db.init_db()
-    yield _db
-    _db.DB_PATH = old
+    old = db.DB_PATH
+    db.DB_PATH = os.path.join(tmp, "t.db")
+    db.init_db()
+    yield db
+    db.DB_PATH = old
+
+
+def _seed_zones(map_name: str, zones: list[dict]) -> None:
+    """往**只读缓存表**里种区域（等价于 maptags.sync_map 的结果；测试直接铺数据）。
+
+    注意 `replace_map_tags` 是「整图重建」——**一次要把该图所有区域一起传进来**，
+    分两次调用会把前一次的行删掉。
+    """
+    db.replace_map_tags(
+        map_name,
+        {"file_mtime": 0, "file_size": 0, "sha1": "", "resolution": 0.05,
+         "origin": {"x": 0.0, "y": 0.0}, "warnings": []},
+        [],
+        zones,
+    )
+
+
+def _zone(uid: str, name: str, poly: list, kind: str = "ward", shape: str = "polygon") -> dict:
+    return {"uid": uid, "name": name, "kind": kind, "shape": shape,
+            "polygon_json": json.dumps(poly), "parent": "", "note": "",
+            "created_at": "", "updated_at": ""}
 
 
 def test_existing_profile_defaults_to_elder(d):
     d.upsert_profile("elder_001", name="张奶奶")
     assert d.get_profile_kind("elder_001") == "elder"
     assert d.get_profile("elder_001")["ward_id"] == ""
+    assert d.get_profile("elder_001")["ward_map"] == ""
+    assert d.get_profile("elder_001")["ward_zone"] == ""
 
 
-def test_upsert_ward_with_zone_id(d):
-    zid = d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
-                     polygon_json=[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
-    d.upsert_ward("ward_101", name="101 病房", zone_id=zid)
-    wards = d.list_profiles(kind="ward")
+def test_unknown_uid_kind_is_empty(d):
+    assert d.get_profile_kind("ghost_9") == ""       # 查不到 → ""，由 session 兜底成 ward（R2）
+
+
+def test_upsert_ward_and_list(d):
+    d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
+    wards = d.list_wards()
     assert [w["uid"] for w in wards] == ["ward_101"]
     assert d.get_profile_kind("ward_101") == "ward"
-    assert d.get_ward_zone("ward_101")["id"] == zid      # 经 profiles.zone_id 反查 zones
-    assert d.get_zone(zid)["name"] == "101"              # 按主键查 zones
-    assert d.list_wards_with_zone() == [
-        {"uid": "ward_101", "name": "101 病房", "zone_id": zid, "zone": d.get_zone(zid)}]
+    assert wards[0]["ward_map"] == "my_map" and wards[0]["ward_zone"] == "z1"
+    assert d.list_profiles(kind="elder") == []       # kind 过滤生效
 
 
-def test_ward_without_zone_id_returns_none(d):
-    d.upsert_ward("ward_102", name="102 病房")           # zone_id 默认 0 = 未关联
-    assert d.get_profile("ward_102")["zone_id"] == 0
-    assert d.get_ward_zone("ward_102") is None
-    assert d.list_wards_with_zone() == []
+def test_upsert_ward_does_not_wipe_linkage_on_rename(d):
+    """重复 upsert_ward（只改名）不许把已有关联清掉——调用方传空串=保持原值。"""
+    d.upsert_ward("ward_101", name="101", ward_map="my_map", ward_zone="z1")
+    d.upsert_ward("ward_101", name="101 病房")
+    p = d.get_profile("ward_101")
+    assert p["name"] == "101 病房"
+    assert p["ward_map"] == "my_map" and p["ward_zone"] == "z1"
 
 
-def test_zone_contains_point_hits_polygon(d):
-    d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
-               polygon_json=[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
-    assert [z["name"] for z in d.zone_contains_point("101", 1.0, 1.0, kind="ward")] == ["101"]
-    assert d.zone_contains_point("101", 9.0, 9.0, kind="ward") == []
+def test_upsert_profile_never_touches_ward_linkage(d):
+    """**核心回归**：档案编辑（upsert_profile）绝不许清掉病房关联（f6f6e54 的教训）。"""
+    d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
+    d.upsert_profile("elder_101_1", name="李爷爷")
+    d.set_profile_ward("elder_101_1", "ward_101")
+    d.upsert_profile("elder_101_1", name="李爷爷（改名）", age=79)
+    p = d.get_profile("elder_101_1")
+    assert p["name"] == "李爷爷（改名）" and p["ward_id"] == "ward_101"
+    w = d.get_profile("ward_101")
+    assert w["ward_map"] == "my_map" and w["ward_zone"] == "z1"
+    assert w["kind"] == "ward"
 
 
-def test_zone_contains_point_uses_bbox_for_rect(d):
-    d.add_zone(map_name="101", name="101", kind="ward", shape="rect",
-               polygon_json=[[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]])
-    assert [z["name"] for z in d.zone_contains_point("101", 3.9, 1.9, kind="ward")] == ["101"]
-    assert d.zone_contains_point("101", 5.0, 1.0, kind="ward") == []
+def test_set_ward_zone_roundtrip(d):
+    d.upsert_ward("ward_101", name="101 病房")
+    assert d.get_profile("ward_101")["ward_zone"] == ""
+    d.set_ward_zone("ward_101", "my_map", "z3")
+    p = d.get_profile("ward_101")
+    assert (p["ward_map"], p["ward_zone"]) == ("my_map", "z3")
 
 
-def test_zone_lookup_degrades_safely(d):
-    assert d.list_zones(map_name="不存在的地图") == []                  # 无区域 → []
-    assert d.zone_contains_point("101", 0.0, 0.0, kind="ward") == []    # 还没建任何区域 → []
-    d.add_zone(map_name="101", name="走廊", kind="other",
-               polygon_json=[[0.0, 0.0], [9.0, 0.0], [9.0, 9.0], [0.0, 9.0]])
-    assert d.zone_contains_point("101", 1.0, 1.0, kind="ward") == []    # kind 过滤：other 不算病房
-    assert d.get_zone(99999) is None                                    # 主键不存在 → None
-
-
-def test_set_elder_ward(d):
+def test_set_profile_ward(d):
     d.upsert_profile("elder_101_1", name="李爷爷")
     d.set_profile_ward("elder_101_1", "ward_101")
     assert d.get_profile("elder_101_1")["ward_id"] == "ward_101"
 
 
+def test_upsert_ward_promotes_existing_profile(d):
+    """**回归（历史隐患①）**：把一个已存在的 uid 提升成病房，`kind` 必须真的变成 ward。
+
+    旧版实现用 `kind=COALESCE(profiles.kind, excluded.kind)` 兜底，而旧行早已被回填成
+    `'elder'`、永不为空 → 兜底分支**永不触发** → 提升静默失败却照写区域关联（半状态）。
+    本版用 `SET kind='ward'` 直写，这条测试就是钉住它。
+    """
+    d.upsert_profile("ward_101", name="其实是先建错的老人档案")   # 先以 elder 存在
+    assert d.get_profile_kind("ward_101") == "elder"
+    d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
+    assert d.get_profile_kind("ward_101") == "ward"
+    assert d.get_profile("ward_101")["ward_map"] == "my_map"
+
+
+def test_list_zones_kind_filter_and_get_zone_with_map(d):
+    _seed_zones("my_map", [
+        _zone("z1", "101", [[0, 0], [2, 0], [2, 2], [0, 2]], kind="ward"),
+        _zone("z2", "走廊", [[0, 0], [9, 0], [9, 9], [0, 9]], kind="other"),
+    ])
+    _seed_zones("my_map2", [_zone("z1", "102", [[10, 10], [12, 10], [12, 12], [10, 12]])])
+
+    assert [z["uid"] for z in d.list_zones(map_name="my_map", kind="ward")] == ["z1"]
+    assert len(d.list_zones(map_name="my_map")) == 2
+    assert d.list_zones(map_name="不存在的地图") == []          # 无缓存 → []（降级）
+
+    # get_zone 必须能按地图限定：三张图各有一个 z1，只按 uid 查会串（既有隐患已修）
+    assert d.get_zone("z1", "my_map")["name"] == "101"
+    assert d.get_zone("z1", "my_map2")["name"] == "102"
+    assert d.get_zone("z1", "nope") is None
+    assert d.get_zone("z9", "my_map") is None
+    assert d.get_zone("z1")["name"] in ("101", "102")           # 不传地图名：兼容旧行为
+
+
+def test_zone_rows_expose_parsed_polygon(d):
+    _seed_zones("my_map", [_zone("z1", "101", [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])])
+    z = d.list_zones(map_name="my_map")[0]
+    assert z["polygon"] == [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]
+    assert "polygon_json" not in z
+
+
 def test_float_setting_roundtrip(d):
     d.set_settings({"ward_zone_default_r": 3.5})
-    assert d.get_settings()["ward_zone_default_r"] == 3.5
+    assert d.get_settings()["ward_zone_default_r"] == 3.5        # 读回来必须是 float 不是 "3.5"
 
 
 def test_admin_password_hash_roundtrip(d):
     assert d.get_admin_auth() == {"required": True, "hash": "", "salt": ""}
     d.set_admin_password("246810")
+    a = d.get_admin_auth()
+    assert a["hash"] and a["salt"] and "246810" not in a["hash"]  # 绝不落明文
     assert d.verify_admin_password("246810") is True
     assert d.verify_admin_password("000000") is False
     d.set_admin_auth_required(False)
     assert d.get_admin_auth()["required"] is False
+    d.set_admin_auth_required(True)
+    assert d.get_admin_auth()["required"] is True
+
+
+def test_verify_admin_password_without_hash_is_false(d):
+    assert d.verify_admin_password("任意") is False
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -125,50 +409,29 @@ def test_admin_password_hash_roundtrip(d):
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_db.py -q`
 预期：FAIL（`AttributeError: module 'LLM.db' has no attribute 'get_profile_kind'`）
 
-- [ ] **步骤 3：实现最少代码**
+- [ ] **步骤 3：实现**
 
-在 `init_db()` 的 `_ensure_columns(conn, "profiles", {...})` 字典里追加三列：
+**(3a)** 在 `init_db()` 的 `_ensure_columns(conn, "profiles", {...})` 字典里追加四列：
 
 ```python
             _ensure_columns(conn, "profiles", {
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
-                # 分层用户体系：kind=elder|ward；ward_id=老人所属病房；zone_id=关联的 zones.id（0=未关联）
+                # 分层用户体系（规格 §9）：kind=elder|ward；ward_id=老人所属病房 uid；
+                # ward_map/ward_zone=病房关联的「地图名 + 区域 uid」（几何真相在 <图名>.tags.json）
                 "kind": "kind TEXT DEFAULT 'elder'",
                 "ward_id": "ward_id TEXT DEFAULT ''",
-                "zone_id": "zone_id INTEGER DEFAULT 0",
+                "ward_map": "ward_map TEXT DEFAULT ''",
+                "ward_zone": "ward_zone TEXT DEFAULT ''",
             })
 ```
 
-**注意：`profiles` 不保存病房区域几何。** 病房区域几何的**唯一真相**是 `zones` 表（一期《地图编辑器》规格 §4.2），`profiles` 只存 `zone_id` 引用，绝不复制几何。P0 尚未执行、`profiles` 目前连 `kind`/`ward_id` 都没有（已 grep 确认），所以**没有迁移负担**，直接按新设计建列即可，**不要**写"列改名迁移"。
+> `kind TEXT DEFAULT 'elder'` 让**旧行自动满足**"默认老人"，所以**不需要**写任何迁移代码。
 
-在 `init_db()` 的建表 SQL（`SCHEMA`）里新增 `zones` 表——照抄一期《地图编辑器》规格 §4.2 的 DDL，字段不改：
-
-```sql
-CREATE TABLE IF NOT EXISTS zones (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  map_name TEXT NOT NULL,               -- 地点绑定的地图名（三张图坐标系不通用，必须绑）
-  name TEXT NOT NULL,                   -- 标准名，如 "101"
-  kind TEXT DEFAULT 'room',             -- room | ward | bed | other
-  shape TEXT DEFAULT 'polygon',         -- polygon | rect
-  polygon_json TEXT DEFAULT '[]',       -- [[x,y], ...] 米坐标（世界系，非像素）
-  parent_id INTEGER DEFAULT 0,          -- 上级区域（病房→床位）；0=无
-  note TEXT DEFAULT '',
-  created_at TEXT, updated_at TEXT,
-  UNIQUE(map_name, name)
-);
-```
-
-> **与一期《地图编辑器》任务 1 的依赖关系：** `zones` 表原属一期任务 1，但 P0 可能先开工，所以 P0 的 db 任务里**自带这份最小 `zones` 支持**。它与一期任务 1 是**同一份实现**：先落地者建表，后落地者复用（`CREATE TABLE IF NOT EXISTS` 幂等）；与 `locator.py`/`mapserver.py` 采用同一约定——**以先开工者为准，后开工者复用**，不要各写一套。
->
-> **病房区域的定义：** 病房区域 = `zones` 表里 `map_name=<当前地图>` + `kind='ward'` + `name=<病房名>` 的一条记录。「小车在哪个病房」= 取 `zones` 中 `kind='ward'` 的多边形做**点在多边形内**判定；`shape='rect'` 时用其 `polygon_json` 的外接矩形判定。
->
-> **降级（fail-safe，沿用 D17 口径）：** `zones` 表不存在、该地图没有 `kind='ward'` 区域、或病房的 `zone_id=0` → **不自动切换**，保持手动选病房，绝不误判、绝不阻塞对话（下列函数与 `session._zone_hit` 均按此实现）。
-
-在 `settings` 区块前新增（`profiles` 区块的 `list_profiles` 需支持 `kind` 过滤）：
+**(3b)** `list_profiles` 加 `kind` 过滤（默认空 = 不过滤，向后兼容），并在其后追加病房相关函数：
 
 ```python
-def list_profiles(kind: str | None = None) -> list[dict]:
+def list_profiles(kind: str = "") -> list[dict]:
     conn = _conn()
     try:
         sql = "SELECT * FROM profiles"
@@ -189,7 +452,13 @@ def list_profiles(kind: str | None = None) -> list[dict]:
 
 
 def get_profile_kind(uid: str) -> str:
-    """唯一权威的角色判定依据（R1）：admin 不在 profiles 里 → 返回 ''。"""
+    """角色判定的**唯一权威依据**（R1）：admin 不写进 profiles → 返回 ""。
+
+    注意：调用方（session.derive_role）必须把 "" 当"未知"并按集体层兜底（R2），
+    绝不按 uid 前缀猜。
+    """
+    if not uid:
+        return ""
     conn = _conn()
     try:
         row = conn.execute("SELECT kind FROM profiles WHERE uid=?", (uid,)).fetchone()
@@ -198,153 +467,107 @@ def get_profile_kind(uid: str) -> str:
         conn.close()
 
 
-def upsert_ward(uid: str, name: str = "", zone_id: int = 0) -> dict:
-    """新建/更新病房 profile；病房几何不在这里存，只存关联的 zones.id（唯一真相在 zones）。"""
-    upsert_profile(uid, name=name, kind="ward", zone_id=int(zone_id or 0))
+def list_wards() -> list[dict]:
+    """全部病房用户（kind='ward'）。"""
+    return list_profiles(kind="ward")
+
+
+def upsert_ward(uid: str, name: str = "", ward_map: str = "", ward_zone: str = "") -> dict:
+    """新建/更新一条病房用户。
+
+    **只由本函数与 set_ward_zone 写 kind/ward_map/ward_zone**：upsert_profile 不碰这三列，
+    否则管理台编辑老人档案时会静默清掉病房关联（见 git f6f6e54）。
+    传空串 = 保持原值（避免"只改个名字"把关联清掉）。
+    """
+    upsert_profile(uid, name=name)          # 先保证行存在（用现有签名，不加参数）
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE profiles SET kind='ward', "
+                "ward_map=CASE WHEN ?<>'' THEN ? ELSE ward_map END, "
+                "ward_zone=CASE WHEN ?<>'' THEN ? ELSE ward_zone END, "
+                "updated_at=? WHERE uid=?",
+                (ward_map, ward_map, ward_zone, ward_zone, now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
     return get_profile(uid) or {}
 
 
+def set_ward_zone(uid: str, map_name: str, zone_uid: str) -> None:
+    """把病房关联到「某张图上的某个区域 uid」（几何真相在 <图名>.tags.json，这里只存引用）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE profiles SET ward_map=?, ward_zone=?, updated_at=? WHERE uid=?",
+                         (map_name or "", zone_uid or "", now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def set_profile_ward(uid: str, ward_id: str) -> None:
+    """老人归入病房（写 profiles.ward_id；空串 = 移出病房）。"""
     with _lock:
         conn = _conn()
         try:
             conn.execute("UPDATE profiles SET ward_id=?, updated_at=? WHERE uid=?",
-                         (ward_id, now_iso(), uid))
+                         (ward_id or "", now_iso(), uid))
             conn.commit()
         finally:
             conn.close()
-
-
-# ---- 病房区域最小集（zones 表 = 唯一真相；与一期《地图编辑器》任务 1 同一份实现）----
-# 依赖说明：一期任务 1 也会实现这些函数，先落地者建表、后落地者复用
-# （CREATE TABLE IF NOT EXISTS 幂等）；与 locator.py / mapserver.py 同一约定。
-# 降级（D17 fail-safe）：表不存在 / 无 kind='ward' 区域 / zone_id=0 → 一律返回空，绝不抛异常。
-
-def add_zone(map_name: str, name: str, kind: str = "room", shape: str = "polygon",
-             polygon_json: list | None = None, parent_id: int = 0, note: str = "") -> int:
-    """写入一条区域记录并返回其 id；同 (map_name, name) 已存在则覆盖几何（幂等，适配 UNIQUE）。"""
-    with _lock:
-        conn = _conn()
-        try:
-            ts = now_iso()
-            cur = conn.execute(
-                "INSERT INTO zones (map_name,name,kind,shape,polygon_json,parent_id,note,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(map_name, name) DO UPDATE SET kind=excluded.kind, "
-                "shape=excluded.shape, polygon_json=excluded.polygon_json, "
-                "parent_id=excluded.parent_id, note=excluded.note, updated_at=excluded.updated_at",
-                (map_name, name, kind, shape,
-                 json.dumps(polygon_json or [], ensure_ascii=False),
-                 int(parent_id or 0), note or "", ts, ts))
-            conn.commit()
-            if cur.lastrowid:
-                return int(cur.lastrowid)
-            row = conn.execute("SELECT id FROM zones WHERE map_name=? AND name=?",
-                               (map_name, name)).fetchone()
-            return int(row["id"]) if row else 0
-        finally:
-            conn.close()
-
-
-def get_zone(zone_id: int) -> dict | None:
-    """按主键查 zones 行（唯一真相）；不存在或表未建 → None。"""
-    try:
-        conn = _conn()
-        try:
-            row = conn.execute("SELECT * FROM zones WHERE id=?", (int(zone_id or 0),)).fetchone()
-            return dict(row) if row else None
-        finally:
-            conn.close()
-    except Exception:                        # 表不存在等 → 降级
-        return None
-
-
-def list_zones(map_name: str | None = None, kind: str | None = None) -> list[dict]:
-    """按地图名 / 类型列出区域；表未建 → []（降级）。"""
-    conds, args = [], []
-    if map_name:
-        conds.append("map_name=?")
-        args.append(map_name)
-    if kind:
-        conds.append("kind=?")
-        args.append(kind)
-    sql = "SELECT * FROM zones"
-    if conds:
-        sql += " WHERE " + " AND ".join(conds)
-    sql += " ORDER BY id"
-    try:
-        conn = _conn()
-        try:
-            return [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
-        finally:
-            conn.close()
-    except Exception:                        # 表不存在等 → 降级
-        return []
-
-
-def _point_in_polygon(x: float, y: float, poly: list) -> bool:
-    """射线法：点是否在多边形内（poly=[[x,y], ...] 米坐标）。"""
-    inside, n = False, len(poly)
-    for i in range(n):
-        x1, y1 = float(poly[i][0]), float(poly[i][1])
-        x2, y2 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
-        if (y1 > y) != (y2 > y):
-            if x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
-                inside = not inside
-    return inside
-
-
-def zone_contains_point(map_name: str, x: float, y: float, kind: str | None = None) -> list[dict]:
-    """点落在哪些区域里：polygon 用射线法；rect 用 polygon_json 的**外接矩形**。
-
-    降级（D17）：表不存在 / 该地图没有区域 / polygon_json 为空 → []，
-    调用方据此保持手动选病房，绝不误判、绝不阻塞对话。
-    """
-    out = []
-    for z in list_zones(map_name=map_name, kind=kind):
-        try:
-            poly = json.loads(z.get("polygon_json") or "[]")
-        except (TypeError, ValueError):
-            poly = []
-        if not poly:
-            continue
-        if str(z.get("shape") or "polygon") == "rect":
-            xs = [float(p[0]) for p in poly]
-            ys = [float(p[1]) for p in poly]
-            if min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys):
-                out.append(z)
-        elif _point_in_polygon(x, y, poly):
-            out.append(z)
-    return out
-
-
-def get_ward_zone(ward_uid: str) -> dict | None:
-    """取该病房 profile 的 zone_id，再查 zones 表（病房几何的唯一真相在 zones）。
-
-    zone_id=0（未关联）或 zones 行缺失 → None，调用方按"拿不到病房区域"降级处理。
-    """
-    p = get_profile(ward_uid) or {}
-    zid = int(p.get("zone_id") or 0)
-    return get_zone(zid) if zid else None
-
-
-def list_wards_with_zone() -> list[dict]:
-    """列出**已关联区域**的病房：{"uid","name","zone_id","zone"}；未关联的病房不返回。"""
-    out = []
-    for w in list_profiles(kind="ward"):
-        zid = int(w.get("zone_id") or 0)
-        zone = get_zone(zid) if zid else None
-        if zone:
-            out.append({"uid": w["uid"], "name": w.get("name", ""), "zone_id": zid, "zone": zone})
-    return out
 ```
 
-`upsert_profile` 签名追加 `kind="elder"`、`zone_id=0` 两个参数，并在 INSERT/UPDATE 的列与值里带上（`kind` 用 `excluded.kind`，注意 `ON CONFLICT` 更新时**不要**覆盖已有 kind——用 `kind=COALESCE(profiles.kind, excluded.kind)`）。
-
-管理员口令（放在 `settings` 区块末尾，**不走 `set_settings`**——它只接受 `DEFAULT_SETTINGS|TOOL_DEFAULTS` 的白名单 key）：
+**(3c)** `list_zones` 加 `kind` 过滤、`get_zone` 加可选 `map_name`（都是向后兼容扩参，不新建表）：
 
 ```python
-# ---- 管理员口令（PBKDF2，绝不落明文）----
+def list_zones(map_name: str = "", uid: str = "", kind: str = "") -> list[dict]:
+    sql = "SELECT * FROM zones"
+    where, args = [], []
+    if map_name:
+        where.append("map_name=?")
+        args.append(map_name)
+    if uid:
+        where.append("uid=?")
+        args.append(uid)
+    if kind:
+        where.append("kind=?")
+        args.append(kind)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY name"
+    conn = _conn()
+    try:
+        out = []
+        for r in conn.execute(sql, args).fetchall():
+            d = dict(r)
+            try:
+                d["polygon"] = json.loads(d.pop("polygon_json") or "[]")
+            except ValueError:
+                d["polygon"] = []
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_zone(uid: str, map_name: str = "") -> dict | None:
+    """按 uid（+ 可选地图名）取区域行。
+
+    **强烈建议带上 map_name**：uid（`z1`）只在单张图内稳定，三张图各有自己的 `z1`，
+    只按 uid 查会跨图串（复合主键是 `(map_name, uid)`）。
+    """
+    rows = list_zones(map_name=map_name, uid=uid)
+    return rows[0] if rows else None
+```
+
+**(3d)** 在 `settings` 区块（`get_settings`/`set_settings` 附近、`get_map_tags_manifest` 之前）追加口令读写：
+
+```python
+# ---------------------------------------------------------------- 管理员口令（规格 D12/D13）
+# 为什么不用 set_settings：它只接受 DEFAULT_SETTINGS|TOOL_DEFAULTS 白名单里的 key，
+# 而口令必须有自己的 key（且绝不落明文、绝不进前端设置页）。
 def _get_setting_raw(key: str, default: str = "") -> str:
     conn = _conn()
     try:
@@ -371,6 +594,7 @@ def _hash_pw(pw: str, salt: str) -> str:
 
 
 def get_admin_auth() -> dict:
+    """口令门状态 + 盐/哈希（哈希为空 = 还没设过口令）。"""
     return {
         "required": _get_setting_raw("admin_auth_required", "1").lower() in ("1", "true", "yes"),
         "hash": _get_setting_raw("admin_password_hash"),
@@ -379,8 +603,9 @@ def get_admin_auth() -> dict:
 
 
 def set_admin_password(pw: str) -> None:
-    import os
-    salt = os.urandom(16).hex()
+    """设/改口令：随机盐 + PBKDF2-SHA256 20 万轮，**不落明文**。"""
+    import os as _os
+    salt = _os.urandom(16).hex()
     _set_setting_raw("admin_password_salt", salt)
     _set_setting_raw("admin_password_hash", _hash_pw(pw, salt))
 
@@ -393,10 +618,11 @@ def verify_admin_password(pw: str) -> bool:
 
 
 def set_admin_auth_required(required: bool) -> None:
+    """开关口令门（D13）。关掉之后任何人点「管理层」都能进，UI 必须显示警示。"""
     _set_setting_raw("admin_auth_required", "1" if required else "0")
 ```
 
-`get_settings()` 的类型转换分支里补 float（否则 `ward_zone_default_r` 读回来是字符串）：
+**(3e)** `get_settings()` 的类型转换分支里补 `float`（否则 `ward_zone_default_r` 读回来是字符串 `"3.5"`）：在现有 `isinstance(out.get(r["key"]), int)` 分支**之后**加：
 
 ```python
             elif isinstance(out.get(r["key"]), float):
@@ -409,29 +635,33 @@ def set_admin_auth_required(required: bool) -> None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_db.py -q`
-预期：9 passed
+预期：`13 passed`
 
-- [ ] **步骤 5：跑全量回归 + Commit**
+- [ ] **步骤 5：跑既有回归 + Commit**
 
 ```bash
-.venv\Scripts\python.exe -m pytest LLM/tests -q
+.venv\Scripts\python.exe -m pytest LLM/tests tests -q
+# 预期仍是 4 failed, 191+N passed（那 4 个红态与本任务无关，不许去修）
 git add LLM/db.py LLM/tests/test_ward_db.py
-git commit -m "feat(llm): profiles 扩 kind/ward_id/zone_id + zones 表最小集 + 病房与管理员口令数据层"
+git commit -m "feat(llm): profiles 扩 kind/ward_id/ward_map/ward_zone + 病房 CRUD + 管理员口令数据层"
 ```
 
 ---
 
-### 任务 2：新增配置项
+### 任务 3：新增配置项
 
 **文件：**
-- 修改：`LLM/conf.py`（`DEFAULT_SETTINGS`，第 18-41 行）
+- 修改：`LLM/conf.py`（`DEFAULT_SETTINGS`，第 18-46 行）
 - 测试：`LLM/tests/test_settings_roles.py`（新建）
+
+**不许加的两个 key**：`rosbridge_url`（它不是设置项，是 `conf.ROSBRIDGE_URL` 模块级常量；`set_settings` 白名单也不含它）与 `current_map`（第 42 行**已存在**，重复添加会让"当前地图"出现两个来源）。
 
 - [ ] **步骤 1：编写失败的测试**
 
 ```python
 # LLM/tests/test_settings_roles.py
 # -*- coding: utf-8 -*-
+"""分层用户体系的配置项默认值（改参数先来这里看）。"""
 from LLM.conf import DEFAULT_SETTINGS
 
 
@@ -439,56 +669,62 @@ def test_role_settings_have_defaults():
     assert DEFAULT_SETTINGS["admin_auth_required"] is True
     assert DEFAULT_SETTINGS["admin_session_ttl_s"] == 300
     assert DEFAULT_SETTINGS["ward_context_window"] == 10
+    assert DEFAULT_SETTINGS["ward_autoswitch_enabled"] is True
     assert DEFAULT_SETTINGS["ward_switch_debounce"] == 3
     assert DEFAULT_SETTINGS["ward_zone_default_r"] == 3.0
     assert DEFAULT_SETTINGS["manual_override_sec"] == 600
-    assert DEFAULT_SETTINGS["rosbridge_url"] == "ws://100.65.82.93:9090"
-    # 一期 §4.3 的同名设置项：P0 先落地则先建，一期落地后复用（不能省——病房自动切换靠它）
+    assert DEFAULT_SETTINGS["ward_map_source"] == "auto"
+
+
+def test_does_not_shadow_existing_map_settings():
+    """`current_map` 一期已有（真值是"下次启导航用哪张图"），本设计不重新定义它。"""
     assert DEFAULT_SETTINGS["current_map"] == "my_map"
+    assert "rosbridge_url" not in DEFAULT_SETTINGS      # rosbridge 地址不在设置表里
+    assert isinstance(DEFAULT_SETTINGS["map_topic_fingerprint_enabled"], bool)
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_settings_roles.py -q`
-预期：FAIL（KeyError: 'admin_auth_required'）
+预期：FAIL（`KeyError: 'admin_auth_required'`）
 
 - [ ] **步骤 3：实现**
 
-在 `DEFAULT_SETTINGS` 里追加：
+在 `DEFAULT_SETTINGS` 末尾（`mapeditor_auto_switch_map` 之后）追加：
 
 ```python
     # ---- 分层用户体系（2026-09-14，规格 docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）----
-    "admin_auth_required": True,    # 管理员口令门开关（可关：详见规格 D13）
-    "admin_session_ttl_s": 300,     # 管理员提权无操作自动降权秒数
-    "ward_context_window": 10,      # 集体层上下文注入条数（老人可见本病房的这 N 条）
-    "rosbridge_url": "ws://100.65.82.93:9090",  # 位置源（空=停用病房自动切换）
-    "ward_switch_debounce": 3,      # 自动切病房防抖：连续 N 次 tick 同病房才认
-    "ward_zone_default_r": 3.0,     # 便捷录入病房区域的默认半径（米）：以当前位姿为中心采样 16 边形
-    "manual_override_sec": 600,     # 手动切病房后位置判定不覆盖的秒数
-    # 车此刻在跑哪张图（**一期 §4.3 的同名设置项**；P0 先落地则先建，一期落地后复用）。
-    # 病房位置自动切换只认"当前地图"上的病房区域；便捷录入也按它写 zones.map_name。
-    "current_map": "my_map",
+    "admin_auth_required": True,     # 管理员口令门开关（D13：可在 UI 直接关掉，界面须警示）
+    "admin_session_ttl_s": 300,      # 管理员提权后无操作自动降权秒数（D8）
+    "ward_context_window": 10,       # 集体层上下文注入条数（老人可读本病房最近 N 条，R5）
+    "ward_autoswitch_enabled": True, # 病房位置自动切换总开关（关掉=退回手动；rosbridge 地址在 conf.ROSBRIDGE_URL）
+    "ward_switch_debounce": 3,       # 自动切病房防抖：连续 N 次 tick 同病房才认（D18）
+    "ward_zone_default_r": 3.0,      # 便捷录入病房区域的半径（米），以当前位姿为圆心采样 16 边形
+    "manual_override_sec": 600,      # 手动切病房后，位置判定不覆盖的秒数（D18）
+    "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=/map 指纹反查（默认）；setting=用 current_map
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_settings_roles.py LLM/tests/test_backend.py -q`
-预期：全 passed
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_settings_roles.py LLM/tests -q`
+预期：新文件 2 passed；全量仍是那 4 个既有红态
 
 - [ ] **步骤 5：Commit**
 
 ```bash
 git add LLM/conf.py LLM/tests/test_settings_roles.py
-git commit -m "feat(llm): 补分层用户体系配置项（口令门/TTL/病房上下文/位置源）"
+git commit -m "feat(llm): 补分层用户体系配置项（口令门/TTL/病房上下文/自动切换/地图来源）"
 ```
 
 ---
 
-### 任务 3：`policy.py` 角色策略包
+### 任务 4：`policy.py` —— 角色策略包
 
 **文件：**
 - 创建：`LLM/policy.py`
 - 测试：`LLM/tests/test_policy_roles.py`（新建）
+
+**只做 P0 需要的**：`POLICY_DEFAULTS` + `role_policy()`。规格 §6.3 的 `check_action()` 属于 P1（依赖 MCP），**不要写空壳函数**——空壳会被后来者误当成"已经实现"。
 
 - [ ] **步骤 1：编写失败的测试**
 
@@ -502,91 +738,101 @@ def test_policy_keys_cover_three_roles():
     assert set(policy.POLICY_DEFAULTS) == {"admin", "ward", "elder"}
 
 
-def test_ward_has_no_personal_scope_and_reads_own_ward():
+def test_ward_reads_own_ward_but_no_personal_scope():
     p = policy.POLICY_DEFAULTS["ward"]
-    assert p["data_scope"] == "none"      # 不注入任何老人档案/私人记忆
-    assert p["ward_context"] is True      # 但读本病房集体上下文
-    assert p["allowed_tools"] == []       # 集体层无车控工具
+    assert p["data_scope"] == "none"        # 不注入任何老人档案/私人记忆
+    assert p["ward_context"] is True        # 但读得到本病房的集体上下文
+    assert p["allowed_tools"] == []         # 集体层无任何工具
 
 
 def test_elder_reads_self_plus_ward_context():
     p = policy.POLICY_DEFAULTS["elder"]
     assert p["data_scope"] == "self"
     assert p["ward_context"] is True
+    assert "robot_stop" in p["allowed_tools"]     # R3：安全动作永远在列
 
 
 def test_admin_reads_all_without_ward_context():
     p = policy.POLICY_DEFAULTS["admin"]
     assert p["data_scope"] == "all"
-    assert p["allowed_tools"] is None     # None = 全部
+    assert p["allowed_tools"] is None             # None = 全部
+    assert p["ward_context"] is False
+
+
+def test_prompt_files_point_into_llm_prompt_dir():
+    for role in ("ward", "elder", "admin"):
+        f = policy.POLICY_DEFAULTS[role]["prompt_file"]
+        assert f.name == f"{role}.md" and f.parent.name == "prompt"
 
 
 def test_unknown_role_falls_back_to_ward():
     assert policy.role_policy("nope") == policy.POLICY_DEFAULTS["ward"]
     assert policy.role_policy(None) == policy.POLICY_DEFAULTS["ward"]
+    assert policy.role_policy("") == policy.POLICY_DEFAULTS["ward"]
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_policy_roles.py -q`
-预期：FAIL（ModuleNotFoundError: No module named 'LLM.policy'）
+预期：FAIL（`ModuleNotFoundError: No module named 'LLM.policy'`）
 
 - [ ] **步骤 3：实现**
 
 ```python
+# LLM/policy.py
 # -*- coding: utf-8 -*-
 r"""
-角色策略包（分层用户体系）：每个层级 = 一套策略 = 提示词片段 + 工具白名单 + 数据可见范围 + 语音策略。
+角色策略包（分层用户体系）：每个层级 = 一套策略 = 提示词片段 + 工具白名单 + 数据可见范围。
 
-规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md
+规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md §3.2/§3.3
 红线：R1 前端 role 不可信（role 只由 session.derive_role 推导）
       R2 fail-closed（未知角色一律按集体层最小能力）
-设计取舍：本模块**只放纯数据 + 纯函数**，不做 IO；会话状态在 session.py。
+      R5 层级上下文单向（集体层对同病房老人可读；反向与跨病房不可读）
+
+设计取舍：本模块**只放纯数据 + 纯函数**，不做任何 IO（会话状态在 session.py）。
+P1 的 check_action()（动作风险分级/二次确认）依赖 car MCP，**不在这里留空壳**。
 """
 from pathlib import Path
+
 from .conf import BASE_DIR
 
 PROMPT_DIR = BASE_DIR / "LLM" / "prompt"
 
-_RISK = {"destinations": "none", "risk_confirm": False, "voice": "wake"}
-
 POLICY_DEFAULTS: dict[str, dict] = {
-    # ---- 集体层：一屋子人，读得到本病房的公开对话，但读不到任何个人档案 ----
+    # ---- 集体层：一屋子人。读得到本病房公开对话，读不到任何个人档案，也没有工具 ----
     "ward": {
         "prompt_file": PROMPT_DIR / "ward.md",
         "allowed_tools": [],
         "data_scope": "none",
         "ward_context": True,
-        **_RISK,
     },
     # ---- 老人层：本人档案 + 本病房集体上下文（只读、单向）----
     "elder": {
         "prompt_file": PROMPT_DIR / "elder.md",
-        "allowed_tools": ["robot_status", "robot_stop"],   # 安全动作永远在列（R3）
+        # R3：急停/呼救类工具永远在列（当前仅有 robot_stop 是安全动作）
+        "allowed_tools": ["robot_status", "robot_stop"],
         "data_scope": "self",
         "ward_context": True,
-        **_RISK,
     },
     # ---- 管理层：全部能力 ----
     "admin": {
         "prompt_file": PROMPT_DIR / "admin.md",
-        "allowed_tools": None,
+        "allowed_tools": None,          # None = 不按角色裁剪（仍受全局 per-tool 开关约束）
         "data_scope": "all",
         "ward_context": False,
-        **_RISK,
     },
 }
 
 
 def role_policy(role: str | None) -> dict:
-    """取角色策略；未知/None → 集体层（R2 fail-closed）。"""
+    """取角色策略；未知/None/空 → **集体层**（R2 fail-closed）。"""
     return POLICY_DEFAULTS.get(role or "", POLICY_DEFAULTS["ward"])
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_policy_roles.py -q`
-预期：5 passed
+预期：`6 passed`
 
 - [ ] **步骤 5：Commit**
 
@@ -597,11 +843,20 @@ git commit -m "feat(llm): 新增 policy.py 角色策略包（三层策略 + fail
 
 ---
 
-### 任务 4：`session.py` —— 双槽主体与角色推导
+### 任务 5：`session.py` —— 双槽主体、角色推导、管理员 TTL
 
 **文件：**
-- 创建：`LLM/session.py`
+- 创建：`LLM/session.py`（**注意**：与早已存在的 `LLM/voice/session.py`（语音状态机）同名不同物，详见文件结构表下的提醒）
 - 测试：`LLM/tests/test_session_roles.py`（新建；**不要**覆盖已有的 `LLM/tests/test_session.py`）
+
+**模型（规格 §3.1/§4.1）：`uid`/`locked` 全端共享，`role` 按槽位隔离。** 这是"管理台登录不会把车前屏提权"（双槽存在的唯一理由）的实现方式：
+
+```
+_shared = {"uid", "locked", "ward_uid", "manual_until"}   # 全局：当前主体 + 当前病房
+_state[slot] = {"role", "source", "until"}                # 按槽：kiosk | admin
+```
+
+**非管理员槽位的角色永远跟着全局主体走**（`get_principal` 里用 `derive_role(_shared["uid"])` 现算），否则会出现"管理台登出后车前屏 role=ward 但 uid 是某位老人"的不一致。
 
 - [ ] **步骤 1：编写失败的测试**
 
@@ -637,12 +892,14 @@ def test_derive_role_by_kind(d):
     assert session.derive_role("elder_101_1") == "elder"
     assert session.derive_role("ward_101") == "ward"
     assert session.derive_role("admin") == "admin"
-    assert session.derive_role("ghost_9") == "ward"     # R2 fail-closed
+    assert session.derive_role("ghost_9") == "ward"      # R2 fail-closed
+    assert session.derive_role("") == "ward"
+    assert session.derive_role(None) == "ward"
 
 
 def test_derive_role_not_fooled_by_uid_prefix(d):
-    d.upsert_profile("ward_fake", name="其实是老人")     # kind 默认 elder
-    assert session.derive_role("ward_fake") == "elder"   # 权威判定查 profiles.kind
+    d.upsert_profile("ward_fake", name="其实是老人")      # kind 默认 elder
+    assert session.derive_role("ward_fake") == "elder"    # 权威判定查 profiles.kind
 
 
 def test_two_slots_are_isolated(d):
@@ -650,14 +907,15 @@ def test_two_slots_are_isolated(d):
     session.login_admin("111111", slot="admin")
     assert session.get_principal("kiosk")["role"] == "ward"
     assert session.get_principal("admin")["role"] == "admin"
-    assert session.get_principal("kiosk")["uid"] == "ward_101"
+    assert session.get_principal("kiosk")["uid"] == "ward_101"     # 车前屏不被提权
+    assert session.get_principal("admin")["uid"] == "admin"
 
 
 def test_admin_never_downgraded_by_voiceprint(d):
     session.login_admin("111111", slot="kiosk")
     session.set_subject("elder_101_1", locked=False, slot="kiosk", source="voiceprint")
     p = session.get_principal("kiosk")
-    assert p["role"] == "admin" and p["uid"] == "admin"   # D8 提权只升不降
+    assert p["role"] == "admin" and p["uid"] == "admin"            # D8 提权只升不降
 
 
 def test_wrong_password_does_not_elevate(d):
@@ -672,7 +930,7 @@ def test_recognizing_elder_follows_his_ward(d):
     session.set_subject("ward_101", slot="kiosk")
     session.set_subject("elder_102_1", slot="kiosk", source="voiceprint")
     p = session.get_principal("kiosk")
-    assert p["role"] == "elder" and p["ward_uid"] == "ward_102"   # D18：当前病房跟随老人
+    assert p["role"] == "elder" and p["ward_uid"] == "ward_102"     # D18：当前病房跟随老人
 
 
 def test_elder_without_ward_keeps_current(d):
@@ -688,42 +946,64 @@ def test_ttl_expiry_falls_back_to_ward(d, monkeypatch):
     base = session._now_ts()
     monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
     p = session.get_principal("kiosk")
-    assert p["role"] == "ward" and p["uid"] == "ward_101"  # 回落集体层
+    assert p["role"] == "ward" and p["uid"] == "ward_101"          # 回落集体层
+    assert p["source"] == "expired"
+
+
+def test_ttl_remain_counts_down(d):
+    session.login_admin("111111", slot="kiosk", ttl_s=60)
+    assert 0 < session.ttl_remain("kiosk") <= 60
+    session.logout("kiosk")
+    assert session.ttl_remain("kiosk") is None                      # 非管理员 → None
+
+
+def test_logout_returns_to_ward_layer(d):
+    session.set_subject("ward_101", slot="kiosk")
+    session.login_admin("111111", slot="kiosk")
+    session.logout("kiosk")
+    p = session.get_principal("kiosk")
+    assert p["role"] == "ward" and p["uid"] == "ward_101" and p["locked"] is False
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：FAIL（No module named 'LLM.session'）
+预期：FAIL（`ModuleNotFoundError: No module named 'LLM.session'`）
 
 - [ ] **步骤 3：实现**
 
 ```python
+# LLM/session.py
 # -*- coding: utf-8 -*-
 r"""
 分层用户体系的会话层：**谁在说话**（角色）与**现在在哪个病房**（集体层归属）。
 
-规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md §3/§4
-两条槽位：kiosk（车前设备，承载语音链路）与 admin（管理台）。role 按槽位隔离，
-uid/locked 全端共享（沿用 2026-08-27 前端多端设计 D11）。
+规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md（2026-09-14 二次修订版）
+
+两条槽位：
+  kiosk —— 车前设备，承载语音链路与车前屏；
+  admin —— 管理台（浏览器）。
+`uid`/`locked`/`ward_uid` 全局一份（一辆车一块屏，沿用现状）；`role` 按槽位隔离，
+所以**管理台登录不会把车前屏提权**（这是双槽存在的唯一理由）。
 
 红线：
-  R1 前端传的 role 不可信 —— 角色只由 derive_role() 从 uid 推导；
+  R1 前端传的 role 不可信 —— 角色只由 derive_role() 从 uid 推导（依据 profiles.kind，不靠前缀）；
   R2 fail-closed —— 未知 uid / 未知角色一律按集体层最小能力；
-  R3 急停呼救永远放行（本模块不做拦截）。
-降级：rosbridge 拿不到位姿时，位置自动切换自行停用（locator 返回 None），
-      会话保持当前病房不变，绝不影响对话链路。
+  R3 急停/呼救永远放行（本模块不做任何拦截）。
+降级：拿不到位姿 / 认不出当前地图 / 本图没有病房区域 → 位置自动切换自行停用，
+      会话保持当前病房不变，绝不阻塞对话。
 """
 import time
 
 from . import db
 from . import log as audit
-from .conf import DEFAULT_SETTINGS
 
 SLOTS = ("kiosk", "admin")
 ADMIN_UID = "admin"
 
-# slot -> {"uid": str, "role": str, "locked": bool, "source": str, "until": float|None, "ward_uid": str, "manual_until": float}
+# 全局共享：当前主体（uid/locked）与"当前病房"（ward_uid/manual_until）
+_shared: dict = {"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0}
+# 按槽位：角色与提权状态
 _state: dict[str, dict] = {}
 
 
@@ -732,23 +1012,21 @@ def _now_ts() -> float:
 
 
 def reset_for_test() -> None:
-    """单测用：清空全部槽位状态。"""
+    """单测用：清空全部会话状态。"""
+    _shared.update({"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0})
     _state.clear()
 
 
 def _slot(slot: str) -> dict:
     if slot not in SLOTS:
         slot = "kiosk"
-    return _state.setdefault(slot, {
-        "uid": "", "role": "ward", "locked": False, "source": "default",
-        "until": None, "ward_uid": "", "manual_until": 0.0,
-    })
+    return _state.setdefault(slot, {"role": "ward", "source": "default", "until": None})
 
 
 def derive_role(uid: str | None) -> str:
-    """uid → 角色（R1 唯一入口）。权威依据是 profiles.kind，不靠 uid 前缀。"""
+    """uid → 角色（**R1 的唯一入口**）。权威依据是 `profiles.kind`，不靠 uid 前缀。"""
     if not uid:
-        return "ward"                      # R2
+        return "ward"                       # R2
     if uid == ADMIN_UID:
         return "admin"
     kind = db.get_profile_kind(uid)
@@ -756,60 +1034,61 @@ def derive_role(uid: str | None) -> str:
         return "ward"
     if kind == "elder":
         return "elder"
-    return "ward"                          # R2 未知 uid
+    return "ward"                           # R2 未知 uid
 
 
 def _settings() -> dict:
     return db.get_settings()
 
 
-def set_subject(uid: str, locked: bool = False, slot: str = "kiosk", source: str = "manual") -> dict:
+def set_subject(uid: str, locked: bool = False, slot: str = "kiosk",
+                source: str = "manual") -> dict:
     """切换会话主体：写 uid，role 由 uid 推导（R1）。"""
     s = _slot(slot)
     if s["role"] == "admin" and source != "manual":
         # D8 提权只升不降：管理员会话期间声纹认人不改主体，只留痕
         audit.log("session_login", action="voiceprint_ignored_in_admin", uid=uid, slot=slot)
         return get_principal(slot)
-    s["uid"] = uid
+    _shared["uid"] = uid or ""
+    _shared["locked"] = bool(locked)
     s["role"] = derive_role(uid)
-    s["locked"] = bool(locked)
     s["source"] = source
     s["until"] = None
     if s["role"] == "elder":
         p = db.get_profile(uid) or {}
         if p.get("ward_id"):
-            s["ward_uid"] = p["ward_id"]   # D18：识别到老人 → 当前病房跟随
+            _shared["ward_uid"] = p["ward_id"]      # D18：认出老人 → 当前病房跟着他
     elif s["role"] == "ward":
-        s["ward_uid"] = uid
+        _shared["ward_uid"] = uid or ""
     return get_principal(slot)
 
 
-def login_admin(password: str | None = None, slot: str = "kiosk", ttl_s: int | None = None) -> dict:
-    """口令门开启时校验口令；关闭时直接放行（D13）。失败返回 ok=False，由路由层计冷却。"""
+def login_admin(password: str | None = None, slot: str = "kiosk",
+                ttl_s: int | None = None) -> dict:
+    """口令门开启时校验口令；门关着时直接放行（D13）。失败返回 ok=False，冷却由路由层计。"""
     auth = db.get_admin_auth()
     if auth["required"]:
         if not password or not db.verify_admin_password(password):
             audit.log("session_login_fail", slot=slot)
             return {"ok": False, "error": "口令错误"}
         source = "password"
+        ttl = int(ttl_s if ttl_s is not None else _settings().get("admin_session_ttl_s", 300))
+        until = _now_ts() + max(1, ttl)
     else:
+        # 口令门关着：无需口令直接进，且**不再自动降权**（已经没有保护可降）
         source = "auth_disabled"
-    ttl = int(ttl_s if ttl_s is not None else _settings().get("admin_session_ttl_s", 300))
-    s = _slot(slot)
-    s["uid"] = ADMIN_UID
-    s["role"] = "admin"
-    s["locked"] = False
-    s["source"] = source
-    s["until"] = _now_ts() + ttl
+        ttl, until = None, None
+    _slot(slot).update({"role": "admin", "source": source, "until": until})
     audit.log("session_login", slot=slot, source=source, ttl_s=ttl)
-    return {"ok": True, **get_principal(slot)}
+    out = dict(get_principal(slot))
+    out["ok"] = True
+    out["ttl_remain"] = ttl_remain(slot)
+    return out
 
 
 def logout(slot: str = "kiosk") -> dict:
-    """退出管理层 → 回落集体层（保持当前病房）。"""
-    s = _slot(slot)
-    uid = s.get("ward_uid") or ""
-    s.update({"uid": uid, "role": "ward", "locked": False, "source": "manual", "until": None})
+    """退出管理层 → 该槽回落（非管理员槽的 role 会自动跟着当前主体走）。"""
+    _slot(slot).update({"role": "ward", "source": "logout", "until": None})
     audit.log("session_logout", slot=slot)
     return get_principal(slot)
 
@@ -817,21 +1096,30 @@ def logout(slot: str = "kiosk") -> dict:
 def _expire_if_needed(slot: str) -> None:
     s = _slot(slot)
     if s["role"] == "admin" and s["until"] and _now_ts() >= s["until"]:
-        s.update({"role": "ward", "uid": s.get("ward_uid") or "", "locked": False,
-                  "source": "expired", "until": None})
+        s.update({"role": "ward", "source": "expired", "until": None})
         audit.log("session_expired", slot=slot)
 
 
 def get_principal(slot: str = "kiosk") -> dict:
+    """当前主体（含角色）。**业务代码只认这个函数**，绝不读前端传来的角色（R1）。"""
     _expire_if_needed(slot)
-    s = dict(_slot(slot))
-    s["slot"] = slot
-    if s["role"] == "admin":
-        s["uid"] = ADMIN_UID
-    return s
+    s = _slot(slot)
+    if s["role"] != "admin":
+        # 非管理员槽位的角色永远跟着全局主体走，避免"role=ward 但 uid 是某位老人"
+        s["role"] = derive_role(_shared["uid"])
+    return {
+        "uid": ADMIN_UID if s["role"] == "admin" else _shared["uid"],
+        "role": s["role"],
+        "locked": bool(_shared["locked"]),
+        "source": s["source"],
+        "slot": slot,
+        "until": s["until"],
+        "ward_uid": _shared["ward_uid"],
+    }
 
 
 def ttl_remain(slot: str = "kiosk") -> int | None:
+    _expire_if_needed(slot)
     s = _slot(slot)
     if s["role"] != "admin" or not s["until"]:
         return None
@@ -841,7 +1129,7 @@ def ttl_remain(slot: str = "kiosk") -> int | None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：8 passed
+预期：`11 passed`
 
 - [ ] **步骤 5：Commit**
 
@@ -852,74 +1140,97 @@ git commit -m "feat(llm): session.py 双槽会话主体 + derive_role + 管理�
 
 ---
 
-### 任务 5：管理员口令的改 / 关 / 开
+### 任务 6：管理员口令的改 / 关 / 开 / 首启生成
 
 **文件：**
 - 修改：`LLM/session.py`（追加函数）
 - 测试：`LLM/tests/test_session_roles.py`（追加用例）
 
-- [ ] **步骤 1：编写失败的测试**（追加到 `test_session_roles.py`）
+- [ ] **步骤 1：编写失败的测试**（追加到 `test_session_roles.py` 末尾）
 
 ```python
-def test_change_password_requires_old(tmp_path, monkeypatch):
-    d = _setup(tmp_path, monkeypatch)
+def test_change_password_requires_old(d):
     d.set_admin_password("111111")
     assert session.change_admin_password("wrong", "222222")["ok"] is False
     assert session.change_admin_password("111111", "222222")["ok"] is True
     assert d.verify_admin_password("222222") is True
+    assert d.verify_admin_password("111111") is False
 
 
-def test_toggle_auth_required(tmp_path, monkeypatch):
-    d = _setup(tmp_path, monkeypatch)
-    d.set_admin_password("111111")
-    assert session.set_admin_auth(True)["required"] is True
+def test_change_password_rejects_too_short(d):
+    assert session.change_admin_password("111111", "12")["ok"] is False
+    assert d.verify_admin_password("111111") is True          # 失败不改动原口令
+
+
+def test_toggle_auth_required_and_login_without_password(d):
     assert session.set_admin_auth(False)["required"] is False
     r = session.login_admin(password=None, slot="kiosk")
-    assert r["ok"] is True and r["source"] == "auth_disabled"   # 口令门关闭 → 直接放行
+    assert r["ok"] is True and r["source"] == "auth_disabled"
+    assert r["ttl_remain"] is None                            # 无口令保护时不再自动降权
+    assert session.set_admin_auth(True)["required"] is True
 
 
-def test_first_boot_generates_random_password(tmp_path, monkeypatch):
-    d = _setup(tmp_path, monkeypatch)
+def test_re_enabling_lock_kills_existing_admin_sessions(d):
+    """重新开启口令门 = 现有 admin 会话立即作废（强制下次要口令）。"""
+    session.login_admin("111111", slot="admin", ttl_s=600)
+    session.set_admin_auth(False)
+    session.login_admin(password=None, slot="admin")          # 无保护状态下进的管理员
+    session.set_admin_auth(True)
+    assert session.get_principal("admin")["role"] == "ward"    # 已被踢回
+
+
+def test_first_boot_generates_random_password(d):
+    d._set_setting_raw("admin_password_hash", "")
+    d._set_setting_raw("admin_password_salt", "")
     pw = session.ensure_admin_password()
-    assert isinstance(pw, str) and len(pw) == 6
+    assert isinstance(pw, str) and len(pw) == 6 and pw.isdigit()
     assert d.verify_admin_password(pw) is True
-    assert session.ensure_admin_password() is None   # 已存在 → 不再生成
+    assert session.ensure_admin_password() is None             # 已有口令 → 不再生成
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：FAIL（AttributeError: module 'LLM.session' has no attribute 'change_admin_password'）
+预期：FAIL（`AttributeError: module 'LLM.session' has no attribute 'change_admin_password'`）
 
 - [ ] **步骤 3：实现**（追加到 `session.py` 末尾）
 
 ```python
+# ---------------------------------------------------------------------------
+# 口令维护（D12/D13）：可改、可整体关闭、首启自动生成 6 位随机口令
+# ---------------------------------------------------------------------------
 def change_admin_password(old: str, new: str) -> dict:
-    """管理员改口令（需旧口令；口令门关闭时允许直接设新口令）。"""
+    """改口令（需旧口令）。口令门关着时允许直接设新口令（此时无旧口令可验）。"""
     auth = db.get_admin_auth()
-    if auth["required"] and not db.verify_admin_password(old):
+    if auth["required"] and not db.verify_admin_password(old or ""):
+        audit.log("admin_password_changed", ok=False, reason="old_mismatch")
         return {"ok": False, "error": "旧口令错误"}
     if len(new or "") < 4:
         return {"ok": False, "error": "新口令太短（至少 4 位）"}
     db.set_admin_password(new)
-    audit.log("admin_password_changed", slot="admin")
+    audit.log("admin_password_changed", ok=True)
     return {"ok": True}
 
 
 def set_admin_auth(required: bool) -> dict:
-    """开关管理员口令门（D13）。"""
-    db.set_admin_auth_required(bool(required))
-    audit.log("admin_auth_changed", required=bool(required))
-    if not required:
-        _slot("admin").update({"role": "admin", "uid": ADMIN_UID, "source": "auth_disabled",
-                               "until": None})
-    return {"required": bool(required)}
+    """开关口令门（D13）。
+
+    重新**开启**时把两个槽的 admin 会话立即作废：否则"先关掉门进来、再开回门"的人会
+    一直留在管理员态，等于门白开了。
+    """
+    required = bool(required)
+    db.set_admin_auth_required(required)
+    audit.log("admin_auth_changed", required=required)
+    if required:
+        for slot in SLOTS:
+            if _slot(slot)["role"] == "admin":
+                _slot(slot).update({"role": "ward", "until": None, "source": "auth_reenabled"})
+    return {"required": required}
 
 
 def ensure_admin_password() -> str | None:
-    """首次启动：库里没有口令哈希就生成 6 位随机口令，返回明文（由调用方打印+审计）。"""
-    auth = db.get_admin_auth()
-    if auth["hash"]:
+    """首启：库里没有口令哈希就生成 6 位随机口令，返回明文（调用方打印 + 审计，D12）。"""
+    if db.get_admin_auth()["hash"]:
         return None
     import secrets
     pw = "".join(secrets.choice("0123456789") for _ in range(6))
@@ -930,181 +1241,39 @@ def ensure_admin_password() -> str | None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：8 passed
+预期：`16 passed`
 
 - [ ] **步骤 5：Commit**
 
 ```bash
 git add LLM/session.py LLM/tests/test_session_roles.py
-git commit -m "feat(llm): 管理员口令可改/可开关 + 首启随机口令"
+git commit -m "feat(llm): 管理员口令可改/可开关 + 重开门即作废旧 admin 会话 + 首启随机口令"
 ```
 
 ---
 
-### 任务 6：`locator.py` 位置源（rosbridge，可注入假位姿）
+### 任务 7：当前病房与位置自动切换（复用一期 locator）
 
 **文件：**
-- 创建：`LLM/locator.py`
-- 测试：`LLM/tests/test_locator.py`（新建）
-
-- [ ] **步骤 1：编写失败的测试**
-
-```python
-# LLM/tests/test_locator.py
-# -*- coding: utf-8 -*-
-from LLM import locator
-
-
-def test_inject_and_read_pose():
-    locator.set_pose_for_test(1.5, -2.0, 0.3)
-    p = locator.get_pose()
-    assert (round(p["x"], 2), round(p["y"], 2)) == (1.5, -2.0)
-
-
-def test_no_pose_returns_none():
-    locator.set_pose_for_test(None)
-    assert locator.get_pose() is None
-
-
-def test_disabled_when_url_empty():
-    locator.set_pose_for_test(1.0, 1.0, 0.0)
-    assert locator.available({"rosbridge_url": ""}) is False
-    assert locator.available({"rosbridge_url": "ws://x:9090"}) is True
-
-
-def test_parse_amcl_pose_message():
-    msg = {"msg": {"pose": {"pose": {"position": {"x": 3.0, "y": 4.0},
-                                     "orientation": {"z": 0.0, "w": 1.0}}}}}
-    p = locator._parse_amcl_pose(msg)
-    assert (p["x"], p["y"]) == (3.0, 4.0)
-    assert round(p["yaw"], 3) == 0.0
-```
-
-- [ ] **步骤 2：运行测试验证失败**
-
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_locator.py -q`
-预期：FAIL（No module named 'LLM.locator'）
-
-- [ ] **步骤 3：实现**
-
-```python
-# -*- coding: utf-8 -*-
-r"""
-位置源（分层用户体系 §4.5）：给"现在在哪个病房"提供小车位姿。
-
-为什么用 rosbridge 而不是 MCP：用户 2026-09-14 明确"先不管 mcp"，而 rosbridge 是
-板卡上本来就跑的 websocket（`~/tools/nav_screen.sh lat`，端口 9090），订阅 /amcl_pose
-即可拿到 map 系位姿；依赖 websocket-client 是**已有依赖**（asr_cloud.py 在用）。
-
-降级（系统稳健性）：连不上/超时/未定位 → get_pose() 返回 None，位置自动切换随之停用，
-绝不抛异常影响对话；另提供 set_pose_for_test() 供无 ROS 环境单测与验收注入假位姿。
-"""
-import json
-import math
-import threading
-import time
-
-try:                      # 可选依赖：缺失时整体降级
-    import websocket      # websocket-client
-    _WS_AVAILABLE = True
-except Exception:
-    _WS_AVAILABLE = False
-
-_POSE_TTL_S = 10.0        # 位姿新鲜度：超过这么久没更新视为"拿不到"
-_pose: dict | None = None
-_pose_ts: float = 0.0
-_lock = threading.Lock()
-_started = False
-
-
-def set_pose_for_test(x: float | None, y: float = 0.0, yaw: float = 0.0) -> None:
-    """注入假位姿（x=None 表示"拿不到位姿"）。仅测试与诊断用。"""
-    global _pose, _pose_ts
-    with _lock:
-        _pose = None if x is None else {"x": float(x), "y": float(y), "yaw": float(yaw)}
-        _pose_ts = time.monotonic()
-
-
-def get_pose() -> dict | None:
-    with _lock:
-        if _pose is None:
-            return None
-        if time.monotonic() - _pose_ts > _POSE_TTL_S:
-            return None
-        return dict(_pose)
-
-
-def available(settings: dict) -> bool:
-    """位置源是否可用（配置了 rosbridge 地址）。"""
-    return bool((settings or {}).get("rosbridge_url"))
-
-
-def _yaw_from_quat(z: float, w: float) -> float:
-    return 2.0 * math.atan2(z, w)
-
-
-def _parse_amcl_pose(msg: dict) -> dict | None:
-    try:
-        pose = msg["msg"]["pose"]["pose"]
-        pos, ori = pose["position"], pose["orientation"]
-        return {"x": float(pos["x"]), "y": float(pos["y"]),
-                "yaw": _yaw_from_quat(float(ori["z"]), float(ori["w"]))}
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def start(settings: dict) -> None:
-    """启动后台订阅线程（幂等）。不可用时静默跳过（降级）。"""
-    global _started
-    if _started or not _WS_AVAILABLE or not available(settings):
-        return
-    _started = True
-    url = settings["rosbridge_url"]
-
-    def _run():
-        sub = {"op": "subscribe", "topic": "/amcl_pose", "type": "geometry_msgs/PoseWithCovarianceStamped"}
-        while True:
-            try:
-                ws = websocket.create_connection(url, timeout=5)
-                ws.send(json.dumps(sub))
-                while True:
-                    p = _parse_amcl_pose(json.loads(ws.recv()))
-                    if p:
-                        global _pose, _pose_ts
-                        with _lock:
-                            _pose, _pose_ts = p, time.monotonic()
-            except Exception:
-                time.sleep(3)      # 连不上就退避重试；不抛异常、不写审计噪音
-
-    threading.Thread(target=_run, name="locator", daemon=True).start()
-```
-
-- [ ] **步骤 4：运行测试验证通过**
-
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_locator.py -q`
-预期：4 passed
-
-- [ ] **步骤 5：Commit**
-
-```bash
-git add LLM/locator.py LLM/tests/test_locator.py
-git commit -m "feat(llm): locator.py 位置源（rosbridge /amcl_pose + 假位姿注入 + 降级）"
-```
-
----
-
-### 任务 7：当前病房与自动切换（防抖 / 手动覆盖 / 不抢私聊）
-
-**文件：**
-- 修改：`LLM/session.py`
+- 修改：`LLM/session.py`（追加；并改 `reset_for_test`）
 - 测试：`LLM/tests/test_ward_autoswitch.py`（新建）
+
+**三条语义（规格 D17/D18）：**
+1. **防抖**：连续 N 次 tick（≈N 秒）落在同一病房才认；离开病房区（走廊）**不切**。
+2. **不抢私聊**：仅当 kiosk 槽 `role=="ward"` 且未锁定时才真正改主体；否则只更新"当前病房"。
+3. **拿不到就停用**：位姿不可用 / 认不出当前图 / 该病房没关联区域 / 该区域不在当前图上 → 一律不判命中。
+
+**两个性能约束（v2 新增，照旧版写会每秒打网络）：**
+- tick **只读本地 `brain.db.zones` 缓存**（`db.list_zones`），**不**调 `maptags.get_zones()`（那条路径含 `_ensure_fresh → sync_map`，`MAPS_IO=ssh` 下可能秒级阻塞）；
+- `locator.current_map()` 会列图 + 逐图读元数据，结果做 **10s TTL 缓存**。
 
 - [ ] **步骤 1：编写失败的测试**
 
 ```python
 # LLM/tests/test_ward_autoswitch.py
 # -*- coding: utf-8 -*-
-"""病房位置自动切换测试：全部注入假位姿，不需要 ROS / rosbridge。"""
+"""病房位置自动切换测试：全部注入假位姿，**不需要 ROS / rosbridge / 板卡**。"""
+import json
 import os
 import tempfile
 
@@ -1114,11 +1283,28 @@ from LLM import db
 from LLM import locator
 from LLM import session
 
-_MAP = "101"      # 单测用的"当前地图"名：病房区域都建在这张图上；_zone_hit 只认当前地图
+_MAP = "my_map"
 
-_SETTINGS = {"rosbridge_url": "ws://x:9090", "ward_switch_debounce": 3,
-             "manual_override_sec": 600, "admin_session_ttl_s": 300,
-             "current_map": _MAP}
+_SETTINGS = {"ward_autoswitch_enabled": True, "ward_switch_debounce": 3,
+             "manual_override_sec": 600, "ward_map_source": "setting",
+             "current_map": _MAP, "admin_session_ttl_s": 300}
+
+
+def _seed_zones(map_name: str, zones: list[dict]) -> None:
+    """整图重建缓存（`replace_map_tags` 是整图级的：一次把该图所有区域一起传）。"""
+    db.replace_map_tags(
+        map_name,
+        {"file_mtime": 0, "file_size": 0, "sha1": "", "resolution": 0.05,
+         "origin": {"x": 0.0, "y": 0.0}, "warnings": []},
+        [],
+        zones,
+    )
+
+
+def _zone(uid: str, name: str, poly: list) -> dict:
+    return {"uid": uid, "name": name, "kind": "ward", "shape": "polygon",
+            "polygon_json": json.dumps(poly), "parent": "", "note": "",
+            "created_at": "", "updated_at": ""}
 
 
 @pytest.fixture()
@@ -1128,56 +1314,66 @@ def d(monkeypatch):
     db.DB_PATH = os.path.join(tmp, "t.db")
     db.init_db()
     session.reset_for_test()
-    zid_101 = db.add_zone(map_name=_MAP, name="101", kind="ward", shape="polygon",
-                          polygon_json=[[-3.0, -3.0], [3.0, -3.0], [3.0, 3.0], [-3.0, 3.0]])
-    zid_102 = db.add_zone(map_name=_MAP, name="102", kind="ward", shape="polygon",
-                          polygon_json=[[17.0, -3.0], [23.0, -3.0], [23.0, 3.0], [17.0, 3.0]])
-    db.upsert_ward("ward_101", name="101", zone_id=zid_101)
-    db.upsert_ward("ward_102", name="102", zone_id=zid_102)
+    locator.clear_injection()
+    _seed_zones(_MAP, [
+        _zone("z1", "101", [[-3.0, -3.0], [3.0, -3.0], [3.0, 3.0], [-3.0, 3.0]]),
+        _zone("z2", "102", [[17.0, -3.0], [23.0, -3.0], [23.0, 3.0], [17.0, 3.0]]),
+    ])
+    db.upsert_ward("ward_101", name="101 病房", ward_map=_MAP, ward_zone="z1")
+    db.upsert_ward("ward_102", name="102 病房", ward_map=_MAP, ward_zone="z2")
     db.upsert_profile("elder_101_1", name="李爷爷")
     db.set_profile_ward("elder_101_1", "ward_101")
     monkeypatch.setattr(session, "_settings", lambda: dict(_SETTINGS))
     session.set_subject("ward_101", slot="kiosk")
-    locator.set_pose_for_test(0.0, 0.0, 0.0)
+    locator.set_pose_for_test(0.0, 0.0, 0.0)          # 起点在 101 里
     yield db
     db.DB_PATH = old
+    locator.clear_injection()
 
 
 def test_debounce_requires_repeated_ticks(d):
-    locator.set_pose_for_test(20.0, 0.0, 0.0)      # 进入 102
+    locator.set_pose_for_test(20.0, 0.0, 0.0)          # 进入 102
     session.tick()
-    assert session.get_principal("kiosk")["uid"] == "ward_101"   # 第 1 次不切
+    assert session.get_principal("kiosk")["uid"] == "ward_101"    # 第 1 次不切
     session.tick()
-    assert session.get_principal("kiosk")["uid"] == "ward_101"   # 第 2 次不切
+    assert session.get_principal("kiosk")["uid"] == "ward_101"    # 第 2 次不切
     session.tick()
-    assert session.get_principal("kiosk")["uid"] == "ward_102"   # 第 3 次才切
+    assert session.get_principal("kiosk")["uid"] == "ward_102"    # 第 3 次才切
+    assert session.current_ward() == "ward_102"
+
+
+def test_debounce_resets_when_leaving_zone(d):
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    session.tick(); session.tick()
+    locator.set_pose_for_test(99.0, 99.0, 0.0)         # 走廊
+    session.tick()
+    locator.set_pose_for_test(20.0, 0.0, 0.0)          # 又回 102
+    session.tick(); session.tick()
+    assert session.get_principal("kiosk")["uid"] == "ward_101"    # 计数被清零，重新数满 3 次
+    session.tick()
+    assert session.get_principal("kiosk")["uid"] == "ward_102"
 
 
 def test_leaving_zone_does_not_switch(d):
-    locator.set_pose_for_test(99.0, 99.0, 0.0)     # 走廊：不在任何 zone 多边形里
+    locator.set_pose_for_test(99.0, 99.0, 0.0)
     for _ in range(5):
         session.tick()
     assert session.get_principal("kiosk")["uid"] == "ward_101"
 
 
-def test_ward_without_zone_id_never_switches(d):
-    """病房 zone_id=0（未关联 zones）→ 位置判定不命中，保持当前病房（D17 fail-safe）。"""
-    db.upsert_ward("ward_102", name="102", zone_id=0)
-    locator.set_pose_for_test(20.0, 0.0, 0.0)      # 位姿落在 102 的多边形里，但没有 zone_id
+def test_ward_without_zone_never_switches(d):
+    """病房没关联区域（清空 ward_map/ward_zone）→ 位置判定不命中（fail-safe）。"""
+    db.set_ward_zone("ward_102", "", "")          # 显式清空关联（空串在 upsert_ward 里=保持原值）
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
     for _ in range(5):
         session.tick()
     assert session.get_principal("kiosk")["uid"] == "ward_101"
 
 
 def test_ward_zone_on_other_map_never_switches(d):
-    """病房区域建在**别的地图**上 → 不判命中，保持当前病房。
-
-    防止"换图后位姿恰好落进旧图的病房多边形"导致静默切错病房（D17 fail-safe）。
-    """
-    zid = db.add_zone(map_name="other_map", name="102", kind="ward", shape="polygon",
-                      polygon_json=[[17.0, -3.0], [23.0, -3.0], [23.0, 3.0], [17.0, 3.0]])
-    db.upsert_ward("ward_102", name="102", zone_id=zid)
-    locator.set_pose_for_test(20.0, 0.0, 0.0)      # 数值上落在 other_map 的 102 多边形里
+    """病房区域绑在**别的地图**上 → 不判命中（防止换图后静默切错病房）。"""
+    db.upsert_ward("ward_102", name="102 病房", ward_map="other_map", ward_zone="z2")
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
     for _ in range(5):
         session.tick()
     assert session.get_principal("kiosk")["uid"] == "ward_101"
@@ -1189,8 +1385,21 @@ def test_does_not_steal_elder_private_chat(d):
     for _ in range(5):
         session.tick()
     p = session.get_principal("kiosk")
-    assert p["role"] == "elder" and p["uid"] == "elder_101_1"    # 私聊不被打断
-    assert session.current_ward() == "ward_102"                  # 但当前病房已更新
+    assert p["role"] == "elder" and p["uid"] == "elder_101_1"     # 私聊不被打断
+    assert session.current_ward() == "ward_102"                   # 但"当前病房"已更新
+    # 退出私聊回集体层时，用的是新病房
+    session.set_subject("ward_102", slot="kiosk")
+    assert session.get_principal("kiosk")["uid"] == "ward_102"
+
+
+def test_locked_session_holds_even_in_ward_layer(d):
+    session.set_subject("ward_101", locked=True, slot="kiosk")
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(5):
+        session.tick()
+    assert session.get_principal("kiosk")["uid"] == "ward_101"
+    assert session.current_ward() == "ward_102"
+    assert session.autoswitch_state()["reason"] == "holding_session"
 
 
 def test_no_pose_disables_autoswitch(d):
@@ -1198,7 +1407,17 @@ def test_no_pose_disables_autoswitch(d):
     for _ in range(5):
         session.tick()
     assert session.get_principal("kiosk")["uid"] == "ward_101"
-    assert session.autoswitch_state()["reason"] == "no_pose"
+    assert session.autoswitch_state() == {"enabled": False, "reason": "no_pose"}
+
+
+def test_disabled_by_setting(d, monkeypatch):
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_autoswitch_enabled": False})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(5):
+        session.tick()
+    assert session.current_ward() == "ward_101"
+    assert session.autoswitch_state()["reason"] == "disabled"
 
 
 def test_manual_override_blocks_location(d):
@@ -1208,132 +1427,218 @@ def test_manual_override_blocks_location(d):
         session.tick()
     assert session.current_ward() == "ward_101"
     assert session.autoswitch_state()["reason"] == "manual_override"
+
+
+def test_auto_map_source_uses_fingerprint(d, monkeypatch):
+    """默认 ward_map_source='auto'：地图名来自 locator.current_map()（/map 指纹反查）。"""
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_map_source": "auto"})
+    monkeypatch.setattr(session.locator, "current_map",
+                        lambda *a, **k: {"ok": True, "source": "map_topic", "name": _MAP})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(3):
+        session.tick()
+    assert session.current_ward() == "ward_102"
+
+
+def test_unknown_map_disables_autoswitch(d, monkeypatch):
+    """指纹认不出当前图 → 不切（宁可不切也不误切）。"""
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_map_source": "auto"})
+    monkeypatch.setattr(session.locator, "current_map",
+                        lambda *a, **k: {"ok": True, "source": "unknown", "name": None})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(5):
+        session.tick()
+    assert session.current_ward() == "ward_101"
+    assert session.autoswitch_state()["reason"] == "map_unknown"
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py -q`
-预期：FAIL（AttributeError: module 'LLM.session' has no attribute 'tick'）
+预期：FAIL（`AttributeError: module 'LLM.session' has no attribute 'tick'`）
 
-- [ ] **步骤 3：实现**（追加到 `session.py`；`_zone_hit` 只做判定、不需要 `math`，多边形几何计算都在 `db.zone_contains_point` 里）
+- [ ] **步骤 3：实现**
+
+**(3a)** `session.py` 顶部导入区补上：
 
 ```python
+from . import bus
 from . import locator
+from . import zonegeo
+```
 
-_candidate: dict[str, int] = {}      # ward_uid -> 连续命中次数（防抖）
+**(3b)** 把 `reset_for_test` 改为也清缓存（否则上一个用例的防抖计数会漏到下一个用例）：
+
+```python
+def reset_for_test() -> None:
+    """单测用：清空全部会话状态与病房判定缓存。"""
+    _shared.update({"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0})
+    _state.clear()
+    _candidate.clear()
+    _map_cache.update({"name": "", "at": 0.0, "reason": ""})
+```
+
+**(3c)** 追加到 `session.py` 末尾：
+
+```python
+# ---------------------------------------------------------------------------
+# 当前病房 + 位置自动切换（D17/D18）
+# ---------------------------------------------------------------------------
+_MAP_CACHE_S = 10.0                     # 「车在跑哪张图」的缓存时长（避免每秒打网络/SSH）
+_map_cache: dict = {"name": "", "at": 0.0, "reason": ""}
+_candidate: dict[str, int] = {}         # ward_uid -> 连续命中次数（防抖）
 
 
-def _running_map_name() -> str:
-    """车**此刻在跑哪张图**——位置自动切换只认"当前地图"上的病房区域。
+def running_map_name() -> tuple[str, str]:
+    """车**此刻在跑哪张图** → `(地图名, 不可用原因)`；认不出返回 `("", reason)`。
 
-    为什么不能拿病房 zone 行自己的 `map_name` 去判定：位姿是**当前地图坐标系**里的数，
-    而三张图坐标系不通用（一期 §4.2）。若按 zone 行的 map_name 判，车换到另一张图后，
-    它的位姿可能"恰好"落进旧图上的病房多边形 → **静默切错病房**（D17 明令禁止的误判）。
+    为什么不能拿病房自己存的 `ward_map` 当判据：位姿是**当前地图坐标系**里的数，而三张图
+    坐标系不通用；若拿位姿去比"旧图上的病房多边形"，会**静默切错病房**（D17 明令禁止）。
 
-    取值口径与便捷录入端点 `POST /api/wards/{uid}/zone` 一致，都用 `settings.current_map`；
-    一期 §5.3 的「当前地图指纹识别」（订阅 `/map` 元数据反查是哪张 yaml）落地后，
-    此处应改为**优先用识别结果**、识别不到再退回 `current_map`。
-    取不到 → `""`，调用方据此不判命中（fail-safe）。
+    取值口径（`settings.ward_map_source`）：
+      * `"auto"`（默认）：`locator.current_map()` 的 `/map` 四项指纹反查，唯一命中才认；
+      * `"setting"`：用 `settings.current_map`（一期语义="下次启导航用哪张图"）——
+        给"指纹识别不可用但现场自己知道在跑哪张图"留一条手动阀。
+    结果缓存 `_MAP_CACHE_S` 秒：`current_map()` 会列地图 + 逐图读元数据，`MAPS_IO=ssh` 下很贵。
     """
-    return str(_settings().get("current_map") or "")
+    st = _settings()
+    now = _now_ts()
+    if now - _map_cache["at"] < _MAP_CACHE_S:
+        return _map_cache["name"], _map_cache["reason"]
+
+    name, reason = "", ""
+    if str(st.get("ward_map_source") or "auto") == "setting":
+        name = str(st.get("current_map") or "").strip()
+        if not name:
+            reason = "no_current_map"
+    else:
+        try:
+            got = locator.current_map()
+        except Exception:               # noqa: BLE001  识别失败=不可用，绝不炸 tick
+            got = {}
+        if got.get("source") == "map_topic" and got.get("name"):
+            name = str(got["name"])
+        else:
+            reason = "map_unknown"
+    _map_cache.update({"name": name, "at": now, "reason": reason})
+    return name, reason
 
 
-def _zone_hit(ward_uid: str, pose: dict) -> bool:
-    """当前位姿是否落在这间病房的 zones 区域里（多边形判定；rect 用外接矩形）。
+def _zone_hit(ward: dict, map_name: str, pose: dict) -> bool:
+    """当前位姿是否落在这间病房关联的区域里（几何判定在 zonegeo）。
 
-    降级（D17）：病房 `zone_id=0` / 该病房区域不在**当前地图**上 / `zones` 里查不到 /
-    表不存在 / `current_map` 取不到 → False（不切病房）。
+    降级（fail-safe）：病房没关联区域 / 关联的是别的地图 / 缓存里查不到该区域 → False。
     """
-    z = db.get_ward_zone(ward_uid)
-    if not z:
+    zone_uid = str(ward.get("ward_zone") or "")
+    if not zone_uid or str(ward.get("ward_map") or "") != map_name:
         return False
-    map_name = _running_map_name()
-    if not map_name or str(z.get("map_name") or "") != map_name:
+    zone = db.get_zone(zone_uid, map_name)
+    if not zone:
         return False
-    hits = db.zone_contains_point(map_name, float(pose["x"]), float(pose["y"]), kind="ward")
-    return any(h["id"] == z["id"] for h in hits)
+    return zonegeo.zone_hit(zone, float(pose["x"]), float(pose["y"]))
 
 
 def current_ward() -> str:
-    return _slot("kiosk").get("ward_uid") or ""
+    """当前病房（集体层主体）的 uid；空串 = 还不知道在哪个病房。"""
+    return _shared.get("ward_uid") or ""
 
 
 def manual_set_ward(ward_uid: str) -> dict:
-    """手动切病房：带 manual_override_until，期间位置判定不覆盖（D18）。"""
+    """手动切病房：带 `manual_until`，期间位置判定不覆盖（D18）。
+
+    只在 kiosk 为集体层且未锁定时改会话主体——正在老人私聊时手动切病房只更新背景变量。
+    """
+    _shared["ward_uid"] = ward_uid
+    _shared["manual_until"] = _now_ts() + float(_settings().get("manual_override_sec", 600))
     s = _slot("kiosk")
-    s["ward_uid"] = ward_uid
-    s["manual_until"] = _now_ts() + float(_settings().get("manual_override_sec", 600))
-    if s["role"] == "ward":
-        s["uid"] = ward_uid
+    if s["role"] == "ward" and not _shared["locked"]:
+        _shared["uid"] = ward_uid
     audit.log("ward_change", source="manual", ward=ward_uid)
+    bus.publish("ward_changed", uid=ward_uid, action="manual")
     return get_principal("kiosk")
 
 
 def autoswitch_state() -> dict:
-    """给前端/诊断用：位置自动切换当前为何没生效。"""
-    s = _slot("kiosk")
+    """给前端/诊断用：位置自动切换**当前为什么没生效**。"""
     st = _settings()
-    if not locator.available(st):
-        return {"enabled": False, "reason": "no_url"}
+    if not st.get("ward_autoswitch_enabled", True):
+        return {"enabled": False, "reason": "disabled"}
     if locator.get_pose() is None:
         return {"enabled": False, "reason": "no_pose"}
-    if _now_ts() < (s.get("manual_until") or 0):
+    if _now_ts() < (_shared.get("manual_until") or 0.0):
         return {"enabled": False, "reason": "manual_override"}
-    if s["role"] == "elder" or s["locked"]:
+    name, reason = running_map_name()
+    if not name:
+        return {"enabled": False, "reason": reason or "map_unknown"}
+    if _slot("kiosk")["role"] == "elder" or _shared["locked"]:
         return {"enabled": True, "reason": "holding_session"}
     return {"enabled": True, "reason": "active"}
 
 
-def tick() -> None:
-    """定时（每 ~1s 调一次）：管理员 TTL + 病房位置自动切换。"""
-    for slot in SLOTS:
-        _expire_if_needed(slot)
-
-    s = _slot("kiosk")
+def _ward_tick() -> None:
+    """一次位置判定（由 tick() 每秒调用一次）。"""
     st = _settings()
-    if not locator.available(st):
+    if not st.get("ward_autoswitch_enabled", True):
         return
-    if _now_ts() < (s.get("manual_until") or 0):
+    if _now_ts() < (_shared.get("manual_until") or 0.0):
         return
     pose = locator.get_pose()
-    if pose is None:
-        return
-
-    debounce = int(st.get("ward_switch_debounce", 3))
-    hit = ""
-    for w in db.list_wards_with_zone():
-        if _zone_hit(w["uid"], pose):
-            hit = w["uid"]
-            break
-    if not hit:                       # 离开病房区（走廊）→ 不切
+    if pose is None or pose.get("x") is None:
         _candidate.clear()
         return
+    map_name, _why = running_map_name()
+    if not map_name:
+        _candidate.clear()
+        return
+
+    hit = ""
+    for w in db.list_wards():               # 只读本地缓存（不走 maptags，见模块头性能约束）
+        if _zone_hit(w, map_name, pose):
+            hit = w["uid"]
+            break
+    if not hit:                             # 离开病房区（走廊/未知区域）→ 不切
+        _candidate.clear()
+        return
+
     _candidate[hit] = _candidate.get(hit, 0) + 1
     for k in list(_candidate):
         if k != hit:
-            _candidate.pop(k, None)
-    if _candidate[hit] < debounce or s.get("ward_uid") == hit:
+            _candidate.pop(k, None)         # 换目标就重新数
+    debounce = max(1, int(st.get("ward_switch_debounce", 3)))
+    if _candidate[hit] < debounce or _shared.get("ward_uid") == hit:
         return
 
-    s["ward_uid"] = hit
+    _shared["ward_uid"] = hit
     audit.log("ward_change", source="location", ward=hit)
-    # D18：只在集体层且未锁定时才真正改会话主体（不抢私聊）
-    if s["role"] == "ward" and not s["locked"]:
-        s["uid"] = hit
+    bus.publish("ward_changed", uid=hit, action="location")
+    # D18：只在集体层且未锁定时才真正改会话主体（正在私聊/已锁定 → 只更新背景变量）
+    s = _slot("kiosk")
+    if s["role"] == "ward" and not _shared["locked"]:
+        _shared["uid"] = hit
         s["source"] = "location"
+
+
+def tick() -> None:
+    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。"""
+    for slot in SLOTS:
+        _expire_if_needed(slot)
+    _ward_tick()
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py -q`
-预期：7 passed
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py LLM/tests/test_session_roles.py -q`
+预期：`13 passed` + `16 passed`
 
-- [ ] **步骤 5：全量回归 + Commit**
+- [ ] **步骤 5：跑回归 + Commit**
 
 ```bash
-.venv\Scripts\python.exe -m pytest LLM/tests -q
+.venv\Scripts\python.exe -m pytest LLM/tests tests -q
+# 预期仍是那 4 个既有红态
 git add LLM/session.py LLM/tests/test_ward_autoswitch.py
-git commit -m "feat(llm): 病房位置自动切换（防抖/手动覆盖/不抢私聊/拿不到位姿即停用）"
+git commit -m "feat(llm): 病房位置自动切换（防抖/手动覆盖/不抢私聊/跟随老人/拿不到即停用）"
 ```
 
 ---
@@ -1342,7 +1647,7 @@ git commit -m "feat(llm): 病房位置自动切换（防抖/手动覆盖/不抢�
 
 **文件：**
 - 创建：`LLM/prompt/ward.md`、`LLM/prompt/elder.md`、`LLM/prompt/admin.md`
-- 修改：`LLM/chat.py`（`_load_prompt_base` 之后新增 `_load_role_prompt`；`build_system` 第 195-214 行；`build_messages` 第 217-224 行；`chat_stream` 第 306 行）
+- 修改：`LLM/chat.py`（`build_system` 第 195-214 行；`build_messages` 第 217-224 行；`chat_stream` 第 306/322 行）
 - 测试：`LLM/tests/test_prompt_layers.py`（新建）
 
 - [ ] **步骤 1：编写失败的测试**
@@ -1350,14 +1655,15 @@ git commit -m "feat(llm): 病房位置自动切换（防抖/手动覆盖/不抢�
 ```python
 # LLM/tests/test_prompt_layers.py
 # -*- coding: utf-8 -*-
-"""三层提示词分层与集体上下文单向注入测试。"""
+"""三层提示词分层 + 集体上下文单向注入（R5）测试。"""
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
-from LLM import db
 from LLM import chat
+from LLM import db
 
 
 @pytest.fixture()
@@ -1367,61 +1673,80 @@ def d(monkeypatch):
     db.DB_PATH = os.path.join(tmp, "t.db")
     db.init_db()
     db.upsert_ward("ward_101", name="101 病房")
+    db.upsert_ward("ward_102", name="102 病房")
     db.upsert_profile("elder_101_1", name="张奶奶")
     db.set_profile_ward("elder_101_1", "ward_101")
+    db.upsert_profile("elder_102_1", name="王奶奶")
+    db.set_profile_ward("elder_102_1", "ward_102")
     for i in range(3):
-        db.add_history("ward_101", "user", f"病房消息{i}", uid="ward_101")
+        db.append_history("ward_101", "user", f"病房消息{i}")
     # 离线：不让 RAG 真去调 embedding（本测试只验装配，不验召回）
     monkeypatch.setattr(chat.rag, "recall_v3", lambda uid, q: {"context": ""})
     yield db
     db.DB_PATH = old
 
 
-def _principal(role, uid):
-    return {"role": role, "uid": uid, "slot": "kiosk", "ward_uid": "ward_101",
-            "source": "manual", "locked": False}
+def _p(role, uid, ward=""):
+    return {"role": role, "uid": uid, "slot": "kiosk", "source": "manual",
+            "locked": False, "ward_uid": ward}
 
 
-def test_role_fragment_loaded(d):
-    sys_p = chat.build_system("ward_101", {}, "", principal=_principal("ward", "ward_101"))
-    assert "病房里" in sys_p            # ward.md 的正文出现
+def test_ward_role_fragment_is_loaded(d):
+    sys_p = chat.build_system("ward_101", {}, "", principal=_p("ward", "ward_101", "ward_101"))
+    assert "病房里" in sys_p                       # ward.md 正文出现
+    assert "小护" in sys_p                         # 共用 base 仍在
 
 
 def test_ward_prompt_has_no_personal_profile(d):
     d.upsert_profile("elder_101_1", name="张奶奶", notes="糖尿病")
-    sys_p = chat.build_system("ward_101", {}, "", principal=_principal("ward", "ward_101"))
+    sys_p = chat.build_system("ward_101", {}, "", principal=_p("ward", "ward_101", "ward_101"))
     assert "张奶奶" not in sys_p and "糖尿病" not in sys_p
 
 
 def test_elder_sees_own_ward_context(d):
-    sys_p = chat.build_system("elder_101_1", {}, "", principal=_principal("elder", "elder_101_1"))
+    sys_p = chat.build_system("elder_101_1", {}, "",
+                              principal=_p("elder", "elder_101_1", "ward_101"))
     assert "病房消息2" in sys_p
 
 
 def test_ward_does_not_see_elder_private_chat(d):
-    d.add_history("elder_101_1", "user", "我昨晚没睡好", uid="elder_101_1")
-    sys_p = chat.build_system("ward_101", {}, "", principal=_principal("ward", "ward_101"))
+    db.append_history("elder_101_1", "user", "我昨晚没睡好")
+    sys_p = chat.build_system("ward_101", {}, "", principal=_p("ward", "ward_101", "ward_101"))
     assert "我昨晚没睡好" not in sys_p
 
 
-def test_missing_role_file_degrades(d, monkeypatch):
-    from pathlib import Path
-    monkeypatch.setattr(chat, "_ROLE_PROMPT_DIR_OVERRIDE", Path("/nonexistent"), raising=False)
-    sys_p = chat.build_system("ward_101", {}, "", principal=_principal("ward", "ward_101"))
-    assert "小护" in sys_p              # base 仍在，没抛异常
-```
+def test_cross_ward_isolation(d):
+    """102 病房的老人看不到 101 病房的集体上下文（R5：跨病房不可读）。"""
+    db.append_history("ward_102", "user", "102 病房的消息")
+    sys_p = chat.build_system("elder_102_1", {}, "",
+                              principal=_p("elder", "elder_102_1", "ward_102"))
+    assert "病房消息2" not in sys_p and "102 病房的消息" in sys_p
 
-> 为让最后一个用例能生效，`_load_role_prompt` 实现里用**模块级可覆盖目录**（见步骤 3 的代码）：
-> `_ROLE_PROMPT_DIR_OVERRIDE = None`（测试 monkeypatch 成不存在目录即可验证降级）。
+
+def test_admin_gets_no_ward_context(d):
+    sys_p = chat.build_system("admin", {}, "", principal=_p("admin", "admin"))
+    assert "病房消息2" not in sys_p
+
+
+def test_missing_role_file_degrades(d, monkeypatch):
+    monkeypatch.setattr(chat, "_ROLE_PROMPT_DIR_OVERRIDE", Path("/nonexistent-dir"))
+    sys_p = chat.build_system("ward_101", {}, "", principal=_p("ward", "ward_101", "ward_101"))
+    assert "小护" in sys_p                          # base 仍在，没抛异常
+
+
+def test_unknown_role_falls_back_to_ward_fragment(d):
+    sys_p = chat.build_system("ward_101", {}, "", principal=_p("??", "ward_101", "ward_101"))
+    assert "病房里" in sys_p
+```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_prompt_layers.py -q`
-预期：FAIL（TypeError: build_system() got an unexpected keyword argument 'principal'）
+预期：FAIL（`TypeError: build_system() got an unexpected keyword argument 'principal'`）
 
 - [ ] **步骤 3：实现**
 
-新建 `LLM/prompt/ward.md`（正文，直接生效）：
+**(3a)** 新建 `LLM/prompt/ward.md`：
 
 ```markdown
 你现在是在**一个病房里**跟"大家"说话，不是跟某一位老人私聊。屋里可能有好几个人，也可能有人刚进来、有人正躺着。
@@ -1433,7 +1758,7 @@ def test_missing_role_file_degrades(d, monkeypatch):
 5. 安全红线照旧：有人说不舒服、胸口疼、摔倒 → 先安抚，再说"我这就去通知护士"。
 ```
 
-新建 `LLM/prompt/elder.md`：
+**(3b)** 新建 `LLM/prompt/elder.md`：
 
 ```markdown
 你现在是跟一位具体的老人单独说话（不是在病房里跟大家广播）。
@@ -1444,7 +1769,7 @@ def test_missing_role_file_degrades(d, monkeypatch):
 4. 说话短、说人话、别背书，红线照旧：医疗只读、危险信号先安抚再叫护士。
 ```
 
-新建 `LLM/prompt/admin.md`：
+**(3c)** 新建 `LLM/prompt/admin.md`：
 
 ```markdown
 你现在是跟**管理员**说话，不是跟老人。
@@ -1456,7 +1781,7 @@ def test_missing_role_file_degrades(d, monkeypatch):
 5. 老人隐私红线不因身份而取消：医疗信息仍只读。
 ```
 
-在 `chat.py` 里：`from .policy import role_policy`（新增 import），并追加：
+**(3d)** `chat.py`：顶部新增 `from .policy import role_policy`，并在 `_load_prompt_base` 之后追加两个函数：
 
 ```python
 _prompt_role_warned: set[str] = set()
@@ -1464,7 +1789,7 @@ _ROLE_PROMPT_DIR_OVERRIDE = None      # 测试用：指向不存在的目录以�
 
 
 def _load_role_prompt(role: str) -> str:
-    """读 LLM/prompt/<role>.md 角色片段；缺失 → 空串 + 告警一次（不阻断对话）。"""
+    """读 `LLM/prompt/<role>.md` 角色片段；缺失 → 空串 + 告警一次（**不阻断对话**）。"""
     base_dir = _ROLE_PROMPT_DIR_OVERRIDE or role_policy(role)["prompt_file"].parent
     path = base_dir / f"{role or 'ward'}.md"
     try:
@@ -1477,12 +1802,10 @@ def _load_role_prompt(role: str) -> str:
 
 
 def _ward_context(ward_uid: str, limit: int) -> str:
-    """本病房集体层最近 N 条（R5 单向：只从这里往外读，绝不把私聊灌进来）。"""
+    """本病房集体层最近 N 条（R5 单向：**只从这里往外读**，绝不把私聊灌进来）。"""
     if not ward_uid:
         return ""
     rows = db.load_history(ward_uid, limit=limit)
-    if not rows:
-        return ""
     lines = [f"{r['role']}: {r['content']}" for r in rows if (r.get("content") or "").strip()]
     if not lines:
         return ""
@@ -1490,10 +1813,14 @@ def _ward_context(ward_uid: str, limit: int) -> str:
             + "\n".join(lines))
 ```
 
-`build_system` 改为（保持 `uid` 老签名兼容，新增 `principal`）：
+**(3e)** `build_system` 改为（**保持 `uid` 老签名兼容**，新增 `principal`）：
 
 ```python
 def build_system(uid: str, settings: dict, query: str = "", principal: dict | None = None) -> str:
+    """组装 System Prompt：base（人设+安全红线）+ 角色片段 + 记忆/上下文 + 当前时间。
+
+    principal 缺省时取 kiosk 槽（兼容旧调用点）；**权限相关的取舍只看 principal（R1）**。
+    """
     from . import session as session_mod
     p = principal or session_mod.get_principal("kiosk")
     pol = role_policy(p.get("role"))
@@ -1504,14 +1831,13 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
     if role_txt:
         parts.append("\n" + role_txt)
 
-    if scope == "self":                      # 老人层：本人档案/记忆/语录
+    if scope == "self":                      # 老人层：本人档案/记忆/画像
         recall_ctx = _recall_cached(uid, query) if query else rag.recall_v3(uid, "")["context"]
-        parts.append(f"\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n{recall_ctx}")
-    elif scope == "all" and query:           # 管理层：默认不注入老人记忆
-        pass
+        parts.append("\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n"
+                     + recall_ctx)
 
-    if pol["ward_context"]:                  # 老人层：本病房集体上下文（只读）
-        ward_txt = _ward_context(p.get("ward_uid", "") if p.get("role") == "elder" else p.get("uid", ""),
+    if pol["ward_context"]:                  # 老人层：本病房集体上下文（只读、单向）
+        ward_txt = _ward_context(p.get("ward_uid", ""),
                                  int(settings.get("ward_context_window", 10)))
         if ward_txt:
             parts.append("\n" + ward_txt)
@@ -1531,31 +1857,42 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
     return "\n".join(parts)
 ```
 
-`build_messages` / `chat_stream` 加 `principal` 透传：
+> **集体层的 `uid` 就是它自己的 uid**（`ward_101`）：历史与记忆本来就按 uid 存，所以集体层不需要新存储；而 `ward` 的 `data_scope="none"` 保证**不会**注入任何老人档案。
+
+**(3f)** `build_messages` / `chat_stream` 透传 `principal`：
 
 ```python
 def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict,
                    principal: dict | None = None) -> list[dict]:
+    """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。"""
     history = db.load_history(uid, limit=HISTORY_WINDOW)
-    system = build_system(uid, settings, query=_build_query(user_text, history), principal=principal)
-    ...
+    system = build_system(uid, settings, query=_build_query(user_text, history),
+                          principal=principal)
+    if thinking_on:
+        system += "\n" + ROUTER_HIT
+    return [{"role": "system", "content": system}, *history,
+            {"role": "user", "content": user_text}]
+
 
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
                 principal: dict | None = None):
     ...
     messages = build_messages(uid, user_text, thinking_on, settings, principal=principal)
+    tools = tool_mod.effective_tools(settings, principal)
 ```
+
+（`chat_stream` 里其它位置不动；第 322-323 行的这两行是唯一改动点，任务的第 9 步会再来看一眼 `tools` 那一行。）
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_prompt_layers.py LLM/tests/test_backend.py -q`
-预期：全 passed
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_prompt_layers.py -q`
+预期：`8 passed`
 
 - [ ] **步骤 5：Commit**
 
 ```bash
 git add LLM/prompt LLM/chat.py LLM/tests/test_prompt_layers.py
-git commit -m "feat(llm): 三层提示词分层 + 集体层上下文单向注入"
+git commit -m "feat(llm): 三层提示词分层 + 集体层上下文单向注入（R5）"
 ```
 
 ---
@@ -1563,8 +1900,8 @@ git commit -m "feat(llm): 三层提示词分层 + 集体层上下文单向注入
 ### 任务 9：工具角色白名单（闸门 2）
 
 **文件：**
-- 修改：`LLM/tools.py`（`tool()` 装饰器第 31-44 行；`effective_tools` 第 83-94 行；`run_tool` 第 118 行起）
-- 修改：`LLM/chat.py`（第 323 行 `effective_tools(settings)`、第 392 行 `run_tool(name, args)`）
+- 修改：`LLM/tools.py`（`tool()` 第 31-44 行；`effective_tools` 第 83-92 行；`run_tool` 第 118-128 行）
+- 修改：`LLM/chat.py`（`effective_tools` 调用点、`run_tool` 调用点）
 - 测试：`LLM/tests/test_policy_tools.py`（新建）
 
 - [ ] **步骤 1：编写失败的测试**
@@ -1579,87 +1916,150 @@ def _p(role):
     return {"role": role, "uid": "u", "slot": "kiosk", "ward_uid": "", "locked": False}
 
 
-def test_ward_gets_no_global_tools():
-    names = [t["function"]["name"] for t in tools.effective_tools({}, _p("ward"))]
-    assert names == []
+def _names(settings, principal):
+    return [t["function"]["name"] for t in tools.effective_tools(settings, principal)]
 
 
-def test_elder_only_gets_safety_tools():
-    names = [t["function"]["name"] for t in tools.effective_tools({}, _p("elder"))]
-    assert set(names) <= {"robot_status", "robot_stop"}
+def test_ward_gets_no_tools():
+    assert _names({}, _p("ward")) == []
+
+
+def test_elder_only_gets_whitelisted_tools():
+    for t in tools.effective_tools({}, _p("elder")):
+        assert t["function"]["name"] in {"robot_status", "robot_stop"}
+
+
+def test_admin_is_not_role_trimmed():
+    """admin 的 allowed_tools=None → 不被角色裁剪（仍受 per-tool 开关约束）。"""
+    all_names = set(tools._TOOL_REGISTRY)
+    assert set(_names({}, _p("admin"))) == {n for n in all_names
+                                            if tools._TOOL_REGISTRY[n]["enabled"]}
+
+
+def test_global_switch_still_applies():
+    for name, reg in tools._TOOL_REGISTRY.items():
+        assert name not in _names({f"{name}_enabled": False}, _p("admin"))
 
 
 def test_unknown_role_falls_back_to_ward():
     assert tools.effective_tools({}, {"role": "??"}) == []
+    assert tools.effective_tools({}) == []          # principal 缺省 → 集体层（R2）
 
 
 def test_run_tool_denies_out_of_whitelist():
     res = tools.run_tool("__nope__", {}, _p("ward"))
-    assert res["ok"] is False and "不允许" in res["error"]
+    assert res["ok"] is False and "不允许" in (res.get("error") or res.get("message") or "")
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_policy_tools.py -q`
-预期：FAIL（TypeError: effective_tools() takes 1 positional argument but 2 were given）
+预期：FAIL（`TypeError: effective_tools() takes 1 positional argument but 2 were given`）
 
 - [ ] **步骤 3：实现**
 
-`tools.py` 里 `@tool(...)` 增加 `roles=None` 参数（`None`=不限角色，保持现有工具行为兼容）并存入 registry；`effective_tools` 改为：
+**(3a)** `@tool` 增加 `roles`（`None`=不限角色，现有工具不改即行为兼容），并存入 registry：
 
 ```python
+def tool(name: str, description: str, parameters: dict, enabled: bool = True,
+         roles: set[str] | None = None):
+    """注册一个工具。`roles=None` = 不限角色（现有工具保持兼容）；空集 = 谁都不给。
+
+    角色白名单只是**闸门 2**（与全局 per-tool 开关取交集）；动作风险分级属 P1 的
+    `policy.check_action()`（闸门 3），本函数不做。
+    """
+    def deco(fn):
+        _TOOL_REGISTRY[name] = {
+            "schema": {
+                "type": "function",
+                "function": {"name": name, "description": description, "parameters": parameters},
+            },
+            "fn": fn,
+            "enabled": enabled,
+            "roles": None if roles is None else set(roles),
+        }
+        return fn
+    return deco
+```
+
+**(3b)** `effective_tools` 改为按「全局开关 ∩ 角色白名单」过滤；MCP 工具按服务器 `roles` 过滤（未声明 = 仅 admin）：
+
+```python
+def _mcp_tools_for(settings: dict, role: str) -> list[dict]:
+    """MCP 工具按 `conf.MCP_SERVERS[server]["roles"]` 过滤；未声明视为 {"admin"}（从严）。"""
+    from .conf import MCP_SERVERS
+    out = []
+    for name, entry in mcp_client.tools().items():
+        if name in _TOOL_REGISTRY:
+            continue                        # 与本地重名时本地优先（沿用旧口径）
+        roles = MCP_SERVERS.get(entry.get("server", ""), {}).get("roles") or {"admin"}
+        if role in roles:
+            out.append(entry["schema"])
+    return out
+
+
 def effective_tools(settings: dict, principal: dict | None = None) -> list[dict]:
-    """按 per-tool 开关 ∩ 角色白名单过滤（闸门 2）。principal 缺省 → 集体层（R2）。"""
+    """闸门 2：per-tool 开关 ∩ 角色白名单。`principal` 缺省 → 集体层（R2 fail-closed）。"""
     from .policy import role_policy
     role = (principal or {}).get("role")
-    allow = role_policy(role)["allowed_tools"]      # None = 全部；[] = 无
-    local_names = set(_TOOL_REGISTRY)
+    allow = role_policy(role)["allowed_tools"]      # None = 不按角色裁剪；[] = 一个都不给
     out = []
     for name, reg in _TOOL_REGISTRY.items():
         if not settings.get(f"{name}_enabled", reg["enabled"]):
             continue
         if allow is not None and name not in allow:
             continue
+        if reg.get("roles") is not None and (role or "") not in reg["roles"]:
+            continue
         out.append(reg["schema"])
     if settings.get("mcp_enabled"):
-        mcp_roles = {"elder", "admin"}              # MCP 默认从严：集体层不给
-        if allow is None or (role in mcp_roles):
-            out += _mcp_tools(settings)             # 既有 MCP 合并逻辑，函数名按现状
+        out += _mcp_tools_for(settings, role or "")
     return out
 ```
 
-`run_tool` 改为在入口做二次校验：
+> `tools_with_state()`（给设置页用）**不动**：它是"有哪些工具、开关在哪"，不是"这个人能用什么"。
+
+**(3c)** `run_tool` 入口做**二次校验**（防绕过闸门 2 的直调点），拒绝时给模型一句可复述的理由并落审计：
 
 ```python
 def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
-    """统一分发（闸门 2 二次校验）：角色白名单不放行的工具一律拒绝并审计。"""
+    """统一分发。**执行前再校验一次角色白名单**（闸门 2 第二道）。"""
     from .policy import role_policy
     from . import log as audit
+    p = principal or {}
+    allow = role_policy(p.get("role"))["allowed_tools"]
     reg = _TOOL_REGISTRY.get(name)
-    allow = role_policy((principal or {}).get("role"))["allowed_tools"]
     if allow is not None and name not in allow:
-        audit.log("policy_deny", tool=name, role=(principal or {}).get("role"),
-                  reason="out_of_role_whitelist")
+        audit.log("policy_deny", tool=name, role=p.get("role"), uid=p.get("uid"),
+                  slot=p.get("slot"), reason="out_of_role_whitelist")
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
-    if reg is None:
-        return _run_mcp_tool(name, args)            # 既有 MCP 分支（按现状保留）
-    return _run_fn(reg["fn"], args)
+    if reg is not None and reg.get("roles") is not None and (p.get("role") or "") not in reg["roles"]:
+        audit.log("policy_deny", tool=name, role=p.get("role"), uid=p.get("uid"),
+                  slot=p.get("slot"), reason="tool_roles_mismatch")
+        return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
+    if not reg:
+        # 不在本地注册表 → 尝试 MCP 工具（未注册/未连接时 mcp_client 返回 ok=False）
+        if name in mcp_client.tools():
+            return mcp_client.call_tool(name, args or {})
+        return {"ok": False, "message": f"未知工具 {name}"}
+    try:
+        return _run_fn(reg["fn"], args or {})
+    except Exception as e:
+        return {"ok": False, "message": f"工具执行失败: {e}"}
 ```
 
-（若现有 `run_tool` 内部结构不同，**等义改写**：在函数最前面插入白名单校验，其余逻辑不动。）
-
-`chat.py` 两处调用改为带 principal：
+**(3d)** `chat.py` 两处调用改为带 `principal`：
 
 ```python
-    tools = tool_mod.effective_tools(settings, principal)
+    tools = tool_mod.effective_tools(settings, principal)          # chat_stream 内
     ...
-                    result = tool_mod.run_tool(name, args, principal)
+                    result = tool_mod.run_tool(name, args, principal)   # 工具循环内
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests -q`
-预期：全 passed（既有 83 项不回归）
+预期：新增 `6 passed`；全量仍是那 4 个既有红态
 
 - [ ] **步骤 5：Commit**
 
@@ -1673,10 +2073,11 @@ git commit -m "feat(llm): 工具角色白名单（闸门 2，含 run_tool 二次
 ### 任务 10：集体层不沉淀记忆 + 语音链路接入角色
 
 **文件：**
-- 修改：`LLM/memory.py`（`note_turn()`）
-- 修改：`LLM/voice_api.py`（`set_session_uid`/`get_session_uid` 第 51-85 行转发到 `session`；`_stream_fn` 第 103-108 行传 principal）
-- 修改：`LLM/voice/worker.py`（`_handle_speech` 第 341-365 行）
-- 测试：`LLM/tests/test_ward_memory.py`（新建）、`LLM/tests/test_worker_roles.py`（新建）
+- 修改：`LLM/memory.py`（`note_turn()` 第 173 行）
+- 修改：`LLM/voice_api.py`（`_session_uid`/`_session_locked` 第 51-81 行、`_stream_fn` 第 103-108 行）
+- 修改：`LLM/voice/worker.py`（`_handle_speech` 第 341-362 行）
+- 修改：`LLM/server.py`（`_post_chat_jobs` 第 113-136 行，本任务只改签名，调用点在任务 11 接上）
+- 测试：`LLM/tests/test_ward_memory.py`、`LLM/tests/test_worker_roles.py`（均新建）
 
 - [ ] **步骤 1：编写失败的测试**
 
@@ -1699,21 +2100,30 @@ def d():
     old = db.DB_PATH
     db.DB_PATH = os.path.join(tmp, "t.db")
     db.init_db()
-    db.upsert_ward("ward_101", name="101 病房")
     yield db
     db.DB_PATH = old
 
 
 def test_ward_turn_is_never_buffered(d):
+    memory._pending_turns.pop("ward_101", None)
     memory.note_turn("ward_101", "小车", "明天九点体检", None, "", {}, role="ward")
-    assert memory._pending_turns.get("ward_101") is None     # 连缓冲都不进
+    assert memory._pending_turns.get("ward_101") is None      # 连缓冲都不进
     assert db.list_memories("ward_101") == []
 
 
 def test_elder_turn_is_still_buffered(d):
+    memory._pending_turns.pop("elder_101_1", None)
     memory.note_turn("elder_101_1", "我", "我不爱吃甜的", None, "",
                      {"memory_consolidation_enabled": False}, role="elder")
-    assert memory._pending_turns.get("elder_101_1")          # 老人层照旧进缓冲
+    assert memory._pending_turns.get("elder_101_1")           # 老人层照旧进缓冲
+
+
+def test_default_role_keeps_old_behavior(d):
+    """不传 role 的老调用点（如旧测试/其他调用方）行为不变。"""
+    memory._pending_turns.pop("elder_002", None)
+    memory.note_turn("elder_002", "我", "话", None, "",
+                     {"memory_consolidation_enabled": False})
+    assert memory._pending_turns.get("elder_002")
 ```
 
 ```python
@@ -1736,91 +2146,211 @@ def d():
     db.DB_PATH = os.path.join(tmp, "t.db")
     db.init_db()
     session.reset_for_test()
-    db.upsert_ward("ward_101", name="101")
+    db.upsert_ward("ward_101", name="101 病房")
+    db.upsert_profile("elder_101_1", name="李爷爷")
+    db.set_profile_ward("elder_101_1", "ward_101")
     yield db
     db.DB_PATH = old
 
 
-def test_voice_api_forwards_to_session(d):
+def test_voice_api_session_roundtrips_through_session(d):
     res = voice_api.set_session_uid("ward_101", False)
     assert res["uid"] == "ward_101" and res["role"] == "ward"
-    assert voice_api.get_session_uid()["uid"] == "ward_101"
+    got = voice_api.get_session_uid()
+    assert got["uid"] == "ward_101" and got["role"] == "ward"
+    assert got["locked"] is False
+    assert "autoswitch" in got and "ttl_remain" in got
+
+
+def test_voice_api_is_the_same_session_as_module(d):
+    voice_api.set_session_uid("elder_101_1", True)
+    assert session.get_principal("kiosk")["role"] == "elder"
+    assert session.get_principal("kiosk")["locked"] is True
+    assert session.get_principal("kiosk")["ward_uid"] == "ward_101"   # 跟随老人
+
+
+def test_empty_uid_reads_as_none_for_old_callers(d):
+    """老前端拿 uid=null 表示"没选人"；集体层没有病房时保持这个形状。"""
+    session.reset_for_test()
+    assert voice_api.get_session_uid()["uid"] in (None, "")
+
+
+def test_worker_admin_is_not_downgraded(d):
+    """管理员在车前说话 → 声纹认到老人也不改主体（D8 提权只升不降）。"""
+    from LLM.voice import worker as worker_mod
+    d.set_admin_password("111111")
+    session.login_admin("111111", slot="kiosk")
+    w = worker_mod.VoiceWorker(stream_fn=lambda uid, text: iter(()))
+    w._apply_role_subject("elder_101_1")
+    assert session.get_principal("kiosk")["role"] == "admin"
+    assert session.get_principal("kiosk")["uid"] == "admin"
+
+
+def test_worker_sets_voiceprint_subject_when_not_admin(d):
+    """非管理员：认出谁就切到谁（source=voiceprint）。"""
+    from LLM.voice import worker as worker_mod
+    calls = []
+    orig = session.set_subject
+
+    def spy(uid, locked=False, slot="kiosk", source="manual"):
+        calls.append((uid, locked, slot, source))
+        return orig(uid, locked, slot, source)
+
+    session.set_subject = spy                       # 函数级替换，测完还原
+    try:
+        w = worker_mod.VoiceWorker(stream_fn=lambda uid, text: iter(()))
+        w._apply_role_subject("elder_101_1")
+    finally:
+        session.set_subject = orig
+    assert calls and calls[0][0] == "elder_101_1" and calls[0][3] == "voiceprint"
+    assert session.get_principal("kiosk")["role"] == "elder"
+    assert session.get_principal("kiosk")["ward_uid"] == "ward_101"   # 当前病房跟随该老人
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_memory.py LLM/tests/test_worker_roles.py -q`
-预期：FAIL（`note_turn() got an unexpected keyword argument 'role'`）
+预期：FAIL（`TypeError: note_turn() got an unexpected keyword argument 'role'`）
 
 - [ ] **步骤 3：实现**
 
-`memory.py::note_turn` 签名加 `role: str = "elder"`，函数体开头：
+**(3a)** `memory.py::note_turn` 签名加 `role: str = "elder"`，函数体**第一行**早退：
 
 ```python
 def note_turn(uid: str, user_text: str, assistant_text: str, client, model: str,
               settings: dict, role: str = "elder"):
+    """把本轮对话放进"待整理"缓冲。
+
+    集体层（role="ward"）**直接返回**：病房里的公开对话只作集体上下文，绝不沉淀成
+    任何一位老人的记忆（规格 §5.3，R5 的另一半）。
+    """
     if role == "ward":
-        # 集体层对话只作病房公开上下文，不沉淀成任何老人的记忆（规格 §5.3）
         return
+    ...（原有实现不动）
 ```
 
-**调用点同步**：`LLM/server.py:117` 的 `rag.note_turn(uid, user_text, assistant, client, MODEL, settings)`
-改为 `rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=principal["role"])`
-（`principal` 由任务 11 在同一处注入）。
-
-`voice_api.py`：把 `_session_uid/_session_locked` 的持有权交给 `session`（保留同名函数，调用点不变）：
+**(3b)** `voice_api.py`：会话持有权交给 `session`，**保留同名函数**（调用点一个都不用改）：
 
 ```python
 def set_session_uid(uid: str, locked: bool) -> dict:
-    """转发到 session（分层用户体系后，会话主体与角色统一由 session 持有）。"""
+    """手动切换当前会话主体（规格 D11）。
+
+    会话主体与角色的持有权已移交 `session.py`；本函数保留同名接口做转发，
+    现有调用点（server 路由 / worker）不变；同时同步 worker 的锁定用户。
+    """
     from . import session as session_mod
-    if not locked:
-        # 解锁 = 恢复声纹自动判定（沿用 I-1 语义：清残留，回到集体层）
-        return session_mod.set_subject(session_mod.current_ward() or uid, False, "kiosk", "manual")
-    return session_mod.set_subject(uid, True, "kiosk", "manual")
+    res = session_mod.set_subject(uid, bool(locked), slot="kiosk", source="manual")
+    if _worker is not None:
+        try:
+            _worker.locked_uid = uid if locked else None
+        except Exception:
+            pass
+    audit.log("session", action="set_uid", uid=uid, locked=bool(locked), by="nurse")
+    return res
 
 
 def get_session_uid() -> dict:
+    """当前会话主体（含角色/槽位/当前病房/TTL/自动切换状态）。"""
     from . import session as session_mod
     p = session_mod.get_principal("kiosk")
-    return {"uid": p["uid"], "locked": p["locked"], "role": p["role"],
-            "slot": p["slot"], "source": p["source"], "ward_uid": p["ward_uid"],
+    uid = p["uid"] or None
+    if uid is None and _worker is not None:      # 兼容旧行为：没主体时看一眼声纹判定结果
+        uid = getattr(_worker, "current_uid", None)
+    return {"ok": True, "uid": uid, "locked": p["locked"], "source": p["source"],
+            "role": p["role"], "slot": p["slot"], "ward_uid": p["ward_uid"],
             "ttl_remain": session_mod.ttl_remain("kiosk"),
+            "auth_required": db.get_admin_auth()["required"],
             "autoswitch": session_mod.autoswitch_state()}
 ```
 
-`_stream_fn` 传 principal：
+> `voice_api.py` 里 `_session_uid`/`_session_locked` 两个模块变量随之删除（它们已无人读）。
+> 注意 `uid=null` 的老语义保留：**没有病房也没主体时** `uid` 仍是 `None`，避免老前端误显示。
+
+**(3c)** `_stream_fn` 里把 principal 传给 `chat_stream`（`voice_api.py` 里没有同名冲突，但仍用 `role_session` 别名，避免与 `LLM.voice.session` 混淆）：
 
 ```python
     def _fn(uid, text):
         settings = db.get_settings()
-        from . import session as session_mod
+        from . import session as role_session
         return chat.chat_stream(client, model, uid, text, "auto", settings,
-                                principal=session_mod.get_principal("kiosk"))
+                                principal=role_session.get_principal("kiosk"))
 ```
 
-`worker.py::_handle_speech` 按规格 §4.3 改：
+**(3d)** `voice/worker.py::_handle_speech`：把"谁在说话"的决定抽成一个可单测的小方法，并在里面按角色分支。
+
+> ⚠️ **名字冲突提醒**：`LLM/voice/session.py` 是**语音状态机**（IDLE/LISTENING/SPEAKING，worker 里已 import 为 `session_mod`），跟本设计的顶层 `LLM/session.py`（角色会话层）**是两回事**。所有新代码一律用 `role_session` 别名引用后者，绝不使用 `session_mod`。
 
 ```python
-        principal = session.get_principal("kiosk")
+    def _apply_role_subject(self, recognized_uid: str | None) -> None:
+        """按当前角色决定这次说话算谁说的（规格 §4.3）。
+
+        * kiosk 槽是 admin → 按 admin 走，声纹认到谁都不降权（D8）；
+        * 否则：认到老人 → 切到该老人（elder）；没认出来 → 留在集体层（当前病房）。
+        """
+        from LLM import session as role_session          # 顶层角色会话层（≠ LLM.voice.session）
+        principal = role_session.get_principal("kiosk")
         if principal["role"] == "admin":
-            uid = principal["uid"]                      # 管理员：语音按 admin 走，且不降权
-        else:
-            vote = ...
-            recognized = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
-            uid = recognized or (principal["uid"] or session.current_ward())
-            session.set_subject(uid, bool(self.locked_uid), "kiosk", "voiceprint")
+            return
+        uid = recognized_uid or principal["uid"] or role_session.current_ward()
+        if uid:
+            role_session.set_subject(uid, bool(self.locked_uid), slot="kiosk",
+                                     source="voiceprint")
+```
+
+`_handle_speech`（第 341-364 行）整体替换为：
+
+```python
+    def _handle_speech(self, seg, text, settings):
+        self.session.note_speech()
+        audit.log("voice_asr", text=text[:200])
+
+        vote = self.fusion.resolve(seg)
+        recognized = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
+        # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
+        if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
+            audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
+                      detected=vote.candidate_uid, score=round(vote.confidence, 3))
+        audit.log("voice_spk", identified=(vote.candidate_uid is not None),
+                  uid=vote.candidate_uid, score=round(vote.confidence, 3))
+
+        from LLM import session as role_session
+        prev = role_session.get_principal("kiosk")
+        self._apply_role_subject(recognized)                 # 谁说的：按角色决定（含 D8）
+        principal = role_session.get_principal("kiosk")
+        chat_uid = principal["uid"] or principal["ward_uid"] or "elder_001"
+        self.current_uid = chat_uid
+        # I-1：主体变了 → 广播 user_changed，与 server.py 手动切换的广播格式一致
+        if principal["uid"] != prev["uid"]:
+            self._publish("user_changed", uid=chat_uid, locked=principal["locked"],
+                          source=principal["source"], role=principal["role"],
+                          slot="kiosk", ward_uid=principal["ward_uid"])
+        self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
+        # 流式问答：应答线程消费 chat_stream → 逐字上屏(chat_partial) + 句级 TTS 播放
+        self._start_answer(chat_uid, text, dict(settings))
+```
+
+> 细节以现有代码为准：**等义改写**——只把"谁说的"这一段的决定权交给 `_apply_role_subject`，其余（VAD/TTS/字幕/审计/`_start_answer`）不动。任务 15 的 §11.10 会实测"管理员期间声纹认人不降权"。
+
+**(3e)** `server.py::_post_chat_jobs` 加角色参数（调用点任务 11 接上）：
+
+```python
+def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str = "elder"):
+    ...
+    try:
+        rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
+    ...
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests -q`
-预期：全 passed
+预期：新增用例全 passed；全量仍是那 4 个既有红态
 
 - [ ] **步骤 5：Commit**
 
 ```bash
-git add LLM/memory.py LLM/voice_api.py LLM/voice/worker.py LLM/tests/test_ward_memory.py LLM/tests/test_worker_roles.py
+git add LLM/memory.py LLM/voice_api.py LLM/voice/worker.py LLM/server.py \
+        LLM/tests/test_ward_memory.py LLM/tests/test_worker_roles.py
 git commit -m "feat(llm): 集体层不沉淀记忆 + 语音链路接入角色（管理员不降权）"
 ```
 
@@ -1829,7 +2359,7 @@ git commit -m "feat(llm): 集体层不沉淀记忆 + 语音链路接入角色（
 ### 任务 11：REST 接口（登录/口令/病房/策略）+ 业务接口取 principal
 
 **文件：**
-- 修改：`LLM/server.py`（`lifespan`；会话状态区块第 658-670 行；`/api/chat` 第 252 行）
+- 修改：`LLM/server.py`（模型区第 205-207 行；会话状态区块第 742-754 行；`/api/chat` 第 327-351 行；`/api/profiles` 之后加一条归属接口；`lifespan` 第 52-77 行）
 - 测试：`LLM/tests/test_server_roles_routes.py`（新建）
 
 - [ ] **步骤 1：编写失败的测试**
@@ -1837,12 +2367,15 @@ git commit -m "feat(llm): 集体层不沉淀记忆 + 语音链路接入角色（
 ```python
 # LLM/tests/test_server_roles_routes.py
 # -*- coding: utf-8 -*-
-"""会话/病房/策略路由测试（临时库隔离，直接改 db.DB_PATH，不 reload）。"""
+"""会话/病房/策略路由测试（临时库隔离，直接改 db.DB_PATH，**不 reload**）。"""
 import os
 import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
+
+K = {"X-Surface": "kiosk"}
+A = {"X-Surface": "admin"}
 
 
 @pytest.fixture()
@@ -1855,79 +2388,130 @@ def c():
     db.init_db()
     session.reset_for_test()
     db.upsert_ward("ward_101", name="101 病房")
+    db.upsert_profile("elder_101_1", name="李爷爷")
     db.set_admin_password("111111")
     import LLM.server as server
-    client = TestClient(server.app)       # 不进 lifespan（不启动语音/轮询）
+    client = TestClient(server.app)        # 不进 lifespan（不启动语音/轮询/rosbridge）
     yield client
     db.DB_PATH = old
 
 
 def test_session_user_rejects_role_field(c):
-    r = c.post("/api/session/user", json={"uid": "ward_101", "locked": False, "role": "admin"})
-    assert r.status_code == 400            # R1
+    r = c.post("/api/session/user", json={"uid": "ward_101", "locked": False, "role": "admin"},
+               headers=K)
+    assert r.status_code == 400            # R1：前端不许指定角色
 
 
-def test_login_and_logout_flow(c):
-    assert c.post("/api/session/login", json={"password": "bad"},
-                  headers={"X-Surface": "admin"}).json()["ok"] is False
-    ok = c.post("/api/session/login", json={"password": "111111"},
-                headers={"X-Surface": "admin"}).json()
+def test_login_and_logout_flow_two_surfaces(c):
+    assert c.post("/api/session/login", json={"password": "bad"}, headers=A).json()["ok"] is False
+    ok = c.post("/api/session/login", json={"password": "111111"}, headers=A).json()
     assert ok["ok"] is True and ok["role"] == "admin"
-    assert c.get("/api/session/user", headers={"X-Surface": "admin"}).json()["role"] == "admin"
-    assert c.get("/api/session/user", headers={"X-Surface": "kiosk"}).json()["role"] == "ward"
-    c.post("/api/session/logout", headers={"X-Surface": "admin"})
-    assert c.get("/api/session/user", headers={"X-Surface": "admin"}).json()["role"] == "ward"
+    assert c.get("/api/session/user", headers=A).json()["role"] == "admin"
+    assert c.get("/api/session/user", headers=K).json()["role"] == "ward"   # 双槽隔离
+    c.post("/api/session/logout", headers=A)
+    assert c.get("/api/session/user", headers=A).json()["role"] == "ward"
+
+
+def test_session_user_get_has_role_fields(c):
+    body = c.get("/api/session/user", headers=K).json()
+    for key in ("uid", "role", "locked", "source", "slot", "ward_uid",
+                "ttl_remain", "auth_required", "autoswitch"):
+        assert key in body
+
+
+def test_login_lockout_after_three_failures(c):
+    for _ in range(3):
+        c.post("/api/session/login", json={"password": "bad"}, headers=K)
+    r = c.post("/api/session/login", json={"password": "111111"}, headers=K).json()
+    assert r["ok"] is False and "10 秒" in r["error"]      # 冷却期内正确口令也先挡住
+    assert c.get("/api/session/user", headers=K).json()["role"] == "ward"
 
 
 def test_wards_crud_and_admin_auth_toggle(c):
-    c.post("/api/session/login", json={"password": "111111"}, headers={"X-Surface": "admin"})
-    assert c.get("/api/wards", headers={"X-Surface": "admin"}).json()["wards"][0]["uid"] == "ward_101"
-    r = c.post("/api/wards", json={"uid": "ward_102", "name": "102 病房"},
-               headers={"X-Surface": "admin"})
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    body = c.get("/api/wards", headers=A).json()
+    assert body["wards"][0]["uid"] == "ward_101"
+    r = c.post("/api/wards", json={"uid": "ward_102", "name": "102 病房"}, headers=A)
     assert r.json()["ok"] is True
-    r = c.post("/api/session/admin-auth", json={"required": False},
-               headers={"X-Surface": "admin"})
+    r = c.post("/api/session/admin-auth", json={"required": False}, headers=A)
     assert r.json()["required"] is False
 
 
 def test_non_admin_cannot_manage_wards(c):
-    r = c.post("/api/wards", json={"uid": "ward_999", "name": "越权"},
-               headers={"X-Surface": "kiosk"})
-    assert r.status_code == 403
+    assert c.post("/api/wards", json={"uid": "ward_999", "name": "越权"}, headers=K).status_code == 403
+    assert c.post("/api/session/admin-auth", json={"required": False}, headers=K).status_code == 403
+    assert c.post("/api/wards/ward_101/zone", headers=K).status_code == 403
+
+
+def test_password_change_flow(c):
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    assert c.post("/api/session/password",
+                  json={"old": "000000", "new": "654321"}, headers=A).json()["ok"] is False
+    assert c.post("/api/session/password",
+                  json={"old": "111111", "new": "654321"}, headers=A).json()["ok"] is True
+    c.post("/api/session/logout", headers=A)
+    assert c.post("/api/session/login", json={"password": "654321"}, headers=A).json()["ok"] is True
+
+
+def test_policy_roles_visibility(c):
+    assert set(c.get("/api/policy/roles", headers=A).json()) == {"admin", "ward", "elder"}
+    kiosk = c.get("/api/policy/roles", headers=K).json()
+    assert set(kiosk) == {"ward"}          # 非管理员只拿到自己那份摘要
+
+
+def test_profiles_endpoint_lists_elders_only(c):
+    """**回归（历史隐患②）**：病房用户不许混进 `GET /api/profiles` 的老人列表。"""
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    c.post("/api/wards", json={"uid": "ward_102", "name": "102 病房"}, headers=A)
+    profiles = c.get("/api/profiles", headers=A).json()["profiles"]
+    uids = [p["uid"] for p in profiles]
+    assert "elder_101_1" in uids and "ward_101" not in uids and "ward_102" not in uids
+    assert [p["uid"] for p in c.get("/api/profiles?kind=ward", headers=A).json()["profiles"]] \
+        == ["ward_101", "ward_102"]
+
+
+def test_profile_ward_assignment(c):
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    r = c.post("/api/profiles/elder_101_1/ward", json={"ward_id": "ward_101"}, headers=A)
+    assert r.json()["ok"] is True
+    wards = c.get("/api/wards", headers=A).json()["wards"]
+    assert wards[0]["elders"] == ["elder_101_1"]
+    assert c.post("/api/profiles/elder_101_1/ward", json={"ward_id": ""}, headers=K).status_code == 403
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_server_roles_routes.py -q`
-预期：FAIL（404 / 422）
+预期：FAIL（`404` / `422`）
 
 - [ ] **步骤 3：实现**
 
-`server.py` 顶部加导入与 surface 依赖、Pydantic 模型（放在其他 `*In` 模型旁）：
+**(3a)** 导入与依赖（`server.py` 顶部）：
+
+- `from fastapi import FastAPI, Query` → `from fastapi import FastAPI, Header, HTTPException, Query`
+- 顶部**新增两行**（本文件目前既没有 `time` 也没有模块级 `audit`，现有代码是在各函数里局部 import 的；本任务的登录冷却与审计要在多处用，改为顶层导入）：
+  ```python
+  import time
+  from . import session
+  from . import log as audit
+  ```
+- `from . import mapserver, maptags, mapstore, locator`（第 848 行）**保持原样**：`locator`/`maptags` 在第 742 行附近的 handler 里用到也没关系——模块导入在任何请求之前就执行完了，函数体内的全局名在调用时解析。
+- **顺手修掉历史隐患②**：`GET /api/profiles` 目前返回**所有** profiles，病房用户会混进前端"老人列表"（`MemoriesPage`/`ChatPage`/`RegisterPage` 的下拉、车前屏换人弹层都吃它）。改为默认只列老人：
+  ```python
+  @app.get("/api/profiles")
+  async def profiles_list(kind: str = Query("elder")):
+      """老人列表（默认只列 kind='elder'）；要看病房用 /api/wards，要看全部传 ?kind=all。"""
+      return {"ok": True, "profiles": db.list_profiles(kind="" if kind == "all" else kind)}
+  ```
+  `_seed_demo()` 里那句 `if db.list_profiles():` **不要动**——它判的是"库里有没有任何档案"，仍应看全量。
+
+**(3b)** 模型区（第 205-207 行）替换/新增：
 
 ```python
-from fastapi import Header, HTTPException
-from . import locator
-from . import session
-from . import log as audit      # 若文件内已有该行则不要重复导入
-
-_SURFACES = ("kiosk", "admin")
-
-
-def _surface(x_surface: str = Header(default="kiosk")) -> str:
-    """端槽位：kiosk（车前/语音）| admin（管理台）。缺省按 kiosk。"""
-    return x_surface if x_surface in _SURFACES else "kiosk"
-
-
-def _public_policy(pol: dict) -> dict:
-    """把策略包转成可 JSON 序列化的形式（Path → str）。"""
-    return {k: (str(v) if isinstance(v, Path) else v) for k, v in pol.items()}
-
-
-class SessionUserIn(BaseModel):        # 既有模型：加 role 只为显式拒绝它（R1）
+class SessionUserIn(BaseModel):
     uid: str
-    locked: bool = False
-    role: str | None = None
+    locked: bool = True
+    role: str | None = None        # 只为显式拒绝它而存在（R1）：传了就 400
 
 
 class LoginIn(BaseModel):
@@ -1946,15 +2530,49 @@ class AdminAuthIn(BaseModel):
 class WardIn(BaseModel):
     uid: str
     name: str = ""
-    zone_id: int = 0            # 关联的 zones.id（0=未关联；几何的唯一真相在 zones 表）
+    ward_map: str = ""             # 关联区域所在的地图名（几何真相在 <图名>.tags.json）
+    ward_zone: str = ""            # 关联的区域 uid（形如 z1）
+
+
+class WardAssignIn(BaseModel):
+    ward_id: str = ""
 ```
 
-会话状态区块替换为：
+**(3c)** 会话状态区块（第 742-754 行）整体替换为：
 
 ```python
+# ---------------------------------------------------------------- 会话 / 角色（分层用户体系）
+_SURFACES = ("kiosk", "admin")
+_login_fail: dict[str, dict] = {}      # slot -> {"n": 连续失败次数, "until": 冷却截止}
+
+
+def _surface(x_surface: str = Header(default="kiosk")) -> str:
+    """端槽位：kiosk（车前/语音）| admin（管理台）。缺省按 kiosk。"""
+    return x_surface if x_surface in _SURFACES else "kiosk"
+
+
+def _public_policy(pol: dict) -> dict:
+    """策略包转成可 JSON 序列化的形式（Path → str）。"""
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in pol.items()}
+
+
+def _login_cooling(slot: str) -> bool:
+    st = _login_fail.get(slot) or {}
+    return bool(st.get("until")) and time.time() < st["until"]
+
+
+def _login_failed(slot: str) -> None:
+    st = _login_fail.setdefault(slot, {"n": 0, "until": 0.0})
+    st["n"] += 1
+    if st["n"] >= 3:                       # 连续 3 次失败 → 该槽冷却 10s
+        st["until"] = time.time() + 10
+        st["n"] = 0
+        audit.log("session_login_fail", slot=slot, action="cooling")
+
+
 @app.get("/api/session/user")
 async def session_user_get(x_surface: str = Header(default="kiosk")):
-    """当前会话主体（uid/role/锁定/TTL/当前病房），按请求槽位返回角色。"""
+    """当前会话主体（uid/角色/锁定/当前病房/TTL），**角色按请求槽位返回**。"""
     slot = _surface(x_surface)
     p = session.get_principal(slot)
     return {**p, "ttl_remain": session.ttl_remain(slot),
@@ -1964,23 +2582,28 @@ async def session_user_get(x_surface: str = Header(default="kiosk")):
 
 @app.post("/api/session/user")
 async def session_user_set(s: SessionUserIn, x_surface: str = Header(default="kiosk")):
-    """切换会话主体：只接受 uid/locked —— 传 role 一律 400（R1）。"""
+    """切换会话主体：**只接受 uid/locked**；传 role 一律 400（R1）。"""
     if s.role:
         raise HTTPException(status_code=400, detail="role 不可由前端指定（R1）")
     slot = _surface(x_surface)
-    res = session.set_subject(s.uid, s.locked, slot, "manual")
+    res = session.set_subject(s.uid, s.locked, slot=slot, source="manual")
     bus.publish("user_changed", uid=res["uid"], role=res["role"], slot=slot,
-                ward_uid=res.get("ward_uid", ""), locked=res["locked"], source="manual")
+                locked=res["locked"], ward_uid=res["ward_uid"], source="manual")
     return res
 
 
 @app.post("/api/session/login")
 async def session_login(body: LoginIn | None = None, x_surface: str = Header(default="kiosk")):
     slot = _surface(x_surface)
+    if _login_cooling(slot):
+        return {"ok": False, "error": "口令失败次数过多，请 10 秒后重试"}
     res = session.login_admin((body.password if body else None), slot=slot)
     if res.get("ok"):
+        _login_fail.pop(slot, None)
         bus.publish("user_changed", uid=res["uid"], role=res["role"], slot=slot,
                     source=res["source"])
+    else:
+        _login_failed(slot)
     return res
 
 
@@ -1993,127 +2616,168 @@ async def session_logout(x_surface: str = Header(default="kiosk")):
 
 
 @app.post("/api/session/password")
-async def session_password(body: PasswordIn):
+async def session_password(body: PasswordIn, x_surface: str = Header(default="kiosk")):
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可改口令")
     return session.change_admin_password(body.old, body.new)
 
 
 @app.get("/api/session/admin-auth")
-async def admin_auth_get(x_surface: str = Header(default="kiosk")):
+async def admin_auth_get():
     return {"required": db.get_admin_auth()["required"]}
 
 
 @app.post("/api/session/admin-auth")
 async def admin_auth_set(body: AdminAuthIn, x_surface: str = Header(default="kiosk")):
-    slot = _surface(x_surface)
-    if session.get_principal(slot)["role"] != "admin":
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可开关口令门")
     res = session.set_admin_auth(body.required)
     bus.publish("admin_auth_changed", required=res["required"])
     return res
 
 
-def _ward_zone_payload(ward_uid: str) -> dict | None:
-    """病房关联的 zones 行（唯一真相）；zone_id=0 或 zones 行缺失 → null。"""
-    return db.get_ward_zone(ward_uid)
+def _ward_payload(w: dict) -> dict:
+    """病房一条（含它关联的区域行与归属老人）——区域从**只读缓存**取，取不到就是 null。"""
+    zone = db.get_zone(w.get("ward_zone") or "", w.get("ward_map") or "") \
+        if w.get("ward_zone") else None
+    return {"uid": w["uid"], "name": w.get("name", ""),
+            "ward_map": w.get("ward_map", ""), "ward_zone": w.get("ward_zone", ""),
+            "zone": zone,
+            "elders": [p["uid"] for p in db.list_profiles(kind="elder")
+                       if p.get("ward_id") == w["uid"]]}
 
 
 @app.get("/api/wards")
-async def wards_list(x_surface: str = Header(default="kiosk")):
-    return {"wards": [{"uid": w["uid"], "name": w.get("name", ""),
-                       "zone_id": int(w.get("zone_id") or 0),
-                       "zone": _ward_zone_payload(w["uid"]),
-                       "elders": [p["uid"] for p in db.list_profiles(kind="elder")
-                                  if p.get("ward_id") == w["uid"]]}
-                      for w in db.list_profiles(kind="ward")]}
+async def wards_list():
+    """病房用户列表（车前屏的层级栏也要用，故任何角色可读；只含名字与归属，无隐私内容）。"""
+    return {"ok": True, "wards": [_ward_payload(w) for w in db.list_wards()]}
 
 
 @app.post("/api/wards")
 async def wards_upsert(w: WardIn, x_surface: str = Header(default="kiosk")):
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
-    db.upsert_ward(w.uid, name=w.name, zone_id=w.zone_id)
-    audit.log("ward_change", source="admin", ward=w.uid)
+    db.upsert_ward(w.uid, name=w.name, ward_map=w.ward_map, ward_zone=w.ward_zone)
+    audit.log("ward_change", source="admin", action="upsert", ward=w.uid)
     bus.publish("ward_changed", uid=w.uid, action="upsert")
-    return {"ok": True, "ward": db.get_profile(w.uid)}
-
-
-def _sample_16gon(x: float, y: float, r: float) -> list[list[float]]:
-    """以 (x, y) 为圆心、r 为半径采样 16 边形（顶点落在圆周上，近似圆）。"""
-    import math
-    return [[round(x + r * math.cos(2 * math.pi * i / 16), 3),
-             round(y + r * math.sin(2 * math.pi * i / 16), 3)] for i in range(16)]
+    return {"ok": True, "ward": _ward_payload(db.get_profile(w.uid) or {"uid": w.uid})}
 
 
 @app.post("/api/wards/{ward_uid}/zone")
 async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk")):
-    """便捷录入：以 locator 当前位姿为中心、`ward_zone_default_r` 为半径采样 16 边形写入 zones 表。
-
-    精确形状请到地图编辑器里画多边形（`/mapeditor`），本接口只负责快速建一个近似区域并把
-    新的 `zones.id` 关联到 `profiles.zone_id`。`ward_zone_default_r` 仍是"半径"语义（米）。
+    """便捷录入：以当前位姿为圆心、`ward_zone_default_r` 为半径采样 16 边形写入**该图的
+    `<图名>.tags.json`**（`maptags.record_room_polygon`，已有实现、本次补 HTTP 入口），
+    再把「地图名 + 区域 uid」回填进 profiles。精确形状请到 /mapeditor 画多边形。
     """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
     pose = locator.get_pose()
-    if pose is None:
-        return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪），可到地图编辑器手绘区域"}
-    map_name = str(db.get_settings().get("current_map") or "").strip()
+    if not pose or pose.get("x") is None:
+        return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪）；可到地图编辑器手绘区域"}
+    map_name, why = session.running_map_name()
     if not map_name:
-        return {"ok": False, "error": "未设置当前地图（settings.current_map），请先在设置里选定地图"}
-    r = float(db.get_settings().get("ward_zone_default_r", 3.0))
+        return {"ok": False,
+                "error": f"认不出当前地图（{why}）：请确认导航在跑且 /map 指纹能唯一命中，"
+                         f"或把设置 ward_map_source 改成 setting 并选好 current_map"}
     ward = db.get_profile(ward_uid) or {}
-    ward_name = ward.get("name") or ward_uid
-    zid = db.add_zone(map_name=map_name, name=ward_name, kind="ward", shape="polygon",
-                      polygon_json=_sample_16gon(float(pose["x"]), float(pose["y"]), r))
-    db.upsert_ward(ward_uid, name=ward.get("name", ""), zone_id=zid)
+    name = ward.get("name") or ward_uid
+    r = float(db.get_settings().get("ward_zone_default_r", 3.0))
+    try:
+        res = maptags.record_room_polygon(map_name, name, float(pose["x"]), float(pose["y"]),
+                                         radius_m=r, kind="ward")
+    except Exception as e:                 # noqa: BLE001  板卡不可达/名字非法等 → 只降级不 500
+        return {"ok": False, "error": f"写地图标记失败：{e}"}
+    db.set_ward_zone(ward_uid, map_name, res["uid"])
+    audit.log("ward_change", source="admin", action="zone", ward=ward_uid,
+              map=map_name, zone=res["uid"])
     bus.publish("ward_changed", uid=ward_uid, action="zone")
-    return {"ok": True, "zone_id": zid, "zone": db.get_zone(zid)}
+    return {"ok": True, "map": map_name, "zone_uid": res["uid"],
+            "zone": maptags.get_zone(map_name, res["uid"])}
+
+
+@app.post("/api/profiles/{uid}/ward")
+async def profile_set_ward(uid: str, body: WardAssignIn,
+                          x_surface: str = Header(default="kiosk")):
+    """把老人归入/移出病房（写 profiles.ward_id）。
+
+    单独一条路由是**故意的**：`upsert_profile` 不许碰病房字段，否则档案编辑会静默清掉关联。
+    """
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可分配病房")
+    db.set_profile_ward(uid, body.ward_id)
+    audit.log("ward_change", source="admin", action="assign", elder=uid, ward=body.ward_id)
+    bus.publish("ward_changed", uid=body.ward_id, action="assign")
+    return {"ok": True, "uid": uid, "ward_id": body.ward_id}
 
 
 @app.get("/api/policy/roles")
 async def policy_roles(x_surface: str = Header(default="kiosk")):
+    """策略矩阵：管理员看全量，其它角色只拿自己那份摘要。"""
     from .policy import POLICY_DEFAULTS
     role = session.get_principal(_surface(x_surface))["role"]
     if role != "admin":
-        return {role: _public_policy(POLICY_DEFAULTS[role])}
+        return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
 ```
 
-（`_public_policy` 只把 `prompt_file` 换成字符串路径，避免 JSON 序列化 `Path`。）
-
-`lifespan` 里加：`session.ensure_admin_password()` 打印+审计、`locator.start(db.get_settings())`、后台 tick 线程：
+**(3d)** `lifespan` 里补三件事（口令首启、位置源提示、每秒 tick）：
 
 ```python
+    # 分层用户体系：首启生成管理员口令（D12）+ 每秒 tick（TTL 降权 + 病房位置自动切换）
     pw = session.ensure_admin_password()
     if pw:
-        print(f"[INFO] 已生成管理员初始口令：{pw}（请登录后立即修改）")
+        print(f"[INFO] 已生成管理员初始口令：{pw}（登录后请立即在「身份与权限」里修改）")
         audit.log("admin_password_generated")
-    locator.start(db.get_settings())
+    ok, why = locator.available()
+    if not ok:
+        print(f"[WARN] 位置源不可用（{why}）→ 病房位置自动切换停用，车前屏可手动切病房")
 
-    async def _ward_tick():
+    async def _role_tick():
         while True:
             await asyncio.sleep(1)
             try:
-                await asyncio.to_thread(session.tick)
-            except Exception:
+                await asyncio.to_thread(session.tick)   # tick 可能碰网络/SSH，别占事件循环
+            except Exception:                           # noqa: BLE001  降级：tick 出错不影响服务
                 pass
 
-    asyncio.create_task(_ward_tick())
+    tick_task = asyncio.create_task(_role_tick())
 ```
+并在 `yield` 之后的收尾里加 `tick_task.cancel()`（与现有 `drain_task.cancel()` 并列）。
 
-`/api/chat` 改为按 surface 取 principal（第 252 行附近）：
+**(3e)** `/api/chat` 按槽位取 principal，并把角色带给后台沉淀任务：
 
 ```python
-            principal = session.get_principal(_surface(x_surface))
+@app.post("/api/chat")
+async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk")):
+    settings = db.get_settings()
+    principal = session.get_principal(_surface(x_surface))
+
+    def gen():
+        assistant = ""
+        speech = voice_api.begin_text_reply() if req.speak else None
+        completed = False
+        try:
             for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking,
                                        settings, principal=principal):
-```
+                if ev["type"] == "content":
+                    voice_api.feed_text_reply(speech, ev.get("content") or "")
+                elif ev["type"] == "done":
+                    assistant = ev.get("assistant", "")
+                    completed = True
+                yield _sse(ev)
+        finally:
+            voice_api.end_text_reply(speech, flush_tail=completed)
+            if completed and assistant.strip():
+                _bg.submit(_post_chat_jobs, req.uid, req.message, assistant, principal["role"])
 
-`/api/chat` 的路由签名补 `x_surface: str = Header(default="kiosk")`。
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+```
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`.venv\Scripts\python.exe -m pytest LLM/tests -q`
-预期：全 passed
+运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_server_roles_routes.py LLM/tests -q`
+预期：新文件 `9 passed`；全量仍是那 4 个既有红态
 
 - [ ] **步骤 5：Commit**
 
@@ -2127,18 +2791,58 @@ git commit -m "feat(llm): 会话/病房/策略 REST 接口 + 业务接口按槽�
 ### 任务 12：前端 —— shared 会话层与事件
 
 **文件：**
-- 修改：`frontend/packages/shared/src/api/client.ts`（加 `X-Surface` 支持）
-- 修改：`frontend/packages/shared/src/api/session.ts`（扩展现有文件，**不新建** src/session.ts）
+- 修改：`frontend/packages/shared/src/api/client.ts`（全文 18 行）
+- 修改：`frontend/packages/shared/src/api/session.ts`（全文 16 行，**扩展现有文件，不新建 `src/session.ts`**）
 - 修改：`frontend/packages/shared/src/events.ts`（事件枚举 + `parseBusPayload`）
+- 测试：`frontend/packages/shared/tests/events.test.ts`（追加用例）
 
-- [ ] **步骤 1：实现**（前端无单测框架，用类型检查 + 构建验证）
+> 落点核实：`shared/src/` 只有 `index.ts` / `events.ts` / `api/{client,session,alarm}.ts`；前端源码里 `X-Surface` **零出现**。
 
-`api/client.ts` 全量替换为：
+- [ ] **步骤 1：编写失败的测试**（追加到 `frontend/packages/shared/tests/events.test.ts`）
 
 ```ts
-// 统一 REST client：所有 /api 调用走这里（规格 §4）
+import { describe, it, expect } from "vitest";
+import { parseBusPayload } from "../src/events";
+
+describe("分层用户体系新增事件", () => {
+  it("session_expired", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "session_expired", slot: "kiosk" }));
+    expect(ev?.type).toBe("session_expired");
+  });
+
+  it("admin_auth_changed", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "admin_auth_changed", required: false }));
+    expect(ev?.type).toBe("admin_auth_changed");
+  });
+
+  it("ward_changed", () => {
+    const ev = parseBusPayload(JSON.stringify({ type: "ward_changed", uid: "ward_101", action: "location" }));
+    expect(ev?.type).toBe("ward_changed");
+  });
+
+  it("user_changed 载荷扩了 role/slot/ward_uid 也不再被丢弃", () => {
+    const ev = parseBusPayload(JSON.stringify({
+      type: "user_changed", uid: "elder_101_1", locked: false,
+      source: "voiceprint", role: "elder", slot: "kiosk", ward_uid: "ward_101",
+    }));
+    expect(ev?.type).toBe("user_changed");
+  });
+});
+```
+
+- [ ] **步骤 2：运行测试验证失败**
+
+运行：`cd frontend && pnpm --filter shared test`
+预期：FAIL（新用例 `expected null to be 'session_expired'`——这三个类型还不在 `KNOWN_TYPES` 里）
+
+- [ ] **步骤 3：实现**
+
+**(3a)** `api/client.ts` 全量替换：
+
+```ts
+// 统一 REST client：所有 /api 调用走这里。
 // 分层用户体系：带 X-Surface 头区分端槽位（kiosk=车前/语音，admin=管理台），
-// 后端据此返回该槽位的角色（role 绝不由前端指定，规格 R1）。
+// 后端据此返回**该槽位的角色**——role 绝不由前端指定（后端红线 R1）。
 export type Surface = "kiosk" | "admin";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -2162,7 +2866,7 @@ export function apiPost<T = any>(url: string, body?: unknown, surface?: Surface)
 }
 ```
 
-`api/session.ts` 全量替换为：
+**(3b)** `api/session.ts` 全量替换：
 
 ```ts
 import { apiGet, apiPost, type Surface } from "./client";
@@ -2171,10 +2875,11 @@ export type Role = "admin" | "ward" | "elder";
 
 export interface SessionUser {
   ok?: boolean;
-  uid: string;
+  uid: string | null;
   role: Role;
   locked: boolean;
   slot: Surface;
+  /** default | manual | voiceprint | password | auth_disabled | expired | location | logout */
   source: string;
   ward_uid: string;
   ttl_remain: number | null;
@@ -2182,12 +2887,22 @@ export interface SessionUser {
   autoswitch: { enabled: boolean; reason: string };
 }
 
+export interface WardZone {
+  uid: string;
+  name?: string;
+  kind?: string;
+  shape?: string;
+  polygon?: number[][];
+}
+
 export interface Ward {
   uid: string;
   name: string;
-  zone_id: number;
-  /** 解析出的病房区域（zones 表行，几何的唯一真相）；未关联时为 null */
-  zone: Record<string, unknown> | null;
+  /** 病房区域所在的地图名（几何真相在地图文件夹的 <图名>.tags.json） */
+  ward_map: string;
+  /** 关联的区域 uid（形如 z1）；空串 = 未关联 */
+  ward_zone: string;
+  zone: WardZone | null;
   elders: string[];
 }
 
@@ -2196,11 +2911,11 @@ export function getSessionUser(surface: Surface): Promise<SessionUser> {
 }
 
 export function setSessionUser(uid: string, locked: boolean, surface: Surface): Promise<SessionUser> {
-  return apiPost<SessionUser>("/api/session/user", { uid, locked }, surface);
+  return apiPost<SessionUser>("/api/session/user", { uid, locked }, surface);   // 不传 role（R1）
 }
 
 export function login(password: string | null, surface: Surface) {
-  return apiPost<{ ok: boolean; error?: string; role?: Role; ttl_remain?: number }>(
+  return apiPost<{ ok: boolean; error?: string; role?: Role; ttl_remain?: number | null }>(
     "/api/session/login", { password }, surface);
 }
 
@@ -2208,8 +2923,9 @@ export function logout(surface: Surface): Promise<SessionUser> {
   return apiPost<SessionUser>("/api/session/logout", {}, surface);
 }
 
-export function changePassword(oldPw: string, newPw: string) {
-  return apiPost<{ ok: boolean; error?: string }>("/api/session/password", { old: oldPw, new: newPw });
+export function changePassword(oldPw: string, newPw: string, surface: Surface) {
+  return apiPost<{ ok: boolean; error?: string }>(
+    "/api/session/password", { old: oldPw, new: newPw }, surface);
 }
 
 export function getAdminAuth(surface: Surface) {
@@ -2221,32 +2937,66 @@ export function setAdminAuth(required: boolean, surface: Surface) {
 }
 
 export function listWards(surface: Surface) {
-  return apiGet<{ wards: Ward[] }>("/api/wards", surface);
+  return apiGet<{ ok: boolean; wards: Ward[] }>("/api/wards", surface);
 }
 
-export function upsertWard(uid: string, name: string, surface: Surface) {
-  return apiPost<{ ok: boolean }>("/api/wards", { uid, name }, surface);
+export function upsertWard(uid: string, name: string, wardMap: string, wardZone: string,
+                          surface: Surface) {
+  return apiPost<{ ok: boolean; ward?: Ward; error?: string }>(
+    "/api/wards", { uid, name, ward_map: wardMap, ward_zone: wardZone }, surface);
 }
 
+/** 便捷录入：以小车当前位姿为圆心、ward_zone_default_r 为半径，把当前房间记成病房区域。 */
 export function recordWardZone(wardUid: string, surface: Surface) {
-  return apiPost<{ ok: boolean; error?: string; zone_id?: number;
-                   zone?: Record<string, unknown> | null }>(
-    `/api/wards/${wardUid}/zone`, {}, surface);
+  return apiPost<{ ok: boolean; error?: string; map?: string; zone_uid?: string;
+                   zone?: WardZone | null }>(`/api/wards/${encodeURIComponent(wardUid)}/zone`,
+                                            {}, surface);
+}
+
+export function assignElderWard(elderUid: string, wardId: string, surface: Surface) {
+  return apiPost<{ ok: boolean }>(`/api/profiles/${encodeURIComponent(elderUid)}/ward`,
+                                  { ward_id: wardId }, surface);
 }
 ```
 
-`events.ts`：`user_changed` 载荷加 `role?: Role`、`slot?: Surface`、`ward_uid?: string`；事件类型枚举加 `"session_expired" | "admin_auth_changed" | "ward_changed"`；`parseBusPayload` 加三个分支（分别返回 `{slot}` / `{required}` / `{uid, action}`）。
+**(3c)** `events.ts`：`UserChangedEvent` 扩字段、加三个事件、把新类型加进 `KNOWN_TYPES`、`parseBusPayload` 的返回类型跟着扩：
 
-- [ ] **步骤 2：类型检查**
+```ts
+export interface UserChangedEvent {
+  type: "user_changed"; uid: string; locked: boolean;
+  source: string;                    // manual | voiceprint | password | auth_disabled | logout ...
+  role?: "admin" | "ward" | "elder";
+  slot?: "kiosk" | "admin";
+  ward_uid?: string;
+}
+export interface SessionExpiredEvent { type: "session_expired"; slot: "kiosk" | "admin" }
+export interface AdminAuthChangedEvent { type: "admin_auth_changed"; required: boolean }
+export interface WardChangedEvent { type: "ward_changed"; uid: string; action: string }
 
-运行：`cd frontend && pnpm --filter shared exec tsc --noEmit`
-预期：无类型错误（若 shared 无独立 tsconfig，则用 `pnpm --filter admin build` 触发依赖编译）
+export type BusEvent =
+  | ReminderEvent | ReminderConfirmedEvent | AlarmEvent | ChatNewEvent | ChatPartialEvent
+  | VoiceStateEvent | UserChangedEvent | VoiceStatusEvent
+  | SessionExpiredEvent | AdminAuthChangedEvent | WardChangedEvent;
 
-- [ ] **步骤 3：Commit**
+const KNOWN_TYPES = new Set([
+  "reminder", "reminder_confirmed", "alarm", "chat_new", "chat_partial",
+  "voice_state", "user_changed", "voice_status",
+  "session_expired", "admin_auth_changed", "ward_changed",
+]);
+```
+
+（`parseBusEvent` / `parseBusPayload` / `parseSseChunk` 三个函数体不用改：它们靠 `KNOWN_TYPES` 放行。）
+
+- [ ] **步骤 4：运行测试验证通过**
+
+运行：`cd frontend && pnpm --filter shared test`
+预期：全部 passed（含原有 events/client 用例）
+
+- [ ] **步骤 5：Commit**
 
 ```bash
 git add frontend/packages/shared
-git commit -m "feat(frontend): shared 会话层（X-Surface/登录/口令/病房）+ 事件类型扩展"
+git commit -m "feat(frontend): shared 会话层（X-Surface/登录/口令/病房）+ 3 个新事件"
 ```
 
 ---
@@ -2254,54 +3004,277 @@ git commit -m "feat(frontend): shared 会话层（X-Surface/登录/口令/病房
 ### 任务 13：前端 —— kiosk 左侧层级栏
 
 **文件：**
-- 修改：`frontend/packages/kiosk/src/components/UserSwitcher.vue`（改为三组层级抽屉）
-- 修改：`frontend/packages/kiosk/src/components/VoiceStatusBar.vue`（按角色换徽标）
-- 修改：`frontend/packages/kiosk/src/App.vue`（第 170-180 行切人逻辑改走 `setSessionUser(uid, locked, "kiosk")`；监听 `ward_changed`/`session_expired`）
+- 修改：`frontend/packages/kiosk/src/components/UserSwitcher.vue`（换成三组层级抽屉）
+- 修改：`frontend/packages/kiosk/src/components/VoiceStatusBar.vue`（角色徽标 + 倒计时）
+- 修改：`frontend/packages/kiosk/src/App.vue`（接线：`setSessionUser(uid, locked, "kiosk")`、监听 `ward_changed`/`session_expired`）
 
-- [ ] **步骤 1：实现层级抽屉**（模板骨架，样式沿用现有弹层）
+> 落点核实：换人入口按钮在 `VoiceStatusBar.vue:34`；弹层由 `App.vue:22/213` 的 `showSwitcher` 控制；`useBus.ts` 已经把 `/api/events` 的所有事件交给 `App.vue::onEvent`。
+
+- [ ] **步骤 1：实现 `UserSwitcher.vue`（三组层级栏，用户明确要求"按下换人后左侧显示当前层级"）**
 
 ```vue
+<script setup lang="ts">
+import { computed, onMounted, ref } from "vue";
+import {
+  changePassword, getSessionUser, listWards, login, logout, recordWardZone,
+  setAdminAuth, setSessionUser, getAdminAuth,
+  type SessionUser, type Ward,
+} from "shared";
+
+const props = defineProps<{ session: SessionUser }>();
+const emit = defineEmits<{ (e: "changed"): void; (e: "close"): void }>();
+
+const profiles = ref<{ uid: string; name?: string; nickname?: string; bed?: string }[]>([]);
+const wards = ref<Ward[]>([]);
+const pw = ref("");
+const errMsg = ref("");
+const showPwChange = ref(false);
+const oldPw = ref("");
+const newPw = ref("");
+const authRequired = ref(true);
+const allWards = ref(false);
+
+const role = computed(() => props.session.role);
+const elders = computed(() => {
+  const cur = wards.value.find(w => w.uid === props.session.ward_uid);
+  const inWard = cur ? cur.elders : [];
+  return props.profiles.filter(p => (allWards.value ? true : inWard.includes(p.uid)));
+});
+
+function fmt(sec: number | null) {
+  if (sec == null) return "--:--";
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
+async function refresh() {
+  try {
+    const [w, a, p] = await Promise.all([
+      listWards("kiosk"),
+      getAdminAuth("kiosk"),
+      fetch("/api/profiles").then(r => r.json()),      // 沿用组件原本的取法（不经 shared）
+    ]);
+    wards.value = w.wards ?? [];
+    authRequired.value = a.required;
+    profiles.value = p.profiles ?? [];
+  } catch { /* 后端不可达：层级栏仍可用已缓存数据 */ }
+}
+
+async function doLogin() {
+  errMsg.value = "";
+  const r = await login(pw.value || null, "kiosk");
+  if (!r.ok) { errMsg.value = r.error ?? "登录失败"; return; }
+  pw.value = ""; emit("changed");
+}
+
+async function doLogout() { await logout("kiosk"); emit("changed"); }
+
+async function pick(uid: string, locked = true) {
+  await setSessionUser(uid, locked, "kiosk");
+  emit("changed");
+}
+
+async function unlock() {                     // 解锁 = 恢复声纹自动判定（不换人）
+  await setSessionUser(props.session.uid ?? "", false, "kiosk");
+  emit("changed");
+}
+
+async function doChangePw() {
+  errMsg.value = "";
+  const r = await changePassword(oldPw.value, newPw.value, "kiosk");
+  if (!r.ok) { errMsg.value = r.error ?? "改口令失败"; return; }
+  showPwChange.value = false; oldPw.value = ""; newPw.value = "";
+}
+
+async function toggleAuth() {
+  const r = await setAdminAuth(!authRequired.value, "kiosk");
+  authRequired.value = r.required;
+  emit("changed");
+}
+
+async function markZone(w: Ward) {
+  errMsg.value = "";
+  const r = await recordWardZone(w.uid, "kiosk");
+  if (!r.ok) errMsg.value = r.error ?? "记录失败";
+  await refresh();
+}
+
+onMounted(refresh);
+</script>
+
 <template>
-  <div class="drawer">
+  <div class="layer-drawer">
     <section>
       <h4>🛡 管理层</h4>
-      <button v-if="role !== 'admin'" @click="showPw = true">输入口令进入</button>
-      <template v-else>
-        <p>当前（剩 {{ fmt(ttl) }}）</p>
-        <button @click="$emit('logout')">退出</button>
-        <button @click="showPwChange = true">口令设置</button>
+      <template v-if="role !== 'admin'">
+        <div class="row">
+          <input v-model="pw" type="password" placeholder="管理员口令" @keyup.enter="doLogin" />
+          <button @click="doLogin">{{ authRequired ? "进入" : "直接进入（无口令保护⚠️）" }}</button>
+        </div>
       </template>
-      <p v-if="!authRequired" class="warn">⚠️ 当前无口令保护，点「输入口令进入」可直接进入</p>
+      <template v-else>
+        <p class="cur">当前（剩 {{ fmt(session.ttl_remain) }}）</p>
+        <div class="row">
+          <button @click="doLogout">退出管理层</button>
+          <button @click="showPwChange = !showPwChange">口令设置</button>
+          <button @click="toggleAuth">{{ authRequired ? "关闭口令门" : "开启口令门" }}</button>
+        </div>
+        <div v-if="showPwChange" class="row">
+          <input v-model="oldPw" type="password" placeholder="旧口令" />
+          <input v-model="newPw" type="password" placeholder="新口令" />
+          <button @click="doChangePw">保存</button>
+        </div>
+      </template>
+      <p v-if="!authRequired" class="warn">⚠️ 当前无口令保护，任何人都能进管理层</p>
     </section>
+
     <section>
-      <h4>🏠 集体层</h4>
-      <p v-if="!autoswitch.enabled" class="hint">位置未知 · 手动切病房（{{ autoswitch.reason }}）</p>
+      <h4>🏠 集体层（病房）</h4>
+      <p v-if="!session.autoswitch.enabled" class="hint">
+        位置未知 · 手动切病房（{{ session.autoswitch.reason }}）
+      </p>
       <ul>
-        <li v-for="w in wards" :key="w.uid" :class="{ active: w.uid === wardUid }"
-            @click="$emit('pick', w.uid)">{{ w.name || w.uid }}</li>
+        <li v-for="w in wards" :key="w.uid" :class="{ active: w.uid === session.ward_uid }">
+          <span @click="pick(w.uid)">{{ w.name || w.uid }}</span>
+          <button class="mini" title="把当前房间记为这个病房的区域" @click="markZone(w)">记录位置</button>
+        </li>
+        <li v-if="!wards.length" class="hint">还没有病房用户（在管理台「病房管理」里新建）</li>
       </ul>
     </section>
+
     <section>
-      <h4>👴 老人层</h4>
+      <h4>
+        👴 老人层
+        <button class="mini" @click="allWards = !allWards">
+          {{ allWards ? "只看本病房" : "全部病房" }}
+        </button>
+      </h4>
       <ul>
-        <li v-for="p in elders" :key="p.uid" :class="{ active: p.uid === current }"
-            @click="$emit('pick', p.uid)">{{ p.nickname || p.name || p.uid }}</li>
+        <li v-for="p in elders" :key="p.uid" :class="{ active: p.uid === session.uid }"
+            @click="pick(p.uid)">
+          {{ p.nickname || p.name || p.uid }}
+        </li>
+        <li v-if="!elders.length" class="hint">本病房还没有登记老人</li>
       </ul>
+      <button v-if="session.locked" class="mini" @click="unlock">解除锁定（恢复声纹自动判定）</button>
     </section>
+
+    <p v-if="errMsg" class="warn">{{ errMsg }}</p>
+    <button class="close" @click="emit('close')">关闭</button>
   </div>
 </template>
+
+<style scoped>
+.layer-drawer { position: absolute; left: 0; top: 0; bottom: 0; width: 320px; overflow-y: auto;
+  background: #1b2430; color: #eef3f8; padding: 16px; z-index: 40; }
+section { border-bottom: 1px solid #33445a; padding-bottom: 12px; margin-bottom: 12px; }
+h4 { margin: 0 0 8px; font-size: 15px; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; justify-content: space-between; padding: 8px;
+  border-radius: 8px; cursor: pointer; }
+li.active { background: #2b6cb0; }
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+input { flex: 1; min-width: 90px; padding: 6px; border-radius: 6px; border: 1px solid #46586f;
+  background: #0f1620; color: inherit; }
+button { padding: 6px 10px; border-radius: 6px; border: 1px solid #46586f; background: #243244;
+  color: inherit; cursor: pointer; }
+button.mini { font-size: 12px; padding: 2px 6px; }
+.hint { color: #9fb2c8; font-size: 12px; }
+.warn { color: #ffd166; font-size: 12px; }
+.cur { margin: 4px 0; }
+</style>
 ```
 
-- [ ] **步骤 2：构建验证**
+> 说明：`kiosk` 的层级栏**不暴露**任何老人档案细节（只显示昵称/床位），符合"集体层不注入个人档案"的口径；"记录位置"是管理员动作，非管理员点击会被后端 403 挡下并显示错误。
+
+- [ ] **步骤 2：改 `App.vue`（接线）**
+
+`<UserSwitcher>` 的用法改为（**组件自己拉 `/api/profiles`**，所以只传 session，不再传 current/pick/unlock）：
+
+```vue
+    <UserSwitcher v-if="showSwitcher" :session="session" @changed="loadSession"
+                  @close="showSwitcher = false" />
+```
+
+`App.vue` 里：
+
+```ts
+import { getSessionUser, setSessionUser, type SessionUser } from "shared";
+
+const session = ref<SessionUser | null>(null);
+
+async function loadSession() {
+  try { session.value = await getSessionUser("kiosk"); } catch { /* 后端不可达：保持旧值 */ }
+}
+
+async function onSwitchUser(nextUid: string) {          // 手动切换 = 锁定（规格 D11）
+  session.value = await setSessionUser(nextUid, true, "kiosk");
+  uid.value = session.value.uid ?? nextUid;
+  locked.value = session.value.locked;
+  showSwitcher.value = false;
+}
+
+async function onUnlock() {
+  session.value = await setSessionUser(uid.value ?? "", false, "kiosk");
+  locked.value = session.value.locked;
+  showSwitcher.value = false;
+}
+```
+
+`onEvent` 里补三个分支：
+
+```ts
+    } else if (ev.type === "user_changed") {
+      uid.value = ev.uid; locked.value = ev.locked; loadSession();
+    } else if (ev.type === "ward_changed") {
+      loadSession();                                   // 当前病房变了（位置/手动）
+    } else if (ev.type === "session_expired") {
+      loadSession();
+      if (ev.slot === "kiosk") liveText.value = "管理员会话已超时，已回到集体层";
+    }
+```
+
+并把 `onMounted` 里的 `loadSession()` 保留（原本已有）。
+
+- [ ] **步骤 3：改 `VoiceStatusBar.vue`（按角色换徽标）**
+
+```vue
+<script setup lang="ts">
+import type { SessionUser } from "shared";
+const props = defineProps<{ state: string; session: SessionUser | null }>();
+const emit = defineEmits<{ (e: "open-switcher"): void }>();
+
+function fmt(sec: number | null) {
+  if (sec == null) return "";
+  return ` ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+const badge = computed(() => {
+  const s = props.session;
+  if (!s) return "👤 未选择";
+  if (s.role === "admin") return `🛡 管理员${fmt(s.ttl_remain)}`;
+  if (s.role === "elder") return `👴 ${s.uid}${s.locked ? " 🔒" : ""}`;
+  return `🏠 ${s.ward_uid || "未选病房"}`;
+});
+</script>
+```
+
+模板里第 34 行那颗按钮改为：
+
+```vue
+    <button class="user" @click="emit('open-switcher')">{{ badge }}</button>
+```
+
+（`App.vue` 传 `:session="session"`；老人昵称可从 `/api/profiles` 查，v1 先用 uid，避免引入新状态。）
+
+- [ ] **步骤 4：构建验证**
 
 运行：`cd frontend && pnpm --filter kiosk build`
-预期：构建成功，无 TS 报错
+预期：构建成功、无 TS 报错
 
-- [ ] **步骤 3：Commit**
+- [ ] **步骤 5：Commit**
 
 ```bash
 git add frontend/packages/kiosk
-git commit -m "feat(kiosk): 左侧层级栏（管理层/集体层/老人层）+ 角色状态条"
+git commit -m "feat(kiosk): 左侧层级栏（管理层/集体层/老人层）+ 状态条角色徽标"
 ```
 
 ---
@@ -2309,25 +3282,351 @@ git commit -m "feat(kiosk): 左侧层级栏（管理层/集体层/老人层）+ 
 ### 任务 14：前端 —— admin 登录门与两个新页签
 
 **文件：**
-- 修改：`frontend/packages/admin/src/App.vue`（登录门 + Header 身份）
-- 创建：`frontend/packages/admin/src/pages/RolesPage.vue`（身份与权限：策略矩阵只读 + 口令设置）
-- 创建：`frontend/packages/admin/src/pages/WardsPage.vue`（病房管理：列表/新建/记录房间区域/归入老人）
+- 修改：`frontend/packages/admin/src/App.vue`（登录门 + `tabs` 数组加两项 + Header 身份）
+- 创建：`frontend/packages/admin/src/pages/RolesPage.vue`（身份与权限）
+- 创建：`frontend/packages/admin/src/pages/WardsPage.vue`（病房管理）
+- 修改：`frontend/packages/admin/src/pages/RegisterPage.vue`（注册向导加「病房」下拉）
 
-- [ ] **步骤 1：实现**
-  - `App.vue`：`onMounted` 调 `getSession("admin")`；`role !== "admin"` 且 `auth_required` → 只渲染登录卡；`auth_required === false` → 直接进入并在顶部渲染红条「当前无口令保护」。
-  - `RolesPage.vue`：`GET /api/policy/roles` 渲染三行（角色/提示词文件/工具白名单/数据范围/是否读病房上下文）；口令区两个按钮：改口令（旧+新）、开关口令门（`setAdminAuth`）。
-  - `WardsPage.vue`：`GET /api/wards` 列表；「新建病房」输入 uid/名称调 `POST /api/wards`；「记录当前房间为病房区域」调 `POST /api/wards/{uid}/zone`，失败时展示后端返回的 `error`（拿不到位姿/未设当前地图）。便捷入口生成的是以当前位置为中心、半径 `ward_zone_default_r` 的 **16 边形近似区域**（写入 `zones` 表 `kind='ward'`，并回填 `profiles.zone_id`）；**精确形状请到地图编辑器里画多边形**（`/mapeditor`），本页只做关联。
+> 落点核实：admin 页签注册唯一位置 = `App.vue:14-23` 的 `tabs` 数组 + 模板 `v-else-if`；admin **目前没有任何登录/鉴权代码**；`RegisterPage.vue` 用本地 `json()` 裸 fetch，不走 shared。
 
-- [ ] **步骤 2：构建验证**
+- [ ] **步骤 1：`App.vue` 登录门 + 新页签**
+
+```ts
+import { getSessionUser, login, logout, type SessionUser } from "shared";
+import RolesPage from "./pages/RolesPage.vue";
+import WardsPage from "./pages/WardsPage.vue";
+
+const session = ref<SessionUser | null>(null);
+const pw = ref("");
+const loginErr = ref("");
+const loading = ref(true);
+
+const tabs = [
+  { id: "overview", label: "监控总览" },
+  { id: "register", label: "老人注册" },
+  { id: "chat", label: "对话" },
+  { id: "memories", label: "记忆" },
+  { id: "reminders", label: "提醒" },
+  { id: "wards", label: "病房管理" },        // 新增
+  { id: "tools", label: "工具日志" },
+  { id: "voice", label: "语音状态" },
+  { id: "roles", label: "身份与权限" },      // 新增
+  { id: "settings", label: "设置" },
+];
+
+async function loadSession() {
+  try { session.value = await getSessionUser("admin"); } finally { loading.value = false; }
+}
+
+async function doLogin() {
+  loginErr.value = "";
+  const r = await login(pw.value || null, "admin");
+  if (!r.ok) { loginErr.value = r.error ?? "登录失败"; return; }
+  await loadSession();
+}
+
+async function doLogout() { await logout("admin"); await loadSession(); }
+
+onMounted(loadSession);
+```
+
+模板骨架（登录门 + 常驻警示 + Header）：
+
+```vue
+<template>
+  <div v-if="loading" class="gate">载入中…</div>
+
+  <div v-else-if="session && session.role !== 'admin'" class="gate">
+    <h3>🛡 管理员登录</h3>
+    <p v-if="!session.auth_required" class="warn">当前口令门已关闭，直接点「进入」即可（建议尽快开启）</p>
+    <input v-if="session.auth_required" v-model="pw" type="password" placeholder="管理员口令"
+           @keyup.enter="doLogin" />
+    <button @click="doLogin">进入</button>
+    <p v-if="loginErr" class="warn">{{ loginErr }}</p>
+  </div>
+
+  <div v-else>
+    <header class="topbar">
+      <strong>陪护机器人 · 管理台</strong>
+      <span class="who">🛡 管理员<span v-if="session?.ttl_remain != null">（剩 {{ Math.floor(session.ttl_remain / 60) }} 分）</span></span>
+      <button @click="doLogout">退出</button>
+    </header>
+    <div v-if="session && !session.auth_required" class="redbar">⚠️ 当前无口令保护，任何人都能进管理台</div>
+
+    <nav class="tabs">
+      <button v-for="t in tabs" :key="t.id" :class="{ active: active === t.id }"
+              @click="active = t.id">{{ t.label }}</button>
+    </nav>
+
+    <OverviewPage v-if="active === 'overview'" />
+    <RegisterPage v-else-if="active === 'register'" />
+    <ChatPage v-else-if="active === 'chat'" />
+    <MemoriesPage v-else-if="active === 'memories'" />
+    <RemindersPage v-else-if="active === 'reminders'" />
+    <WardsPage v-else-if="active === 'wards'" />
+    <ToolLogPage v-else-if="active === 'tools'" />
+    <VoiceStatusPage v-else-if="active === 'voice'" />
+    <RolesPage v-else-if="active === 'roles'" />
+    <SettingsPage v-else-if="active === 'settings'" />
+  </div>
+</template>
+```
+
+（`<style>` 里补 `.gate/.topbar/.who/.redbar/.tabs` 的基础样式即可；`.tabs` 沿用现有页签样式。）
+
+- [ ] **步骤 2：`pages/RolesPage.vue`（策略矩阵只读 + 口令设置）**
+
+```vue
+<script setup lang="ts">
+import { onMounted, ref } from "vue";
+import { changePassword, getAdminAuth, setAdminAuth } from "shared";
+
+const roles = ref<Record<string, any>>({});
+const authRequired = ref(true);
+const oldPw = ref(""); const newPw = ref(""); const msg = ref("");
+const ttl = ref(300); const wardWindow = ref(10);
+
+async function load() {
+  const [p, a, s] = await Promise.all([
+    fetch("/api/policy/roles", { headers: { "X-Surface": "admin" } }).then(r => r.json()),
+    getAdminAuth("admin"),
+    fetch("/api/settings", { headers: { "X-Surface": "admin" } }).then(r => r.json()),
+  ]);
+  roles.value = p ?? {}; authRequired.value = a.required;
+  ttl.value = s.admin_session_ttl_s ?? 300; wardWindow.value = s.ward_context_window ?? 10;
+}
+
+async function savePw() {
+  msg.value = "";
+  const r = await changePassword(oldPw.value, newPw.value, "admin");
+  msg.value = r.ok ? "✅ 口令已更新" : `❌ ${r.error}`;
+  if (r.ok) { oldPw.value = ""; newPw.value = ""; }
+}
+
+async function toggleAuth() {
+  const r = await setAdminAuth(!authRequired.value, "admin");
+  authRequired.value = r.required;
+  msg.value = r.required ? "口令门已开启" : "口令门已关闭（当前无保护）";
+}
+
+async function saveLimits() {
+  await fetch("/api/settings", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Surface": "admin" },
+    body: JSON.stringify({ admin_session_ttl_s: Number(ttl.value),
+                           ward_context_window: Number(wardWindow.value) }),
+  });
+  msg.value = "✅ 已保存";
+}
+
+onMounted(load);
+</script>
+
+<template>
+  <section class="page">
+    <h3>身份与权限</h3>
+    <table>
+      <thead><tr><th>角色</th><th>提示词片段</th><th>工具白名单</th><th>数据范围</th><th>读病房上下文</th></tr></thead>
+      <tbody>
+        <tr v-for="(pol, role) in roles" :key="role">
+          <td>{{ role }}</td>
+          <td class="mono">{{ pol.prompt_file }}</td>
+          <td class="mono">{{ pol.allowed_tools === null ? "全部" : (pol.allowed_tools.join(", ") || "无") }}</td>
+          <td>{{ pol.data_scope }}</td>
+          <td>{{ pol.ward_context ? "是" : "否" }}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>口令设置</h4>
+    <p v-if="!authRequired" class="warn">⚠️ 口令门当前是关的：任何人点「管理层」都能进</p>
+    <div class="row">
+      <input v-model="oldPw" type="password" placeholder="旧口令" />
+      <input v-model="newPw" type="password" placeholder="新口令（≥4 位）" />
+      <button @click="savePw">改口令</button>
+      <button @click="toggleAuth">{{ authRequired ? "关闭口令门" : "开启口令门" }}</button>
+    </div>
+
+    <h4>可调项</h4>
+    <div class="row">
+      <label>管理员会话时效(秒) <input v-model.number="ttl" type="number" /></label>
+      <label>病房上下文条数 <input v-model.number="wardWindow" type="number" /></label>
+      <button @click="saveLimits">保存</button>
+    </div>
+    <p v-if="msg">{{ msg }}</p>
+  </section>
+</template>
+```
+
+- [ ] **步骤 3：`pages/WardsPage.vue`（病房管理）**
+
+```vue
+<script setup lang="ts">
+import { onMounted, ref } from "vue";
+import { assignElderWard, listWards, recordWardZone, upsertWard, type Ward } from "shared";
+
+const wards = ref<Ward[]>([]);
+const elders = ref<{ uid: string; name?: string; nickname?: string; ward_id?: string }[]>([]);
+const newUid = ref(""); const newName = ref("");
+const bindMap = ref(""); const bindZone = ref("");
+const msg = ref(""); const err = ref("");
+
+async function load() {
+  const [w, p] = await Promise.all([
+    listWards("admin"),
+    fetch("/api/profiles", { headers: { "X-Surface": "admin" } }).then(r => r.json()),
+  ]);
+  wards.value = w.wards ?? [];
+  elders.value = (p.profiles ?? []).filter((x: any) => (x.kind ?? "elder") === "elder");
+}
+
+async function create() {
+  err.value = "";
+  if (!newUid.value.trim()) { err.value = "请填病房 uid（如 ward_101）"; return; }
+  const r = await upsertWard(newUid.value.trim(), newName.value, "", "", "admin");
+  if (!r.ok) { err.value = r.error ?? "创建失败"; return; }
+  newUid.value = ""; newName.value = ""; await load();
+}
+
+/** 精确形状（多边形/矩形）在 /mapeditor 里画；这里只做「关联」到已存在的区域 uid。 */
+async function bind(w: Ward) {
+  err.value = "";
+  if (!bindMap.value.trim() || !bindZone.value.trim()) {
+    err.value = "地图名与区域 uid 都要填（区域 uid 到地图编辑器的区域列表里抄）";
+    return;
+  }
+  const r = await upsertWard(w.uid, w.name, bindMap.value.trim(), bindZone.value.trim(), "admin");
+  msg.value = r.ok ? "✅ 已关联区域" : `❌ ${r.error}`;
+  await load();
+}
+
+/** 便捷入口：以小车当前位姿为圆心 + ward_zone_default_r 半径，采样 16 边形写进该图 tags.json。 */
+async function markHere(w: Ward) {
+  err.value = "";
+  const r = await recordWardZone(w.uid, "admin");
+  if (!r.ok) { err.value = r.error ?? "记录失败"; return; }
+  msg.value = `✅ 已记下 ${r.map} / ${r.zone_uid}`;
+  await load();
+}
+
+async function assign(elderUid: string, wardId: string) {
+  await assignElderWard(elderUid, wardId, "admin");
+  await load();
+}
+
+onMounted(load);
+</script>
+
+<template>
+  <section class="page">
+    <h3>病房管理（集体层）</h3>
+    <p class="hint">一个病房 = 一个"病房用户"（uid 形如 ward_101）。区域几何的真相在地图文件夹的
+      &lt;图名&gt;.tags.json：便捷入口按当前位姿生成 16 边形近似圆，**精确形状请到
+      <a href="/mapeditor/" target="_blank">地图编辑器</a> 画多边形/矩形**（类型选「ward 病区」），
+      本页只负责把病房关联到那个区域。</p>
+
+    <div class="row">
+      <input v-model="newUid" placeholder="uid（ward_101）" />
+      <input v-model="newName" placeholder="名称（101 病房）" />
+      <button @click="create">新建病房</button>
+    </div>
+
+    <table>
+      <thead><tr><th>uid</th><th>名称</th><th>关联区域</th><th>归属老人</th><th>操作</th></tr></thead>
+      <tbody>
+        <tr v-for="w in wards" :key="w.uid">
+          <td class="mono">{{ w.uid }}</td>
+          <td>{{ w.name }}</td>
+          <td class="mono">
+            <template v-if="w.zone">{{ w.ward_map }} / {{ w.ward_zone }}（{{ w.zone.name }}）</template>
+            <template v-else>未关联</template>
+          </td>
+          <td class="mono">{{ w.elders.join(", ") || "—" }}</td>
+          <td>
+            <button @click="markHere(w)">记录当前房间为病房区域</button>
+            <button @click="bind(w)">关联已画区域</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>关联已画好的区域</h4>
+    <p class="hint">先在上一列填好「地图名 + 区域 uid」（区域在地图编辑器里画好后从它的列表里抄 uid），
+      再点目标病房那一行的「关联已画区域」。</p>
+    <div class="row">
+      <input v-model="bindMap" placeholder="地图名（my_map）" />
+      <input v-model="bindZone" placeholder="区域 uid（z1）" />
+    </div>
+
+    <h4>老人归属</h4>
+    <table>
+      <thead><tr><th>老人</th><th>当前病房</th><th>改为</th></tr></thead>
+      <tbody>
+        <tr v-for="e in elders" :key="e.uid">
+          <td>{{ e.nickname || e.name || e.uid }}</td>
+          <td class="mono">{{ wards.find(w => w.elders.includes(e.uid))?.uid || "—" }}</td>
+          <td>
+            <select @change="assign(e.uid, ($event.target as HTMLSelectElement).value)">
+              <option value="">（移出病房）</option>
+              <option v-for="w in wards" :key="w.uid" :value="w.uid">{{ w.name || w.uid }}</option>
+            </select>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p v-if="msg">{{ msg }}</p>
+    <p v-if="err" class="warn">{{ err }}</p>
+  </section>
+</template>
+```
+
+> 后端的 `upsert_ward` 约定"空串 = 保持原值"，所以改名不会把已有区域关联清掉；
+> 要**清空**关联走 `db.set_ward_zone(uid, "", "")`（验收 §11.13 用到）。
+
+- [ ] **步骤 4：`RegisterPage.vue` 加病房归属**
+
+在 step1（基本信息）表单里加一个下拉，并在 `saveProfile()` 成功后调用归属接口（**记得把 `watch` 加进 `vue` 的 import**，第 1 行原本只有 `onMounted, ref`）：
+
+```ts
+const wards = ref<{ uid: string; name: string }[]>([]);
+const wardId = ref("");
+
+// onMounted 里补：
+fetch("/api/wards", { headers: { "X-Surface": "admin" } })
+  .then(r => r.json()).then(b => { wards.value = b.wards ?? []; });
+
+// 【按床位号自动建议病房】bed="101-2" → 建议 ward_101（可改）
+watch(bed, (v) => {
+  const m = /^(\d+)/.exec((v || "").trim());
+  if (m) wardId.value = `ward_${m[1]}`;
+});
+
+// saveProfile() 末尾补：
+if (wardId.value) {
+  await json(`/api/profiles/${encodeURIComponent(uid.value)}/ward`,
+             { method: "POST", body: { ward_id: wardId.value } });
+}
+```
+
+模板（step1）加：
+
+```vue
+    <label>病房
+      <select v-model="wardId">
+        <option value="">（暂不指定）</option>
+        <option v-for="w in wards" :key="w.uid" :value="w.uid">{{ w.name || w.uid }}</option>
+      </select>
+    </label>
+```
+
+- [ ] **步骤 5：构建验证 + Commit**
 
 运行：`cd frontend && pnpm --filter admin build && pnpm --filter kiosk build`
-预期：两个包均构建成功
-
-- [ ] **步骤 3：Commit**
+预期：两个包均构建成功、无 TS 报错
 
 ```bash
 git add frontend/packages/admin
-git commit -m "feat(admin): 登录门 + 身份与权限页签 + 病房管理页签"
+git commit -m "feat(admin): 登录门 + 身份与权限页签 + 病房管理页签 + 注册向导加病房归属"
 ```
 
 ---
@@ -2335,32 +3634,77 @@ git commit -m "feat(admin): 登录门 + 身份与权限页签 + 病房管理页�
 ### 任务 15：文档、降级自检与端到端验收
 
 **文件：**
-- 修改：`AGENTS.md`（「LLM/ 后端」模块表加 `session.py`/`policy.py`/`locator.py`/`prompt/`；「关键约定」补 R1–R5）
+- 修改：`AGENTS.md`（「LLM/ 后端」模块表加 `session.py`/`policy.py`/`zonegeo.py`/`prompt/`；「关键约定」补角色闸门与红线 R1–R5）
 - 修改：`docs/log.md`（按日期追加本次实现）
 - 修改：`docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（状态改「已实现 P0」）
 
-- [ ] **步骤 1：跑规格 §11 的 12 条验收**（全部本机，不用动车）
+- [ ] **步骤 1：跑规格 §11 的 16 条验收（全部本机，**不用动车、不用板卡**）**
 
-逐条执行并把结果记到 `docs/log.md`，其中：
-- 第 13-16 条（病房自动切换）用 `locator.set_pose_for_test()` 在 Python 交互里注入位姿，观察 `GET /api/session/user` 的 `ward_uid` 与审计 `ward_change`；
-- 第 15 条额外验证：把设置里 `rosbridge_url` 置空 → `autoswitch.enabled == false`，对话仍正常。
+起后端（项目根目录）：
+```bash
+.venv\Scripts\python.exe -m uvicorn LLM.server:app --host 0.0.0.0 --port 8000
+```
+借助 `X-Surface` 模拟两端；借助 `POST /api/mapeditor/pose/inject` 注入假位姿与假地图（无 ROS 也能验）：
+
+| 验收项 | 怎么验（本机） | 判据 |
+|---|---|---|
+| §11.1 三层可切 | 先 `POST /api/wards {"uid":"ward_101","name":"101 病房"}`（admin 槽），再 `GET /api/session/user`（kiosk 槽） | 返回 `role` 随主体在 `ward`/`elder` 间切；前端层级栏三组可见 |
+| §11.2 口令门 | 连发 3 次错口令再发正确口令 | 第 4 次返回 `ok:false`（冷却），审计有 `session_login_fail`；等 10s 后正确口令可进 |
+| §11.3 口令可改可关 | 改口令 → 旧口令失效；关口令门 → 无口令直接进且 `source=auth_disabled`；开回来 → 需口令 | 审计 `admin_password_changed` / `admin_auth_changed` |
+| §11.4 R1 | `POST /api/session/user` 带 `"role":"admin"` | HTTP 400 |
+| §11.5 集体层无个人数据 | 给老人填 `notes="糖尿病"` → `GET /api/context?uid=ward_101` | 返回的 System Prompt 里**不含**"糖尿病"，但含本病房最近对话 |
+| §11.6 R5 单向 | 集体层说"明天九点体检" → 切到该老人 | 老人 System Prompt 含这条；反向：老人私聊内容**不出现**在 `ward_101` 的后续上下文 |
+| §11.7 跨病房隔离 | 102 老人上下文 | 不含 `ward_101` 的任何消息 |
+| §11.8 TTL | 把 `admin_session_ttl_s` 调成 20 秒，登录后等过期 | 审计 `session_expired`，再发管理请求得 403 |
+| §11.9 双槽隔离 | admin 槽登录 → 查 kiosk 槽 | kiosk 槽 `role` 仍是 `ward`/`elder` |
+| §11.10 管理员语音 | kiosk 槽登录管理员后调 `_apply_role_subject("elder_001")` | 主体不变（`role=admin`），审计 `voiceprint_ignored_in_admin` |
+| §11.11 未识别默认态 | kiosk 槽主体为空时发 `/api/chat` | System Prompt 里无任何老人档案，角色是集体层 |
+| §11.12 不破坏既有 | `POST /api/alarm`（任何角色）；`python -c "import LLM.server"` | 报警 `ok:true`；import 成功 |
+| §11.13 按位置自动切病房 | `maptags.upsert_zone("my_map", {"name":"102","kind":"ward","polygon":[[17,-3],[23,-3],[23,3],[17,3]]})` → 取回 `uid` 写进 `ward_102`；`POST /api/mapeditor/pose/inject {"x":20,"y":0,"yaw":0,"width":100,"height":100,"resolution":0.05,"origin":[0,0,0]}`；设置 `ward_map_source="setting"` + `current_map="my_map"` | 3 秒后 `GET /api/session/user` 的 `ward_uid=ward_102`，审计 `ward_change source=location`；把位姿挪到 `(99,99)` 后**不变** |
+| §11.14 不打断私聊 | 上一步之前先把 kiosk 切到某位 101 的老人 | 主体不动（仍 `elder`），但 `ward_uid` 已变 `ward_102`；退出私聊回集体层即 `ward_102` |
+| §11.15 位置源不可用即降级 | 设置里把 `ward_autoswitch_enabled` 关掉（或让指纹认不出） | `/api/session/user` 的 `autoswitch.enabled=false`、reason 明确；对话照常无报错 |
+| §11.16 手动覆盖 | 手动把当前病房设为 `ward_101` 后再注入 `ward_102` 位姿 | 10 分钟内不抢（仍 `ward_101`），`autoswitch.reason="manual_override"` |
+
+把结果逐条记进 `docs/log.md`。
 
 - [ ] **步骤 2：降级自检**
 
-运行：`.venv\Scripts\python.exe -c "import LLM.server; print('import ok')"`
-预期：`import ok`（可选依赖缺失也不许炸；新代码不得有顶层硬 import `websocket` 之外的第三方）
+```bash
+.venv\Scripts\python.exe -c "import LLM.server; print('import ok')"
+.venv\Scripts\python.exe -c "from LLM import zonegeo, policy, session; print('modules ok')"
+```
+预期：两行都打印 ok（**新代码不得引入顶层硬 import 第三方库**；`zonegeo`/`policy`/`session` 只依赖 stdlib 与仓内模块）。
 
-- [ ] **步骤 3：Commit**
+- [ ] **步骤 3：改 AGENTS.md 与规格状态**
+
+`AGENTS.md` 的「LLM/ 后端」模块表补四行（`session.py` / `policy.py` / `zonegeo.py` / `prompt/`），「关键约定」补一段：
+
+```markdown
+7. **角色闸门与红线（2026-09-14 分层用户体系）**：前端传上来的 role 一律不可信（R1）——uid→role
+   只由 `session.derive_role()` 按 `profiles.kind` 推导；未知 ≈ 集体层最小能力（R2）；急停/呼救
+   永远放行（R3）；医疗写入红线与角色无关（R4）；层级上下文单向（R5）。业务接口按请求头
+   `X-Surface: kiosk|admin` 取 principal。**病房区域几何的唯一真相是地图文件夹的
+   `<图名>.tags.json`，`brain.db.zones` 只是只读缓存；`profiles` 只记（地图名 + 区域 uid）。**
+```
+
+`docs/superpowers/specs/2026-09-14-layered-user-roles-design.md` 头部状态改「**已实现 P0（2026-09-14）**」，并把本文档路径标为"实现计划（v2，已执行）"。
+
+- [ ] **步骤 4：跑全量测试 + 最终 Commit**
 
 ```bash
+.venv\Scripts\python.exe -m pytest LLM/tests tests -q
+# 预期：通过数 = 191 + 本次新增（约 60 项）；红态仍是那 4 个既有的
+cd frontend && pnpm test && pnpm -r build
 git add AGENTS.md docs/log.md docs/superpowers/specs/2026-09-14-layered-user-roles-design.md
-git commit -m "docs: 分层用户体系 P0 实现日志 + AGENTS 红线 R1-R5"
+git commit -m "docs: 分层用户体系 P0 实现日志 + AGENTS 红线 R1-R5 与角色闸门"
 ```
 
 ---
 
 ## 交付说明
 
-- 本计划覆盖规格的 **P0**（用户系统）。规格 §6.3 动作分级、§7 地点白名单/`robot_goto`/二次确认为 **P1 暂缓**（用户 2026-09-14：先不管 MCP）。
-- 全程**不需要动车、不需要板卡**：病房自动切换用注入假位姿验证；真机联调（rosbridge 实际位姿）留到 MCP/导航线重启后一并做。
+- 本计划覆盖规格 **P0（用户系统）**。规格 §6.3 动作分级、§7 地点白名单 / `robot_goto` / 二次确认属 **P1 暂缓**（用户 2026-09-14：「先不管 mcp，先完成用户系统」）。
+- **全程不需要动车、不需要板卡**：病房自动切换用注入假位姿验证；真机联调（rosbridge 实位姿 + 真地图指纹）留到 MCP/导航线重启后一并做。
+- **每完成一个任务就 commit**（计划里每任务末尾都给了 commit 命令），不要攒大提交。
+- 动手前的三条提醒（来自规格 §14）：① 先跑一次基线命令认下那 4 个既有红态；② 任何"改标记"的接口都必须是「改 `<图名>.tags.json` → `maptags.sync_map()` 刷缓存 → 审计」三步，**禁止只改 SQLite**；③ 病房自动切换的一切路径都要能"拿不到就不切"。
 - 验收通过后，把 P1 的动作约束按规格 §7 另立计划。

@@ -1,6 +1,7 @@
 # 分层用户体系设计（管理层 / 集体层 / 老人层）
 
-> 日期：2026-09-14（含当晚用户追加需求：集体层=病房用户、口令可改可关、MCP 暂缓）｜ 状态：待用户审查 ｜ 范围：后端会话与权限层 + 提示词分层 + 前端层级切换 + 集体层（病房用户）
+> 日期：2026-09-14（含当晚用户追加需求：集体层=病房用户、口令可改可关、MCP 暂缓）｜ **2026-09-14 二次复审修订**（结论与逐条处置见 **§14**：修正与代码现状的 7 处冲突——病房区域几何载体、位置源配置项、`locator.py` 已存在、`profiles` 关联列、地点真相载体、`db` 既有函数签名、测试基线）｜ 状态：已复审，P0 待实施 ｜ 范围：后端会话与权限层 + 提示词分层 + 前端层级切换 + 集体层（病房用户）
+> P0 实现计划（可直接照着写代码的那一份）：`docs/superpowers/plans/2026-09-14-layered-user-roles.md`（2026-09-14 二次修订版，15 任务 TDD）。
 > 关联：`docs/superpowers/specs/2026-08-27-frontend-multi-end-design.md`（D11 手动选择+锁定模式，本设计在其上扩展「角色」维度）、
 > `docs/superpowers/specs/2026-08-22-voice-pipeline-design.md`（声纹识别产出 uid，本设计消费它）、
 > `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`（老人档案与声纹注册，本设计在同一张 `profiles` 表上扩展 `kind='ward'`）、
@@ -69,7 +70,7 @@
 | D14 | 集体层 ↔ 老人层上下文 | **单向可读**（红线 R5）：老人可读**本病房**集体层最近 N 条；私聊不回灌集体层；跨病房不可读。老人→病房归属由 `profiles.ward_id` 决定 |
 | D15 | 前端层级切换 | 「换人」按钮 → **左侧层级栏**列出 管理层 / 集体层 / 老人层 及其主体；前端只传主体 uid，**role 由后端推导**（守住 R1） |
 | D16 | 本轮范围 | 用户 2026-09-14 明确「**先不管 mcp，先完成用户系统**」：本轮只做 §10 的 P0（角色地基 + 集体层 + 提示词分层 + 层级 UI + 病房自动切换）；依赖 car MCP 的**地点白名单 / `robot_goto` / 二次确认**（原 P1）**暂缓**，待 MCP 线重启再做 |
-| D17 | 「当前在哪个病房」 | **按小车位置自动切**（用户 2026-09-14 选定 B）：`LLM/locator.py` 取小车在当前地图中的位姿 → 命中病房 zone（一期 `zones` 表里 `kind='ward'` 的多边形，米坐标，**点在多边形内**判定）即为当前病房 → 跨病房自动切集体层。位置源走 **rosbridge（websocket，非 MCP）**，与 D16 不冲突；拿不到位姿、`zones` 表不存在、或本图没画病房区域时，自动切换同样停用、退回手动，绝不阻塞对话、绝不误判 |
+| D17 | 「当前在哪个病房」 | **按小车位置自动切**（用户 2026-09-14 选定 B）：取小车在当前地图中的位姿 → 命中病房区域（`<图名>.tags.json` 里 `kind='ward'` 的多边形，米坐标，**点在多边形内**判定；`brain.db.zones` 只是只读索引缓存）即为当前病房 → 跨病房自动切集体层。位置源走 **rosbridge（websocket，非 MCP）**，与 D16 不冲突。**复审补注（2026-09-14）**：① 位置源**复用一期已落地的** `LLM/locator.py` + `LLM/roslink.py`（`get_pose()`/`available()`），**不是**本设计新增的模块；② rosbridge 地址是 `conf.ROSBRIDGE_URL`（模块级常量，环境变量 `ROSBRIDGE_URL` 可改），**不进 settings 表**（`set_settings` 白名单不含它）——「一键停用自动切病房」改用新增设置项 `ward_autoswitch_enabled`（默认 `True`）；③ **「车此刻在跑哪张图」以 `/map` 四项指纹反查（`locator.current_map()`）为准**，认不出（`source != "map_topic"`）时**一律不判命中**（fail-safe：宁可不切，也不误切）；`settings.current_map` 是"下次启导航用哪张图"的目标值，仅当把 `ward_map_source` 显式设为 `"setting"` 时才拿它当判定依据；④ 拿不到位姿 / 认不出当前图 / 本图没有 `kind='ward'` 区域 / 该病房未关联区域 → 自动切换停用、退回手动，绝不阻塞对话、绝不误判 |
 | D18 | 自动切换的克制规则 | 位置只驱动**「当前病房」这个背景变量**；仅当 kiosk 槽为 `ward` 且未锁定才真正改会话主体——**正在老人私聊时绝不抢会话**；声纹认出老人时把当前病房**跟随**到该老人的病房（用户 2026-09-14 选定 A）；手动切病房后 10 分钟内位置判定不覆盖 |
 
 ## 3. 核心模型
@@ -94,7 +95,8 @@ Principal = {
 - 老人通过 `profiles.ward_id`（新增字段，指向病房 uid）归属病房；**一个老人只属于一个病房**。
 - 归属建议：注册向导里按 `bed`（床位号）自动建议病房号（如 `bed="101-2"` → 建议 `ward_101`，可改），也可手动指定。
 - 声纹识别到某位老人 → 从集体层切到该老人的 `elder` 会话（现有声纹链路，§4.3）。
-- 每个病房用户还有一块**地图区域**，用于"小车在哪个病房"的位置判定（§4.5）。**几何的唯一真相在一期的 `zones` 表**（`2026-09-14-map-editor-design.md` §4.2：多边形/矩形、米坐标、可多层级），`profiles` 只存引用 `zone_id`（`0`=未关联），**不复制几何**——两处几何并存必然打架。
+- 每个病房用户还有一块**地图区域**，用于"小车在哪个病房"的位置判定（§4.5）。**几何的唯一真相是地图文件夹里的 `<图名>.tags.json`**（`2026-09-14-map-editor-design.md` §4.1 与 §〇 第 7 条：多边形/矩形、米坐标、层级用 `parent` 的 uid；`brain.db.zones` 只是**只读索引缓存**，严格单向、可丢弃可重建）。`profiles` 只记 **`ward_map`（地图名）+ `ward_zone`（区域 uid，形如 `z1`）** 两列，**不复制几何**——两处几何并存必然打架。解析几何一律走 `maptags.get_zone(map_name, uid)`，**不要**用 `db.get_zone(uid)`（只按 uid 查，三张图会串）。
+  > **口径变更史（勿用中间版本）**：① `profiles.zone_json`（存圆）→ ② 独立 `zones` 表自增 `id`（`profiles.zone_id`）→ ③ **最终：`<图名>.tags.json` + `(地图名, 区域 uid)`**。① ② 均已作废；`zone_id` / `zone_json` 这两个名字在代码里**从未落地过一行**（grep 确认），所以**没有迁移负担**。
 
 ### 3.2 角色策略包（Policy）
 
@@ -162,6 +164,7 @@ tick()                                # 定时（沿用 bus/reminder 线程或 l
 | `GET|POST /api/session/admin-auth`（新增） | 读/写 `admin_auth_required`（**口令门的开关**，D13）；关闭需 admin 身份，落审计 |
 | `GET|POST /api/wards`（新增） | 病房用户列表/新建（`kind='ward'` 的 profile）；`POST` 可带 `{name, ward_uid}` |
 | `GET /api/policy/roles`（新增） | 返回策略矩阵（`admin` 可见全量，其它角色只拿到自己那份摘要） |
+| `GET /api/profiles` | **默认只列 `kind='elder'`**（新增 `?kind=` 查询参数，传 `all` 才全量）。理由：病房用户不能混进前端的"老人列表"（记忆页/对话页/注册页下拉、车前屏换人弹层都吃这个接口）；要看病房用 `/api/wards` |
 
 口令校验：`hashlib.pbkdf2_hmac("sha256", pw, salt, 200_000)`，盐与哈希存 `settings` 表（key `admin_password_hash` / `admin_password_salt`，**不落明文**）；初始口令见 D12。防暴力：连续 3 次失败 → 该槽冷却 10s。
 
@@ -209,16 +212,18 @@ def derive_role(uid, *, slot, admin_logged_in=False) -> str:
 
 - **防抖**：连续 3 次 tick（≈3s）落在同一病房才认；离开病房区（进走廊/未知区域）**不切**，保持上一病房。
 - **不抢私聊**：仅当 kiosk 槽 `role == "ward"` 且 `locked == False` 时，自动切换才真正改会话主体（切到新病房的集体层）。若正处在 `elder` 私聊中或已锁定 → **只更新"当前病房"背景变量**并广播 `ward_changed`，会话主体不动；退出私聊/解锁回集体层时自然用上新病房。
-- 任何来源的切换都广播 `ward_changed`（含 `source = location|manual|follow`）并落审计 `ward_change`。
+- 任何来源的切换都广播 `ward_changed`（载荷 `{uid, action}`，`action = location|manual|upsert|zone|assign`）并落审计 `ward_change`。**"跟随老人"不单独广播 `ward_changed`**：它随 `user_changed` 一起体现（`set_subject` 里同步当前病房），避免同一件事广播两条。
 
-位姿来源与降级（`LLM/locator.py`）：
+位姿来源与降级（**复用一期已落地的 `LLM/locator.py` + `LLM/roslink.py`，P0 不新写位置源**）：
 
-- 首选 **rosbridge**（`ws://<板卡>:9090`，即板卡上 `~/tools/nav_screen.sh lat` 起的那个会话）订阅 `/amcl_pose`（map 系；AMCL 只在位移 ≥0.25m 或转角 ≥0.2rad 时发布，判"进没进病房"足够）。**这是 websocket，不是 MCP**，与 D16「先不管 MCP」不冲突；依赖 `websocket-client`（`asr_cloud.py` 已在用，**不新增外部依赖**）。
+- 位姿来自 rosbridge（`ws://<板卡>:9090`，即板卡上 `~/tools/nav_screen.sh lat` 起的那个会话）订阅 `/amcl_pose`（map 系，米 + 弧度；AMCL 只在位移 ≥0.25m 或转角 ≥0.2rad 时发布，判"进没进病房"足够）。**这是 websocket，不是 MCP**，与 D16「先不管 MCP」不冲突。地址取 `conf.ROSBRIDGE_URL`（默认 `ws://100.65.82.93:9090`，环境变量 `ROSBRIDGE_URL` 可覆盖）——**不是 settings 表项**。
+- 现成接口口径（已实现，直接调用，不要重写）：`locator.get_pose() -> dict|None`（`{x, y, yaw(弧度), source, at, suspect}`，拿不到 = `None`）、`locator.available() -> (bool, reason)`、`locator.current_map() -> {ok, source, name, detail}`、`locator.set_pose_for_test(x, y, yaw)`（已有，供无 ROS 环境注入假位姿）。
+- **停用阀**：新增设置项 `ward_autoswitch_enabled`（默认 `True`，设置页可关）。位姿不可用 / 当前图认不出 / 缓存里没有病房区域 → 自动切换**自动停用**，UI 显示「位置未知 · 手动切病房」，会话保持当前病房不变；**不报错、不阻断对话**（沿用降级原则）。
 - 备选（可选加固，非 P0 必须）：订阅 `/tf` 自己串 `map→base_link` 拿连续位姿。
-- **拿不到位姿**（rosbridge 没起 / 未定位 / 超时）→ 自动切换**自动停用**，UI 显示「位置未知 · 手动切病房」，会话保持当前病房不变；**不报错、不阻断对话**（沿用降级原则）。
-- locator **必须可注入假位姿**（`locator.set_pose_for_test()` 或构造注入），使本机无 ROS 环境也能跑单测与验收（§11.13-15）。
 
-病房 zone 的录入走两条路，**都落一期的 `zones` 表**（`map_name` = 当前地图、`kind='ward'`、`shape='polygon'`、`polygon_json` 为米坐标）：① **便捷入口**——管理员在「病房管理」页点「记录当前房间为病房区域」→ 取 locator 当前位姿作圆心 + 半径 `ward_zone_default_r`（3m，可调），**采样成 16 边形**写入（近似圆；这样"半径"语义与设置项名一致，判定里不必特判圆），落库前校验该点在地图有效范围内（复用 `ros2_car/tools/where_am_i.py` 的边界余量口径），拿不到位姿时 → 提示先起定位/rosbridge；② **精确形状**——到地图编辑器（`/mapeditor`）画多边形/矩形，病房管理页只负责把病房**关联**到该 `zones.id`。
+病房的区域录入走两条路，**都落一期的 `<图名>.tags.json`**（`LLM/maptags.py`：`kind='ward'`、`shape='polygon'`、`polygon` 为 `[[x米, y米], ...]`；`brain.db.zones` 由 `maptags.sync_map()` 单向刷成只读缓存）：① **便捷入口**——管理员在「病房管理」页点「记录当前房间为病房区域」→ 取 `locator.get_pose()` 当前位姿作圆心 + 半径 `ward_zone_default_r`（3m，可调），调**现成的** `maptags.record_room_polygon(map_name, name, x, y, radius_m, kind="ward", segments=16)`（16 边形近似圆，**已有实现、目前没有 HTTP 入口**，P0 补一条 `POST /api/wards/{uid}/zone`）→ 写文件 + 刷缓存 + 把 `(地图名, 区域 uid)` 回填进 `profiles.ward_map / ward_zone`；拿不到位姿 → 返回 `ok:false` 并提示"先起定位/rosbridge，或到地图编辑器手绘"；② **精确形状**——到地图编辑器（`/mapeditor`）画多边形/矩形（`kind` 选「ward 病区」），病房管理页只负责把病房**关联**到该区域的 `uid`。
+
+**判定读哪份数据（性能约束）**：位置自动切换的 tick 约 1s 一次，**只读本地 `brain.db.zones` 只读缓存**（`db.list_zones(map_name=…, kind="ward")`）；**绝不**在 tick 里走 `maptags.get_zones()`——那条路径含 `_ensure_fresh → sync_map`，在 `MAPS_IO=ssh` 下可能秒级阻塞。缓存新鲜度由「编辑器/接口读过或写过就会刷」保证。同理，`locator.current_map()` 内部要列地图 + 逐图读元数据（可能走 SSH），**必须缓存**（TTL 10s）后再用于 tick。
 
 ## 5. 提示词分层（D9）
 
@@ -233,7 +238,7 @@ LLM/prompt/admin.md      # 管理层片段（本期新增）
 
 - `chat.py::_load_prompt_base()` **逻辑与路径不变**（继续读 `prompt.md` 的 `<!-- PROMPT -->` 之下正文、缺文件退回 `_DEFAULT_PROMPT_BASE`）。
 - 新增 `_load_role_prompt(role)`：读 `LLM/prompt/<role>.md` 全文，缺失 → 返回空串 + 告警一次（`prompt_role_missing` 审计），**不阻断对话**。
-- 装配：`build_system(principal, settings, query)` = `base` + `role_fragment` + 现有动态块（档案/记忆 → 集体上下文 → 摘要 → 语录 → 当前时间）。
+- 装配：`build_system(uid, settings, query, principal=None)` = `base` + `role_fragment` + 现有动态块（档案/记忆 → 集体上下文 → 摘要 → 语录 → 当前时间）。**`uid` 老签名保留、`principal` 新增且可选**（缺省取 kiosk 槽），这样既有调用点与测试不用改；`build_messages`/`chat_stream` 同样加可选 `principal` 透传。
 
 ### 5.2 各层片段要点（内容要点，措辞在实现时按现有 prompt.md 的笔法写）
 
@@ -264,7 +269,7 @@ LLM/prompt/admin.md      # 管理层片段（本期新增）
 
 - `tools.py::effective_tools(settings, principal)`：全局 per-tool 开关 **∩** 角色白名单。
 - 注册装饰器扩展：`@tool(name, desc, schema, enabled=True, roles=None)`（`None`=不限角色；现有工具不改则默认不限，行为兼容）。
-- MCP 工具：`MCP_SERVERS` 每项加 `roles` 字段（`car` → `{"elder","admin"}`；`fetch`/`tavily` → `{"elder","admin"}`；未声明视为 `admin` only——MCP 是不受控外部能力，默认从严）。
+- MCP 工具：`conf.MCP_SERVERS` 每项加 `roles` 字段（未声明视为 `{"admin"}`——MCP 是不受控外部能力，默认从严）。运行时经 `mcp_client.tools()[工具名]["server"]` 反查所属服务器名，再取 `MCP_SERVERS[server].get("roles")` 判定。现状：`MCP_SERVERS` 只有 `fetch` / `tavily` 两台（car 那台属 P1），故 P0 的 net 效果是「MCP 工具只给 admin」。
 - `run_tool(name, args, principal)`：执行前**再校验一次**（防绕过闸门 2 的直调点），并调用 `policy.check_action()`。
 
 ### 6.3 闸门 3：动作层（`LLM/policy.py::check_action`）
@@ -290,7 +295,9 @@ check_action(principal, tool, args) -> {"decision": "allow"|"confirm"|"deny", "r
 
 ### 7.1 数据
 
-新表 `destinations`：`name`(PK) / `goal_json`（`{x, y, yaw, frame:"map"}`）/ `risk`（`low|high`）/ `elder_allowed`(0/1) / `note` / `learned_by` / `updated_at`。
+**地点数据的唯一真相 = 地图文件夹里的 `<图名>.tags.json`**（`LLM/maptags.py`，一期已落地；字段 `uid`/`name`/`aliases`/`x`/`y`/`yaw_deg`/`risk`/`elder_allowed`/`note`/`learned_by`）。`brain.db.destinations` 只是**只读索引缓存**（复合主键 `(map_name, uid)`，`UNIQUE(map_name, name)`），唯一写入口是 `maptags.sync_map()`；**任何接口都不允许只改 SQLite 表**。
+
+> 原「新表 `destinations`：`name`(PK) / `goal_json`（`{x, y, yaw, frame:"map"}`）…」的写法**已作废**（2026-09-14，随地图标记迁到地图文件夹）。`name` 也不再是主键——稳定身份是 `uid`（`d<N>`），改名不改 uid。
 
 新设置项（`conf.DEFAULT_SETTINGS`）：`elder_destinations_enabled: True`、`elder_confirm_required: True`、`admin_session_ttl_s: 300`、`pending_action_ttl_s: 30`、`dest_point_tolerance_m: 0.3`。
 
@@ -308,7 +315,7 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
   - `admin`：可给表内地名，也可给显式 `x/y/yaw`（`explicit` 语义由"是否带坐标"表达）。
   - 解析后 MCP 侧拿到的**永远是坐标**，`destination` 只作日志/回话用。
 - **落地实现**：car_server 经既有 ROS2 服务 `robot/navigate_to`（`robot_interfaces/srv/NavigateTo`，见 `ros2_car/src/robot_navigation/robot_navigation/robot_actions.py:75`）下发 **x/y/theta**。
-  ⚠️ 已核实：该 srv 虽有 `place` 字段，但车端当前**明确拒绝** place（`robot_actions.py:179-184`「地点表后置…请改用 x/y/theta」）。故本期**不启用车端地点表**，地名→坐标唯一事实来源放在 LLM 侧 `destinations` 表（管理台可视化编辑）。将来若车端建了 place 表，只需改这一处转发。
+  ⚠️ 已核实：该 srv 虽有 `place` 字段，但车端当前**明确拒绝** place（`robot_actions.py:179-184`「地点表后置…请改用 x/y/theta」）。故本期**不启用车端地点表**；地名→坐标的唯一事实来源是**地图文件夹里的 `<图名>.tags.json`**（`LLM/maptags.py`，地图编辑器/管理台可视化编辑），`brain.db.destinations` 只是只读索引缓存。将来若车端建了 place 表，只需改这一处转发。
 - **前置条件与降级**：需导航栈在跑（`~/tools/nav_screen.sh nav <地图>`；见 `ros2_car/《建图与导航操作手册.md》`）。导航栈没起 / rclpy 不可用 / 服务超时 / 目标越界 → 返回 `{"ok": false, "error": "..."}`，模型据此回话「我现在走不了」，**绝不假装成功**（沿用 car_server 顶部注释里的 `ok/error` JSON 风格）。
 
 ### 7.3 管理接口
@@ -368,9 +375,11 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 ## 9. 数据与审计
 
-- **`profiles` 表扩展**（集体层的全部数据基础）：新增 `kind`（`'elder'|'ward'`，默认 `'elder'`）、`ward_id`（老人所属病房 uid，可空）与 `zone_id`（仅 `kind='ward'` 用：**指向一期 `zones` 表主键的引用**，`0`=未关联，**不存几何**，§4.5）；病房用户即 `kind='ward'` 的一条 profile（`uid=ward_101`、`bed` 留空、不录声纹）。旧数据迁移：现有 profiles 全部置 `kind='elder'`。
-- **新增设置项**：`admin_auth_required`（口令门，默认 True）、`admin_session_ttl_s`（默认 300）、`ward_context_window`（默认 10）、`rosbridge_url`（默认 `ws://100.65.82.93:9090`，空=停用自动切病房）、`ward_switch_debounce`（默认 3 次 tick）、`ward_zone_default_r`（默认 3.0m；**仅用于便捷入口采样 16 边形的半径**）、`manual_override_sec`（默认 600s），以及 `current_map`（**一期 §4.3 同名项**，默认 `"my_map"`；P0 先落地则先建、一期落地后复用——病房位置自动切换只认"当前地图"上的病房区域，便捷录入也按它写 `zones.map_name`）。
-- **新表**：`destinations`（§7.1）——**随 §7 暂缓，本轮不建**。
+- **`profiles` 表扩展**（集体层的全部数据基础）：新增 `kind`（`'elder'|'ward'`，默认 `'elder'`）、`ward_id`（老人所属病房 uid，可空）、`ward_map` + `ward_zone`（仅 `kind='ward'` 用：**「地图名 + 区域 uid」**，指向 `<地图名>.tags.json` 里的 `z<N>`，空=未关联，**不存几何**，§4.5）；病房用户即 `kind='ward'` 的一条 profile（`uid=ward_101`、`bed` 留空、不录声纹）。旧数据迁移：`kind` 列默认值就是 `'elder'`，`ALTER TABLE ADD COLUMN` 后旧行自动满足，**不需要写迁移代码**。
+  > **复审补注**：现状 `profiles` 连 `kind`/`ward_id` 都没有（P0 任务 1 曾实现又 revert，`zone_id` 从未落地），所以是"纯加列"。两条来自实操的教训必须守住：① **病房↔区域的关联只允许由专用函数（`upsert_ward`/`set_ward_zone`）写，`upsert_profile` 不得带上/覆盖这两个字段**——否则管理台编辑老人档案时会静默清掉病房关联；② `upsert_ward` 提权 `kind` 必须**直写 `SET kind='ward'`**，**不要**用 `COALESCE(profiles.kind, excluded.kind)` 兜底——旧行恒为 `'elder'`、兜底永不触发，会把"把已有 uid 提升成病房"变成静默失败（半状态：kind 还是 elder，区域关联却写进去了）。
+- **新增设置项**（都进 `conf.DEFAULT_SETTINGS`，否则 `set_settings` 的白名单会拒收）：`admin_auth_required`（口令门，默认 True）、`admin_session_ttl_s`（默认 300）、`ward_context_window`（默认 10）、`ward_autoswitch_enabled`（默认 True；**这是"一键停用病房自动切换"的开关**）、`ward_switch_debounce`（默认 3 次 tick）、`ward_zone_default_r`（默认 3.0m；**仅用于便捷入口采样 16 边形的半径**）、`manual_override_sec`（默认 600s）、`ward_map_source`（默认 `"auto"`：以 `/map` 指纹反查为准；`"setting"`=改用 `settings.current_map` 当判定地图）。
+  > **复审修正**：原文把 `rosbridge_url` 列为设置项——**不行**。rosbridge 地址是 `conf.ROSBRIDGE_URL` 模块级常量（环境变量 `ROSBRIDGE_URL` 可改），不在 `DEFAULT_SETTINGS` 里，`set_settings` 也拒收；"空=停用自动切病房"的功能改由 `ward_autoswitch_enabled` 承担。`current_map`（一期 §4.3 同名项，默认 `"my_map"`）**已经存在**（`conf.py:42`），P0 **不要重复添加**。
+- **新表**：**不建任何新表**。`zones` / `destinations` / `map_tags_manifest` 三张**只读索引缓存表一期已建**（`db.py:91-129`，复合主键 `(map_name, uid)`）；`destinations` 相关业务接口随 §7 暂缓。
 - **不建 `accounts` 表**（D1 轻量口径）；口令哈希放 `settings` 表（`admin_password_hash` / `admin_password_salt` / `admin_auth_required`），将来扩多账号时再建表并迁移。
 - **审计事件**（`log.py::log` 的 `event`）：`session_login`（含 `source=password|auth_disabled`）/ `session_login_fail` / `session_logout` / `session_expired` / `admin_password_generated` / `admin_password_changed` / `admin_auth_changed` / `ward_change` / `policy_deny` / `prompt_role_missing`；暂缓项对应的 `policy_confirm` / `policy_allow_dangerous` / `destination_change` 留待 §7 落地。
 - 每条策略判定至少含：`role` / `uid` / `slot` / `tool` / `decision` / `reason`。
@@ -380,7 +389,7 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 | 阶段 | 内容 | 交付物 | 预估 |
 |---|---|---|---|
-| **P0（本轮，用户指定优先）** 用户系统 | `profiles.kind/ward_id/zone_id` 迁移（`zone_id` 引用一期 `zones` 表）+ **`zones` 表最小集**（DDL + `add_zone`/`get_zone`/`list_zones`/`zone_contains_point`，与一期任务 1 同一份，先落地者建）+ `ward` 病房用户 CRUD + `session.py` 双槽主体与 TTL + 口令登录/登出/**改口令/开关口令门** + `derive_role` + **`locator.py` 位置源（rosbridge `/amcl_pose` + 可注入假位姿）与病房自动切换** + 提示词分层（4 个 md + `_load_role_prompt`）+ `@tool(roles=)` 与 `effective_tools/run_tool` 校验 + 集体层上下文注入（含 R5 单向规则）+ 前端左侧层级栏/登录门/病房管理页签 + 审计 | 三层可切：管理层（口令可开可关）、集体层（病房用户，**按位置自动切**）、老人层（声纹/手选）；越权请求被拒且有审计；老人能读到本病房集体上下文 | ~2 天 |
+| **P0（本轮，用户指定优先）** 用户系统 | `profiles` 加 `kind`/`ward_id`/`ward_map`/`ward_zone`（纯加列，无迁移）+ `ward` 病房用户 CRUD + 管理员口令数据层（PBKDF2 哈希存 `settings` raw key）+ 新增 `zonegeo.py`（"点在区域内"，纯 stdlib，约 30 行）+ `session.py`（双槽主体 / TTL / `derive_role` / 口令登录·登出·改·关·开 / **当前病房与位置自动切换**）+ `policy.py`（角色策略包）+ 提示词分层（`LLM/prompt/{ward,elder,admin}.md` + `_load_role_prompt`）+ `@tool(roles=)` 与 `effective_tools/run_tool` 白名单校验 + 集体层上下文注入（R5 单向）+ 前端 shared（`X-Surface` + 事件）、kiosk 左侧层级栏、admin 登录门 + 「身份与权限」「病房管理」页签 + 审计 | 三层可切：管理层（口令可开可关）、集体层（病房用户，**按位置自动切**）、老人层（声纹/手选）；越权请求被拒且有审计；老人能读到本病房集体上下文 | ~2 天 |
 | **P1（暂缓，D16）** 动作约束 | car MCP 新增 `robot_goto`（§7.2）+ `destinations` 表与接口 + 地点白名单解析 + 风险分级 + 二次确认状态机 + admin「地点白名单」页签 | 老人说「去护士站」能走通，说「去停车场」被拒 | ~1.5 天（MCP 线重启后） |
 | **P2** 预留 | 集体层能力扩展（进病房自动打招呼/广播）、`accounts` 表多账号、老人动作审批流、权限矩阵细化到「谁能看哪段记忆」 | 另立 spec | — |
 
@@ -400,24 +409,32 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 10. **管理员语音**：管理员在车前（kiosk 槽）登录后说话 → 按 `admin` 角色的提示词与权限处理；期间声纹识别到老人**不降权**（审计 `ignored_in_admin`）。
 11. **未识别默认态**：完全没有声纹匹配时说话 → 走集体层（`🏠 当前病房`），不注入任何老人档案。
 12. **不破坏现有链路**：SOS（`/api/alarm`）在任何角色下都成功（R3）；缺依赖时后端仍能启动（降级运行）。
-13. **按位置自动切病房**：先在 `zones` 表里给 `ward_102` 建一条 `kind='ward'` 的多边形区域并把它的 id 关联到 `profiles.zone_id`，再给 locator 注入落在该区域内的位姿 → kiosk 槽（当前为集体层、未锁定）在防抖窗口后自动切到 `ward_102`，广播 `ward_changed source=location`、审计 `ward_change`；位姿回到病房外（走廊）→ 不切、保持原病房。
+13. **按位置自动切病房**：先在某图的 `<图名>.tags.json` 里建一条 `kind='ward'` 的多边形区域，把**地图名 + 区域 uid** 写进 `ward_102` 的 `ward_map`/`ward_zone`，再给 locator 注入落在该区域内的位姿（判定的地图按 `ward_map_source`：默认用 `/map` 指纹；本机验收时注入 `/map` 元数据，或临时置 `ward_map_source="setting"` + `current_map`）→ kiosk 槽（当前为集体层、未锁定）在防抖窗口后自动切到 `ward_102`，广播 `ward_changed source=location`、审计 `ward_change`；位姿回到病房外（走廊）→ 不切、保持原病房。
 14. **不打断私聊（D18）**：老人私聊中（kiosk 槽 role=elder）注入"换到 102 病房"的位姿 → 会话主体不变，仅"当前病房"更新；退出私聊回集体层时已是 `ward_102`。
-15. **位置源不可用即降级**：停掉 rosbridge（或把 `rosbridge_url` 置空）→ 自动切换停用，UI 显示「位置未知 · 手动切病房」，对话链路照常、无报错、无卡顿。
+15. **位置源不可用即降级**：停掉 rosbridge（或把 `ward_autoswitch_enabled` 置假、或让指纹认不出当前图）→ 自动切换停用，UI 显示「位置未知 · 手动切病房」，对话链路照常、无报错、无卡顿。
 16. **手动覆盖生效**：手动把当前病房设为 `ward_101` 后，注入指向 `ward_102` 的位姿 → `manual_override_sec` 内不抢（仍为 `ward_101`），超时后恢复位置判定。
 
 ## 12. 测试与红线清单
 
-**单测（pytest，放 `LLM/tests/`）**：
-- `test_derive_role.py`：`admin`/`ward_*`/`elder_*`/未知 uid → 期望角色；伪造前缀（把老人 uid 起成 `ward_` 开头）仍按 `profiles.kind` 判定。
-- `test_session.py`：TTL 到期降权、提权只升不降、双槽隔离、登录失败冷却、口令门关闭时登录放行且 `source=auth_disabled`。
-- `test_prompt_layers.py`：四层装配正确（含 ward 的"不含个人档案"断言）、缺文件降级不崩。
-- `test_ward_context.py`：集体上下文注入单向性（elder 看得到 ward、ward 看不到 elder 私聊）、跨病房不串。
-- `test_policy_tools.py`：`effective_tools` 角色白名单 ∩ 全局开关；`run_tool` 二次校验（§11.4）。
-- `test_ward_autoswitch.py`（**全部用注入假位姿，不需要 ROS**）：跨 zone 切/不切、防抖窗口、私聊期间不抢、手动覆盖期内不抢、locator 拿不到位姿时整体停用且不改会话。
-- `test_ward_follow.py`：认出 `elder_102_1` → 当前病房跟到 `ward_102`；该老人无 `ward_id` 时不改变当前病房。
+**单测（pytest，放 `LLM/tests/`；文件划分与 P0 计划的任务一一对应）**：
+- `test_zonegeo.py`：射线法点在多边形内/外/边界、`rect` 用外接矩形、点数 <3 一律 `False`（不抛异常）。
+- `test_ward_db.py`：`profiles` 扩列（旧行 `kind` 默认 `elder`）、`get_profile_kind`、`upsert_ward`/`set_ward_zone`/`list_wards` 往返、`upsert_profile` **不覆盖** `ward_id`/`ward_map`/`ward_zone`、`list_zones(kind=)` 过滤、口令哈希往返。
+- `test_session_roles.py`：`derive_role`（含伪造前缀仍按 `profiles.kind`）、双槽隔离、提权只升不降、TTL 到期降权、登录失败冷却、口令门关闭时放行且 `source=auth_disabled`、改口令/开关口令门/首启生成随机口令。
+- `test_policy_roles.py` + `test_policy_tools.py`：三层策略包取值与 fail-closed 兜底；`effective_tools` 角色白名单 ∩ 全局开关；`run_tool` 二次校验（§11.4）。
+- `test_prompt_layers.py`：四层装配正确（含 ward 的"不含个人档案"断言）、缺文件降级不崩、集体上下文单向（elder 看得到 ward、ward 看不到 elder 私聊）。
+- `test_ward_autoswitch.py`（**全部用注入假位姿，不需要 ROS**）：跨区域切/不切、防抖窗口、私聊期间不抢、手动覆盖期内不抢、跟随老人、认不出当前图或拿不到位姿时整体停用且不改会话。
+- `test_ward_memory.py` + `test_worker_roles.py`：集体层不沉淀记忆；`voice_api` 会话函数转发到 `session`。
+- `test_server_roles_routes.py`：会话/病房/策略路由；`POST /api/session/user` 带 `role` → 400；非管理员调管理接口 → 403。
 - 暂缓项的单测（`test_destination_resolve.py` / `test_confirm_flow.py`）随 §7 一起做。
 
-**端到端**：§11 的 12 条全部在**本机后端**可验（集体层/老人层用 `/api/chat` + `X-Surface` 模拟），**不需要动车、不需要板卡**。
+**测试基线（2026-09-14 实测，改代码前先认下这个数）**：
+```
+.venv\Scripts\python.exe -m pytest LLM/tests tests -q
+→ 4 failed, 191 passed in ~78s
+```
+那 4 个红态是**既有基线漂移，与本次无关**：`tests/test_modules_status.py::test_modules_status_shape`（模块集合没算 `mcp`）与 `tests/test_unlock_switch.py` 3 例（`VoiceWorker` 旧签名 `chat_fn`，现签名是 `stream_fn`）。**不要去修、也不要当成自己打坏的**；本设计的预期是"红态仍是这 4 个、通过数只增不减"。
+
+**端到端**：§11 的 16 条全部在**本机后端**可验（集体层/老人层用 `/api/chat` + `X-Surface` 模拟），**不需要动车、不需要板卡**。
 
 **红线自检（改代码时逐条对照）**：
 - R1 前端 role 不可信 → 所有业务接口无 role 入参，uid→role 由 `derive_role` 推导。
@@ -432,23 +449,49 @@ robot_goto(destination: str = "", x: float = 0, y: float = 0, yaw: float = 0) ->
 
 | 文件 | 改动 | 轮次 |
 |---|---|---|
-| `LLM/locator.py` | **新增**：位置源（rosbridge 订阅 `/amcl_pose`，websocket 非 MCP）+ 可注入假位姿 + 拿不到即停用 | P0 |
+| `LLM/locator.py` | **不改代码**（一期已落地）：直接复用 `get_pose()` / `available()` / `current_map()` / `set_pose_for_test()`；P0 只补单测锁定其降级语义 | P0（复用） |
 | `LLM/session.py` | **新增**：双槽 Principal、`set_subject`/`derive_role`、登录/登出/改口令/开关口令门、TTL tick、**当前病房与自动切换判定（含防抖/手动覆盖）** | P0 |
-| `LLM/policy.py` | **新增**：`POLICY_DEFAULTS` 三角色策略、`allowed_tools`/`data_scope`/`ward_context`、`check_action` 骨架 | P0（`check_action` 动作分级随 P1 补全） |
+| `LLM/policy.py` | **新增**：`POLICY_DEFAULTS` 三角色策略、`role_policy()`、`allowed_tools`/`data_scope`/`ward_context` | P0（`check_action` 动作分级**不写空壳**，随 P1 与 §7 一起做） |
 | `LLM/prompt/ward.md` `elder.md` `admin.md` | **新增**：角色提示词片段 | P0 |
 | `LLM/prompt.md` | 不动（共用 base） | — |
-| `LLM/conf.py` | 新增设置项（`admin_session_ttl_s` / `admin_auth_required` / `ward_context_window` / `rosbridge_url` / `ward_switch_debounce` / `ward_zone_default_r` / `manual_override_sec`；P1 再加地点与确认项） | P0 |
-| `LLM/db.py` | `profiles` 加 `kind`/`ward_id`/`zone_id`；病房用户 CRUD；口令哈希读写；**`zones` 表 DDL + 最小函数集**（与一期任务 1 同一份，先落地者建） | P0 |
+| `LLM/conf.py` | 新增设置项（`admin_auth_required` / `admin_session_ttl_s` / `ward_context_window` / `ward_autoswitch_enabled` / `ward_switch_debounce` / `ward_zone_default_r` / `manual_override_sec` / `ward_map_source`）；**不加 `rosbridge_url`**（那是 `conf.ROSBRIDGE_URL`，环境变量可控）；`current_map` 一期已有、**不重复加** | P0 |
+| `LLM/db.py` | `profiles` 加 `kind`/`ward_id`/`ward_map`/`ward_zone`（纯加列）；`list_profiles(kind=)`、`get_profile_kind`、`upsert_ward`/`set_ward_zone`/`set_profile_ward`/`list_wards`；口令哈希 raw-key 读写；`list_zones(map_name, uid, kind=)` 补 `kind` 过滤、`get_zone(uid, map_name="")` 补地图名（顺手修掉既有跨图歧义） | P0 |
+| `LLM/zonegeo.py` | **新增**（约 30 行，纯 stdlib）：`point_in_polygon(x, y, poly)` + `zone_hit(zone, x, y)`（多边形射线法；`shape='rect'` 用外接矩形；点数 <3 返回 `False`）——口径照抄前端 `packages/mapeditor/src/lib/coords.ts:44` | P0 |
 | `LLM/chat.py` | `build_system/build_messages/chat_stream` 接 `principal`；`_load_role_prompt`；集体上下文注入 | P0 |
 | `LLM/tools.py` | `@tool(roles=)`、`effective_tools(settings, principal)`、`run_tool(name, args, principal)` | P0 |
 | `LLM/memory.py` | `note_turn()` 对 `role=ward` 不沉淀 | P0 |
 | `LLM/voice_api.py` | 会话持有权移交 `session.py`（同名函数转发） | P0 |
 | `LLM/voice/worker.py` | `_handle_speech` 按角色分支（§4.3） | P0 |
-| `LLM/server.py` | 新增 `/api/session/{login,logout,password,admin-auth}`、`/api/wards`、`/api/policy/roles`；业务接口取 principal；广播 `session_expired`/`admin_auth_changed`/`ward_changed` | P0 |
-| `frontend/packages/shared/src/{session.ts,events.ts,api/*}` | 新文件 + 事件扩展 + `X-Surface` 头 | P0 |
-| `frontend/packages/kiosk/*` | **左侧层级栏**（管理层/集体层/老人层）+ 状态条角色徽标 + 管理员登录与口令设置 | P0 |
-| `frontend/packages/admin/*` | 登录门 + Header 身份 + 「身份与权限」「病房管理」页签 + 注册向导加病房归属 | P0 |
+| `LLM/server.py` | 新增 `/api/session/{login,logout,password,admin-auth}`、`/api/wards`、`/api/wards/{uid}/zone`（调 `maptags.record_room_polygon`）、`/api/policy/roles`；业务接口按 `X-Surface` 取 principal；`lifespan` 补首启口令 + 每秒 `session.tick()`；广播 `session_expired`/`admin_auth_changed`/`ward_changed` | P0 |
+| `frontend/packages/shared/src/{api/client.ts,api/session.ts,events.ts}` + `tests/` | **扩展现有文件**（**不要**新建 `src/session.ts`——session API 在 `src/api/session.ts`）：client 加 `X-Surface`；session 加登录/登出/口令/口令门/病房 API；events 事件 +3 与 `user_changed` 载荷扩展；vitest 补用例 | P0 |
+| `frontend/packages/kiosk/src/{components/UserSwitcher.vue,components/VoiceStatusBar.vue,App.vue}` | **左侧层级栏**（管理层/集体层/老人层）+ 状态条角色徽标/倒计时 + 管理员登录与口令设置 + 监听 `ward_changed`/`session_expired` | P0 |
+| `frontend/packages/admin/src/{App.vue,pages/RolesPage.vue,pages/WardsPage.vue,pages/RegisterPage.vue}` | 登录门 + Header 身份/退出 + 页签数组加「身份与权限」「病房管理」+ 注册向导加病房归属下拉 | P0 |
+| `LLM/tests/*` + `tests/`（既有） | 10 个新测试文件（§12）；既有基线 191 passed / 4 failed 的红态**不动** | P0 |
 | `LLM/car_mcp/car_server.py` / `car_controller.py` | 新增 `robot_goto` + 按地图点导航路径 | **P1（暂缓）** |
 | `ros2_car/` | 不改代码（沿用 `robot/navigate_to` 的 x/y/theta 分支；`place` 仍拒绝） | P1（暂缓） |
 | `docs/log.md` | 追加实现日志 | P0 |
-| `AGENTS.md` | 「关键约定」补角色闸门与红线 R1–R5；`LLM/` 模块表补 `session.py`/`policy.py`/`prompt/` | P0 |
+| `AGENTS.md` | 「关键约定」补角色闸门与红线 R1–R5；`LLM/` 模块表补 `session.py`/`policy.py`/`zonegeo.py`/`prompt/` | P0 |
+
+---
+
+## 14. 复审结论（2026-09-14 二次修订）
+
+**复审方法**：把规格里的每一处接口/字段/配置项逐条对照**当前工作区代码**（`LLM/*.py`、`frontend/packages/*`）核实，而不是靠文档互引。README 级结论：**设计意图与决策（三层结构、双槽、口令可改可关、按位置自动切、R1–R5 红线、MCP 暂缓）全部成立，不需要推翻**；出问题的是"落地口径"——有几处描述的是**已经变过的中间版本**，照它写代码会撞车或建出第二份真相。
+
+| # | 问题（复审发现） | 证据 | 处置（已写进正文章节） |
+|---|---|---|---|
+| F1 | **病房区域几何载体过期**：正文与 P0 计划都按"`zones` 表 = 唯一真相 + 自增 `id` + `profiles.zone_id`"写；中途还出现过 `profiles.zone_json` | 地图编辑器定案：真相 = `<图名>.tags.json`（`maptags.py`），`brain.db.zones` 降为只读缓存；`map-editor-design.md` §〇 第 7 条、§十 回填项明确要求本规格二次回填 | §3.1.1 / §4.5 / §9：几何真相 = tags.json；`profiles` 记 **`ward_map` + `ward_zone`（`z<N>`）**；解析走 `maptags.get_zone(map_name, uid)`；顺带记录三次口径变更史，避免再用 `zone_id`/`zone_json` |
+| F2 | **`rosbridge_url` 不是设置项**：它不在 `DEFAULT_SETTINGS`，而 `set_settings()` 只接受白名单里的 key → 写了也存不进去、改不了 | `conf.py:80-83` 是模块级 `ROSBRIDGE_URL`（环境变量可改）；`db.set_settings()` 白名单逻辑 | §9：改为新增 `ward_autoswitch_enabled`（默认 True）承担"一键停用"；`rosbridge_url` 从设置项清单删除 |
+| F3 | **`locator.py` 不是本设计新增**：一期地图编辑器已落地，且既有签名与计划里"新写一份"不同（`available()` 返回 `(bool, reason)`；`get_pose()` 拿不到返回 `None`；`current_map()`/`set_pose_for_test()` 都已存在） | `LLM/locator.py`（240 行）、`LLM/roslink.py`（255 行）已在工作区 | §4.5 / §13：**复用，不重写**；P0 只补单测锁定降级语义 |
+| F4 | **`db` 里已有 `zones`/`destinations` 访问函数，且签名与计划冲突**：`db.get_zone(uid)` 只按 uid（多图歧义）、`db.list_zones(map_name, uid)` 无 `kind` | `db.py:1231-1260`；被 revert 的那版计划写的是 `get_zone(int)` + `add_zone()` | §13：改为**向后兼容扩参**（`list_zones(..., kind="")`、`get_zone(uid, map_name="")`），**不新建表、不加 `add_zone`**；`zones` 只读 |
+| F5 | **地点真相也过期**：§7.1 写"新表 `destinations`，`name` 为主键"，§7.2 写"地名→坐标唯一事实来源在 LLM 侧 destinations 表" | 同 F1：地点已随地图迁到 tags.json，稳定身份是 `d<N>` uid | §7.1 / §7.2 / §9：改为 tags.json 为真相、`brain.db.destinations` 为只读缓存、主键 `(map_name, uid)`、**本轮不建任何新表** |
+| F6 | **前端落点写错**：计划让"新建 `shared/src/session.ts`"，实际 session API 在 `src/api/session.ts`；`X-Surface` 前端零实现；kiosk 换人入口在 `VoiceStatusBar.vue:34`，弹层是 `UserSwitcher.vue`；admin 页签注册唯一位置是 `App.vue` 的 `tabs` 数组 | `shared/src/`（4 个文件）、`kiosk/src/`（8 个文件）、`admin/src/App.vue:14-23`；grep `X-Surface` 21 处全在文档里 | §8 / §13：改成**扩展现有文件**并写清真实落点 |
+| F7 | **测试基线与既有 API 名过期**：计划写"预期全 passed / 既有 83 项不回归"，实际全量是 **191 passed / 4 failed**（红态在 `tests/test_modules_status.py` 与 `tests/test_unlock_switch.py`，与本次无关）；计划里的 `db.add_history` 实际叫 **`append_history`** | 本次实测 `pytest LLM/tests tests -q` → `4 failed, 191 passed in 78.34s`；`db.py:921` | §12：写死真实基线与"4 个红态不许修"；计划里所有 `add_history` 改为 `append_history` |
+| F8 | **「当前在跑哪张图」取值不可靠**：按 `settings.current_map` 判会"换图后位姿恰好落进旧图病房"→ 静默切错病房（D17 明令禁止） | 一期已落地 `/map` 指纹反查 `locator.current_map()`；`conf.py:42` 注释明说 `current_map` ≠ 车此刻在跑的图 | §2 D17 补注 / §4.5：默认以指纹反查为准，认不出**不判命中**（fail-safe）；`settings.current_map` 仅在 `ward_map_source="setting"` 时当判定依据 |
+| F9 | **热路径会打网络**：每秒 tick 里调 `maptags.get_zones()` 会走 `_ensure_fresh → sync_map`（`MAPS_IO=ssh` 下可能秒级阻塞），`locator.current_map()` 也会列图 + 逐图读元数据 | `maptags.py:370/390`、`locator.py:200-218` | §4.5：tick **只读本地 `db.zones` 缓存**；`current_map()` 结果做 10s TTL 缓存 |
+| F10 | **档案编辑会清掉病房关联**（上一版实现踩过的坑：`f6f6e54` 专门修过） | git 历史 `f6f6e54 fix(llm): 病房 zone_id 只由 upsert_ward 写，避免档案编辑静默清掉区域关联` | §9 补注：`ward_id`/`ward_map`/`ward_zone` **只允许 `upsert_ward`/`set_ward_zone`/`set_profile_ward` 写**，`upsert_profile` 不碰 |
+| F11 | **两条只有写代码才会暴露的隐患**（来自被 revert 的那版实现）：① `kind=COALESCE(profiles.kind, excluded.kind)` 因旧行已被回填成 `'elder'`、永不为空 → 兜底**永不触发** → 把已有 uid 提升成病房**静默失败**却照写区域关联（半状态）；② `list_profiles()` 不过滤 `kind` → 病房行混进 `GET /api/profiles` 的"老人列表"（记忆页/对话页/注册页下拉、车前屏换人弹层全吃它） | 被 revert 提交 `478504d`/`f6f6e54` 的复盘 | §9 加"不许用 COALESCE 兜底、直接 `SET kind='ward'`"；§4.2 表格新增一行：`GET /api/profiles` 默认只列 `kind='elder'`（`?kind=all` 才全量）；计划任务 2/11 各带一条回归用例 |
+
+**未改动（复审确认成立）**：三层结构与能力矩阵（§3.3）、双槽会话与提权只升不降（§4）、口令可改可关与首启随机口令（D12/D13）、提示词分层方式（§5，`prompt.md` 继续作共用 base）、R1–R5 红线（§1.3）、P1 暂缓范围（§6.3/§7 的动作分级与 `robot_goto`）。
+
+**给实施者的三条提醒**：① 动手前先跑一次 §12 的基线命令，把"4 个既有红态"认下来；② 任何"改标记"的接口都必须是「改 `<图名>.tags.json` → `maptags.sync_map()` 刷缓存 → 审计」三步，**禁止只改 SQLite**；③ 病房自动切换的一切路径都要能"拿不到就不切"。
