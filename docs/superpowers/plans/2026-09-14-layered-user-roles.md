@@ -4000,3 +4000,109 @@ git commit -m "docs: 分层用户体系 P0 实现日志 + AGENTS 红线 R1-R5 �
 - **每完成一个任务就 commit**（计划里每任务末尾都给了 commit 命令），不要攒大提交。
 - 动手前的三条提醒（来自规格 §14）：① 先跑一次基线命令认下那 4 个既有红态；② 任何"改标记"的接口都必须是「改 `<图名>.tags.json` → `maptags.sync_map()` 刷缓存 → 审计」三步，**禁止只改 SQLite**；③ 病房自动切换的一切路径都要能"拿不到就不切"。
 - 验收通过后，把 P1 的动作约束按规格 §7 另立计划。
+
+---
+
+# 实现台账与偏差（2026-09-14 落地）
+
+> **本节性质：** 上文（v2 计划正文）是**设计意图**，本节是**实际落地事实**。凡与正文冲突，以本节为准。
+> **事实来源：** 本节条目逐条核对过 `LLM/{zonegeo,policy,session,chat,tools,memory,voice_api,server,db,conf}.py`、
+> `LLM/prompt/{ward,elder,admin}.md`、`frontend/packages/{shared,kiosk,admin}/**` 与
+> `pytest --collect-only -q` 的**实际代码/实测值**，不是照抄计划。
+> **「计划怎么写」一列以基线 `6295df3` 的计划文本为准** —— 计划文件在实现期被**部分回写**
+> （`255f2e4`/`b83cb9f`/`610bee1` 是计划修订提交；并行会话的 `29fa314` 又混入 330 行计划回写，
+> 其中包含任务 4 的白名单与浅拷贝），所以**直接看当前工作区的计划文件已经看不到这些差异**，
+> 必须 `git show 6295df3:<本文件>` 才能对照。
+
+## L1. 各任务的测试条数（最终值）
+
+`LLM/tests` 按文件 `--collect-only -q` 实测（2026-09-14）：
+
+| 任务 | 测试文件 | 条数 |
+|---|---|---|
+| 1 | `LLM/tests/test_zonegeo.py` | 6 |
+| 2 | `LLM/tests/test_ward_db.py` | 16 |
+| 3 | `LLM/tests/test_settings_roles.py` | 3 |
+| 4 | `LLM/tests/test_policy_roles.py` | 7 |
+| 5 / 6（同文件） | `LLM/tests/test_session_roles.py` | 26（会话/角色/双槽/TTL + 口令族） |
+| 7 | `LLM/tests/test_ward_autoswitch.py` | 15 |
+| 8 | `LLM/tests/test_prompt_layers.py` | 11 |
+| 9 | `LLM/tests/test_policy_tools.py` | 12 |
+| 10 | `LLM/tests/test_ward_memory.py` + `LLM/tests/test_worker_roles.py` | 4 + 9 = 13 |
+| 11 | `LLM/tests/test_server_roles_routes.py` | 14 |
+| 12-14 | 前端 `vitest`（**本机跑不了**，见 L3 第 1 条） | 未测 |
+
+- **新增合计 123 条、11 个新测试文件**。计划 §13/任务清单写的是"10 个新测试文件"：实际是 **11 个**
+  （口令族用例进了任务 2 的 `test_ward_db.py`，任务 5/6 共用 `test_session_roles.py`，
+  另多了 `test_worker_roles.py`）—— 条数与本表为准。
+- 另有 **1 个既有文件改断言**：`LLM/tests/test_chat_text_tts.py` 随 `_post_chat_jobs(..., role)` 新签名
+  改断言（用例条数不变，不是新增）。
+- 全量实测：`pytest LLM/tests -q` → **222 passed**；`pytest tests -q` → **4 failed / 186 passed / 1 skipped**
+  （4 个红态是既有基线漂移，红态名与 §12 记的一致，未修）。
+
+## L2. 事实性偏差（计划怎么写 → 实际怎么落 → 为什么）
+
+### 任务 4：`policy.py`
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-1 | `ward.allowed_tools = []`（"集体层无任何工具"，测试断言 `p["allowed_tools"] == []`） | `["robot_status", "robot_stop"]` | **R3 急停/呼救永远放行** —— 空列表等于连急停都做不了；规格 §3.3 里 `robot_stop` 是安全动作（`aaef2cc`） |
+| L2-2 | `role_policy()` 直接 `return POLICY_DEFAULTS.get(...)`（返回共享 dict） | 返回浅拷贝（`allowed_tools` 也是新 list） | 策略表是模块级共享常量，调用方一次原地 `append` 就会**往低权限角色的白名单里长出工具**（比少一条危险得多）；已补回归用例 `test_role_policy_returns_copy_not_the_shared_table` |
+
+### 任务 8：提示词分层与集体层上下文
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-3 | `_load_role_prompt`：`path = base_dir / f"{role or 'ward'}.md"` | 文件名取 `role_policy(role)["prompt_file"].name` | 未知角色在 `role_policy` 里已 fail-closed 落集体层，这里必须**跟着落 `ward.md`**；否则一个没见过的 `role` 会把整层角色提示词都丢掉、只剩共用 base |
+| L2-4 | `ward.md` 第 4 条：「别用**"张奶奶"这种称呼**点名」 | 「别用**具体姓名**点名」 | 计划同文件的测试断言 `assert "张奶奶" not in sys_p` —— 片段里照写"张奶奶"会**与断言互斥**（把测试要排除的字符串亲手写进提示词） |
+| L2-5 | `build_system` 里 `rag.recall_v3(uid, ...)` / `db.get_summary(uid)`（直接用入参 uid） | 以 `principal["uid"]` 为准（`data_uid`；`principal` 缺省时才回落到入参 uid） | 客户端传来的 uid 可能过期/伪造，拿它取档案会把**另一位老人的画像**注入当前会话（R1 与 R5 同族的互泄） |
+| L2-6 | `_ward_context` 只判 `if not ward_uid: return ""` | 再加**"必须是真病房"**守卫（`db.get_profile_kind(ward_uid) != "ward"` → 空串 + 审计 `ward_context_denied`） | `profiles.ward_id` 一旦被误设成某位老人的 uid，就会把那位的**私聊**当"病房里刚说过的事"注入给别人（R5 的反方向） |
+| L2-7 | `int(settings.get("ward_context_window", 10))`（无保护） | `try/except (TypeError, ValueError)` → 10 | 设置被写坏也不许炸掉整条对话（降级原则） |
+
+### 任务 9：工具角色白名单（闸门 2）
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-8 | 测试直接断言 `_names({}, _p("ward")) == []`、`set(_names(...)) == set(tools._TOOL_REGISTRY)` | 改为**注册测试期探针工具**（`__probe__`/`__probe_ward_only__` fixture，用完即摘）再断言可见性 | 空列表断言本身与 R3 冲突（见 L2-1）；拿真注册表当期望值会让"工具集合变化"变成假红。探针 + 对照组才有判别力 |
+| L2-9 | 只写"admin 不被角色裁剪" | 明确为**只收窄**（交集语义）：admin 也受工具自身 `roles` 约束 | 否则 `@tool(roles={"ward"})` 这类声明对 admin 形同虚设，"闸门 2"漏成两套口径 |
+| L2-10 | `_mcp_tools_for()` 单独按服务器 `roles` 过滤 MCP 工具（未声明 = 仅 admin） | 纳入**同一份角色白名单交集**（白名单是天花板），并给 `run_tool()` 补**服务器级 roles 二次校验** | 只按服务器 roles 过滤时，白名单外的高权限 MCP 工具仍能被低权限角色**看见并调用**；回归用例 `test_mcp_tools_intersect_role_whitelist` / `test_run_tool_denies_mcp_outside_server_roles` |
+| L2-11 | `policy_deny` 审计未列字段 | 补 `decision`（规格 §9 要求每条策略判定含 `role/uid/slot/tool/decision/reason`） | 没有 `decision` 的审计无法区分"拒绝"与"记账"，事后追溯不可用；断言 `test_policy_deny_audit_has_decision_field` |
+
+### 任务 10：集体层不沉淀 + 语音链路接入角色
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-12 | worker：`uid = recognized_uid or principal["uid"] or role_session.current_ward()`，非空就 `set_subject(uid, ...)` | **未识别时不改主体**（不再把"当前病房/兜底 uid"回灌成主体） | 回灌会把"没认出是谁"变成一次**主体切换**，还可能把兜底值当老人的话沉淀成记忆 |
+| L2-13 | 前端 `unlock()` 传 `props.session.uid ?? ""`（把当前 uid 原样送回） | 后端**忽略前端 uid**：解锁 = 回**当前病房**的集体层（规格 §4.5） | 否则"解锁"等于用前端 uid 再设一次主体，可借解锁把主体设成任意 uid（绕开"解锁不改人"的语义） |
+| L2-14 | `_ensure_schema` 只做记忆化幂等建表 | 加**廉价探活 + 失效重试**：命中缓存也读一次 `profiles`；库文件被删/被换则清记忆化重试一次，仍失败就抛出 | 记忆化的洞是"库文件被删/被换（路径没变）"会让车前屏轮询端点**一直 500**；同时不吞真实错误（如目录不可写） |
+| L2-15 | `/api/chat` 显式把角色传给 `_post_chat_jobs` | 再加「`role=None` 时**从会话层现取**」，取不到按 fail-closed 记 `ward` 且异常不外抛 | 语音等老调用点只传 3 个参数；漏这一步会把**病房公开对话当老人的话沉淀**（规格 §5.3），异常外抛则整条 post-chat 管线（沉淀/摘要）跟着丢 |
+
+### 任务 11：REST 接口 + lifespan 接线
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-16 | `_surface`：`return x_surface if x_surface in _SURFACES else "kiosk"`（**静默回落**） | 非法值/空串一律 **400**（只有非 str 才按缺省处理） | 静默回落会让 `X-Surface: TABLET` 这类笔误把**管理台的口令登录写进车前屏槽**（顺带提权），且返回体/审计里的 slot 还是那个错名（追溯性一并破坏） |
+| L2-17 | `GET /api/session/user` 同步返回 `{**p, ...}` | `await asyncio.to_thread(_session_user_payload, slot)`，并补老契约形状（`ok` 必在、无主体时 `uid` 为 `None`） | `autoswitch_state()` 会碰位姿（最多 drain 0.8s）并反查"车在跑哪张图"（`MAPS_IO=ssh` 下含远端 stat/整图拉取），占住事件循环会拖慢整个后端 |
+| L2-18 | lifespan：首启生成口令 + **1 条 WARN**（位置源不可用）+ 每秒 tick | **多补 1 条 WARN**：`ensure_admin_password()` 返回 `None` ⇒ `[WARN] 管理员口令未初始化：管理层将无法登录！` | 首启"半写坏库"（盐在哈希没了）时口令自愈失败**不会进任何日志**，管理员只会看到"进不去"而无从排查。（tick 的 `asyncio.to_thread` 与计划一致，非偏差） |
+
+### 任务 12-14：前端落点
+
+| # | 计划怎么写 | 实际怎么落 | 为什么 |
+|---|---|---|---|
+| L2-19 | 计划 v1：「**新建** `shared/src/session.ts`」 | **扩展现有** `shared/src/api/session.ts`（+ `api/client.ts` 加 `X-Surface`、`events.ts` +3 事件与 `user_changed` 载荷扩展） | v1 没核实前端现状（session API 早已在 `src/api/` 下）。v2 修订表第 5 条已改，实现按 v2 落地，**无二次偏差** |
+| L2-20 | 计划正文把换人按钮写在 `components/UserSwitcher.vue` | 入口按钮在 `components/VoiceStatusBar.vue`（`@open-switcher`），`UserSwitcher.vue` 是**抽屉本体**，开关状态在 `App.vue` | 与 v2 修订表核实的落点（`VoiceStatusBar.vue`）一致；改这一带时别只翻 `UserSwitcher.vue` |
+| L2-21 | 计划正文按页签名描述 admin 新页签 | 唯一注册点是 `App.vue` 的 `tabs` 数组（新增 `{id:"wards"}` 病房管理、`{id:"roles"}` 身份与权限），页面组件 `pages/WardsPage.vue` / `pages/RolesPage.vue` | 与 v2 修订表第 5 条一致；页签渲染分支也在 `App.vue`（`WardsPage`/`RolesPage` 各一行） |
+
+## L3. 未做 / 待验（与计划的差距）
+
+1. **前端未验**：本机（沙箱）`cd frontend && pnpm --filter shared test` 直接失败于
+   `Error: spawn EPERM`（`child_process.spawn`，栈底 `esbuild@0.21.3/lib/main.js ensureServiceIsRunning`）——
+   属环境限制，非代码问题。故三个包的 `vitest` 与 `pnpm -r build` **均未在本机复验**，需用户侧执行
+   `cd frontend && pnpm test && pnpm -r build` 确认。
+2. **真机联调未做**：rosbridge 真位姿 + 真地图指纹下的病房自动切换（本机只用注入假位姿验过），
+   以及"麦克风声纹 → 角色 → 提示词分层"这条链的实测。
+3. **P1 未做（D16 暂缓）**：car MCP `robot_goto`（§7.2）、`destinations` 与地点白名单解析、风险分级、
+   二次确认状态机、admin「地点白名单」页签（§6.3/§7）。用户 2026-09-14：「先不管 mcp，先完成用户系统」。
+4. **验收覆盖**：规格 §11 的 16 条中，13 条以一次性脚本（`.superpowers/sdd/task-15-acceptance.py`，
+   **未提交**）在本机跑通 PASS；其余 4 条（§11.8 TTL、§11.10 管理员语音、§11.11 未识别默认态、
+   §11.14 不打断私聊）由上表单测覆盖，未在脚本里单列。详见 `docs/log.md` 2026-09-14（续三）条目。

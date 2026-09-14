@@ -33,6 +33,10 @@ docs/      需求/教程/接口契约/开发日志
 - `chat.py` — 对话编排：`chat_stream()`（SSE 生成器，工具循环最多 2 轮）、`route_thinking()`（思考路由）、`build_system()/build_messages()`（System Prompt + RAG + 滚动窗口）、`llm_json()`。
 - `conf.py` — **集中配置**。路径、`DEFAULT_SETTINGS`、`THINKING_KEYWORDS`、`HISTORY_WINDOW`、`MEMORY_RULES`、`MODEL`、超时等。**改参数先来这里**。
 - `db.py` — SQLite 数据层（`LLM/data/brain.db`，WAL + 线程锁）。函数命名 `get_*`/`add_*`/`set_*`/`update_*`/`delete_*`/`upsert_*`，协程侧用 `asyncio.to_thread`。
+- `session.py` — **分层用户体系的会话层**（双槽会话主体 + 角色推导 + 口令 + 病房自动切换）：`derive_role()`（uid→role 的唯一权威，按 `profiles.kind`，**不靠 uid 前缀**）、`get_principal(slot)`、`set_subject()`、`login_admin()/logout()`、`change_admin_password()/set_admin_auth()/ensure_admin_password()`、`current_ward()/manual_set_ward()/running_map_name()/autoswitch_state()`、`tick()`（每秒：admin TTL 降权 + 病房位置判定）。**角色只在这里推导，业务代码一律读 `get_principal()`（R1）**。
+- `policy.py` — **三角色策略包**：`POLICY_DEFAULTS`（ward/elder/admin 三层的 `prompt_file`/`allowed_tools`/`data_scope`/`ward_context`）+ `role_policy()`（未知角色 fail-closed 落集体层，返回浅拷贝防全局白名单被污染）。**纯数据 + 纯函数、不做任何 IO**；P1 的 `check_action()` 动作分级不在此留空壳。
+- `zonegeo.py` — **点是否在区域内**（纯几何、纯 stdlib、约 30 行）：`point_in_polygon()`（射线法）+ `zone_hit()`（吃缓存行，`shape='rect'` 用外接矩形，点数 <3 一律 `False`，**坏入参绝不抛异常**）。口径与前端 `packages/mapeditor/src/lib/coords.ts` 一致。
+- `prompt/` — **角色提示词片段**：`ward.md`/`elder.md`/`admin.md` 三层各一份，由 `chat._load_role_prompt()` 按 `role_policy(role)["prompt_file"]` 装载、叠加在 `prompt.md` 之上（`prompt.md` **仍是共用 base**，管"怎么说"；角色片段管"现在跟谁说话"）；缺文件 → 空串 + 审计 `prompt_role_missing`，不阻断对话。
 - `memory.py` — RAG 记忆 + 半自动沉淀：`recall()`、`note_turn()`、`consolidate()`、`suggest_from_chat()`。**红线：`MEDICAL_KEYWORDS` 命中拒绝写入**。（MaiBot 对标增强：核心记忆定稿/保护、回收站、纠错、画像防退化等，见 `docs/log.md` 2026-09 条目）
 - `reminder.py` — 独立线程定时调度（15s tick），状态机 `pending→triggered→confirmed/unconfirmed/missed`。
 - `bus.py` — SSE 事件总线，`publish()`（任意线程）→ asyncio 扇出订阅者。
@@ -79,6 +83,13 @@ docs/      需求/教程/接口契约/开发日志
 4. **SSE 事件协议两端强耦合**：聊天流事件类型（`meta`/`reasoning`/`content`/`tool_start`/`tool_result`/`done`/`error`）由 `chat.py::chat_stream` 产出；总线事件（`reminder`/`alarm`/`voice_state`/`chat_new`/`user_changed`…）由 `bus.py::publish` 产出。前端消费侧的**唯一事实来源** = `frontend/packages/shared/src/events.ts`（类型枚举 + `parseBusPayload`），新增/改动事件要在后端 publish 点与 events.ts 同步维护。
 5. **DeepSeek 流式陷阱**：thinking disabled 时 `delta` 无 `reasoning_content` 属性，必须用 `getattr(delta, "reasoning_content", None)` 安全取值（见 `llm_request.py` 示例）。
 6. 包内模块用 `from . import xxx` 相对导入；文件头 `# -*- coding: utf-8 -*-` + r-string docstring。
+7. **角色闸门与红线（2026-09-14 分层用户体系 P0）**：前端传上来的 `role` 一律不可信（R1）——uid→role
+   只由 `session.derive_role()` 按 `profiles.kind` 推导（不靠 uid 前缀）；未知 ≈ 集体层最小能力（R2）；
+   急停/呼救永远放行（R3）；医疗写入红线与角色无关（R4）；层级上下文单向（R5）。业务接口按请求头
+   `X-Surface: kiosk|admin` 取 principal（非法值 400）。**拿 admin 只能走 `/api/session/login`（口令）**，
+   `POST /api/session/user` 带 `uid="admin"` 或 `role` 一律 400。**病房区域几何的唯一真相是地图文件夹的
+   `<图名>.tags.json`**（`brain.db.zones` 只是只读缓存），`profiles` 只记 `ward_map`+`ward_zone`。
+   详细规格：`docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（§14 是复审结论）。
 
 ## 系统稳健性（降级运行，重点）
 

@@ -658,3 +658,132 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
   也会列出来"的情形；`Get-PnpDevice` 在本机报 CIM 不可用。这正是加 `--list-cameras` 的原因。
 - **板卡 MIPI 路径未回归**：改动不应影响 mipi，但本机无 MIPI 硬件、ssh 也不通，未实测。
 - **GIL 风险未实测**：见 D3，需在装好 cv2 的真机上量 PING 延迟。
+
+---
+
+## 2026-09-14（续三）—— 分层用户体系 P0：管理层 / 集体层 / 老人层（15 任务落地）
+
+### 背景与用户原话
+
+> 「我想创立一个管理员用户，与老人用户分开。前端可以切换。我的想法是分层级，比如管理员层，
+> 众人层（这个先放着不做），老人层，方便给每个层级的用户分配不同的权限和提示词。比如老人层
+> 可以使用声纹识别，发出简单的指令（比如让小车从病房出去），管理层可以发布所以指令」
+> 「挂人身份上。但不要声纹，管理员是特殊账号，以免误识别。但语音链路要保留，以实现管理员也可以语音控制」
+> 「先不管mcp，先完成用户系统。还有，管理员的口令可以直接修改，甚至可以关闭。」
+> 「**集体层**的设计是想让小车与"大家"对话。比如小车进入某个病房，与大家打招呼，公布消息之类的。
+> 然后就可以根据声纹切换到特定老人与他对话。我想把同一个病房的老人打包成一个病房用户放在集体层，
+> 集体层的消息上下文也可以被老人用户读取到。」
+
+规格 `docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（§14 = 二次复审结论）；
+实现计划 `docs/superpowers/plans/2026-09-14-layered-user-roles.md`（v2，15 任务 TDD，已执行完）。
+**代码区间：`b83c594`（任务 1 `zonegeo.py`）→ `5c3e1db`（任务 14 admin 登录门与两个页签）**，
+基线 `6295df3`。该区间内混有**并行会话**的 vision / mapeditor 提交（`bbfcb8b`/`ff82042`/`29fa314`/
+`a69aba7`/`3516839`），不属于本批。
+
+### 实现（15 个任务）
+
+**新增模块**
+
+- `LLM/zonegeo.py`（任务 1，约 30 行，纯 stdlib）：`point_in_polygon()`（射线法）+ `zone_hit()`
+  （吃缓存行；`shape='rect'` 用外接矩形；点数 <3 一律 `False`；**任何坏入参都不抛异常**）。
+  口径与前端 `packages/mapeditor/src/lib/coords.ts` 对齐。
+- `LLM/policy.py`（任务 4）：三角色策略包 `POLICY_DEFAULTS` + `role_policy()`（未知角色 fail-closed
+  落集体层，返回浅拷贝防全局白名单被污染）。纯数据 + 纯函数，不做 IO；P1 的 `check_action()` 不留空壳。
+- `LLM/session.py`（任务 5/6/7）：`derive_role()`（uid→role 唯一权威，按 `profiles.kind`，**不靠前缀**）、
+  双槽 `get_principal()/set_subject()`、`login_admin()/logout()`、口令改/关/开/首启生成、
+  `current_ward()/manual_set_ward()/running_map_name()/autoswitch_state()`、`tick()`。
+- `LLM/prompt/{ward,elder,admin}.md`（任务 8）：角色片段，叠加在共用 base `prompt.md` 之上；
+  装载口径取自 `role_policy(role)["prompt_file"]`，缺文件 → 空串 + 审计 `prompt_role_missing`。
+
+**改造**
+
+- `db.py`（任务 2）：`profiles` 纯加列 `kind`/`ward_id`/`ward_map`/`ward_zone`；`upsert_ward`/
+  `set_ward_zone`/`set_profile_ward`/`list_wards`/`get_profile_kind`/`list_profiles(kind=)`；
+  管理员口令 PBKDF2-SHA256（20 万轮、随机盐）存 `settings` **raw key**；`list_zones(kind=)`、
+  `get_zone(uid, map_name="")` 向后兼容扩参。**口令 key 不进 `GET /api/settings`**（堵泄露）。
+- `conf.py`（任务 3）：`admin_auth_required`/`admin_session_ttl_s`/`ward_context_window`/
+  `ward_autoswitch_enabled`/`ward_switch_debounce`/`ward_zone_default_r`/`manual_override_sec`/
+  `ward_map_source`（`current_map` 一期已有，未重复添加）。
+- `chat.py`（任务 8）：`build_system(..., principal=)`、`_load_role_prompt()`、`_ward_context()`
+  （**R5 单向**：只从病房 uid 往外读，且必须先确认"真的是病房档案"）。
+- `tools.py`（任务 9）：`@tool(roles=)`、`effective_tools(settings, principal)`、`run_tool()` 二次校验；
+  **MCP 工具纳入角色白名单交集**（服务器未声明 `roles` = 仅 admin）。
+- `memory.py`（任务 10）：`note_turn()` 对 `role=ward` 不沉淀。
+- `voice_api.py` + `voice/worker.py`（任务 10）：会话持有权移交 `session.py`（同名函数转发）；
+  worker 按角色分支——**管理员不降权**（审计 `voice_spk action=ignored_in_admin`），未识别不改主体。
+- `server.py`（任务 11）：新增 `/api/session/{user,login,logout,password,admin-auth}`、`/api/wards`
+  （+`/{uid}/zone`）、`/api/profiles/{uid}/ward`、`/api/policy/roles`；业务接口按请求头
+  `X-Surface: kiosk|admin` 取 principal（**非法值 400**）；`lifespan` 补首启口令、两条 WARN、
+  每秒 `session.tick()`；广播 `session_expired`/`admin_auth_changed`/`ward_changed`。
+
+**前端（任务 12-14）**
+
+- `shared`：`src/api/client.ts` 加 `X-Surface`、`src/api/session.ts` 加登录/口令/病房 API、
+  `src/events.ts` +3 事件（`ward_changed`/`session_expired`/`admin_auth_changed`）并扩展 `user_changed` 载荷。
+- `kiosk`：左侧层级栏（管理层/集体层/老人层）+ 状态条角色徽标与 TTL 倒计时（换人入口在
+  `components/VoiceStatusBar.vue`）。
+- `admin`：登录门 + Header 身份/退出 + 「身份与权限」「病房管理」两个页签（注册在 `App.vue` 的 `tabs`）
+  + 注册向导加病房归属下拉。
+
+### 测试（本机实跑）
+
+- `.venv\Scripts\python.exe -m pytest LLM/tests -q` → **222 passed in 52.05s**。
+- `.venv\Scripts\python.exe -m pytest tests -q` → **4 failed, 186 passed, 1 skipped in 64.05s**。
+  那 4 个红态是**既有基线漂移、非本批引入**（`tests/test_modules_status.py::test_modules_status_shape`
+  1 例 + `tests/test_unlock_switch.py` 3 例 `VoiceWorker.__init__() got an unexpected keyword
+  argument 'chat_fn'`），与规格 §12 记的基线一致，**按约定未修**。
+- 本批**新增 11 个测试文件、123 条用例**（`--collect-only` 逐文件实测）：`test_zonegeo.py` 6、
+  `test_ward_db.py` 16、`test_settings_roles.py` 3、`test_policy_roles.py` 7、`test_session_roles.py` 26、
+  `test_ward_autoswitch.py` 15、`test_prompt_layers.py` 11、`test_policy_tools.py` 12、
+  `test_ward_memory.py` 4、`test_worker_roles.py` 9、`test_server_roles_routes.py` 14。
+  （规格 §13 写"10 个新测试文件"，**实际 11 个**——口令族独立进了 `test_ward_db.py`，
+  任务 5/6 共用 `test_session_roles.py`；口径以本条为准。）另有 1 个既有文件
+  `LLM/tests/test_chat_text_tts.py` 随 `/api/chat` 新签名改断言（条数不变）。
+
+### 端到端验收（13 条，本机 TestClient，不进 lifespan）
+
+一次性脚本 `.superpowers/sdd/task-15-acceptance.py`（**跑完即弃、未提交**；临时库 + 逐条重建隔离；
+位姿用 `locator.set_pose_for_test` 注入，**不动车、不用板卡**）。结果：**13/13 PASS**。
+
+| # | 验收项 | 结果 |
+|---|---|---|
+| 1 | 三层可切（admin 建病房 → kiosk 槽 role=ward → 切老人 uid → role=elder） | PASS |
+| 2 | 口令门：连错 3 次后第 4 次正确口令也被冷却拦住（error 含"10 秒"） | PASS |
+| 3 | 口令可改可关（旧口令失效、`login(null)` 直进且 `source=auth_disabled`） | PASS |
+| 4 | R1：`POST /api/session/user` 带 `role` → 400、带 `uid="admin"` → 400 | PASS |
+| 5 | 集体层 System Prompt 无老人档案（无"糖尿病"/姓名）、含本病房上下文 | PASS |
+| 6 | R5 单向：老人读得到集体层上下文；老人私聊不出现于集体层 | PASS |
+| 7 | 跨病房隔离（`elder_102_1` 看不到 `ward_101` 消息） | PASS |
+| 8 | 双槽隔离（admin 槽登录不影响 kiosk 槽角色） | PASS |
+| 9 | R3：`POST /api/alarm` 在集体层/老人层/管理层都 `ok:true` | PASS |
+| 10 | 位置自动切病房（`ward_map_source="setting"` + 注入位姿 + 3 次 `tick()` → `ward_102`；走廊位姿不切） | PASS |
+| 11 | 位置源不可用即降级（`ward_autoswitch_enabled=False` → `enabled:false, reason:"disabled"`，对话照常） | PASS |
+| 12 | 手动覆盖（`manual_set_ward` 后位置判定不抢，`reason:"manual_override"`） | PASS |
+| 13 | 降级自检：`import LLM.server` 成功 | PASS |
+
+**本脚本未单列、改由单测覆盖的 4 条**（提示词把"逐条重跑规格 §11 的 16 条"收窄为"本机可自动化部分"）：
+§11.8 管理员 TTL 到期降权（`test_session_roles.py::test_ttl_expiry_*`）、§11.10 管理员语音不降权
+（`test_worker_roles.py::test_worker_admin_is_not_downgraded`）、§11.11 未识别默认态
+（`test_session_roles.py::test_derive_role_by_kind` + 验收 #5）、§11.14 不打断私聊
+（`test_ward_autoswitch.py::test_does_not_steal_elder_private_chat`）。**真机（rosbridge 真位姿 +
+真地图指纹）未验**，留待 MCP/导航线重启后一并做。
+
+### 实现偏差（详情见规格 §15 与计划文末「实现台账与偏差」）
+
+- `GET /api/session/user` 走 `asyncio.to_thread`（`autoswitch_state()` 会碰位姿/地图，占事件循环）。
+- 解锁（`POST /api/session/user {locked:false}`）= 回**当前病房**的集体层（规格 §4.5 语义），前端传的 uid 被忽略。
+- 改口令：**只要已设过口令就必须验旧口令**，与口令门开关无关（堵"关门→改口令→开门"永久占住口令的链）。
+- `POST /api/session/user` 额外拒绝 `uid="admin"`；`X-Surface` 非法值 400。
+- `remote`-MCP 工具纳入角色白名单**交集**（白名单是天花板）；MCP 服务器未声明 `roles` = 仅 admin。
+- 集体层白名单 = `["robot_status","robot_stop"]`（**R3 急停必须可用**），不是空列表。
+
+### 已知限制与暂缓项
+
+- **前端构建/单测在本机跑不了（环境限制，非代码问题）**：`frontend` 下 `pnpm --filter shared test`
+  → `Error: spawn EPERM`（栈底是 `esbuild@0.21.3/lib/main.js ensureServiceIsRunning`，
+  即沙箱不允许子进程管道通信）。故**三个前端包的 `vitest` 与 `vite build` 均未在本机复验**，
+  需**用户侧**跑 `cd frontend && pnpm test && pnpm -r build` 后复验；`vite build` 产物未重建。
+- **P1 暂缓（D16，用户 2026-09-14：「先不管 mcp，先完成用户系统」）**：car MCP 的 `robot_goto`、
+  地点白名单解析、风险分级与二次确认状态机、admin「地点白名单」页签（规格 §6.3/§7）——**本轮未做**，
+  待 MCP 线重启后另立计划。
+- **真实语音链路未联调**：声纹→角色→提示词分层这条链在本机只有单测覆盖，未接麦克风实测。
