@@ -18,12 +18,13 @@ AI 对话后端（FastAPI + SSE 流式）—— 大模型端"大脑与嘴"的 HT
 import asyncio
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
@@ -31,6 +32,8 @@ from pydantic import BaseModel
 
 from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
 from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
+from . import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
+from . import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
 from .conf import MODEL, BASE_DIR
 from . import conf
 
@@ -71,10 +74,36 @@ async def lifespan(app: FastAPI):
     drain_task = bus.start_drain()   # 广播扇出任务
     voice_api.start_voice(client, MODEL, _post_chat_jobs)
     mcp_client.start(db.get_settings())   # MCP 外部工具（mcp_enabled 开启时拉起）
+
+    # 分层用户体系：首启生成管理员口令（D12）+ 位置源自检 + 每秒 tick（TTL 降权 + 病房位置自动切换）
+    pw = session.ensure_admin_password()
+    if pw:
+        print(f"[INFO] 已生成管理员初始口令：{pw}（登录后请立即修改）")
+        audit.log("admin_password_generated")
+    if not db.get_admin_auth()["hash"]:
+        # 半写坏库（盐在哈希没了）等场合 ensure_admin_password 会自愈；这里再兜一层可见性：
+        # 口令没落地 = 管理层**永远进不去**，必须让人在启动日志里就看见
+        print("[WARN] 管理员口令未初始化：管理层将无法登录！")
+    ok, why = locator.available()
+    if not ok:
+        print(f"[WARN] 位置源不可用（{why}）→ 病房位置自动切换停用，车前屏可手动切病房")
+
+    async def _role_tick():
+        """每秒一次：admin TTL 到期降权 + 按位姿自动切病房。"""
+        while True:
+            await asyncio.sleep(1)
+            try:
+                await asyncio.to_thread(session.tick)   # tick 会碰网络/SSH，别占事件循环
+            except Exception:                           # noqa: BLE001  降级：tick 出错不拖垮服务
+                pass
+
+    tick_task = asyncio.create_task(_role_tick())
+
     yield
     mcp_client.stop()
     voice_api.stop_voice()
     drain_task.cancel()
+    tick_task.cancel()
 
 
 app = FastAPI(title="AI 陪护机器人后端", lifespan=lifespan)
@@ -214,6 +243,31 @@ class ReminderIn(BaseModel):
 class SessionUserIn(BaseModel):
     uid: str
     locked: bool = True
+    role: str | None = None        # 只为显式拒绝它而存在（R1）：传了就 400
+
+
+class LoginIn(BaseModel):
+    password: str | None = None
+
+
+class PasswordIn(BaseModel):
+    old: str = ""
+    new: str
+
+
+class AdminAuthIn(BaseModel):
+    required: bool
+
+
+class WardIn(BaseModel):
+    uid: str
+    name: str = ""
+    ward_map: str = ""             # 关联区域所在的地图名（几何真相在 <图名>.tags.json）
+    ward_zone: str = ""            # 关联的区域 uid（形如 z1）
+
+
+class WardAssignIn(BaseModel):
+    ward_id: str = ""
 
 
 class AlarmIn(BaseModel):
@@ -334,15 +388,18 @@ async def logs_warnings(limit: int = Query(50)):
 
 
 @app.post("/api/chat")
-async def chat_route(req: ChatRequest):
+async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk")):
     settings = db.get_settings()
+    # 角色只从会话层取（R1）：前端传来的任何身份字段都不可信；槽位由 X-Surface 决定
+    principal = session.get_principal(_surface(x_surface))
 
     def gen():
         assistant = ""
         speech = voice_api.begin_text_reply() if req.speak else None
         completed = False
         try:
-            for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking, settings):
+            for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking,
+                                       settings, principal=principal):
                 if ev["type"] == "content":
                     voice_api.feed_text_reply(speech, ev.get("content") or "")
                 elif ev["type"] == "done":
@@ -352,7 +409,8 @@ async def chat_route(req: ChatRequest):
         finally:
             voice_api.end_text_reply(speech, flush_tail=completed)
             if completed and assistant.strip():
-                _bg.submit(_post_chat_jobs, req.uid, req.message, assistant)
+                # 角色随本轮的 principal 一起带给沉淀任务（集体层不沉淀，规格 §5.3）
+                _bg.submit(_post_chat_jobs, req.uid, req.message, assistant, principal["role"])
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",
@@ -377,8 +435,9 @@ async def chat_history_clear(uid: str = Query("elder_001")):
 
 # ---------------------------------------------------------------- 老人档案
 @app.get("/api/profiles")
-async def profiles_list():
-    return {"ok": True, "profiles": db.list_profiles()}
+async def profiles_list(kind: str = Query("elder")):
+    """老人列表（默认只列 kind='elder'）；要看病房用 /api/wards，要看全部传 ?kind=all。"""
+    return {"ok": True, "profiles": db.list_profiles(kind="" if kind == "all" else kind)}
 
 
 @app.post("/api/profiles")
@@ -748,19 +807,230 @@ async def voice_enroll(body: dict = None):
     return await asyncio.to_thread(voice_api.enroll_speaker, uid, seconds)
 
 
-# ---------------------------------------------------------------- 会话状态
+# ---------------------------------------------------------------- 会话 / 角色（分层用户体系）
+# 规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md
+# 红线 R1：角色只由 session.derive_role()（依据 profiles.kind）推导，前端传的一律不可信。
+_SURFACES = ("kiosk", "admin")
+_login_fail: dict[str, dict] = {}      # slot -> {"n": 连续失败次数, "until": 冷却截止}
+
+
+def _surface(x_surface: str = Header(default="kiosk")) -> str:
+    """端槽位：kiosk（车前/语音）| admin（管理台）。**缺头**按 kiosk，非法值显式 400。
+
+    绝不静默回落 kiosk：那会让 `X-Surface: TABLET` 这种笔误把"管理台的口令登录"写到车前屏
+    上（顺带把车前屏提权），而且返回体/审计里的 slot 还是那个错名（追溯性一并破坏）。
+
+    空串也一律 400（"提供了非法值"与"没提供"是两回事：空串回落同样会把管理台的登录写进
+    kiosk 槽）。只有**非 str** 才按缺省处理 —— 那是 handler 被直接调用（不经 FastAPI 依赖
+    注入，如既有单测 `server.chat_route(req)`）时留在形参默认值里的 `Header(...)` 标记对象，
+    真实请求里的请求头永远是 str。
+
+    顺带兜底建表：会话/病房/策略这一族路由**全部**以本函数为公共入口，而它们都要读
+    `profiles.kind`（R1 角色推导的唯一依据）或 `settings`（口令门/口令哈希）——"库文件在、
+    表不在"的场合（首启半途中断、测试隔离出空库）必须自愈而不是 500，同
+    `voice_api._ensure_schema()` 的初衷；生产上 lifespan 已建过表，这里只是一次字符串比较。
+    """
+    voice_api._ensure_schema()
+    if not isinstance(x_surface, str):
+        x_surface = "kiosk"
+    if x_surface not in _SURFACES:
+        raise HTTPException(status_code=400, detail=f"未知的 X-Surface：{x_surface!r}（只允许 {_SURFACES}）")
+    return x_surface
+
+
+def _public_policy(pol: dict) -> dict:
+    """策略包转成可 JSON 序列化的形式（Path → str）。"""
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in pol.items()}
+
+
+def _login_cooling(slot: str) -> bool:
+    st = _login_fail.get(slot) or {}
+    return bool(st.get("until")) and time.time() < st["until"]
+
+
+def _login_failed(slot: str) -> None:
+    st = _login_fail.setdefault(slot, {"n": 0, "until": 0.0})
+    st["n"] += 1
+    if st["n"] >= 3:                       # 连续 3 次失败 → 该槽冷却 10s
+        st["until"] = time.time() + 10
+        st["n"] = 0
+        audit.log("session_login_fail", slot=slot, action="cooling")
+
+
+def _session_user_payload(slot: str) -> dict:
+    """当前会话主体的返回体（**同步**，由路由丢进线程跑，见下）。
+
+    形状保持老契约：`ok` 必在、没有主体时 `uid` 是 `None` —— 车前屏靠 `uid === null` 判断
+    "没选人"，`frontend/packages/shared/src/api/session.ts` 与 `tests/test_session_api.py`
+    都吃这个形状（`voice_api.get_session_uid()` 也是这么兜的）。
+    """
+    p = dict(session.get_principal(slot))       # 建表兜底在 `_surface()`（本族路由的公共入口）
+    p["uid"] = p["uid"] or None
+    return {"ok": True, **p,
+            "ttl_remain": session.ttl_remain(slot),
+            "auth_required": db.get_admin_auth()["required"],
+            "autoswitch": session.autoswitch_state()}
+
+
 @app.get("/api/session/user")
-async def session_user_get():
-    """当前会话用户（active_uid + 锁定标志），全端共享。"""
-    return voice_api.get_session_uid()
+async def session_user_get(x_surface: str = Header(default="kiosk")):
+    """当前会话主体（uid/角色/锁定/当前病房/TTL），**角色按请求槽位返回**（双槽隔离）。
+
+    必须走线程：`autoswitch_state()` 会读位姿（`locator.get_pose()` 最多 drain 0.8s）并反查
+    "车在跑哪张图"（`MAPS_IO=ssh` 下含远端 stat/整图拉取），占住事件循环会拖慢整个后端。
+    """
+    slot = _surface(x_surface)
+    return await asyncio.to_thread(_session_user_payload, slot)
 
 
 @app.post("/api/session/user")
-async def session_user_set(s: SessionUserIn):
-    """手动切换当前会话用户并广播 user_changed（kiosk 切用户/admin 同步）。"""
-    res = voice_api.set_session_uid(s.uid, s.locked)
-    bus.publish("user_changed", uid=s.uid, locked=s.locked, source="manual")
+async def session_user_set(s: SessionUserIn, x_surface: str = Header(default="kiosk")):
+    """切换会话主体：**只接受 uid/locked**；`role` 与 `uid="admin"` 一律 400（R1）。
+
+    `uid="admin"` 必须在边界拒：`session.set_subject()` 的拒绝对 admin 提权分支返回的是
+    **当前主体**（与成功同形），前端会误以为"切到管理员成功了"。
+    """
+    if s.role:
+        raise HTTPException(status_code=400, detail="role 不可由前端指定（R1）")
+    if s.uid == session.ADMIN_UID:
+        raise HTTPException(status_code=400,
+                            detail="管理员身份只能经 /api/session/login 获取（R1）")
+    slot = _surface(x_surface)
+    res = dict(session.set_subject(s.uid, s.locked, slot=slot, source="manual"))
+    res["ok"] = True                       # 老接口形状（voice_api.set_session_uid 同款）
+    bus.publish("user_changed", uid=res["uid"], role=res["role"], slot=slot,
+                locked=res["locked"], ward_uid=res["ward_uid"], source="manual")
     return res
+
+
+@app.post("/api/session/login")
+async def session_login(body: LoginIn | None = None, x_surface: str = Header(default="kiosk")):
+    slot = _surface(x_surface)
+    if _login_cooling(slot):
+        return {"ok": False, "error": "口令失败次数过多，请 10 秒后重试"}
+    res = session.login_admin((body.password if body else None), slot=slot)
+    if res.get("ok"):
+        _login_fail.pop(slot, None)
+        bus.publish("user_changed", uid=res["uid"], role=res["role"], slot=slot,
+                    source=res["source"])
+    else:
+        _login_failed(slot)
+    return res
+
+
+@app.post("/api/session/logout")
+async def session_logout(x_surface: str = Header(default="kiosk")):
+    slot = _surface(x_surface)
+    res = session.logout(slot)
+    bus.publish("user_changed", uid=res["uid"], role=res["role"], slot=slot, source="logout")
+    return res
+
+
+@app.post("/api/session/password")
+async def session_password(body: PasswordIn, x_surface: str = Header(default="kiosk")):
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可改口令")
+    return session.change_admin_password(body.old, body.new)
+
+
+@app.get("/api/session/admin-auth")
+async def admin_auth_get():
+    voice_api._ensure_schema()   # 本族仅此路由不经过 _surface（无端槽位语义），建表兜底单独兜一次
+    return {"required": db.get_admin_auth()["required"]}
+
+
+@app.post("/api/session/admin-auth")
+async def admin_auth_set(body: AdminAuthIn, x_surface: str = Header(default="kiosk")):
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可开关口令门")
+    res = session.set_admin_auth(body.required)
+    bus.publish("admin_auth_changed", required=res["required"])
+    return res
+
+
+def _ward_payload(w: dict) -> dict:
+    """病房一条（含它关联的区域行与归属老人）——区域从**只读缓存**取，取不到就是 null。"""
+    zone = db.get_zone(w.get("ward_zone") or "", w.get("ward_map") or "") \
+        if w.get("ward_zone") else None
+    return {"uid": w["uid"], "name": w.get("name", ""),
+            "ward_map": w.get("ward_map", ""), "ward_zone": w.get("ward_zone", ""),
+            "zone": zone,
+            "elders": [p["uid"] for p in db.list_profiles(kind="elder")
+                       if p.get("ward_id") == w["uid"]]}
+
+
+@app.get("/api/wards")
+async def wards_list():
+    """病房用户列表（车前屏的层级栏也要用，故任何角色可读；只含名字与归属，无隐私内容）。"""
+    voice_api._ensure_schema()   # 同上：本路由不经过 _surface（任何角色可读）
+    return {"ok": True, "wards": [_ward_payload(w) for w in db.list_wards()]}
+
+
+@app.post("/api/wards")
+async def wards_upsert(w: WardIn, x_surface: str = Header(default="kiosk")):
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    db.upsert_ward(w.uid, name=w.name, ward_map=w.ward_map, ward_zone=w.ward_zone)
+    audit.log("ward_change", source="admin", action="upsert", ward=w.uid)
+    bus.publish("ward_changed", uid=w.uid, action="upsert")
+    return {"ok": True, "ward": _ward_payload(db.get_profile(w.uid) or {"uid": w.uid})}
+
+
+@app.post("/api/wards/{ward_uid}/zone")
+async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk")):
+    """便捷录入：以当前位姿为圆心、`ward_zone_default_r` 为半径采样 16 边形写入**该图的
+    `<图名>.tags.json`**（`maptags.record_room_polygon`，已有实现、本次补 HTTP 入口），
+    再把「地图名 + 区域 uid」回填进 profiles。精确形状请到 /mapeditor 画多边形。
+    """
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    pose = locator.get_pose()
+    if not pose or pose.get("x") is None:
+        return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪）；可到地图编辑器手绘区域"}
+    map_name, why = session.running_map_name()
+    if not map_name:
+        return {"ok": False,
+                "error": f"认不出当前地图（{why}）：请确认导航在跑且 /map 指纹能唯一命中，"
+                         f"或把设置 ward_map_source 改成 setting 并选好 current_map"}
+    ward = db.get_profile(ward_uid) or {}
+    name = ward.get("name") or ward_uid
+    r = float(db.get_settings().get("ward_zone_default_r", 3.0))
+    try:
+        res = maptags.record_room_polygon(map_name, name, float(pose["x"]), float(pose["y"]),
+                                          radius_m=r, kind="ward")
+    except Exception as e:                 # noqa: BLE001  板卡不可达/名字非法等 → 只降级不 500
+        return {"ok": False, "error": f"写地图标记失败：{e}"}
+    db.set_ward_zone(ward_uid, map_name, res["uid"])
+    audit.log("ward_change", source="admin", action="zone", ward=ward_uid,
+              map=map_name, zone=res["uid"])
+    bus.publish("ward_changed", uid=ward_uid, action="zone")
+    return {"ok": True, "map": map_name, "zone_uid": res["uid"],
+            "zone": maptags.get_zone(map_name, res["uid"])}
+
+
+@app.post("/api/profiles/{uid}/ward")
+async def profile_set_ward(uid: str, body: WardAssignIn,
+                           x_surface: str = Header(default="kiosk")):
+    """把老人归入/移出病房（写 profiles.ward_id）。
+
+    单独一条路由是**故意的**：`upsert_profile` 不许碰病房字段，否则档案编辑会静默清掉关联。
+    """
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可分配病房")
+    db.set_profile_ward(uid, body.ward_id)
+    audit.log("ward_change", source="admin", action="assign", elder=uid, ward=body.ward_id)
+    bus.publish("ward_changed", uid=body.ward_id, action="assign")
+    return {"ok": True, "uid": uid, "ward_id": body.ward_id}
+
+
+@app.get("/api/policy/roles")
+async def policy_roles(x_surface: str = Header(default="kiosk")):
+    """策略矩阵：管理员看全量，其它角色只拿自己那份摘要。"""
+    from .policy import POLICY_DEFAULTS
+    role = session.get_principal(_surface(x_surface))["role"]
+    if role != "admin":
+        return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
+    return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
 
 
 # ---------------------------------------------------------------- 紧急呼叫
