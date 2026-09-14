@@ -69,6 +69,8 @@ _sessions: dict[str, tuple] = {}   # 服务器名 -> (stdio_client 上下文 ctx
 _tools: dict[str, dict] = {}       # 工具名 -> {"server": 所属服务器名, "schema": OpenAI function schema}
 _errors: dict[str, str] = {}       # 服务器名 -> 连接失败原因（字符串），供 status() 展示
 _started = False                   # 是否至少有一台服务器成功连接并注册了工具
+_connect_future = None             # 后台连接任务；启动阶段只调度，不同步等待
+_generation = 0                    # 隔离 stop 后才完成的过期回调
 
 
 def available() -> bool:
@@ -240,7 +242,7 @@ def start(settings: dict):
       - 成功：全部 MCP 工具的 OpenAI schema 列表（供工具循环合并）；
       - 任何降级/失败情况：None。
     """
-    global _loop, _thread, _started
+    global _loop, _thread, _started, _connect_future, _generation
     # —— 降级检查 1：mcp SDK 依赖不可用（没装 / 版本不兼容）——
     if not _MCP_AVAILABLE:
         reason = "缺少依赖：" + "; ".join(_MISSING_DEPS)   # 缺多个时全列出
@@ -258,25 +260,33 @@ def start(settings: dict):
         audit.log("mcp_degraded", reason="conf.MCP_SERVERS 未配置启用的服务器")
         return None
 
+    if _thread is not None and _thread.is_alive():
+        return schemas()
+
     # 1) 创建专属事件循环 + 后台守护线程，让 MCP 异步操作与主程序隔离运行。
     _loop = asyncio.new_event_loop()                                   # 新建一个独立事件循环
     _thread = threading.Thread(target=_loop_runner, name="mcp-client", daemon=True)
     _thread.start()                                                    # 线程内 run_forever
-    # 2) 把"连接全部服务器"的协程投递进后台循环，并同步阻塞等待完成。
-    #    fut.result(timeout=...) 同时承担"总超时兜底"：即便某台服务器被 wait_for
-    #    放过后仍僵住，这里也能兜住整体启动时间。
-    fut = asyncio.run_coroutine_threadsafe(_connect_all(enabled), _loop)
-    try:
-        # 总超时 = 单台超时 × 服务器数（各台串行） + 15s 余量，给启动留足时间。
-        fut.result(timeout=MCP_CONNECT_TIMEOUT * max(1, len(enabled)) + 15)
-    except Exception as e:
-        audit.log("mcp_degraded", reason=f"连接阶段异常: {e}")
-        print(f"[WARN] MCP 连接阶段异常: {e}")
-    # 3) 收尾：只要注册到 ≥1 个工具就算"启动成功"；一台都没有则整体降级提示。
-    _started = bool(_tools)
-    if not _started:
-        audit.log("mcp_degraded", reason="所有 MCP 服务器连接失败")
-        print("[WARN] MCP 所有服务器连接失败，本次运行无 MCP 工具")
+    # 2) 只调度连接，不等待外部子进程握手；FastAPI 可立即完成 lifespan 启动。
+    _generation += 1
+    generation = _generation
+    _connect_future = asyncio.run_coroutine_threadsafe(_connect_all(enabled), _loop)
+
+    def _connected(done):
+        global _started
+        if generation != _generation or done.cancelled():
+            return
+        try:
+            done.result()
+        except Exception as e:      # noqa: BLE001  后台失败只能降级，不能影响主服务
+            audit.log("mcp_degraded", reason=f"连接阶段异常: {e}")
+            print(f"[WARN] MCP 连接阶段异常: {e}")
+        _started = bool(_tools)
+        if not _started:
+            audit.log("mcp_degraded", reason="所有 MCP 服务器连接失败")
+            print("[WARN] MCP 所有服务器连接失败，本次运行无 MCP 工具")
+
+    _connect_future.add_done_callback(_connected)
     return schemas()
 
 
@@ -305,7 +315,16 @@ def stop():
       3. 等待后台线程退出（join）并清空全部运行时状态。
     幂等性：无论 start() 是否真正拉起过线程，调用多次/在异常路径调用都安全。
     """
-    global _loop, _thread, _started, _tools, _errors
+    global _loop, _thread, _started, _tools, _errors, _connect_future, _generation
+    _generation += 1
+    if _connect_future is not None and not _connect_future.done():
+        _connect_future.cancel()
+        if _loop is not None:
+            try:
+                barrier = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), _loop)
+                barrier.result(timeout=1)
+            except Exception:
+                pass
     # 阶段 1：有事件循环且有会话 → 投递关闭协程，最多等 10s。
     if _loop is not None and _sessions:
         try:
@@ -324,6 +343,7 @@ def stop():
     if _thread is not None:
         _thread.join(timeout=10)
     _loop = _thread = None
+    _connect_future = None
     _sessions.clear()
     _tools.clear()
     _errors.clear()
