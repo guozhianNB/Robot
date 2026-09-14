@@ -193,3 +193,47 @@ def test_first_boot_generates_random_password(d):
     assert isinstance(pw, str) and len(pw) == 6 and pw.isdigit()
     assert d.verify_admin_password(pw) is True
     assert session.ensure_admin_password() is None             # 已有口令 → 不再生成
+
+
+def test_change_password_requires_old_even_when_auth_disabled(d):
+    """**回归（可利用链）**：口令门关着也必须校验旧口令 —— 否则"关→改→开"能永久占住口令。
+
+    只有"还没设过口令"（hash 为空）才允许无旧口令直接设，否则第一个管理员建不起来。
+    """
+    d.set_admin_password("111111")
+    session.set_admin_auth(False)
+    assert session.change_admin_password("wrong", "222222")["ok"] is False
+    assert d.verify_admin_password("111111") is True          # 原口令未被改掉
+    assert session.change_admin_password("111111", "222222")["ok"] is True
+    # 首启态（没有哈希）允许无旧口令直接设
+    d._set_setting_raw("admin_password_hash", "")
+    d._set_setting_raw("admin_password_salt", "")
+    assert session.change_admin_password("", "333333")["ok"] is True
+    assert d.verify_admin_password("333333") is True
+
+
+def test_re_enabling_kills_both_slots(d):
+    """作废必须覆盖两个槽位（kiosk 与 admin），且是降权不是换人。"""
+    d.set_admin_password("111111")
+    session.set_subject("ward_101", slot="kiosk")
+    session.login_admin("111111", slot="kiosk", ttl_s=600)
+    session.login_admin("111111", slot="admin", ttl_s=600)
+    session.set_admin_auth(True)
+    assert session.get_principal("kiosk")["role"] == "ward"
+    assert session.get_principal("admin")["role"] == "ward"
+    assert session.get_principal("kiosk")["uid"] == "ward_101"     # 主体没被清掉
+
+
+def test_ensure_password_repairs_half_written_hash(d):
+    """半写坏（有哈希无盐）必须能自愈，否则 admin 面永久进不去。"""
+    d._set_setting_raw("admin_password_hash", "deadbeef")
+    d._set_setting_raw("admin_password_salt", "")
+    pw = session.ensure_admin_password()
+    assert isinstance(pw, str) and len(pw) == 6 and pw.isdigit()
+    assert d.verify_admin_password(pw) is True
+
+
+def test_ensure_password_never_overwrites(d):
+    d.set_admin_password("111111")
+    assert session.ensure_admin_password() is None
+    assert d.verify_admin_password("111111") is True

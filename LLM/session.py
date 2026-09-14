@@ -179,12 +179,19 @@ def ttl_remain(slot: str = "kiosk") -> int | None:
 # 口令维护（D12/D13）：可改、可整体关闭、首启自动生成 6 位随机口令
 # ---------------------------------------------------------------------------
 def change_admin_password(old: str, new: str) -> dict:
-    """改口令（需旧口令）。口令门关着时允许直接设新口令（此时无旧口令可验）。"""
+    """改口令。
+
+    **只要已经设过口令（库里有哈希），就必须校验旧口令——与口令门开关无关。** 否则会出现
+    这条可利用链：关掉口令门（此时人人可免口令进 admin）→ 攻击者把口令改成自己的 →
+    管理员把门开回来（只踢会话、不回滚口令）→ 攻击者仍持有口令。首启态（还没设过口令）
+    才允许无旧口令直接设，否则第一个管理员根本没法建立口令。
+    """
     auth = db.get_admin_auth()
-    if auth["required"] and not db.verify_admin_password(old or ""):
+    if auth["hash"] and not db.verify_admin_password(old or ""):
         audit.log("admin_password_changed", ok=False, reason="old_mismatch")
         return {"ok": False, "error": "旧口令错误"}
     if len(new or "") < 4:
+        audit.log("admin_password_changed", ok=False, reason="too_short")
         return {"ok": False, "error": "新口令太短（至少 4 位）"}
     db.set_admin_password(new)
     audit.log("admin_password_changed", ok=True)
@@ -195,7 +202,7 @@ def set_admin_auth(required: bool) -> dict:
     """开关口令门（D13）。
 
     重新**开启**时把两个槽的 admin 会话立即作废：否则"先关掉门进来、再开回门"的人会
-    一直留在管理员态，等于门白开了。
+    一直留在管理员态，等于门白开了。作废是**降权不是换人**（不动 `_shared` 的主体）。
     """
     required = bool(required)
     db.set_admin_auth_required(required)
@@ -204,12 +211,18 @@ def set_admin_auth(required: bool) -> dict:
         for slot in SLOTS:
             if _slot(slot)["role"] == "admin":
                 _slot(slot).update({"role": "ward", "until": None, "source": "auth_reenabled"})
+                audit.log("session_logout", slot=slot, source="auth_reenabled")
     return {"required": required}
 
 
 def ensure_admin_password() -> str | None:
-    """首启：库里没有口令哈希就生成 6 位随机口令，返回明文（调用方打印 + 审计，D12）。"""
-    if db.get_admin_auth()["hash"]:
+    """首启：库里没有口令（哈希与盐都不全）就生成 6 位随机口令，返回明文（调用方打印 + 审计）。
+
+    判据是 `hash and salt` 而不是只看 `hash`：半写坏状态（哈希在、盐没了）下必须能自愈，
+    否则 `verify_admin_password` 恒 False、admin 面永久进不去。
+    """
+    auth = db.get_admin_auth()
+    if auth["hash"] and auth["salt"]:
         return None
     import secrets
     pw = "".join(secrets.choice("0123456789") for _ in range(6))
