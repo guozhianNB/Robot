@@ -45,6 +45,27 @@ def test_ward_without_zone_id_returns_none(d):
     assert d.list_wards_with_zone() == []
 
 
+def test_edit_profile_does_not_clear_ward_zone(d):
+    """编辑病房档案（不带 zone_id）**不得**清掉已有的病房↔区域关联。
+
+    zone_id 只由 upsert_ward 写；upsert_profile 的 ON CONFLICT 更新子句不含它。
+    否则管理台改个病房名就会让该病房的位置自动切换静默失效。
+    """
+    zid = d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
+                     polygon_json=[[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+    d.upsert_ward("ward_101", name="101 病房", zone_id=zid)
+    d.upsert_profile("ward_101", name="101 病房（改名）")   # 不带 zone_id
+    p = d.get_profile("ward_101")
+    assert p["zone_id"] == zid, "档案编辑把病房区域关联清掉了"
+    assert p["name"] == "101 病房（改名）", "改名应生效"
+    assert d.get_ward_zone("ward_102") is None
+    # 简报原文此行为 `assert d.list_wards_with_zone() == []`，但它只在"关联被清成 0"的
+    # 破损状态下成立，与上一行 `p["zone_id"] == zid` 互斥（已批准的改法正是不再清关联）；
+    # 故按本缺陷的目标语义修正为：关联保留 → ward_101 仍在"已关联病房"列表里且指向同一 zone。
+    assert d.list_wards_with_zone() == [
+        {"uid": "ward_101", "name": "101 病房（改名）", "zone_id": zid, "zone": d.get_zone(zid)}]
+
+
 def test_zone_contains_point_hits_polygon(d):
     d.add_zone(map_name="101", name="101", kind="ward", shape="polygon",
                polygon_json=[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])

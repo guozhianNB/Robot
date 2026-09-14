@@ -212,7 +212,6 @@ def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
                      profile_json=excluded.profile_json, style=excluded.style,
                      preferences_json=excluded.preferences_json, notes=excluded.notes,
                      kind=COALESCE(profiles.kind, excluded.kind),
-                     zone_id=excluded.zone_id,
                      updated_at=excluded.updated_at""",
                 (uid, name, nickname, bed, age, gender, birthday,
                  json.dumps(profile, ensure_ascii=False),
@@ -227,8 +226,23 @@ def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
 
 
 def upsert_ward(uid: str, name: str = "", zone_id: int = 0) -> dict:
-    """新建/更新病房 profile；病房几何不在这里存，只存关联的 zones.id（唯一真相在 zones）。"""
-    upsert_profile(uid, name=name, kind="ward", zone_id=int(zone_id or 0))
+    """新建/更新病房 profile；病房几何不在这里存，只存关联的 zones.id（唯一真相在 zones）。
+
+    **`zone_id` 只由本函数写**（病房↔区域关联的唯一写入口）。`upsert_profile` 的
+    `ON CONFLICT` 更新子句**不含** zone_id（只在 INSERT 时带），否则任何一次不带
+    zone_id 的档案编辑（默认 0）都会把已有病房的区域关联静默清成 0，
+    导致该病房的位置自动切换"不报错地失效"。
+    `zone_id=0` 在此处是**显式解除关联**（有意的，唯一能清空关联的路径）。
+    """
+    upsert_profile(uid, name=name, kind="ward")
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE profiles SET zone_id=?, updated_at=? WHERE uid=?",
+                         (int(zone_id or 0), now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
     return get_profile(uid) or {}
 
 
