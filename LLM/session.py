@@ -329,21 +329,30 @@ def _holds_session() -> bool:
 
 
 def autoswitch_state() -> dict:
-    """给前端/诊断用：位置自动切换**当前为什么没生效**（判定顺序与 `_ward_tick` 保持一致）。"""
-    st = _settings()
-    if not st.get("ward_autoswitch_enabled", True):
-        return {"enabled": False, "reason": "disabled"}
-    if _now_ts() < (_shared.get("manual_until") or 0.0):
-        return {"enabled": False, "reason": "manual_override"}
-    pose = locator.get_pose()
-    if pose is None or pose.get("x") is None:
-        return {"enabled": False, "reason": "no_pose"}
-    name, reason = running_map_name()
-    if not name:
-        return {"enabled": False, "reason": reason or "map_unknown"}
-    if not _holds_session():
-        return {"enabled": True, "reason": "holding_session"}
-    return {"enabled": True, "reason": "active"}
+    """给前端/诊断用：位置自动切换**当前为什么没生效**（判定顺序与 `_ward_tick` 保持一致）。
+
+    本函数挂在车前屏的轮询端点上，而 `locator.get_pose()` / `running_map_name()`
+    可能走网络/SSH：任何意外异常都不许把它变成 500。故整体兜底降级为
+    `{"enabled": False, "reason": "error"}` + 审计，绝不抛穿。
+    """
+    try:
+        st = _settings()
+        if not st.get("ward_autoswitch_enabled", True):
+            return {"enabled": False, "reason": "disabled"}
+        if _now_ts() < (_shared.get("manual_until") or 0.0):
+            return {"enabled": False, "reason": "manual_override"}
+        pose = locator.get_pose()
+        if pose is None or pose.get("x") is None:
+            return {"enabled": False, "reason": "no_pose"}
+        name, reason = running_map_name()
+        if not name:
+            return {"enabled": False, "reason": reason or "map_unknown"}
+        if not _holds_session():
+            return {"enabled": True, "reason": "holding_session"}
+        return {"enabled": True, "reason": "active"}
+    except Exception as e:                  # noqa: BLE001
+        audit.log("session_tick_error", action="autoswitch_state", error=str(e))
+        return {"enabled": False, "reason": "error"}
 
 
 def _ward_tick() -> None:

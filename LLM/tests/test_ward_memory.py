@@ -39,3 +39,13 @@ def test_default_role_keeps_old_behavior(d):
     memory.note_turn("elder_002", "我", "话", None, "",
                      {"memory_consolidation_enabled": False})
     assert memory._pending_turns.get("elder_002")
+
+
+def test_unknown_role_is_not_settled(d):
+    """未知角色取值按 fail-closed 处理：不沉淀（R2）。"""
+    memory._pending_turns.pop("u_unknown", None)
+    memory.note_turn("u_unknown", "我", "话", None, "", {}, role="??")
+    assert memory._pending_turns.get("u_unknown") is None
+    for bad in ("WARD", " ward ", ""):        # 大小写 / 空格 / 空值一并 fail-closed
+        memory.note_turn("u_unknown", "我", "话", None, "", {}, role=bad)
+        assert memory._pending_turns.get("u_unknown") is None, bad

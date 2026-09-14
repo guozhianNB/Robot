@@ -8,6 +8,7 @@ r"""语音服务的挂载逻辑：启动 worker、状态查询、声纹建档。
   绝不让导入链崩掉主程序 —— 后端必须在无语音依赖时也能正常启动。
 """
 import io
+import sqlite3
 import time
 import uuid
 import wave
@@ -56,11 +57,19 @@ def _ensure_schema() -> None:
     表不在"的场合（首启半途中断、测试隔离出空库）——`GET /api/session/user` 是车前屏
     轮询的热路径，绝不能因为缺表就 500。`init_db()` 幂等但含迁移检查，故按 DB_PATH
     记忆化：生产上 lifespan 已建过表，这里只是一次字符串比较。
+
+    记忆化的洞：库文件**被删/被换**（路径没变）时，短路会让这个端点一直 500。
+    故 `sqlite3.OperationalError` 时清掉记忆化**重试一次**；仍失败就抛出去
+    （不吞真实错误——比如目录不可写，重试也没用，必须让调用方看到）。
     """
     global _schema_path
     if _schema_path == db.DB_PATH:
         return
-    db.init_db()
+    try:
+        db.init_db()
+    except sqlite3.OperationalError:
+        _schema_path = None
+        db.init_db()
     _schema_path = db.DB_PATH
 
 

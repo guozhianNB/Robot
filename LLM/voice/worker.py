@@ -346,15 +346,23 @@ class VoiceWorker(threading.Thread):
 
         注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
         语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
+
+        **降级**：`set_subject()` 内部会 `derive_role()` → `db.get_profile_kind()` 读库，
+        库路径错/文件被换/锁都会抛异常；这里绝不能让它抛穿到 `run()` 的 except
+        （那会 `_reconnect()` 掉这一整句——没有应答、没有 TTS）。出问题只记审计并
+        退回上一主体（本方法不改任何内存态）。
         """
-        from LLM import session as role_session          # 顶层角色会话层（≠ LLM.voice.session）
-        principal = role_session.get_principal("kiosk")
-        if principal["role"] == "admin":
-            return
-        uid = recognized_uid or principal["uid"] or role_session.current_ward()
-        if uid:
-            role_session.set_subject(uid, bool(self.locked_uid), slot="kiosk",
-                                     source="voiceprint")
+        try:
+            from LLM import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
+            principal = role_session.get_principal("kiosk")
+            if principal["role"] == "admin":
+                return
+            uid = recognized_uid or principal["uid"] or role_session.current_ward()
+            if uid:
+                role_session.set_subject(uid, bool(self.locked_uid), slot="kiosk",
+                                         source="voiceprint")
+        except Exception as e:              # noqa: BLE001  DB/会话层异常不许掐掉整句应答
+            audit.log("voice_error", action="role_subject", uid=recognized_uid, error=str(e))
 
     def _handle_speech(self, seg, text, settings):
         self.session.note_speech()
@@ -373,8 +381,15 @@ class VoiceWorker(threading.Thread):
         prev = role_session.get_principal("kiosk")
         self._apply_role_subject(recognized)                 # 谁说的：按角色决定（含 D8）
         principal = role_session.get_principal("kiosk")
-        chat_uid = principal["uid"] or principal["ward_uid"] or "elder_001"
-        self.current_uid = chat_uid
+        # 只把**权威主体**写回内存态；兜底常量只用于本轮应答 uid。
+        # 反例（本行曾写错）：无条件 `self.current_uid = chat_uid` 会把 "elder_001"
+        # 回灌成内存态，而 `id_mod.effective_uid()` 在未识别时返回 current_uid ——
+        # 第二轮就被当成"声纹认出了 elder_001"：冒充演示档案、把集体层对话沉淀进
+        # 该老人的记忆、`session._holds_session()` 变 False 让位置自动切换停摆。
+        subject = principal["uid"] or principal["ward_uid"]
+        if subject:
+            self.current_uid = subject
+        chat_uid = subject or self.current_uid or "elder_001"
         # I-1：主体变了 → 广播 user_changed。payload 与 server.py 手动切换
         # （uid/locked/source）**严格同形**：多塞字段会撞上按整字典比对的既有用例，
         # 前端 events.ts 的 parseBusPayload 也只认这三个字段。

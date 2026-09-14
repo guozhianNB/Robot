@@ -176,11 +176,15 @@ def note_turn(uid: str, user_text: str, assistant_text: str, client, model: str,
     老人 N 秒不再说话 → 触发 consolidate()（话题结束才整理记忆）。
 
     集体层（role="ward"）**直接返回**：病房里的公开对话只作集体上下文，绝不沉淀成
-    任何一位老人的记忆（规格 §5.3，R5 的另一半）。
+    任何一位老人的记忆（规格 §5.3，R5 的另一半）。守卫**归一化后 fail-closed**：
+    只有 elder（本人）与 admin（自己的会话）才进缓冲，`"WARD"`/空格/未知取值一律不沉淀
+    （R2：未知取值按集体层最小能力）。
 
     默认值 "elder" 保住老调用点行为——不传 role 的一律按老人层照旧沉淀。
     """
-    if role == "ward":
+    if str(role or "").strip().lower() not in ("elder", "admin"):
+        # 集体层（ward）与任何未知取值都不沉淀：病房公开对话只作集体上下文（规格 §5.3）。
+        # 只有 elder（本人）与 admin（自己的会话）才进记忆整理缓冲。
         return
     with _buf_lock:
         _pending_turns.setdefault(uid, []).append({"role": "user", "content": user_text})

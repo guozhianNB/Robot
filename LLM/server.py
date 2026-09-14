@@ -110,14 +110,20 @@ def _sse(event: dict) -> str:
     return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
 
 
-def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str = "elder"):
+def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None = None):
     """对话结束后的后台任务（线程池，不阻塞请求）：
     1. 本轮对话记入记忆整理缓冲，并安排"空闲 30s → 话题结束 → 批量整理记忆"定时器
     2. 上下文窗口已满时立即整理（不等到空闲）
     3. 滚动窗口历史摘要
 
     `role` 透传给 `rag.note_turn`：collective 层（role="ward"）的话**不沉淀成任何老人
-    的记忆**（规格 §5.3）。默认 "elder" 保住老调用点行为不变。"""
+    的记忆**（规格 §5.3）。`role=None`（语音等老调用点只传 3 个参数）时**从会话层现取**
+    —— 会话层是角色的唯一权威（R1）。语音是集体层的主入口，漏了这一步就会把病房公开
+    对话当成老人的话沉淀下去。`/api/chat` 路由由任务 11 显式传 `principal["role"]`。"""
+    if role is None:
+        # 语音等老调用点没传角色：按当前主体现取（会话层是角色的唯一权威，R1）
+        from . import session as role_session
+        role = role_session.get_principal("kiosk")["role"]
     settings = db.get_settings()
     try:
         rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
