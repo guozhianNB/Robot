@@ -383,8 +383,13 @@ def test_zone_rows_expose_parsed_polygon(d):
 
 
 def test_float_setting_roundtrip(d):
-    d.set_settings({"ward_zone_default_r": 3.5})
-    assert d.get_settings()["ward_zone_default_r"] == 3.5        # 读回来必须是 float 不是 "3.5"
+    """float 设置项读回来必须是 float 不是 "0.45"。
+
+    这里用**一期末尾就已存在**的 `map_boundary_margin_m`（默认 0.3，float）来验类型转换分支——
+    本任务不依赖任务 3 新增的键（`ward_zone_default_r` 的 float 往返由任务 3 自己的测试覆盖）。
+    """
+    d.set_settings({"map_boundary_margin_m": 0.45})
+    assert d.get_settings()["map_boundary_margin_m"] == 0.45
 
 
 def test_admin_password_hash_roundtrip(d):
@@ -676,6 +681,21 @@ def test_role_settings_have_defaults():
     assert DEFAULT_SETTINGS["ward_map_source"] == "auto"
 
 
+def test_new_float_setting_roundtrips_as_float(d):
+    """新增的 float 键要能真的存进去并读回 float（任务 2 已给 get_settings 补 float 分支）。"""
+    from LLM import db
+    import os, tempfile
+    tmp = tempfile.mkdtemp()
+    old = db.DB_PATH
+    db.DB_PATH = os.path.join(tmp, "t.db")
+    db.init_db()
+    try:
+        db.set_settings({"ward_zone_default_r": 3.5})
+        assert db.get_settings()["ward_zone_default_r"] == 3.5
+    finally:
+        db.DB_PATH = old
+
+
 def test_does_not_shadow_existing_map_settings():
     """`current_map` 一期已有（真值是"下次启导航用哪张图"），本设计不重新定义它。"""
     assert DEFAULT_SETTINGS["current_map"] == "my_map"
@@ -707,7 +727,7 @@ def test_does_not_shadow_existing_map_settings():
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_settings_roles.py LLM/tests -q`
-预期：新文件 2 passed；全量仍是那 4 个既有红态
+预期：新文件 3 passed；全量仍是那 4 个既有红态
 
 - [ ] **步骤 5：Commit**
 
