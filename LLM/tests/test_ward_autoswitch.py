@@ -50,6 +50,8 @@ def d(monkeypatch):
     db.upsert_ward("ward_102", name="102 病房", ward_map=_MAP, ward_zone="z2")
     db.upsert_profile("elder_101_1", name="李爷爷")
     db.set_profile_ward("elder_101_1", "ward_101")
+    db.set_admin_password("111111")           # 口令门默认开：不设口令则 login_admin 必定
+                                              # 被拒（槽位 role 根本变不成 admin，分歧态构造不出来）
     monkeypatch.setattr(session, "_settings", lambda: dict(_SETTINGS))
     session.set_subject("ward_101", slot="kiosk")
     locator.set_pose_for_test(0.0, 0.0, 0.0)          # 起点在 101 里
@@ -179,3 +181,63 @@ def test_unknown_map_disables_autoswitch(d, monkeypatch):
         session.tick()
     assert session.current_ward() == "ward_101"
     assert session.autoswitch_state()["reason"] == "map_unknown"
+
+
+def test_divergent_slot_role_does_not_steal_private_chat(d, monkeypatch):
+    """**回归（关键）**：位置判定必须用**有效角色**判断能不能改主体。
+
+    `_expire_if_needed()`（admin TTL 到期）会把槽位原始 role 直接写成 `"ward"` 而**不重算**，
+    而 `tick()` 的第一步恰好就是 `_expire_if_needed()`。拿原始 role 判定，就会把正在私聊的老人
+    静默换成病房主体（D18 明令不抢私聊）。
+    """
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    session.login_admin("111111", slot="kiosk", ttl_s=1)      # kiosk 槽变 admin（主体仍是李爷爷）
+    base = session._now_ts()
+    monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(5):
+        session.tick()
+    assert session.get_principal("kiosk")["uid"] == "elder_101_1"   # 主体不许被换掉
+    assert session.current_ward() == "ward_102"                     # 背景病房照常更新
+
+
+def test_manual_override_expiry_needs_full_recount(d, monkeypatch):
+    """**回归**：手动覆盖期内不攒计数 —— 覆盖一到期，不许"一个采样就切"（防抖不许跨 epoch 续数）。"""
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    session.tick()
+    session.tick()                                            # 已攒 2 次（debounce=3）
+    session.manual_set_ward("ward_101")                       # 手动覆盖 → 计数清零
+    session.tick()
+    assert session.current_ward() == "ward_101"               # 覆盖期内：不切也不攒（计数是空的）
+    # 把时钟推过 `manual_until`（它记在快进后的时钟上）→ 手动覆盖到期。
+    # 不用 `monkeypatch.undo()`：那会把 fixture 的 `_settings` 补丁一并撤掉。
+    base = session.time.monotonic()
+    monkeypatch.setattr(session, "_now_ts", lambda: base + 10_000)
+    session.manual_set_ward("ward_101")                       # 记下 manual_until = base+10600
+    monkeypatch.setattr(session, "_now_ts", lambda: base + 20_000)   # 时钟越过 manual_until
+    session.tick()
+    assert session.current_ward() == "ward_101"               # 第 1 次不许切
+    session.tick()
+    assert session.current_ward() == "ward_101"               # 第 2 次不许切
+    session.tick()
+    assert session.current_ward() == "ward_102"               # 从头数满 3 次才切
+
+
+def test_current_map_is_cached_within_ttl(d, monkeypatch):
+    """**性能红线回归**：`locator.current_map()`（含列图 + 逐图远端 stat + 全图像素统计）
+    在 TTL 窗口内只准调一次 —— 它每秒跑在热路径上。"""
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_map_source": "auto"})
+    calls = []
+    monkeypatch.setattr(session.locator, "current_map",
+                        lambda *a, **k: calls.append(1) or
+                        {"ok": True, "source": "map_topic", "name": _MAP})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    # 光跑 30 次 tick 只要几毫秒，测不出缓存时长 → 让虚拟时钟每次走 2s。
+    # 24s < TTL(30s)：整段只准调一次（TTL 若退回 10s，这段会调 3 次 → 红）。
+    clock = [session._now_ts()]
+    monkeypatch.setattr(session, "_now_ts", lambda: clock[0])
+    for _ in range(12):
+        session.tick()
+        clock[0] += 2.0
+    assert len(calls) == 1

@@ -43,7 +43,7 @@ def reset_for_test() -> None:
     _shared.update({"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0})
     _state.clear()
     _candidate.clear()
-    _map_cache.update({"name": "", "at": 0.0, "reason": ""})
+    _map_cache.update({"name": "", "at": float("-inf"), "reason": ""})
 
 
 def _slot(slot: str) -> dict:
@@ -238,8 +238,13 @@ def ensure_admin_password() -> str | None:
 # ---------------------------------------------------------------------------
 # 当前病房 + 位置自动切换（D17/D18）
 # ---------------------------------------------------------------------------
-_MAP_CACHE_S = 10.0                     # 「车在跑哪张图」的缓存时长（避免每秒打网络/SSH）
-_map_cache: dict = {"name": "", "at": 0.0, "reason": ""}
+_MAP_CACHE_S = 30.0                     # 「车在跑哪张图」的缓存时长
+# 为什么是 30s 而不是 10s：`locator.current_map()` 除了可能 `drain(1.0)`，还要列地图 + **逐图**
+# 做 `mapserver.map_info()`（`MAPS_IO=ssh` 下每张图一次远端 stat，未命中缓存时还要拉整幅 PGM
+# 并做全图像素统计）——这是**热路径**上的重活。病房切换晚 30 秒知道完全可接受（车也不会瞬移）。
+_map_cache: dict = {"name": "", "at": float("-inf"), "reason": ""}
+#                                                     ^^^^^^^^^^^^ 哨兵用 -inf 而不是 0.0：
+#                     `_now_ts()` 是 monotonic（开机计时），用 0.0 会让"开机后头 N 秒"被判成"缓存未过期"
 _candidate: dict[str, int] = {}         # ward_uid -> 连续命中次数（防抖）
 
 
@@ -304,37 +309,55 @@ def manual_set_ward(ward_uid: str) -> dict:
     """
     _shared["ward_uid"] = ward_uid
     _shared["manual_until"] = _now_ts() + float(_settings().get("manual_override_sec", 600))
-    s = _slot("kiosk")
-    if s["role"] == "ward" and not _shared["locked"]:
+    _candidate.clear()               # 手动覆盖 = 判定重新开始，不许复用旧计数（否则到期后一个采样就切）
+    if _holds_session():
         _shared["uid"] = ward_uid
     audit.log("ward_change", source="manual", ward=ward_uid)
     bus.publish("ward_changed", uid=ward_uid, action="manual")
     return get_principal("kiosk")
 
 
+def _holds_session() -> bool:
+    """kiosk 槽现在是不是"集体层 + 未锁定"——只有这种状态才允许位置/手动切换**真的改主体**。
+
+    **必须用有效角色（`get_principal()`），不能用 `_slot("kiosk")["role"]`**：槽位里那个原始
+    role 会被 `_expire_if_needed()`（admin TTL 到期直接写 `"ward"`）与 `set_admin_auth()` 改写
+    而**不重算**，于是出现"派生角色=elder、槽位 role=ward"的分歧态；而 `tick()` 的第一步恰好就是
+    `_expire_if_needed()`。拿原始 role 判定，就会把正在私聊的老人静默换成病房主体（D18 明令不抢私聊）。
+    """
+    return get_principal("kiosk")["role"] == "ward" and not _shared["locked"]
+
+
 def autoswitch_state() -> dict:
-    """给前端/诊断用：位置自动切换**当前为什么没生效**。"""
+    """给前端/诊断用：位置自动切换**当前为什么没生效**（判定顺序与 `_ward_tick` 保持一致）。"""
     st = _settings()
     if not st.get("ward_autoswitch_enabled", True):
         return {"enabled": False, "reason": "disabled"}
-    if locator.get_pose() is None:
-        return {"enabled": False, "reason": "no_pose"}
     if _now_ts() < (_shared.get("manual_until") or 0.0):
         return {"enabled": False, "reason": "manual_override"}
+    pose = locator.get_pose()
+    if pose is None or pose.get("x") is None:
+        return {"enabled": False, "reason": "no_pose"}
     name, reason = running_map_name()
     if not name:
         return {"enabled": False, "reason": reason or "map_unknown"}
-    if _slot("kiosk")["role"] == "elder" or _shared["locked"]:
+    if not _holds_session():
         return {"enabled": True, "reason": "holding_session"}
     return {"enabled": True, "reason": "active"}
 
 
 def _ward_tick() -> None:
-    """一次位置判定（由 tick() 每秒调用一次）。"""
+    """一次位置判定（由 tick() 每秒调用一次）。
+
+    每个 early-return 都要把 `_candidate` 清掉："连续 N 次"必须是**连续**的——否则手动覆盖
+    10 分钟到期后，只要再有**一个**瞬时跳变的采样就能凑满计数、把病房改掉（防抖等于失效）。
+    """
     st = _settings()
     if not st.get("ward_autoswitch_enabled", True):
+        _candidate.clear()
         return
     if _now_ts() < (_shared.get("manual_until") or 0.0):
+        _candidate.clear()
         return
     pose = locator.get_pose()
     if pose is None or pose.get("x") is None:
@@ -353,27 +376,40 @@ def _ward_tick() -> None:
     if not hit:                             # 离开病房区（走廊/未知区域）→ 不切
         _candidate.clear()
         return
+    if _shared.get("ward_uid") == hit:      # 已经在这个病房：不累加、不广播（否则计数无上限膨胀）
+        _candidate.clear()
+        return
 
     _candidate[hit] = _candidate.get(hit, 0) + 1
     for k in list(_candidate):
         if k != hit:
             _candidate.pop(k, None)         # 换目标就重新数
     debounce = max(1, int(st.get("ward_switch_debounce", 3)))
-    if _candidate[hit] < debounce or _shared.get("ward_uid") == hit:
+    if _candidate[hit] < debounce:
         return
 
     _shared["ward_uid"] = hit
     audit.log("ward_change", source="location", ward=hit)
     bus.publish("ward_changed", uid=hit, action="location")
     # D18：只在集体层且未锁定时才真正改会话主体（正在私聊/已锁定 → 只更新背景变量）
-    s = _slot("kiosk")
-    if s["role"] == "ward" and not _shared["locked"]:
+    if _holds_session():
         _shared["uid"] = hit
-        s["source"] = "location"
+        _slot("kiosk")["source"] = "location"
 
 
 def tick() -> None:
-    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。"""
+    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。
+
+    整体兜底 try/except：这个函数将来挂在定时线程（或 server 的每秒任务）上，任何意外异常都会
+    让这一轮乃至整条 tick 死掉 —— 连带"自动切换"与"admin TTL 降权"一起永久失效。降级原则：
+    出问题只记审计，绝不中断。
+    """
     for slot in SLOTS:
-        _expire_if_needed(slot)
-    _ward_tick()
+        try:
+            _expire_if_needed(slot)
+        except Exception as e:              # noqa: BLE001
+            audit.log("session_tick_error", action="expire", slot=slot, error=str(e))
+    try:
+        _ward_tick()
+    except Exception as e:                  # noqa: BLE001
+        audit.log("session_tick_error", action="ward", error=str(e))
