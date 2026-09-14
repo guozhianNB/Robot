@@ -25,6 +25,8 @@ def test_degenerate_input_is_false_never_raises():
     assert zonegeo.point_in_polygon(0.0, 0.0, 5) is False          # 不可迭代入参
     assert zonegeo.in_bbox(0.0, 0.0, 3.5) is False                 # 非列表入参（无 isinstance 守卫的旧实现会在 for 处抛 TypeError）
     assert zonegeo.point_in_polygon(0.0, 0.0, object()) is False   # 真值但不是可迭代序列
+    big = "9" * 401                                                    # 合法 JSON number → Python 大整数 → float() 溢出
+    assert zonegeo.zone_hit({"polygon_json": f"[[{big},0],[1,0],[1,1]]"}, 0.5, 0.1) is False
 
 
 def test_broken_points_are_dropped_not_fatal():
@@ -39,6 +41,10 @@ def test_rect_shape_uses_bbox():
     # 同一 shape 换成 polygon_json 字符串形态（缓存表里存的就是字符串）
     zone_json = {"shape": "rect", "polygon_json": "[[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]]"}
     assert zonegeo.zone_hit(zone_json, 3.9, 1.9) is True
+    l_shape = {"shape": "rect",
+               "polygon": [[0.0, 0.0], [4.0, 0.0], [4.0, 1.0], [1.0, 1.0], [1.0, 4.0], [0.0, 4.0]]}
+    assert zonegeo.zone_hit(l_shape, 2.0, 2.0) is True       # 在 bbox 内、在多边形外 → rect 语义取 True
+    assert zonegeo.point_in_polygon(2.0, 2.0, l_shape["polygon"]) is False   # 同一形状按多边形语义是 False
 
 
 def test_zone_hit_accepts_cache_row_with_polygon_json_string():
