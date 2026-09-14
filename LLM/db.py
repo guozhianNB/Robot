@@ -1141,6 +1141,10 @@ def get_settings() -> dict:
     conn = _conn()
     try:
         for r in conn.execute("SELECT key,value FROM settings").fetchall():
+            if r["key"].startswith("admin_password_"):
+                # 口令族 raw key 不参与设置项合并：它们只能经 get_admin_auth()/
+                # verify_admin_password() 访问，绝不能随 GET /api/settings 外泄给前端。
+                continue
             v = r["value"]
             if isinstance(out.get(r["key"]), bool):
                 v = v.lower() in ("1", "true", "yes")

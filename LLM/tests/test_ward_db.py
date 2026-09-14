@@ -160,5 +160,14 @@ def test_admin_password_hash_roundtrip(d):
     assert d.get_admin_auth()["required"] is True
 
 
+def test_get_settings_never_leaks_password_keys(d):
+    """口令哈希/盐存在 settings 表里，但绝不许随 get_settings() 外泄（GET /api/settings 会透出）。"""
+    d.set_admin_password("246810")
+    leaked = [k for k in d.get_settings() if k.startswith("admin_password_")]
+    assert leaked == []
+    # 口令通路本身仍然可用
+    assert d.get_admin_auth()["hash"] and d.verify_admin_password("246810") is True
+
+
 def test_verify_admin_password_without_hash_is_false(d):
     assert d.verify_admin_password("任意") is False
