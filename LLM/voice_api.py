@@ -46,39 +46,62 @@ def _degraded_msg():
 
 _worker = None
 _recognizer = None   # 声纹实例（建档端点复用，避免重复加载）
+_schema_path = None  # 已确认建过表的 DB_PATH（见 _ensure_schema）
 
-# 会话状态（独立于语音可用性）：手动选择用户 + 锁定标志（规格 §8）
-_session_uid = None
-_session_locked = False
+
+def _ensure_schema() -> None:
+    """兜底建表：会话层要按 `profiles.kind` 推导角色（R1），没有表就推导不了。
+
+    正常启动由 `server.lifespan` 的 `db.init_db()` 建好；这里再兜一次是为了"库文件在、
+    表不在"的场合（首启半途中断、测试隔离出空库）——`GET /api/session/user` 是车前屏
+    轮询的热路径，绝不能因为缺表就 500。`init_db()` 幂等但含迁移检查，故按 DB_PATH
+    记忆化：生产上 lifespan 已建过表，这里只是一次字符串比较。
+    """
+    global _schema_path
+    if _schema_path == db.DB_PATH:
+        return
+    db.init_db()
+    _schema_path = db.DB_PATH
 
 
 def set_session_uid(uid: str, locked: bool) -> dict:
-    """手动切换当前会话用户（规格 D11）。
-    锁定时写 worker.locked_uid（声纹不再自动切换）；解锁时清空。
-    语音不可用时仍返回 ok —— 会话状态独立于语音能力。"""
-    global _session_uid, _session_locked
-    # I-1：解锁（locked=False）必须清 _session_uid 残留，否则 get_session_uid 永远返回
-    # 手动 uid（source='none'），声纹自动判定无法恢复
-    _session_uid = uid if locked else None
-    _session_locked = bool(locked)
+    """手动切换当前会话主体（规格 D11）。
+
+    会话主体与角色的持有权已移交 `session.py`；本函数保留同名接口做转发，
+    现有调用点（server 路由 / worker）不变；同时同步 worker 的锁定用户。
+    语音不可用时仍返回 ok —— 会话状态独立于语音能力。
+
+    返回体在 principal 之上补 `ok`：老接口形状（`{"ok": True, "uid", "locked"}`）
+    有既有调用点与用例依赖，不能少。"""
+    from . import session as session_mod
+    _ensure_schema()
+    res = dict(session_mod.set_subject(uid, bool(locked), slot="kiosk", source="manual"))
+    res["ok"] = True
     if _worker is not None:
         try:
             _worker.locked_uid = uid if locked else None
         except Exception:
             pass
     audit.log("session", action="set_uid", uid=uid, locked=bool(locked), by="nurse")
-    return {"ok": True, "uid": uid, "locked": bool(locked)}
+    return res
 
 
 def get_session_uid() -> dict:
-    """当前会话用户：手动选择优先；否则语音链路识别结果；否则 None。"""
-    uid = _session_uid
-    locked = _session_locked
-    source = "manual" if locked else "none"
-    if uid is None and _worker is not None:
+    """当前会话主体（含角色/槽位/当前病房/TTL/自动切换状态）。
+
+    `uid` 的老语义保留：**没有主体时仍是 None**（老前端靠 null 判断"没选人"），
+    此时兼容旧行为看一眼声纹判定结果。"""
+    from . import session as session_mod
+    _ensure_schema()
+    p = session_mod.get_principal("kiosk")
+    uid = p["uid"] or None
+    if uid is None and _worker is not None:      # 兼容旧行为：没主体时看一眼声纹判定结果
         uid = getattr(_worker, "current_uid", None)
-        source = "voiceprint" if uid else "none"
-    return {"ok": True, "uid": uid, "locked": locked, "source": source}
+    return {"ok": True, "uid": uid, "locked": p["locked"], "source": p["source"],
+            "role": p["role"], "slot": p["slot"], "ward_uid": p["ward_uid"],
+            "ttl_remain": session_mod.ttl_remain("kiosk"),
+            "auth_required": db.get_admin_auth()["required"],
+            "autoswitch": session_mod.autoswitch_state()}
 
 _pending = {}   # recording_id -> {"emb", "segments", "wav", "ts"}（录制暂存，TTL 后清理）
 
@@ -101,10 +124,16 @@ def _cleanup_pending():
 
 
 def _stream_fn(client, model):
-    """(uid, text) -> chat_stream 事件迭代器（worker 流式问答消费，任务5）。"""
+    """(uid, text) -> chat_stream 事件迭代器（worker 流式问答消费，任务5）。
+
+    principal 由顶层角色会话层提供（权限与数据注入口径的唯一来源，R1）——
+    这里的 `session` 是**角色会话层**，与 `LLM.voice.session`（语音状态机）无关，
+    故用 role_session 别名避免误读。"""
     def _fn(uid, text):
         settings = db.get_settings()
-        return chat.chat_stream(client, model, uid, text, "auto", settings)
+        from . import session as role_session
+        return chat.chat_stream(client, model, uid, text, "auto", settings,
+                                principal=role_session.get_principal("kiosk"))
     return _fn
 
 

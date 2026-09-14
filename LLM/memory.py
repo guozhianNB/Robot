@@ -170,9 +170,18 @@ def _query_entities(uid: str, query: str) -> list[str]:
 # ================================================================
 # 记忆沉淀 v2：话题结束批量整理
 # ================================================================
-def note_turn(uid: str, user_text: str, assistant_text: str, client, model: str, settings: dict):
+def note_turn(uid: str, user_text: str, assistant_text: str, client, model: str, settings: dict,
+              role: str = "elder"):
     """每轮对话后调用：把本轮对话记入缓冲，并安排空闲定时器。
-    老人 N 秒不再说话 → 触发 consolidate()（话题结束才整理记忆）。"""
+    老人 N 秒不再说话 → 触发 consolidate()（话题结束才整理记忆）。
+
+    集体层（role="ward"）**直接返回**：病房里的公开对话只作集体上下文，绝不沉淀成
+    任何一位老人的记忆（规格 §5.3，R5 的另一半）。
+
+    默认值 "elder" 保住老调用点行为——不传 role 的一律按老人层照旧沉淀。
+    """
+    if role == "ward":
+        return
     with _buf_lock:
         _pending_turns.setdefault(uid, []).append({"role": "user", "content": user_text})
         if assistant_text.strip():

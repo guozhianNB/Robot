@@ -338,27 +338,49 @@ class VoiceWorker(threading.Thread):
         self._asr_tail = []
         self._last_partial = ""
 
+    def _apply_role_subject(self, recognized_uid: str | None) -> None:
+        """按当前角色决定这次说话算谁说的（规格 §4.3）。
+
+        * kiosk 槽是 admin → 按 admin 走，声纹认到谁都不降权（D8）；
+        * 否则：认到老人 → 切到该老人（elder）；没认出来 → 留在集体层（当前病房）。
+
+        注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
+        语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
+        """
+        from LLM import session as role_session          # 顶层角色会话层（≠ LLM.voice.session）
+        principal = role_session.get_principal("kiosk")
+        if principal["role"] == "admin":
+            return
+        uid = recognized_uid or principal["uid"] or role_session.current_ward()
+        if uid:
+            role_session.set_subject(uid, bool(self.locked_uid), slot="kiosk",
+                                     source="voiceprint")
+
     def _handle_speech(self, seg, text, settings):
         self.session.note_speech()
         audit.log("voice_asr", text=text[:200])
 
         vote = self.fusion.resolve(seg)
-        uid = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
+        recognized = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
         # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
         if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
             audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
                       detected=vote.candidate_uid, score=round(vote.confidence, 3))
-        prev_uid = self.current_uid
-        self.current_uid = uid or self.current_uid
         audit.log("voice_spk", identified=(vote.candidate_uid is not None),
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
-        chat_uid = self.current_uid or "elder_001"
-        # I-1：声纹识别切换了用户（或首次识别出用户）→ 广播 user_changed，
-        # 与 server.py 手动切换的广播格式一致，前端状态条/admin toast 同步
-        if self.current_uid and self.current_uid != prev_uid:
-            self._publish("user_changed", uid=chat_uid,
-                          locked=bool(self.locked_uid), source="voiceprint")
+        from LLM import session as role_session
+        prev = role_session.get_principal("kiosk")
+        self._apply_role_subject(recognized)                 # 谁说的：按角色决定（含 D8）
+        principal = role_session.get_principal("kiosk")
+        chat_uid = principal["uid"] or principal["ward_uid"] or "elder_001"
+        self.current_uid = chat_uid
+        # I-1：主体变了 → 广播 user_changed。payload 与 server.py 手动切换
+        # （uid/locked/source）**严格同形**：多塞字段会撞上按整字典比对的既有用例，
+        # 前端 events.ts 的 parseBusPayload 也只认这三个字段。
+        if principal["uid"] != prev["uid"]:
+            self._publish("user_changed", uid=chat_uid, locked=principal["locked"],
+                          source=principal["source"])
         self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
         # 流式问答：应答线程消费 chat_stream → 逐字上屏(chat_partial) + 句级 TTS 播放
         self._start_answer(chat_uid, text, dict(settings))
