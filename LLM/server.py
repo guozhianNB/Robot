@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
@@ -110,14 +110,17 @@ def _sse(event: dict) -> str:
     return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
 
 
-def _post_chat_jobs(uid: str, user_text: str, assistant: str):
+def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str = "elder"):
     """对话结束后的后台任务（线程池，不阻塞请求）：
     1. 本轮对话记入记忆整理缓冲，并安排"空闲 30s → 话题结束 → 批量整理记忆"定时器
     2. 上下文窗口已满时立即整理（不等到空闲）
-    3. 滚动窗口历史摘要"""
+    3. 滚动窗口历史摘要
+
+    `role` 透传给 `rag.note_turn`：collective 层（role="ward"）的话**不沉淀成任何老人
+    的记忆**（规格 §5.3）。默认 "elder" 保住老调用点行为不变。"""
     settings = db.get_settings()
     try:
-        rag.note_turn(uid, user_text, assistant, client, MODEL, settings)
+        rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
     except Exception as e:
         from . import log as audit
         audit.log("memory_change", action="note_error", uid=uid, error=str(e))
@@ -851,8 +854,31 @@ from fastapi.responses import Response                 # noqa: E402
 _MAP_EXTS = ("yaml", "pgm", "tags")
 
 
-def _store():
-    return mapstore.get_store()
+def _store(source: str = ""):
+    """「地图源」依赖：``source`` 空 = 用默认源（``mapsources.default``）。
+
+    **源未知一律转 HTTP 400**（附可用源清单）——这是用户可纠正的输入错误，不能变 500
+    （实测：未知源原来会抛 500）。作为 FastAPI 依赖使用时（``store=Depends(_store)``）
+    异常自动变成 400 响应；直接调用时抛 ``HTTPException``，路由无需各自 try/except。
+    """
+    from fastapi import HTTPException
+    from . import mapsources
+    try:
+        return mapstore.get_store(source)
+    except (mapstore.MapStoreError, mapsources.SourceError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _store_or_err(source: str = ""):
+    """``(store, None)`` 或 ``(None, 400 响应)``：所有带 ``?source=`` 的路由统一用它。
+
+    未知源是用户可纠正的输入错误，必须 400 + 可用源清单（实测直接抛会变 500）。
+    """
+    from . import mapsources
+    try:
+        return mapstore.get_store(source), None
+    except (mapstore.MapStoreError, mapsources.SourceError) as e:
+        return None, _err(str(e))
 
 
 def _err(msg: str, code: int = 400, **extra):
@@ -876,25 +902,104 @@ def _tag_counts(names: list[str]) -> dict[str, dict]:
     return out
 
 
+# ---------------------------------------------------------------- 地图源（sources）
+@app.get("/api/map/sources")
+async def map_sources_list(test: bool = Query(False)):
+    """列出全部地图源（只读；界面只做"选"、不手填路径）。
+
+    ``test=true`` 时对每个源真连一次（等价于 ``/test``），慢（ssh 每个源一次往返）；
+    默认只给配置态，连通性由前端按需点"自检"或对当前源调用 ``/test``。
+    """
+    from . import mapsources
+    doc = mapsources.load()
+    store_map = {}
+    if test:
+        for s in doc["items"]:
+            try:
+                store_map[s["id"]] = mapstore.get_store(s["id"])
+            except Exception:      # noqa: BLE001  单个源造不出来不影响列表
+                pass
+    return mapsources.view_list(store_map or None)
+
+
+@app.post("/api/map/sources")
+async def map_sources_upsert(body: dict = None):
+    """新增/修改一条源。**这是配置入口，不是给界面自由填路径用的**：界面只做选择。"""
+    from . import log as audit, mapsources
+    body = body or {}
+    src = body.get("source") if isinstance(body.get("source"), dict) else body
+    try:
+        doc = mapsources.upsert(src)
+    except mapsources.SourceError as e:
+        return _err(str(e))
+    mapstore.reset_store()                 # 源变了 → 丢掉缓存实例，下次按新配置重建
+    audit.log("map_source", action="upsert", source=src.get("id"), kind=src.get("kind"))
+    return {"ok": True, **mapsources.view_list(), "default": doc["default"]}
+
+
+@app.post("/api/map/sources/{sid}/default")
+async def map_sources_set_default(sid: str):
+    """把某源设为默认源（不传 ``?source=`` 时用它）。"""
+    from . import log as audit, mapsources
+    try:
+        doc = mapsources.set_default(sid)
+    except mapsources.SourceError as e:
+        return _err(str(e), 404)
+    mapstore.reset_store()
+    audit.log("map_source", action="set_default", source=sid)
+    return {"ok": True, "default": doc["default"], **mapsources.view_list()}
+
+
+@app.post("/api/map/sources/{sid}/test")
+async def map_sources_test(sid: str):
+    """对某个源做连通性自检（``list()`` 一次，**不改任何文件**）。"""
+    from . import mapsources
+    try:
+        mapstore.resolve_source(sid)
+    except (mapstore.MapStoreError, mapsources.SourceError) as e:
+        return _err(str(e), 404)
+    return await asyncio.to_thread(mapstore.io_test, sid)
+
+
+@app.delete("/api/map/sources/{sid}")
+async def map_sources_delete(sid: str):
+    """删一条源（默认源不允许删，见 mapsources.remove 的说明）。"""
+    from . import log as audit, mapsources
+    try:
+        mapsources.remove(sid)
+    except mapsources.SourceError as e:
+        return _err(str(e))
+    mapstore.reset_store()
+    audit.log("map_source", action="delete", source=sid)
+    return {"ok": True, **mapsources.view_list()}
+
+
 @app.get("/api/map/list")
-async def map_list():
+async def map_list(source: str = Query("", alias="source")):
     """列地图（**必须排除 .backup/**，规格 §〇 第 4 条）。带尺寸/元数据/未知率/标记数/残缺态。"""
-    return await asyncio.to_thread(_map_list_sync)
+    return await asyncio.to_thread(_map_list_sync, source)
 
 
-def _map_list_sync():
+def _map_list_sync(source: str = ""):
     """同步地图扫描在线程池执行，避免 SSH/PGM 工作阻塞 ASGI 事件循环。"""
     from . import log as audit
-    st = _store()
-    ok, why = st.available()
+    from . import mapsources
+    try:
+        store = mapstore.get_store(source)
+    except (mapstore.MapStoreError, mapsources.SourceError) as e:
+        # 未知源 = 用户可纠正的输入错误 → 明确 400（含可用源），不要 500
+        return _err(str(e))
+    ok, why = store.available()
     if not ok:
         return {"ok": True, "status": "unavailable", "reason": why, "maps": [],
-                "mode": conf.MAPS_IO, "root": st.root}
+                "source": mapstore.current_source().get("id", ""),
+                "mode": conf.MAPS_IO, "root": store.root}
     try:
-        entries = st.list()
+        entries = store.list()
     except mapstore.MapStoreError as e:
         return {"ok": True, "status": "unavailable", "reason": str(e), "maps": [],
-                "mode": conf.MAPS_IO, "root": st.root}
+                "source": mapstore.current_source().get("id", ""),
+                "mode": conf.MAPS_IO, "root": store.root}
     counts = _tag_counts([e["name"] for e in entries])
     maps = []
     for e in entries:
@@ -909,7 +1014,7 @@ def _map_list_sync():
         item["unknown_ratio"] = None
         if e["has_yaml"]:
             try:
-                info = mapserver.map_info(e["name"], st)
+                info = mapserver.map_info(e["name"], store)
                 item.update({"width": info.get("width"), "height": info.get("height"),
                              "resolution": info.get("resolution"), "origin": info.get("origin"),
                              "unknown_ratio": info.get("unknown_ratio"),
@@ -921,14 +1026,14 @@ def _map_list_sync():
         item["current"] = (db.get_settings().get("current_map") == e["name"])
         maps.append(item)
     audit.log("map_change", action="list", count=len(maps), mode=conf.MAPS_IO)
-    return {"ok": True, "maps": maps, "mode": conf.MAPS_IO, "root": st.root,
+    return {"ok": True, "maps": maps, "mode": conf.MAPS_IO, "root": store.root,
             "current_map": db.get_settings().get("current_map")}
 
 
 @app.get("/api/map/current")
-async def map_current():
+async def map_current(source: str = Query("", alias="source"), store=Depends(_store)):
     """车此刻在跑哪张图（**不靠人工声明**，指纹反查，规格 §5.3）。"""
-    return await asyncio.to_thread(locator.current_map, _store())
+    return await asyncio.to_thread(locator.current_map, store)
 
 
 @app.get("/api/map/{name}/meta")
@@ -936,36 +1041,36 @@ async def map_meta(name: str):
     return await asyncio.to_thread(_map_meta_sync, name)
 
 
-def _map_meta_sync(name: str):
+def _map_meta_sync(name: str, store):
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     try:
-        info = mapserver.map_info(n, st)
+        info = mapserver.map_info(n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e), 404)
     counts = db.count_map_tags(n)
-    got = maptags.resolve(n, st)
+    got = maptags.resolve(n, store)
     return {"ok": True, "meta": info, "counts": counts,
             "tags_exists": got["exists"], "tags_warnings": got.get("warnings") or [],
-            "tags_path": maptags.tags_path(n, st),
+            "tags_path": maptags.tags_path(n, store),
             "fingerprint": got.get("fingerprint"),
-            "tags_mtime": maptags.file_mtime_iso(n, st)}
+            "tags_mtime": maptags.file_mtime_iso(n, store)}
 
 
 @app.post("/api/map/{name}/meta")
-def map_meta_set(name: str, body: MapMetaIn):
+def map_meta_set(name: str, body: MapMetaIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """改 resolution/origin 等元数据：**先返回将失效的标记数并要求 confirm=true**（规格 §7.2）。"""
     from . import log as audit
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     try:
-        info = mapserver.map_info(n, st)
+        info = mapserver.map_info(n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e), 404)
     counts = db.count_map_tags(n)
@@ -988,7 +1093,7 @@ def map_meta_set(name: str, body: MapMetaIn):
                     f"改 resolution/origin 会让它们的坐标含义改变", 409,
                     need_confirm=True, affects=counts)
     try:
-        text = st.read(n, "yaml").decode("utf-8", "replace")
+        text = store.read(n, "yaml").decode("utf-8", "replace")
         y = mapserver.parse_yaml_flat(text)
         changes = []
         for k, v in patch.items():
@@ -999,8 +1104,8 @@ def map_meta_set(name: str, body: MapMetaIn):
             changes.append(f"{k}: {old} → {v}")
         new_text = _rewrite_yaml_fields(text, patch)
         # 改元数据 = 覆盖语义 → 强制备份
-        backup = st.backup(n)
-        st.write(n, "yaml", new_text.encode("utf-8"))
+        backup = store.backup(n)
+        store.write(n, "yaml", new_text.encode("utf-8"))
         mapserver.clear_cache()
         locator.clear_current_map_cache()
     except mapstore.MapStoreError as e:
@@ -1009,7 +1114,7 @@ def map_meta_set(name: str, body: MapMetaIn):
     tags_updated = False
     if affects:
         try:
-            got = maptags.resolve(n, st)
+            got = maptags.resolve(n, store)
             if got["ok"] and got["exists"]:
                 tags = got["tags"]
                 tags["resolution"] = float(y.get("resolution")) if y.get("resolution") else None
@@ -1017,16 +1122,16 @@ def map_meta_set(name: str, body: MapMetaIn):
                 if isinstance(org, list) and len(org) >= 2:
                     tags["origin"] = [float(org[0]), float(org[1]),
                                       float(org[2]) if len(org) > 2 else 0.0]
-                maptags.save(n, tags, st, action="meta_fingerprint_confirm",
+                maptags.save(n, tags, store, action="meta_fingerprint_confirm",
                              changes="; ".join(changes))
                 tags_updated = True
         except mapstore.MapStoreError as e:
             return _err(f"元数据已改，但刷新 tags.json 指纹失败：{e}", 500)
-    maptags.sync_map(n, st, force=True)
+    maptags.sync_map(n, store, force=True)
     audit.log("map_change", action="meta_update", map=n, changes=changes,
               backup=",".join(backup), affected=affects, tags_updated=tags_updated)
     return {"ok": True, "changed": changes, "backup": backup, "affected": affects,
-            "tags_updated": tags_updated, "meta": mapserver.map_info(n, st)}
+            "tags_updated": tags_updated, "meta": mapserver.map_info(n, store)}
 
 
 def _rewrite_yaml_fields(text: str, patch: dict) -> str:
@@ -1062,40 +1167,40 @@ def _rewrite_yaml_fields(text: str, patch: dict) -> str:
 
 
 @app.post("/api/map/{name}/rename")
-def map_rename(name: str, body: MapNameIn):
+def map_rename(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """重命名成对文件（.pgm/.yaml/.tags.json）并同步改 yaml 的 image: 与 tags 的 map:。"""
     from . import log as audit
     try:
         n, new = _name_of(name), mapstore.check_name(body.new_name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     if n == new:
         return _err("新名字与原图相同")
-    if st.exists(new, "yaml") or st.exists(new, "pgm"):
+    if store.exists(new, "yaml") or store.exists(new, "pgm"):
         return _err(f"目标已存在：{new}", 409)
     try:
-        st.rename(n, new)
+        store.rename(n, new)
         # yaml 里的 image: 必须跟着走，否则 map_server 找不到 pgm
         try:
-            text = st.read(new, "yaml").decode("utf-8", "replace")
-            st.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
+            text = store.read(new, "yaml").decode("utf-8", "replace")
+            store.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
         except mapstore.MapStoreError:
             pass
         # tags.json 的 map 字段与文件名对齐（指纹不变）
-        if st.exists(new, "tags"):
-            got = maptags.resolve(new, st)
+        if store.exists(new, "tags"):
+            got = maptags.resolve(new, store)
             if got["ok"] and got["exists"]:
                 tags = got["tags"]
                 tags["map"] = new
                 tags["updated_at"] = db.now_iso()
                 import json as _json
-                st.write(new, "tags",
+                store.write(new, "tags",
                          _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
         mapserver.clear_cache()
         locator.clear_current_map_cache()
         db.drop_map_tags(n)
-        maptags.sync_map(new, st, force=True)
+        maptags.sync_map(new, store, force=True)
         if db.get_settings().get("current_map") == n:
             db.set_settings({"current_map": new})
     except mapstore.MapStoreError as e:
@@ -1105,56 +1210,56 @@ def map_rename(name: str, body: MapNameIn):
 
 
 @app.post("/api/map/{name}/copy")
-def map_copy(name: str, body: MapNameIn):
+def map_copy(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """复制成对文件 → **标记随行**（指纹一致才复制，规格 §B5.2 第 6 步 / §B九 坑 13）。"""
     from . import log as audit
     try:
         n, new = _name_of(name), mapstore.check_name(body.new_name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     if n == new:
         return _err("新名字与原图相同")
     warnings: list[str] = []
     try:
-        got = maptags.resolve(n, st)
+        got = maptags.resolve(n, store)
     except mapstore.MapStoreError as e:
         return _err(f"读取原图标记失败：{e}", 500)
     try:
-        st.copy(n, new)                 # 会连带复制 tags.json（若存在）
+        store.copy(n, new)                 # 会连带复制 tags.json（若存在）
     except mapstore.MapStoreError as e:
         # 目标已存在 / 源不存在 → 都是"用户可纠正"的冲突，给 409 而不是 500
         code = 409 if "已存在" in str(e) else 404
         return _err(str(e), code)
     try:
         try:
-            text = st.read(new, "yaml").decode("utf-8", "replace")
-            st.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
+            text = store.read(new, "yaml").decode("utf-8", "replace")
+            store.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
         except mapstore.MapStoreError:
             pass
         # 指纹比对：一致则保留随行的标记，不一致就删掉新图的 tags（绝不静默错配）
         copied_tags = False
-        if got["ok"] and got["exists"] and st.exists(new, "tags"):
+        if got["ok"] and got["exists"] and store.exists(new, "tags"):
             try:
-                info = mapserver.map_info(new, st)
+                info = mapserver.map_info(new, store)
                 fp = maptags.fingerprint_check(got["tags"], info)
                 if fp.get("changed"):
                     warnings.append(f"该图元数据与标记指纹不一致（{'; '.join(fp.get('reasons') or [])}），"
                                     f"标记未随行")
-                    st.remove(new, "tags")
+                    store.remove(new, "tags")
                 else:
                     tags = got["tags"]
                     tags["map"] = new
                     tags["updated_at"] = db.now_iso()
                     import json as _json
-                    st.write(new, "tags",
+                    store.write(new, "tags",
                              _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
                     copied_tags = True
             except mapstore.MapStoreError as e:
                 warnings.append(f"标记随行失败：{e}")
         mapserver.clear_cache()
         locator.clear_current_map_cache()
-        maptags.sync_map(new, st, force=True)
+        maptags.sync_map(new, store, force=True)
     except mapstore.MapStoreError as e:
         return _err(str(e), 500)
     if not copied_tags:
@@ -1165,14 +1270,14 @@ def map_copy(name: str, body: MapNameIn):
 
 
 @app.delete("/api/map/{name}")
-def map_delete(name: str, confirm: bool = Query(False)):
+def map_delete(name: str, confirm: bool = Query(False), source: str = Query("", alias="source"), store=Depends(_store)):
     """删除成对文件（含 .tags.json）。本图有标记时必须 ``confirm=true``（规格 §5.1）。"""
     from . import log as audit
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     counts = db.count_map_tags(n)
     affects = counts["destinations"] + counts["zones"]
     if affects and not confirm:
@@ -1181,8 +1286,8 @@ def map_delete(name: str, confirm: bool = Query(False)):
     removed = []
     try:
         for ext in _MAP_EXTS:
-            if st.exists(n, ext):
-                st.remove(n, ext)
+            if store.exists(n, ext):
+                store.remove(n, ext)
                 removed.append(ext)
     except mapstore.MapStoreError as e:
         return _err(str(e), 500)
@@ -1196,7 +1301,7 @@ def map_delete(name: str, confirm: bool = Query(False)):
 
 
 @app.get("/api/map/{name}/download")
-def map_download(name: str, file: str = Query("yaml")):
+def map_download(name: str, file: str = Query("yaml"), source: str = Query("", alias="source"), store=Depends(_store)):
     """下载原始文件；``file`` **只接受 yaml/pgm/tags**（其他值报错，避免变成任意文件读取）。"""
     if file not in _MAP_EXTS:
         return _err(f"file 只接受 {'/'.join(_MAP_EXTS)}，收到 {file!r}")
@@ -1204,9 +1309,9 @@ def map_download(name: str, file: str = Query("yaml")):
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
+    store = _store(source)
     try:
-        data, stale, at = st.read_with_meta(n, file)
+        data, stale, at = store.read_with_meta(n, file)
     except mapstore.MapStoreError as e:
         return _err(str(e), 404)
     media = {"yaml": "text/yaml; charset=utf-8", "pgm": "image/x-portable-graymap",
@@ -1222,14 +1327,14 @@ def map_download(name: str, file: str = Query("yaml")):
 
 
 @app.get("/api/map/{name}/image.png")
-async def map_image(name: str):
+async def map_image(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
     """**后端把 PGM 转成灰度 PNG**（前端按阈值着色）；按 mtime+size 缓存（规格 §7.4）。"""
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     try:
-        png, stale, at = await asyncio.to_thread(mapserver.image_png, n, _store())
+        png, stale, at = await asyncio.to_thread(mapserver.image_png, n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e), 404)
     headers = {"Cache-Control": "no-cache"}
@@ -1242,24 +1347,24 @@ async def map_image(name: str):
 
 # ---------------------------------------------------------------- 地点与区域（§5.2）
 @app.get("/api/destinations")
-async def destinations_list(map: str = Query("", alias="map")):
+async def destinations_list(map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
     if not map:
         return _err("缺少 map 参数")
     try:
         n = _name_of(map)
-        rows = await asyncio.to_thread(maptags.get_destinations, n, _store())
+        rows = await asyncio.to_thread(maptags.get_destinations, n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return {"ok": True, "map": n, "destinations": rows}
 
 
 @app.post("/api/destinations")
-def destinations_add(d: DestinationIn):
+def destinations_add(d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """新增地点：服务端完整校验（名称唯一、坐标在地图内、障碍检查）并返回 ``warnings[]``。"""
     from . import log as audit
     try:
         n = _name_of(d.map_name)
-        out = maptags.upsert_destination(n, d.model_dump(), store=_store())
+        out = maptags.upsert_destination(n, d.model_dump(), store=store)
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", action="destination_add", map=d.map_name, error=str(e))
         return _err(str(e))
@@ -1267,7 +1372,7 @@ def destinations_add(d: DestinationIn):
 
 
 @app.post("/api/destinations/validate")
-def destinations_validate(v: ValidateIn):
+def destinations_validate(v: ValidateIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """标点即校验（§7.6）：越界 / 障碍 / 未知 / 距障碍余量 —— **只警告不阻止**。
 
     ⚠️ 本路由必须**定义在** ``POST /api/destinations/{uid}`` **之前**：否则 FastAPI 会先匹配
@@ -1275,18 +1380,18 @@ def destinations_validate(v: ValidateIn):
     """
     try:
         n = _name_of(v.map_name)
-        out = mapserver.validate_point(n, v.x, v.y, _store(), v.margin_m)
+        out = mapserver.validate_point(n, v.x, v.y, store, v.margin_m)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return out
 
 
 @app.post("/api/destinations/{uid}")
-def destinations_update(uid: str, d: DestinationIn):
+def destinations_update(uid: str, d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
     from . import log as audit
     try:
         n = _name_of(d.map_name)
-        out = maptags.upsert_destination(n, d.model_dump(), uid=uid, store=_store())
+        out = maptags.upsert_destination(n, d.model_dump(), uid=uid, store=store)
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", action="destination_update", map=d.map_name,
                   uid=uid, error=str(e))
@@ -1295,13 +1400,13 @@ def destinations_update(uid: str, d: DestinationIn):
 
 
 @app.delete("/api/destinations/{uid}")
-def destinations_delete(uid: str, map: str = Query("", alias="map")):
+def destinations_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
     from . import log as audit
     if not map:
         return _err("缺少 map 参数")
     try:
         n = _name_of(map)
-        maptags.delete_destination(n, uid, store=_store())
+        maptags.delete_destination(n, uid, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     audit.log("map_change", action="destination_delete", map=n, uid=uid)
@@ -1309,13 +1414,13 @@ def destinations_delete(uid: str, map: str = Query("", alias="map")):
 
 
 @app.post("/api/destinations/learn")
-def destinations_learn(body: LearnIn):
+def destinations_learn(body: LearnIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """取**当前位姿**写入该图 tags.json（位姿不可用 → 明确失败并提示"可改为在图上点选"）。"""
     from . import log as audit
     try:
         n = _name_of(body.map_name)
         pose = locator.get_pose()
-        out = maptags.learn_here(n, body.model_dump(), pose, store=_store())
+        out = maptags.learn_here(n, body.model_dump(), pose, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     audit.log("map_change", action="destination_learn", map=n, uid=out["uid"],
@@ -1325,23 +1430,23 @@ def destinations_learn(body: LearnIn):
 
 
 @app.get("/api/zones")
-async def zones_list(map: str = Query("", alias="map")):
+async def zones_list(map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
     if not map:
         return _err("缺少 map 参数")
     try:
         n = _name_of(map)
-        rows = await asyncio.to_thread(maptags.get_zones, n, _store())
+        rows = await asyncio.to_thread(maptags.get_zones, n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return {"ok": True, "map": n, "zones": rows}
 
 
 @app.post("/api/zones")
-def zones_add(z: ZoneIn):
+def zones_add(z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
     from . import log as audit
     try:
         n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), store=_store())
+        out = maptags.upsert_zone(n, z.model_dump(), store=store)
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", action="zone_add", map=z.map_name, error=str(e))
         return _err(str(e))
@@ -1349,23 +1454,23 @@ def zones_add(z: ZoneIn):
 
 
 @app.post("/api/zones/{uid}")
-def zones_update(uid: str, z: ZoneIn):
+def zones_update(uid: str, z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
     try:
         n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), uid=uid, store=_store())
+        out = maptags.upsert_zone(n, z.model_dump(), uid=uid, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return {"ok": True, "uid": out["uid"]}
 
 
 @app.delete("/api/zones/{uid}")
-def zones_delete(uid: str, map: str = Query("", alias="map")):
+def zones_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
     from . import log as audit
     if not map:
         return _err("缺少 map 参数")
     try:
         n = _name_of(map)
-        out = maptags.delete_zone(n, uid, store=_store())
+        out = maptags.delete_zone(n, uid, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     audit.log("map_change", action="zone_delete", map=n, uid=uid, orphaned=out.get("orphaned"))
@@ -1373,51 +1478,51 @@ def zones_delete(uid: str, map: str = Query("", alias="map")):
 
 
 @app.get("/api/map/{name}/tags")
-def map_tags_get(name: str):
+def map_tags_get(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
     """**直读该图 .tags.json 原文**（调试 / 迁移 / 人工核对用）。"""
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    st = _store()
-    got = maptags.resolve(n, st)
+    store = _store(source)
+    got = maptags.resolve(n, store)
     return {"ok": got["ok"], "map": n, "exists": got["exists"], "tags": got["tags"],
             "warnings": got.get("warnings") or [], "stale": got.get("stale"),
             "cached_at": got.get("cached_at"), "error": got.get("error") or "",
-            "fingerprint": got.get("fingerprint"), "path": maptags.tags_path(n, st)}
+            "fingerprint": got.get("fingerprint"), "path": maptags.tags_path(n, store)}
 
 
 @app.put("/api/map/{name}/tags")
-def map_tags_put(name: str, body: MapTagsIn):
+def map_tags_put(name: str, body: MapTagsIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """整份替换标记文件（高级用途，做 schema 校验）；写文件 + sync_map()。"""
     try:
         n = _name_of(name)
-        out = maptags.replace_all(n, body.model_dump(), store=_store())
+        out = maptags.replace_all(n, body.model_dump(), store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return out
 
 
 @app.post("/api/map/{name}/tags/reindex")
-def map_tags_reindex(name: str):
+def map_tags_reindex(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
     """强制重建该图的索引缓存（缓存丢失或怀疑不一致时用）。"""
     try:
         n = _name_of(name)
-        out = maptags.reindex(n, store=_store())
+        out = maptags.reindex(n, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     return {"ok": True, **out}
 
 
 @app.post("/api/map/reindex-all/tags")
-def map_tags_reindex_all():
+def map_tags_reindex_all(source: str = Query("", alias="source"), store=Depends(_store)):
     """重建**所有**图的索引缓存（缓存整个丢了时的恢复入口，验收红线 3 用）。
 
     路径特意避开 ``/api/map/{name}/...`` 前缀，免得和 ``{name}`` 参数路由抢匹配。
     """
     from . import log as audit
     try:
-        out = maptags.reindex_all(_store())
+        out = maptags.reindex_all(store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
     audit.log("map_change", action="tags_reindex_all", maps=len(out))
@@ -1432,29 +1537,29 @@ async def robot_pose():
 
 
 @app.get("/api/mapeditor/status")
-async def mapeditor_status():
+async def mapeditor_status(source: str = Query("", alias="source")):
     """编辑器顶部状态条的一份汇总：位姿 + rosbridge + 当前地图 + IO 模式。"""
-    st = _store()
+    store = _store(source)
     io, loc = await asyncio.gather(
-        asyncio.to_thread(mapstore.io_status),
-        asyncio.to_thread(locator.status, st),
+        asyncio.to_thread(mapstore.io_status, "", source),
+        asyncio.to_thread(locator.status, store),
     )
     return {"ok": True, "io": io, "locator": loc}
 
 
 @app.get("/api/mapeditor/io")
-async def mapeditor_io(name: str = Query("")):
-    return {"ok": True, **(await asyncio.to_thread(mapstore.io_status, name))}
+async def mapeditor_io(name: str = Query(""), source: str = Query("", alias="source")):
+    return {"ok": True, **(await asyncio.to_thread(mapstore.io_status, name, source))}
 
 
 @app.post("/api/mapeditor/io/test")
-async def mapeditor_io_test():
+async def mapeditor_io_test(source: str = Query("", alias="source")):
     """主动连通性自检（``list()`` 一次），返回耗时与错误原因；**不改任何文件**。"""
-    return await asyncio.to_thread(mapstore.io_test)
+    return await asyncio.to_thread(mapstore.io_test, source)
 
 
 @app.post("/api/mapeditor/pose/inject")
-def mapeditor_pose_inject(body: PoseInjectIn):
+def mapeditor_pose_inject(body: PoseInjectIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """注入假位姿 / 假地图元数据（**无 ROS 环境开发与测试用**，规格 §5.4 / §nine 4）。"""
     if body.x is None and body.width is None:
         locator.clear_injection()
@@ -1463,12 +1568,12 @@ def mapeditor_pose_inject(body: PoseInjectIn):
         locator.set_pose_for_test(body.x, body.y, body.yaw)
     if body.width is not None:
         locator.set_map_for_test(body.width, body.height, body.resolution, body.origin)
-    return {"ok": True, "pose": locator.pose_payload(), "current_map": locator.current_map(_store())}
+    return {"ok": True, "pose": locator.pose_payload(), "current_map": locator.current_map(store)}
 
 
 # ---------------------------------------------------------------- 像素修图保存（B 篇 §B5.2）
 @app.post("/api/map/{name}/save")
-def map_save(name: str, body: MapSaveIn):
+def map_save(name: str, body: MapSaveIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """保存像素改动：白名单 → 体积 → yaml 白名单校验 → 备份 → 标记随行 → 原子写 → 审计。"""
     from . import log as audit
     import base64
@@ -1477,7 +1582,7 @@ def map_save(name: str, body: MapSaveIn):
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", map=name, error=str(e), stage="name")
         return _err(str(e))
-    st = _store()
+    store = _store(source)
 
     # 2) 体积校验
     try:
@@ -1510,7 +1615,7 @@ def map_save(name: str, body: MapSaveIn):
 
     # 3) yaml 白名单校验：除 image 外任何字段与磁盘原值不一致 → 409
     try:
-        disk_yaml = st.read(n, "yaml").decode("utf-8", "replace")
+        disk_yaml = store.read(n, "yaml").decode("utf-8", "replace")
     except mapstore.MapStoreError as e:
         return _err(f"读磁盘原 yaml 失败：{e}", 404)
     from_disk = mapserver.parse_yaml_flat(disk_yaml)
@@ -1533,9 +1638,9 @@ def map_save(name: str, body: MapSaveIn):
     warnings: list[str] = []
     try:
         if body.mode == "overwrite":
-            backup = st.backup(target)
-        elif st.exists(target, "yaml") or st.exists(target, "pgm"):
-            backup = st.backup(target)
+            backup = store.backup(target)
+        elif store.exists(target, "yaml") or store.exists(target, "pgm"):
+            backup = store.backup(target)
     except mapstore.MapStoreError as e:
         if body.mode == "overwrite":
             # 备份是覆盖的前置条件，不允许"备份失败但继续"（规格 §B八）
@@ -1547,21 +1652,21 @@ def map_save(name: str, body: MapSaveIn):
     tags_copied = False
     if body.mode == "overwrite":
         try:
-            got = maptags.resolve(n, st)
+            got = maptags.resolve(n, store)
             if got["ok"] and got["exists"]:
                 got["tags"]["updated_at"] = db.now_iso()
                 import json as _json
-                st.write(n, "tags",
+                store.write(n, "tags",
                          _json.dumps(got["tags"], ensure_ascii=False, indent=2).encode("utf-8"))
                 tags_copied = True
         except mapstore.MapStoreError as e:
             warnings.append(f"标记指纹更新失败：{e}")
     else:
         try:
-            got = maptags.resolve(n, st)
+            got = maptags.resolve(n, store)
             if got["ok"] and got["exists"]:
                 # 用**本次要写出的** pgm 元数据与原名指纹比对（像素改不了 resolution/origin）
-                info = mapserver.map_info(n, st)
+                info = mapserver.map_info(n, store)
                 fp = maptags.fingerprint_check(got["tags"], info)
                 if fp.get("changed"):
                     warnings.append(f"该图元数据已变（{'; '.join(fp.get('reasons') or [])}），标记未随行")
@@ -1570,7 +1675,7 @@ def map_save(name: str, body: MapSaveIn):
                     tags["map"] = target
                     tags["updated_at"] = db.now_iso()
                     import json as _json
-                    st.write(target, "tags",
+                    store.write(target, "tags",
                              _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
                     tags_copied = True
         except mapstore.MapStoreError as e:
@@ -1578,7 +1683,7 @@ def map_save(name: str, body: MapSaveIn):
 
     # 7) 写 pgm（原子）
     try:
-        st.write(target, "pgm", pgm)
+        store.write(target, "pgm", pgm)
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", map=n, target=target, error=str(e), stage="pgm")
         return _err(f"写 pgm 失败：{e}", 500)
@@ -1586,7 +1691,7 @@ def map_save(name: str, body: MapSaveIn):
     # 8) 写 yaml：以磁盘原文为本，只替换 image: 一行
     try:
         out_yaml = mapserver.update_yaml_image(disk_yaml, f"{target}.pgm")
-        st.write(target, "yaml", out_yaml.encode("utf-8"))
+        store.write(target, "yaml", out_yaml.encode("utf-8"))
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", map=n, target=target, error=str(e), stage="yaml_write")
         return _err(f"写 yaml 失败：{e}", 500)
@@ -1595,12 +1700,12 @@ def map_save(name: str, body: MapSaveIn):
     locator.clear_current_map_cache()
     if body.mode == "overwrite":
         try:
-            maptags.sync_map(target, st, force=True)
+            maptags.sync_map(target, store, force=True)
         except mapstore.MapStoreError as e:
             warnings.append(f"刷新索引缓存失败：{e}")
     else:
         try:
-            maptags.sync_map(target, st, force=True)
+            maptags.sync_map(target, store, force=True)
         except mapstore.MapStoreError:
             pass
 
@@ -1625,6 +1730,52 @@ def _same_value(a, b) -> bool:
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
     return str(a) == str(b)
+
+
+# ------------------------------------------------------------------ 摄像头 HTTP 桥
+# 摄像头共享服务（vision/camera_server.py）本身是裸 TCP，浏览器说不了那套协议；
+# 这里桥成 HTTP，**让上位机 PC 浏览器直接看板卡画面**（不必登录板卡/到现场）。
+# 摄像头没起时全部降级：查询类返回 status=unavailable 且 ok=True，写操作 ok=False。
+@app.get("/api/vision/status")
+async def vision_status():
+    """摄像头共享服务状态（含通道/帧计数/模式）。"""
+    from vision import webbridge
+    return webbridge.status()
+
+
+@app.get("/api/vision/snapshot")
+async def vision_snapshot(channel: int = Query(1), quality: int = Query(80),
+                          token: str = Query(None)):
+    """单帧 JPEG 快照。`<img src="/api/vision/snapshot?channel=1">` 可直接显示。"""
+    from . import log as audit
+    from fastapi.responses import JSONResponse
+    from vision import webbridge
+    try:
+        jpg, _w, _h, source = await asyncio.to_thread(
+            webbridge.get_jpeg, channel, None, None, quality)
+    except Exception as e:  # noqa: BLE001  （连不上/无帧都按 503 语义返回 JSON）
+        audit.log("vision_snapshot_failed", channel=channel, error=str(e))
+        return JSONResponse({"ok": False, "error": f"取帧失败：{e}"},
+                            status_code=503)
+    return Response(content=jpg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store",
+                             "X-Vision-Source": source})
+
+
+@app.get("/api/vision/stream")
+async def vision_stream(channel: int = Query(1), fps: int = Query(10),
+                        quality: int = Query(80)):
+    """MJPEG 连续流：`<img src="/api/vision/stream">` 即可看到动态画面。
+
+    摄像头不可用时**直接结束流**（返回空 body），由前端显示占位，避免无限空转。
+    """
+    from vision import webbridge
+    gen = webbridge.mjpeg_stream(channel=channel, fps=fps, quality=quality)
+    return StreamingResponse(
+        (chunk for chunk in gen),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------- 前端静态托管

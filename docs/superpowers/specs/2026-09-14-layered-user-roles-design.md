@@ -81,7 +81,7 @@
 Principal = {
   role:  "admin" | "ward" | "elder",
   uid:   str,               # elder→"elder_001"；ward→"ward_101"（病房用户）；admin→"admin"
-  source: "manual" | "voiceprint" | "password" | "default" | "auth_disabled",
+  source: "manual" | "voiceprint" | "password" | "default" | "auth_disabled" | "logout" | "expired" | "location" | "auth_reenabled",
   slot:  "kiosk" | "admin", # 该角色挂在哪个端槽位
   until: float | None,      # 管理员提权到期时间戳（monotonic）；None=不过期
 }
@@ -160,7 +160,7 @@ tick()                                # 定时（沿用 bus/reminder 线程或 l
 | `POST /api/session/user` | **保持现签名**（`{uid, locked}`），只允许切主体/锁定；**拒绝 `role` 字段**（有则 400）。可传病房用户 uid（如 `ward_101`）切到集体层——role 由后端按 uid 推导（§4.4） |
 | `POST /api/session/login`（新增） | `{password}` + `X-Surface` → 成功 `{ok:true, role:"admin", uid:"admin", ttl_remain}`；口令门关闭时**无需 password 直接放行**（`source=auth_disabled`）；失败 `{ok:false, error}`，失败计数 + 审计 |
 | `POST /api/session/logout`（新增） | 该槽回落集体层 |
-| `POST /api/session/password`（新增） | 管理员改口令（需旧口令）；口令门关闭时可直接设新口令并重新开启 |
+| `POST /api/session/password`（新增） | 管理员改口令（需旧口令）。**只要已经设过口令（库里有哈希）就必须验旧口令——与口令门开关无关**；否则会出现"关门（人人可免口令进 admin）→ 攻击者改口令 → 管理员开门（只踢会话、不回滚口令）"这条永久占住口令的链。只有**还没设过口令**（首启态）才允许无旧口令直接设并重新开启口令门 |
 | `GET|POST /api/session/admin-auth`（新增） | 读/写 `admin_auth_required`（**口令门的开关**，D13）；关闭需 admin 身份，落审计 |
 | `GET|POST /api/wards`（新增） | 病房用户列表/新建（`kind='ward'` 的 profile）；`POST` 可带 `{name, ward_uid}` |
 | `GET /api/policy/roles`（新增） | 返回策略矩阵（`admin` 可见全量，其它角色只拿到自己那份摘要） |

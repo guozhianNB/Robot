@@ -5,7 +5,7 @@ import MapCanvas from "./pages/MapCanvas.vue";
 import PlacePanel from "./pages/PlacePanel.vue";
 import ZonePanel from "./pages/ZonePanel.vue";
 import MapFiles from "./pages/MapFiles.vue";
-import { enc, getJson } from "./lib/api";
+import { enc, getJson, getSource, setSource, sourcesUrl } from "./lib/api";
 import type {
   CurrentMapResp,
   Destination,
@@ -15,6 +15,8 @@ import type {
   MapMetaFields,
   MetaResp,
   PoseResp,
+  SourceItem,
+  SourcesResp,
   Zone,
 } from "./lib/types";
 
@@ -34,6 +36,10 @@ const tabs: { id: Tab; label: string }[] = [
 const tab = ref<Tab>("places");
 const mapName = ref("");
 const maps = ref<MapListResp | null>(null);
+// 地图源：只读列表（界面只允许"选"，不允许手填路径——用户 2026-09-14 定）
+const sources = ref<SourceItem[]>([]);
+const sourceId = ref(getSource());
+const sourcesNote = ref("");
 const meta = ref<MapMetaFields | null>(null);
 const places = ref<Destination[]>([]);
 const zones = ref<Zone[]>([]);
@@ -93,6 +99,46 @@ function round2(n: number | null | undefined): string {
   const v = Number(n);
   return Number.isFinite(v) ? v.toFixed(2) : "—";
 }
+
+// ---------------------------------------------------------------- 地图源
+/** 拉源清单（只读）。`?test=false`：不做 ssh 探活，快；连通性由 /sources/{id}/test 按需触发。 */
+async function loadSources() {
+  // 源注册表本身不该带 ?source=
+  const r = await getJson<SourcesResp>(sourcesUrl(), { noSource: true });
+  if (!r.ok) {
+    sourcesNote.value = r.error || "读取地图源失败";
+    return;
+  }
+  sources.value = r.data.items || [];
+  sourcesNote.value = "";
+  // 本地记的源已不存在（被删/改名）→ 退回后端默认源
+  const ids = sources.value.map((s) => s.id);
+  if (sourceId.value && !ids.includes(sourceId.value)) {
+    sourcesNote.value = `本机记住的源「${sourceId.value}」已不存在，已退回默认源`;
+    await applySource(r.data.default || "");
+  }
+}
+
+/** 切换地图源：写 localStorage → 清空当前图 → 重新拉列表（list/meta/tags 全都会带新 source）。 */
+async function applySource(id: string) {
+  setSource(id);
+  sourceId.value = getSource();
+  mapName.value = "";
+  maps.value = null;
+  meta.value = null;
+  places.value = [];
+  zones.value = [];
+  selectedUid.value = "";
+  await refreshAll();
+}
+
+async function onSelectSource(e: Event) {
+  const v = (e.target as HTMLSelectElement | null)?.value ?? "";
+  if (v === sourceId.value) return;
+  await applySource(v);
+}
+
+const curSource = computed(() => sources.value.find((s) => s.id === sourceId.value) || null);
 
 // ---------------------------------------------------------------- 加载
 async function loadMaps() {
@@ -184,7 +230,11 @@ async function refreshAll() {
 }
 
 onMounted(() => {
-  void refreshAll();
+  // 先拿源清单（决定后续所有请求的 ?source=），再加载地图
+  void (async () => {
+    await loadSources();
+    await refreshAll();
+  })();
   timer = window.setInterval(() => {
     void statusTick();
   }, 2500);
@@ -259,6 +309,19 @@ function onSelectMap(e: Event) {
     <!-- 顶部状态条 -->
     <header>
       <div class="brand">🗺 地图编辑器</div>
+      <!-- 地图源：划线/标点/管文件/像素修图全都看它（用户诉求「指定同一个地图源」） -->
+      <label class="srclab">地图源
+        <select class="mapsel" :value="sourceId" @change="onSelectSource">
+          <option v-for="s in sources" :key="s.id" :value="s.id">
+            {{ s.label }}（{{ s.kind }}）{{ s.path_ok === false ? " · 路径不存在" : "" }}
+          </option>
+          <option v-if="!sources.length" value="">（读不到源列表）</option>
+        </select>
+      </label>
+      <span v-if="curSource" class="pill" :class="curSource.kind === 'ssh' ? 'warn' : ''"
+            :title="curSource.target || ''">
+        {{ curSource.kind }} · {{ curSource.target || "" }}
+      </span>
       <select class="mapsel" :value="mapName" @change="onSelectMap">
         <option v-for="m in maps?.maps || []" :key="m.name" :value="m.name">
           {{ m.name }}{{ m.current ? "（当前）" : "" }}{{ m.status && m.status !== "ok" ? ` · ${m.status}` : "" }}
@@ -305,6 +368,7 @@ function onSelectMap(e: Event) {
       <span v-if="pose?.note" class="bad">· {{ pose.note }}</span>
       <span v-if="io && !io.available" class="gray">· 地图存储：{{ io.reason }}</span>
       <span v-if="canvasStale" class="bad">· 当前离线，画布显示缓存</span>
+      <span v-if="sourcesNote" class="bad">· {{ sourcesNote }}</span>
       <span v-if="fpLine" class="gray">· {{ fpLine }}</span>
       <span v-if="loadNote" class="bad">· {{ loadNote }}</span>
     </div>
@@ -388,6 +452,7 @@ body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; 
 header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   padding: 8px 12px; background: #111827; border-bottom: 1px solid #1f2937; }
 .brand { font-size: 15px; font-weight: 600; margin-right: 4px; }
+.srclab { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #94a3b8; }
 .spacer { flex: 1; }
 .mapsel { background: #0b1220; border: 1px solid #334155; color: #e2e8f0;
   border-radius: 6px; padding: 5px 8px; font-size: 13px; max-width: 220px; }

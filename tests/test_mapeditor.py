@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
-from LLM import conf, db, locator, log as audit_log, mapserver, mapstore, maptags  # noqa: E402
+from LLM import conf, db, locator, log as audit_log, mapserver, mapsources, mapstore, maptags  # noqa: E402
 
 SAMPLE_YAML = """image: my_map.pgm
 mode: trinary
@@ -50,6 +50,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(conf, "MAPS_DIR", maps)
     monkeypatch.setattr(conf, "MAPS_CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(conf, "ROSBRIDGE_MOCK_POSE", "")
+    # 「地图源」注册表也必须隔离（2026-09-14 新增）：真实那份 maps_sources.json 指向板卡/仓库路径，
+    # 不隔离的话测试会打真实路径（实测会多出约 30 个失败）。这里用一个只有临时目录的单源注册表。
+    monkeypatch.setattr(conf, "MAPS_SOURCES_FILE", tmp_path / "maps_sources.json")
+    (tmp_path / "maps_sources.json").write_text(
+        json.dumps({"version": 1, "default": "test",
+                    "items": [{"id": "test", "label": "测试", "kind": "local", "root": str(maps)}]},
+                   ensure_ascii=False), encoding="utf-8")
+    mapsources._cache, mapsources._cache_sig = None, None
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "brain.db"))
     # log.py 在 import 期就绑定了 AUDIT_LOG，所以必须改它模块里的那一份
     monkeypatch.setattr(conf, "AUDIT_LOG", tmp_path / "audit.jsonl")
@@ -128,9 +136,19 @@ def test_name_whitelist_rejects_and_touches_nothing(env):
 
 
 def test_unavailable_store_degrades(tmp_path, monkeypatch):
-    """本机没有地图目录却把 MAPS_IO 设为 local → available=False 且不抛（AGENTS 降级红线）。"""
+    """本机没有地图目录（源指向不存在的路径）→ available=False 且不抛（AGENTS 降级红线）。
+
+    2026-09-14「地图源」之后：默认源来自 maps_sources.json，所以要连注册表一起指向不存在的目录。
+    """
+    missing = tmp_path / "not-there"
     monkeypatch.setattr(conf, "MAPS_IO", "local")
-    monkeypatch.setattr(conf, "MAPS_DIR", tmp_path / "not-there")
+    monkeypatch.setattr(conf, "MAPS_DIR", missing)
+    monkeypatch.setattr(conf, "MAPS_SOURCES_FILE", tmp_path / "maps_sources.json")
+    (tmp_path / "maps_sources.json").write_text(
+        json.dumps({"version": 1, "default": "gone",
+                    "items": [{"id": "gone", "label": "不存在", "kind": "local",
+                               "root": str(missing)}]}, ensure_ascii=False), encoding="utf-8")
+    mapsources._cache, mapsources._cache_sig = None, None
     mapstore.reset_store()
     st = mapstore.get_store()
     ok, why = st.available()
@@ -904,12 +922,14 @@ def test_map_list_does_not_block_event_loop(monkeypatch):
             time.sleep(0.15)
             return []
 
-    monkeypatch.setattr(server, "_store", lambda: SlowStore())
+    # 2026-09-14「地图源」之后 _store 带一个 source 形参（默认源时不传），lambda 要能收下它；
+    # map_list 也显式传 source=""，免得直接拿到 Query 默认对象。
+    monkeypatch.setattr(server, "_store", lambda source="": SlowStore())
     monkeypatch.setattr(server.db, "get_settings", lambda: {"current_map": ""})
 
     async def exercise():
         started = time.perf_counter()
-        request = asyncio.create_task(server.map_list())
+        request = asyncio.create_task(server.map_list(""))
         await asyncio.sleep(0.01)
         heartbeat_elapsed = time.perf_counter() - started
         await request

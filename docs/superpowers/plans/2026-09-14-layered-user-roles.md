@@ -808,11 +808,21 @@ def test_policy_keys_cover_three_roles():
     assert set(policy.POLICY_DEFAULTS) == {"admin", "ward", "elder"}
 
 
-def test_ward_reads_own_ward_but_no_personal_scope():
+def test_ward_has_only_safety_tools_and_no_personal_scope():
     p = policy.POLICY_DEFAULTS["ward"]
     assert p["data_scope"] == "none"        # 不注入任何老人档案/私人记忆
     assert p["ward_context"] is True        # 但读得到本病房的集体上下文
-    assert p["allowed_tools"] == []         # 集体层无任何工具
+    # 集体层只接"安全 + 只读"：急停（R3 永远允许）+ 状态只读播报（规格 §3.3 矩阵）。
+    # 未识别的说话人会回落到这一层，所以这里**不能**是空列表。
+    assert p["allowed_tools"] == ["robot_status", "robot_stop"]
+
+
+def test_role_policy_returns_copy_not_the_shared_table():
+    """策略表是模块级共享常量：调用方原地 append 会污染全局白名单（往低权限角色里长工具）。"""
+    a, b = policy.role_policy("ward"), policy.role_policy("ward")
+    a["allowed_tools"].append("__注入__")
+    assert b["allowed_tools"] == ["robot_status", "robot_stop"]
+    assert policy.POLICY_DEFAULTS["ward"]["allowed_tools"] == ["robot_status", "robot_stop"]
 
 
 def test_elder_reads_self_plus_ward_context():
@@ -869,10 +879,13 @@ from .conf import BASE_DIR
 PROMPT_DIR = BASE_DIR / "LLM" / "prompt"
 
 POLICY_DEFAULTS: dict[str, dict] = {
-    # ---- 集体层：一屋子人。读得到本病房公开对话，读不到任何个人档案，也没有工具 ----
+    # ---- 集体层：一屋子人。读得到本病房公开对话，读不到任何个人档案 ----
     "ward": {
         "prompt_file": PROMPT_DIR / "ward.md",
-        "allowed_tools": [],
+        # 只接"安全 + 只读"两类：状态播报与急停。
+        # 依据规格 §3.3 能力矩阵：`车·状态查询（位姿/电量）✅ 只读播报`、`车·急停/呼救 ✅ 永远允许（R3）`。
+        # 未识别的说话人也会回落到这一层 —— 急停必须可用（空列表 = 连急停都做不了，违反 R3）。
+        "allowed_tools": ["robot_status", "robot_stop"],
         "data_scope": "none",
         "ward_context": True,
     },
@@ -895,14 +908,19 @@ POLICY_DEFAULTS: dict[str, dict] = {
 
 
 def role_policy(role: str | None) -> dict:
-    """取角色策略；未知/None/空 → **集体层**（R2 fail-closed）。"""
-    return POLICY_DEFAULTS.get(role or "", POLICY_DEFAULTS["ward"])
+    """取角色策略；未知/None/空 → **集体层**（R2 fail-closed）。
+
+    返回**浅拷贝**（`allowed_tools` 也是新 list）：策略表是模块级共享常量，调用方一旦原地
+    `append` 就会污染全局白名单 —— 往低权限角色的白名单里长出一条危险工具，比少一条危险得多。
+    """
+    p = POLICY_DEFAULTS.get(role or "", POLICY_DEFAULTS["ward"])
+    return {**p, "allowed_tools": None if p["allowed_tools"] is None else list(p["allowed_tools"])}
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_policy_roles.py -q`
-预期：`6 passed`
+预期：`7 passed`
 
 - [ ] **步骤 5：Commit**
 
@@ -1033,6 +1051,61 @@ def test_logout_returns_to_ward_layer(d):
     session.logout("kiosk")
     p = session.get_principal("kiosk")
     assert p["role"] == "ward" and p["uid"] == "ward_101" and p["locked"] is False
+
+
+def test_manual_switch_to_admin_uid_is_denied(d):
+    """**R1 红线回归**：提权只能走 login_admin（口令）。
+
+    主体切换若能把角色变成 admin，`POST /api/session/user {"uid":"admin"}` 就是免口令后门
+    （该端点只拒绝 role 字段、CORS 全开）。
+    """
+    session.set_subject("admin", slot="kiosk", source="manual")
+    p = session.get_principal("kiosk")
+    assert p["role"] == "ward" and p["uid"] != "admin"
+
+
+def test_expired_admin_slot_does_not_swallow_voiceprint(d, monkeypatch):
+    """过期的 admin 槽不许吞掉一次声纹认人（D8 守卫只对"有效期内"的管理员会话生效）。"""
+    session.set_subject("ward_101", slot="kiosk")
+    session.login_admin("111111", slot="kiosk", ttl_s=1)
+    base = session._now_ts()
+    monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    p = session.get_principal("kiosk")
+    assert p["role"] == "elder" and p["uid"] == "elder_101_1"
+
+
+def test_unknown_slot_is_rejected(d):
+    """槽位名非法必须报错，绝不静默回落到 kiosk（否则会把车前屏提权、审计也失真）。"""
+    with pytest.raises(ValueError):
+        session.get_principal("TABLET")
+    with pytest.raises(ValueError):
+        session.login_admin("111111", slot="TABLET")
+
+
+def test_admin_ignored_voiceprint_is_audited(d, monkeypatch):
+    calls = []
+    monkeypatch.setattr(session.audit, "log", lambda ev, **kw: calls.append((ev, kw)))
+    session.login_admin("111111", slot="kiosk")
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    assert calls and calls[-1][0] == "voice_spk"
+    assert calls[-1][1]["action"] == "ignored_in_admin"
+    assert calls[-1][1]["slot"] == "kiosk"
+
+
+def test_auth_disabled_login_needs_no_password(d):
+    """口令门关着时：无需口令直接进 admin，且**不再自动降权**（D13）。"""
+    d.set_admin_auth_required(False)
+    r = session.login_admin(password=None, slot="kiosk")
+    assert r["ok"] is True and r["source"] == "auth_disabled" and r["until"] is None
+    assert session.get_principal("kiosk")["role"] == "admin"
+
+
+def test_unknown_uid_does_not_hijack_current_ward(d):
+    """fail-closed 判成 ward，但不许把"当前病房"顶成那个不存在的 uid。"""
+    session.set_subject("ward_101", slot="kiosk")
+    session.set_subject("ghost_9", slot="kiosk", source="voiceprint")
+    assert session.get_principal("kiosk")["ward_uid"] == "ward_101"
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -1088,13 +1161,21 @@ def reset_for_test() -> None:
 
 
 def _slot(slot: str) -> dict:
+    """取槽位状态。**槽位名非法直接抛 ValueError**——绝不静默回落到 kiosk：那会让
+    `X-Surface: TABLET` 这种笔误把"管理台的口令登录"写到车前屏上，顺带把车前屏提权，
+    而且返回体/审计里的 slot 还是那个错名（追溯性也被破坏）。"""
     if slot not in SLOTS:
-        slot = "kiosk"
+        raise ValueError(f"未知槽位 {slot!r}（只允许 {SLOTS}）")
     return _state.setdefault(slot, {"role": "ward", "source": "default", "until": None})
 
 
 def derive_role(uid: str | None) -> str:
-    """uid → 角色（**R1 的唯一入口**）。权威依据是 `profiles.kind`，不靠 uid 前缀。"""
+    """uid → 角色（**R1 的唯一入口**）。权威依据是 `profiles.kind`，不靠 uid 前缀。
+
+    `uid == "admin"` 短路返回 `"admin"` 只表达"这个主体属于管理员层"；**拿到 admin 权限
+    必须经 `login_admin()`（口令）**——`set_subject()` 会拒绝任何把槽位角色变成 admin 的调用，
+    所以这里的短路不会变成免口令后门。
+    """
     if not uid:
         return "ward"                       # R2
     if uid == ADMIN_UID:
@@ -1113,23 +1194,40 @@ def _settings() -> dict:
 
 def set_subject(uid: str, locked: bool = False, slot: str = "kiosk",
                 source: str = "manual") -> dict:
-    """切换会话主体：写 uid，role 由 uid 推导（R1）。"""
+    """切换会话主体：写 uid，role 由 uid 推导（R1）。
+
+    **提权只走 `login_admin()`（口令）**：主体切换一律不许把槽位角色变成 admin ——
+    否则 `POST /api/session/user {"uid": "admin"}` 就是一个免口令后门（R1 明令
+    "要拿 admin 只能走 /api/session/login"。CORS 全开 + 该端点只拒绝 role 字段，
+    这条后门是真实可利用的）。命中就拒绝并落审计，当前主体保持不变。
+    """
     s = _slot(slot)
+    _expire_if_needed(slot)          # 先让"已过期但还没被 tick 到"的 admin 会话降权，
+                                     # 否则守卫会吞掉一次声纹认人并写一条误导性审计
     if s["role"] == "admin" and source != "manual":
-        # D8 提权只升不降：管理员会话期间声纹认人不改主体，只留痕
-        audit.log("session_login", action="voiceprint_ignored_in_admin", uid=uid, slot=slot)
+        # D8 提权只升不降：管理员会话期间声纹认人不改主体，只留痕（事件名按规格 §4.1 = voice_spk）
+        audit.log("voice_spk", action="ignored_in_admin", uid=uid, slot=slot)
         return get_principal(slot)
+
+    role = derive_role(uid)
+    if role == "admin":
+        # 免口令提权通道：拒绝，保持当前主体（fail-closed）
+        audit.log("policy_deny", action="admin_grant_denied", uid=uid, slot=slot, source=source)
+        return get_principal(slot)
+
     _shared["uid"] = uid or ""
     _shared["locked"] = bool(locked)
-    s["role"] = derive_role(uid)
+    s["role"] = role
     s["source"] = source
     s["until"] = None
-    if s["role"] == "elder":
+    if role == "elder":
         p = db.get_profile(uid) or {}
         if p.get("ward_id"):
             _shared["ward_uid"] = p["ward_id"]      # D18：认出老人 → 当前病房跟着他
-    elif s["role"] == "ward":
-        _shared["ward_uid"] = uid or ""
+    elif role == "ward" and db.get_profile_kind(uid) == "ward":
+        # 只有"真的是病房档案"的 uid 才更新当前病房；未知 uid 一律 fail-closed 判 ward，
+        # 但不许把它写进"当前病房"（否则一个幽灵 uid 会把当前病房顶掉）
+        _shared["ward_uid"] = uid
     return get_principal(slot)
 
 
@@ -1199,7 +1297,7 @@ def ttl_remain(slot: str = "kiosk") -> int | None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：`11 passed`
+预期：`16 passed`
 
 - [ ] **步骤 5：Commit**
 
@@ -1311,7 +1409,7 @@ def ensure_admin_password() -> str | None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_session_roles.py -q`
-预期：`16 passed`
+预期：`21 passed`
 
 - [ ] **步骤 5：Commit**
 
@@ -1522,6 +1620,54 @@ def test_unknown_map_disables_autoswitch(d, monkeypatch):
         session.tick()
     assert session.current_ward() == "ward_101"
     assert session.autoswitch_state()["reason"] == "map_unknown"
+
+
+def test_divergent_slot_role_does_not_steal_private_chat(d, monkeypatch):
+    """**回归（关键）**：位置判定必须用**有效角色**判断能不能改主体。
+
+    `_expire_if_needed()`（admin TTL 到期）会把槽位原始 role 直接写成 `"ward"` 而**不重算**，
+    而 `tick()` 的第一步恰好就是 `_expire_if_needed()`。拿原始 role 判定，就会把正在私聊的老人
+    静默换成病房主体（D18 明令不抢私聊）。
+    """
+    session.set_subject("elder_101_1", slot="kiosk", source="voiceprint")
+    session.login_admin("111111", slot="kiosk", ttl_s=1)      # kiosk 槽变 admin（主体仍是李爷爷）
+    base = session._now_ts()
+    monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(5):
+        session.tick()
+    assert session.get_principal("kiosk")["uid"] == "elder_101_1"   # 主体不许被换掉
+    assert session.current_ward() == "ward_102"                     # 背景病房照常更新
+
+
+def test_manual_override_expiry_needs_full_recount(d, monkeypatch):
+    """**回归**：手动覆盖期内不攒计数 —— 覆盖一到期，不许"一个采样就切"（防抖不许跨 epoch 续数）。"""
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    session.tick()
+    session.tick()                                            # 已攒 2 次（debounce=3）
+    session.manual_set_ward("ward_101")                       # 手动覆盖 → 计数清零
+    monkeypatch.setattr(session, "_now_ts", lambda: session.time.monotonic() + 10_000)
+    session.tick()
+    assert session.current_ward() == "ward_101"               # 第 1 次不许切
+    session.tick()
+    assert session.current_ward() == "ward_101"               # 第 2 次不许切
+    session.tick()
+    assert session.current_ward() == "ward_102"               # 数满 3 次才切
+
+
+def test_current_map_is_cached_within_ttl(d, monkeypatch):
+    """**性能红线回归**：`locator.current_map()`（含列图 + 逐图远端 stat + 全图像素统计）
+    在 TTL 窗口内只准调一次 —— 它每秒跑在热路径上。"""
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_map_source": "auto"})
+    calls = []
+    monkeypatch.setattr(session.locator, "current_map",
+                        lambda *a, **k: calls.append(1) or
+                        {"ok": True, "source": "map_topic", "name": _MAP})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(30):
+        session.tick()
+    assert len(calls) == 1
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -1547,7 +1693,7 @@ def reset_for_test() -> None:
     _shared.update({"uid": "", "locked": False, "ward_uid": "", "manual_until": 0.0})
     _state.clear()
     _candidate.clear()
-    _map_cache.update({"name": "", "at": 0.0, "reason": ""})
+    _map_cache.update({"name": "", "at": float("-inf"), "reason": ""})
 ```
 
 **(3c)** 追加到 `session.py` 末尾：
@@ -1556,8 +1702,13 @@ def reset_for_test() -> None:
 # ---------------------------------------------------------------------------
 # 当前病房 + 位置自动切换（D17/D18）
 # ---------------------------------------------------------------------------
-_MAP_CACHE_S = 10.0                     # 「车在跑哪张图」的缓存时长（避免每秒打网络/SSH）
-_map_cache: dict = {"name": "", "at": 0.0, "reason": ""}
+_MAP_CACHE_S = 30.0                     # 「车在跑哪张图」的缓存时长
+# 为什么是 30s 而不是 10s：`locator.current_map()` 除了可能 `drain(1.0)`，还要列地图 + **逐图**
+# 做 `mapserver.map_info()`（`MAPS_IO=ssh` 下每张图一次远端 stat，未命中缓存时还要拉整幅 PGM
+# 并做全图像素统计）——这是**热路径**上的重活。病房切换晚 30 秒知道完全可接受（车也不会瞬移）。
+_map_cache: dict = {"name": "", "at": float("-inf"), "reason": ""}
+#                                                     ^^^^^^^^^^^^ 哨兵用 -inf 而不是 0.0：
+#                     `_now_ts()` 是 monotonic（开机计时），用 0.0 会让"开机后头 N 秒"被判成"缓存未过期"
 _candidate: dict[str, int] = {}         # ward_uid -> 连续命中次数（防抖）
 
 
@@ -1622,37 +1773,55 @@ def manual_set_ward(ward_uid: str) -> dict:
     """
     _shared["ward_uid"] = ward_uid
     _shared["manual_until"] = _now_ts() + float(_settings().get("manual_override_sec", 600))
-    s = _slot("kiosk")
-    if s["role"] == "ward" and not _shared["locked"]:
+    _candidate.clear()               # 手动覆盖 = 判定重新开始，不许复用旧计数（否则到期后一个采样就切）
+    if _holds_session():
         _shared["uid"] = ward_uid
     audit.log("ward_change", source="manual", ward=ward_uid)
     bus.publish("ward_changed", uid=ward_uid, action="manual")
     return get_principal("kiosk")
 
 
+def _holds_session() -> bool:
+    """kiosk 槽现在是不是"集体层 + 未锁定"——只有这种状态才允许位置/手动切换**真的改主体**。
+
+    **必须用有效角色（`get_principal()`），不能用 `_slot("kiosk")["role"]`**：槽位里那个原始
+    role 会被 `_expire_if_needed()`（admin TTL 到期直接写 `"ward"`）与 `set_admin_auth()` 改写
+    而**不重算**，于是出现"派生角色=elder、槽位 role=ward"的分歧态；而 `tick()` 的第一步恰好就是
+    `_expire_if_needed()`。拿原始 role 判定，就会把正在私聊的老人静默换成病房主体（D18 明令不抢私聊）。
+    """
+    return get_principal("kiosk")["role"] == "ward" and not _shared["locked"]
+
+
 def autoswitch_state() -> dict:
-    """给前端/诊断用：位置自动切换**当前为什么没生效**。"""
+    """给前端/诊断用：位置自动切换**当前为什么没生效**（判定顺序与 `_ward_tick` 保持一致）。"""
     st = _settings()
     if not st.get("ward_autoswitch_enabled", True):
         return {"enabled": False, "reason": "disabled"}
-    if locator.get_pose() is None:
-        return {"enabled": False, "reason": "no_pose"}
     if _now_ts() < (_shared.get("manual_until") or 0.0):
         return {"enabled": False, "reason": "manual_override"}
+    pose = locator.get_pose()
+    if pose is None or pose.get("x") is None:
+        return {"enabled": False, "reason": "no_pose"}
     name, reason = running_map_name()
     if not name:
         return {"enabled": False, "reason": reason or "map_unknown"}
-    if _slot("kiosk")["role"] == "elder" or _shared["locked"]:
+    if not _holds_session():
         return {"enabled": True, "reason": "holding_session"}
     return {"enabled": True, "reason": "active"}
 
 
 def _ward_tick() -> None:
-    """一次位置判定（由 tick() 每秒调用一次）。"""
+    """一次位置判定（由 tick() 每秒调用一次）。
+
+    每个 early-return 都要把 `_candidate` 清掉："连续 N 次"必须是**连续**的——否则手动覆盖
+    10 分钟到期后，只要再有**一个**瞬时跳变的采样就能凑满计数、把病房改掉（防抖等于失效）。
+    """
     st = _settings()
     if not st.get("ward_autoswitch_enabled", True):
+        _candidate.clear()
         return
     if _now_ts() < (_shared.get("manual_until") or 0.0):
+        _candidate.clear()
         return
     pose = locator.get_pose()
     if pose is None or pose.get("x") is None:
@@ -1671,36 +1840,49 @@ def _ward_tick() -> None:
     if not hit:                             # 离开病房区（走廊/未知区域）→ 不切
         _candidate.clear()
         return
+    if _shared.get("ward_uid") == hit:      # 已经在这个病房：不累加、不广播（否则计数无上限膨胀）
+        _candidate.clear()
+        return
 
     _candidate[hit] = _candidate.get(hit, 0) + 1
     for k in list(_candidate):
         if k != hit:
             _candidate.pop(k, None)         # 换目标就重新数
     debounce = max(1, int(st.get("ward_switch_debounce", 3)))
-    if _candidate[hit] < debounce or _shared.get("ward_uid") == hit:
+    if _candidate[hit] < debounce:
         return
 
     _shared["ward_uid"] = hit
     audit.log("ward_change", source="location", ward=hit)
     bus.publish("ward_changed", uid=hit, action="location")
     # D18：只在集体层且未锁定时才真正改会话主体（正在私聊/已锁定 → 只更新背景变量）
-    s = _slot("kiosk")
-    if s["role"] == "ward" and not _shared["locked"]:
+    if _holds_session():
         _shared["uid"] = hit
-        s["source"] = "location"
+        _slot("kiosk")["source"] = "location"
 
 
 def tick() -> None:
-    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。"""
+    """定时（server 里每秒一次）：管理员 TTL 到期降权 + 病房位置自动切换。
+
+    整体兜底 try/except：这个函数将来挂在定时线程（或 server 的每秒任务）上，任何意外异常都会
+    让这一轮乃至整条 tick 死掉 —— 连带"自动切换"与"admin TTL 降权"一起永久失效。降级原则：
+    出问题只记审计，绝不中断。
+    """
     for slot in SLOTS:
-        _expire_if_needed(slot)
-    _ward_tick()
+        try:
+            _expire_if_needed(slot)
+        except Exception as e:              # noqa: BLE001
+            audit.log("session_tick_error", action="expire", slot=slot, error=str(e))
+    try:
+        _ward_tick()
+    except Exception as e:                  # noqa: BLE001
+        audit.log("session_tick_error", action="ward", error=str(e))
 ```
 
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_autoswitch.py LLM/tests/test_session_roles.py -q`
-预期：`13 passed` + `16 passed`
+预期：`15 passed` + `25 passed`
 
 - [ ] **步骤 5：跑回归 + Commit**
 
@@ -1979,6 +2161,13 @@ git commit -m "feat(llm): 三层提示词分层 + 集体层上下文单向注入
 ```python
 # LLM/tests/test_policy_tools.py
 # -*- coding: utf-8 -*-
+"""工具角色白名单（闸门 2）测试。
+
+⚠️ `LLM/tool/` 目前**没有任何 `@tool` 注册**（只有两个 `_` 开头的 demo），`_TOOL_REGISTRY` 是空的
+—— 直接断言"哪些工具可见"会**空转变绿**。所以下面注册一个只在测试期存在的探针工具，测完摘干净。
+"""
+import pytest
+
 from LLM import tools
 
 
@@ -1990,35 +2179,68 @@ def _names(settings, principal):
     return [t["function"]["name"] for t in tools.effective_tools(settings, principal)]
 
 
-def test_ward_gets_no_tools():
-    assert _names({}, _p("ward")) == []
+@pytest.fixture()
+def probe():
+    """注册一个测试期探针工具（默认 enabled=True、不限角色），测完摘干净。"""
+    tools.tool("__probe__", "探针（仅测试）", {})(lambda **kw: {"ok": True, "message": "probe"})
+    yield "__probe__"
+    tools._TOOL_REGISTRY.pop("__probe__", None)
+    tools.TOOL_DEFAULTS.pop("__probe___enabled", None)
 
 
-def test_elder_only_gets_whitelisted_tools():
-    for t in tools.effective_tools({}, _p("elder")):
-        assert t["function"]["name"] in {"robot_status", "robot_stop"}
+def test_ward_gets_only_safety_tools(probe):
+    """集体层（含未识别说话人的兜底）只拿安全工具：急停 + 状态只读（R3 + 规格 §3.3 矩阵）。"""
+    names = set(_names({}, _p("ward")))
+    assert "__probe__" not in names
+    assert names <= {"robot_status", "robot_stop"}
 
 
-def test_admin_is_not_role_trimmed():
+def test_elder_only_gets_whitelisted_tools(probe):
+    names = set(_names({}, _p("elder")))
+    assert "__probe__" not in names
+    assert names <= {"robot_status", "robot_stop"}
+
+
+def test_admin_sees_registered_tool(probe):
     """admin 的 allowed_tools=None → 不被角色裁剪（仍受 per-tool 开关约束）。"""
-    all_names = set(tools._TOOL_REGISTRY)
-    assert set(_names({}, _p("admin"))) == {n for n in all_names
-                                            if tools._TOOL_REGISTRY[n]["enabled"]}
+    assert "__probe__" in _names({}, _p("admin"))
 
 
-def test_global_switch_still_applies():
-    for name, reg in tools._TOOL_REGISTRY.items():
-        assert name not in _names({f"{name}_enabled": False}, _p("admin"))
+def test_global_switch_still_applies(probe):
+    assert "__probe__" not in _names({"__probe___enabled": False}, _p("admin"))
 
 
-def test_unknown_role_falls_back_to_ward():
-    assert tools.effective_tools({}, {"role": "??"}) == []
-    assert tools.effective_tools({}) == []          # principal 缺省 → 集体层（R2）
+def test_tool_roles_field_filters_even_for_admin():
+    """`@tool(roles=...)` 是闸门 2 的第二道：admin 不被角色白名单裁剪，但仍受工具自己的 roles 约束。"""
+    tools.tool("__probe_elder_only__", "探针", {}, roles={"elder"})(lambda **kw: {"ok": True})
+    try:
+        assert "__probe_elder_only__" not in _names({}, _p("admin"))
+        assert "__probe_elder_only__" in _names({}, _p("elder"))
+    finally:
+        tools._TOOL_REGISTRY.pop("__probe_elder_only__", None)
+        tools.TOOL_DEFAULTS.pop("__probe_elder_only___enabled", None)
 
 
-def test_run_tool_denies_out_of_whitelist():
-    res = tools.run_tool("__nope__", {}, _p("ward"))
+def test_unknown_role_falls_back_to_ward(probe):
+    assert _names({}, {"role": "??"}) == _names({}, _p("ward"))
+    assert _names({}) == _names({}, _p("ward"))     # principal 缺省 → 集体层（R2）
+
+
+def test_run_tool_denies_out_of_whitelist(probe):
+    res = tools.run_tool("__probe__", {}, _p("ward"))
     assert res["ok"] is False and "不允许" in (res.get("error") or res.get("message") or "")
+    assert tools.run_tool("__probe__", {}, _p("admin"))["ok"] is True
+
+
+def test_mcp_tools_default_to_admin_only(monkeypatch):
+    """MCP 工具未声明 roles → 只有 admin 看得到（不受控外部能力，默认从严）。"""
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "fetch_html": {"server": "fetch", "schema": {
+            "type": "function",
+            "function": {"name": "fetch_html", "description": "", "parameters": {}}}}})
+    assert "fetch_html" in _names({"mcp_enabled": True}, _p("admin"))
+    assert "fetch_html" not in _names({"mcp_enabled": True}, _p("ward"))
+    assert "fetch_html" not in _names({"mcp_enabled": True}, _p("elder"))
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -3727,7 +3949,7 @@ git commit -m "feat(admin): 登录门 + 身份与权限页签 + 病房管理页�
 | §11.7 跨病房隔离 | 102 老人上下文 | 不含 `ward_101` 的任何消息 |
 | §11.8 TTL | 把 `admin_session_ttl_s` 调成 20 秒，登录后等过期 | 审计 `session_expired`，再发管理请求得 403 |
 | §11.9 双槽隔离 | admin 槽登录 → 查 kiosk 槽 | kiosk 槽 `role` 仍是 `ward`/`elder` |
-| §11.10 管理员语音 | kiosk 槽登录管理员后调 `_apply_role_subject("elder_001")` | 主体不变（`role=admin`），审计 `voiceprint_ignored_in_admin` |
+| §11.10 管理员语音 | kiosk 槽登录管理员后调 `_apply_role_subject("elder_001")` | 主体不变（`role=admin`），审计 `voice_spk action=ignored_in_admin` |
 | §11.11 未识别默认态 | kiosk 槽主体为空时发 `/api/chat` | System Prompt 里无任何老人档案，角色是集体层 |
 | §11.12 不破坏既有 | `POST /api/alarm`（任何角色）；`python -c "import LLM.server"` | 报警 `ok:true`；import 成功 |
 | §11.13 按位置自动切病房 | `maptags.upsert_zone("my_map", {"name":"102","kind":"ward","polygon":[[17,-3],[23,-3],[23,3],[17,3]]})` → 取回 `uid` 写进 `ward_102`；`POST /api/mapeditor/pose/inject {"x":20,"y":0,"yaw":0,"width":100,"height":100,"resolution":0.05,"origin":[0,0,0]}`；设置 `ward_map_source="setting"` + `current_map="my_map"` | 3 秒后 `GET /api/session/user` 的 `ward_uid=ward_102`，审计 `ward_change source=location`；把位姿挪到 `(99,99)` 后**不变** |

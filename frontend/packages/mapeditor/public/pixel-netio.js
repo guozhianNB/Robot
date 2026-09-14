@@ -76,6 +76,7 @@
   // ===================== 二、状态 =====================
 
   var mapName = '';            // URL 参数 ?map=
+  var sourceId = '';           // URL 参数 ?source=（地图源 id；空=后端默认源）
   var ui = null;               // 状态条元素句柄（ensureBar 里填）
   var busy = false;            // 保存/加载进行中（防重复提交）
   var staleSeen = false;       // 读通道是否见到 X-Map-Stale: 1
@@ -109,12 +110,25 @@
     return String(e);
   }
 
-  /** 读 URL 里的 ?map=xxx（不用 URLSearchParams，兼容更老的浏览器）。 */
-  function readQueryMap() {
-    var m = /[?&]map=([^&#]*)/.exec(window.location.search || '');
+  /** 读 URL 里的查询参数（不用 URLSearchParams，兼容更老的浏览器）。 */
+  function readQuery(key) {
+    var m = new RegExp('[?&]' + key + '=([^&#]*)').exec(window.location.search || '');
     if (!m) return '';
     var raw = m[1].replace(/\+/g, ' ');
     try { return decodeURIComponent(raw).trim(); } catch (e) { return raw.trim(); }
+  }
+
+  /** 读 URL 里的 ?map=xxx。 */
+  function readQueryMap() { return readQuery('map'); }
+
+  /** 读 URL 里的 ?source=xxx ——「地图源」id（空 = 让后端用默认源）。
+   *  地图编辑器主界面打开本页时会带上它，于是"划线看的图"和"这里改的图"是同一份。 */
+  function readQuerySource() { return readQuery('source'); }
+
+  /** 给任意 /api 路径补上 ?source=（空则不补）。所有请求都必须走它。 */
+  function apiUrl(path) {
+    if (!sourceId) return path;
+    return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'source=' + encodeURIComponent(sourceId);
   }
 
   /** 按 state 更新按钮可用性（busy 时禁止重复点击）。 */
@@ -141,6 +155,11 @@
     row1.appendChild(el('span', 'font-weight:600', '地图：'));
     var nameSpan = el('span', 'font-weight:600;color:#bff3ff', mapName ? mapName : '(未指定)');
     row1.appendChild(nameSpan);
+    // 地图源：让用户一眼知道"我在改哪一份地图文件"（空 = 后端默认源）
+    var srcSpan = el('span', 'color:#9fd8e2',
+      '  源：' + (sourceId ? sourceId : '(后端默认)'));
+    if (sourceId) srcSpan.title = '地图源 id：' + sourceId + '（由地图编辑器主页传入）';
+    row1.appendChild(srcSpan);
     var homeLink = el('a', ST_LINK, '← 地图编辑器主页');
     homeLink.href = '/mapeditor/';
     row1.appendChild(homeLink);
@@ -444,7 +463,7 @@
 
     return blobToBase64(pgmBlob).then(function (b64) {
       body.pgm_b64 = b64;
-      return fetch('/api/map/' + encodeURIComponent(mapName) + '/save', {
+      return fetch(apiUrl('/api/map/' + encodeURIComponent(mapName) + '/save'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -550,7 +569,7 @@
 
   /** 拉原始字节。fetch 会忽略 Content-Disposition: attachment，直接 arrayBuffer() 即可。 */
   function getBytes(ext) {
-    var url = '/api/map/' + encodeURIComponent(mapName) + '/download?file=' + ext;
+    var url = apiUrl('/api/map/' + encodeURIComponent(mapName) + '/download?file=' + ext);
     return fetch(url, { cache: 'no-store' }).then(function (res) {
       if (res.headers && res.headers.get && res.headers.get('X-Map-Stale') === '1') {
         staleSeen = true;
@@ -611,7 +630,7 @@
   // ===================== 十、IO 状态与连通性自检 =====================
 
   function refreshIO() {
-    return fetch('/api/mapeditor/io', { cache: 'no-store' }).then(function (r) {
+    return fetch(apiUrl('/api/mapeditor/io'), { cache: 'no-store' }).then(function (r) {
       return r.json();
     }).then(function (j) {
       if (!ui || !ui.io) return;
@@ -637,7 +656,7 @@
     var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
     setBusy(true, '正在做连通性自检…');
     // 自检不改任何文件（后端只 list() 一次）
-    fetch('/api/mapeditor/io/test', { method: 'POST' }).then(function (r) {
+    fetch(apiUrl('/api/mapeditor/io/test'), { method: 'POST' }).then(function (r) {
       return r.json();
     }).then(function (j) {
       var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -676,7 +695,7 @@
   function showNoMapHint() {
     msg('warn', '未指定地图：请在网址后加 ?map=<地图名>（例如 ?map=my_map），或点下面任意一张进入。');
     if (!ui || !ui.msg) return;
-    fetch('/api/map/list', { cache: 'no-store' }).then(function (r) {
+    fetch(apiUrl('/api/map/list'), { cache: 'no-store' }).then(function (r) {
       return r.json();
     }).then(function (j) {
       if (!ui || !ui.msg) return;
@@ -702,6 +721,7 @@
 
   function init() {
     mapName = readQueryMap();
+    sourceId = readQuerySource();     // 空 = 后端默认源（向后兼容老链接）
     ensureBar();
 
     // 写通道补丁是核心能力：失败则还原原始下载行为，但页面照常可用（规格 §B8 最后一行）。

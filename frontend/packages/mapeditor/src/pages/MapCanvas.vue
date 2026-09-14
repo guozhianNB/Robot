@@ -105,7 +105,9 @@ async function load() {
   errText.value = "";
   try {
     // 用 fetch 而非 <img>：需要读 X-Map-Stale 头判断"离线缓存"
-    const url = mapImageUrl(name) + `?t=${Date.now()}`;
+    // 缓存穿透参数必须由 api 层拼（它才知道 URL 里已经有没有 `?source=`）——
+    // 直接 `+ "?t=..."` 会拼出两个 `?` 导致 400（实测踩过）。
+    const url = mapImageUrl(name, true);
     const r = await fetch(url, { headers: { Accept: "image/png" } });
     if (!r.ok) {
       let msg = `取图失败（HTTP ${r.status}）`;

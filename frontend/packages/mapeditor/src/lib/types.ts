@@ -78,6 +78,39 @@ export interface IoStatus {
   stale?: boolean;
   cached_at?: number | string | null;
   host?: string;
+  // 2026-09-14「地图源」新增
+  source?: string;
+  source_label?: string;
+  source_kind?: string;
+}
+
+/** 一条地图源（`GET /api/map/sources` 的 items 元素）。界面只读展示、只允许"选"。 */
+export interface SourceItem {
+  id: string;
+  label: string;
+  kind: "local" | "ssh";
+  note?: string;
+  root?: string;
+  host?: string;
+  user?: string;
+  port?: number;
+  /** 人类可读的目标：local 是目录、ssh 是 user@host:root */
+  target?: string;
+  /** local 源的本机路径是否存在；ssh 源为 null（要 /test 才知道） */
+  path_ok?: boolean | null;
+  is_default?: boolean;
+  available?: boolean;
+  reason?: string;
+}
+
+export interface SourcesResp {
+  ok: boolean;
+  default: string;
+  items: SourceItem[];
+  path?: string;
+  warnings?: string[];
+  env_robot_ip?: string;
+  readonly_note?: string;
 }
 
 export interface PoseResp {

@@ -864,52 +864,104 @@ class SshMapStore:
 
 
 # ---------------------------------------------------------------------------
-# 工厂
+# 工厂（按「地图源」取 store，支持多源共存）
 # ---------------------------------------------------------------------------
-_store: MapStore | None = None
-_store_sig: tuple | None = None
+# 说明（2026-09-14）：原来这里是个"按 conf.MAPS_IO 造一个单例"的工厂，地图源等于进程级隐式状态。
+# 现在改成**按命名源**造实例并各自缓存 —— 但**默认路径完全兼容**：不传 source_id 时走
+# mapsources 的默认源，而默认源的首个种子就是从 conf.MAPS_IO / MAPS_DIR / MAPS_SSH_* 来的。
+_stores: dict[tuple, MapStore] = {}      # 缓存键 = 源的指纹（路径/主机变了自然不命中）
+_last_resolve: dict = {}                 # 最近一次解析结果：{"id","label","kind","root","warnings"}
 
 
-def _signature() -> tuple:
-    return (conf.MAPS_IO, str(conf.MAPS_DIR), conf.MAPS_SSH_HOST, conf.MAPS_SSH_USER,
-            conf.MAPS_SSH_PORT, conf.MAPS_SSH_ROOT, conf.MAPS_SSH_TRANSPORT,
-            conf.MAPS_SSH_KEY, bool(conf.MAPS_SSH_PASSWORD))
+def _build(io_mode: str, root: str, ssh: dict | None = None) -> MapStore:
+    """按配置造一个 store（不缓存）。"""
+    if io_mode == "local":
+        return LocalMapStore(root=root)
+    ssh = ssh or {}
+    # SshMapStore 读的是 conf 里的连接参数；这里为"某一条 ssh 源"临时覆盖，用完还原，
+    # 免得把进程级配置改脏（多源共存时这很关键）。
+    keys = ("MAPS_SSH_HOST", "MAPS_SSH_USER", "MAPS_SSH_PORT", "MAPS_SSH_ROOT", "MAPS_SSH_KEY")
+    backup = {k: getattr(conf, k) for k in keys}
+    try:
+        if ssh.get("host"):
+            conf.MAPS_SSH_HOST = str(ssh["host"])
+        if ssh.get("user"):
+            conf.MAPS_SSH_USER = str(ssh["user"])
+        if ssh.get("port"):
+            conf.MAPS_SSH_PORT = int(ssh["port"])
+        if ssh.get("root"):
+            conf.MAPS_SSH_ROOT = str(ssh["root"])
+        if "key" in ssh:
+            conf.MAPS_SSH_KEY = str(ssh.get("key") or "")
+        return SshMapStore(root=str(ssh.get("root") or conf.MAPS_SSH_ROOT))
+    finally:
+        for k, v in backup.items():
+            setattr(conf, k, v)
 
 
-def get_store(force_new: bool = False) -> MapStore:
-    """按 ``conf.MAPS_IO`` 惰性构造单例；配置变了自动重建（设置页改 MAPS_IO 后无需重启）。"""
-    global _store, _store_sig
-    sig = _signature()
-    if force_new or _store is None or _store_sig != sig:
-        _store = LocalMapStore() if conf.MAPS_IO == "local" else SshMapStore()
-        _store_sig = sig
-    return _store
+def resolve_source(source_id: str = "") -> dict:
+    """把 ``source_id``（可空=默认源）解析成源字典。空/未知都给出明确信息。"""
+    from . import mapsources      # 延迟导入：mapsources 是上层（只依赖 conf），避免 import 期成环
+    src = mapsources.get(source_id)
+    _last_resolve.clear()
+    _last_resolve.update({"id": src["id"], "label": src.get("label", src["id"]),
+                          "kind": src["kind"], "root": src.get("root", "")})
+    return src
+
+
+def get_store(source_id: str = "", force_new: bool = False) -> MapStore:
+    """按地图源取 ``MapStore``（每个源一个实例，按源指纹缓存）。
+
+    * ``source_id`` 空 → 用 ``mapsources`` 的**默认源**（首次运行由 ``conf.MAPS_IO`` 种入）；
+    * 源不存在 → 抛 ``MapStoreError``（路由层转 400/404，附可用源清单）；
+    * 源配置改了（换目录/换主机）→ 指纹变，自动重建，无需重启后端。
+    """
+    from . import mapsources
+    src = resolve_source(source_id)
+    fp = mapsources.fingerprint_of(src)
+    key = (fp["io_mode"], fp["root"], fp.get("host", ""), fp.get("user", ""), fp.get("port", ""))
+    if force_new or key not in _stores:
+        _stores[key] = _build(fp["io_mode"], fp["root"], src if fp["io_mode"] == "ssh" else None)
+    return _stores[key]
+
+
+def current_source() -> dict:
+    """最近一次 :func:`get_store`/``resolve_source`` 解析出的源（给 io_status 显示用）。"""
+    if _last_resolve:
+        return dict(_last_resolve)
+    try:
+        return resolve_source()
+    except Exception:      # noqa: BLE001  源表都没了也不该让状态接口崩
+        return {"id": "", "label": "", "kind": conf.MAPS_IO, "root": str(conf.MAPS_DIR)}
 
 
 def reset_store() -> None:
-    """丢弃单例（测试与设置变更后调用）。"""
-    global _store, _store_sig
-    _store = None
-    _store_sig = None
+    """丢弃全部缓存的 store（测试与源配置变更后调用）。"""
+    _stores.clear()
 
 
-def io_status(name: str = "") -> dict:
+def io_status(name: str = "", source_id: str = "") -> dict:
     """``GET /api/mapeditor/io`` 的载荷（规格 §B5.2）。
 
     ``name`` 非空时额外给出该图的缓存新鲜度：连不上/读失败但缓存里有值 → ``stale: True``
     + ``cached_at``（前端据此显示「当前离线，显示缓存（2026-09-14 11:00）」）。
     """
-    st = get_store()
+    st = get_store(source_id)
+    src = current_source()
     ok, why = st.available()
     out = {
-        "mode": conf.MAPS_IO,
+        # source 是新口径（哪个命名源）；mode/root/host 保留给老前端与日志，语义不变
+        "source": src.get("id", ""),
+        "source_label": src.get("label", ""),
+        "source_kind": src.get("kind", ""),
+        "mode": "local" if src.get("kind") == "local" else "ssh",
         "root": st.root,
         "available": ok,
         "reason": why,
-        "transport": getattr(st, "_tr_kind", "") or ("local" if conf.MAPS_IO == "local" else ""),
+        "transport": getattr(st, "_tr_kind", "") or ("local" if src.get("kind") == "local" else ""),
         "stale": False,
         "cached_at": None,
-        "host": conf.MAPS_SSH_HOST if conf.MAPS_IO == "ssh" else "",
+        "host": conf.MAPS_SSH_HOST if src.get("kind") == "ssh" else "",
     }
     cache = getattr(st, "cache", None)
     if name and cache is not None:
@@ -922,19 +974,20 @@ def io_status(name: str = "") -> dict:
     return out
 
 
-def io_test() -> dict:
+def io_test(source_id: str = "") -> dict:
     """主动连通性自检：只 ``list()`` 一次，返回耗时与错误原因；**不改任何文件**。"""
-    st = get_store()
+    st = get_store(source_id)
+    src = current_source()
     t0 = time.time()
     ok, why = st.available()
+    base = {"source": src.get("id", ""), "source_label": src.get("label", ""),
+            "root": st.root, "elapsed_ms": int((time.time() - t0) * 1000)}
     if not ok:
-        return {"ok": False, "available": False, "reason": why,
-                "elapsed_ms": int((time.time() - t0) * 1000), "count": 0}
+        return {"ok": False, "available": False, "reason": why, "count": 0, **base}
     try:
         items = st.list()
     except MapStoreError as e:
-        return {"ok": False, "available": True, "reason": str(e),
-                "elapsed_ms": int((time.time() - t0) * 1000), "count": 0}
-    return {"ok": True, "available": True, "reason": "",
-            "elapsed_ms": int((time.time() - t0) * 1000), "count": len(items),
-            "transport": getattr(st, "_tr_kind", "")}
+        return {"ok": False, "available": True, "reason": str(e), "count": 0, **base}
+    return {"ok": True, "available": True, "reason": "", "count": len(items),
+            "transport": getattr(st, "_tr_kind", ""),
+            "elapsed_ms": int((time.time() - t0) * 1000), **base}
