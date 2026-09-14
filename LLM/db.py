@@ -85,6 +85,18 @@ CREATE TABLE IF NOT EXISTS expressions (
   authority TEXT DEFAULT 'llm',   -- llm(自动学) | nurse(人工维护)
   source TEXT DEFAULT '', ts TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS zones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  map_name TEXT NOT NULL,               -- 地点绑定的地图名（三张图坐标系不通用，必须绑）
+  name TEXT NOT NULL,                   -- 标准名，如 "101"
+  kind TEXT DEFAULT 'room',             -- room | ward | bed | other
+  shape TEXT DEFAULT 'polygon',         -- polygon | rect
+  polygon_json TEXT DEFAULT '[]',       -- [[x,y], ...] 米坐标（世界系，非像素）
+  parent_id INTEGER DEFAULT 0,          -- 上级区域（病房→床位）；0=无
+  note TEXT DEFAULT '',
+  created_at TEXT, updated_at TEXT,
+  UNIQUE(map_name, name)
+);
 """
 
 
@@ -111,6 +123,10 @@ def init_db():
             _ensure_columns(conn, "profiles", {
                 "gender": "gender TEXT DEFAULT ''",
                 "birthday": "birthday TEXT DEFAULT ''",
+                # 分层用户体系：kind=elder|ward；ward_id=老人所属病房；zone_id=关联的 zones.id（0=未关联）
+                "kind": "kind TEXT DEFAULT 'elder'",
+                "ward_id": "ward_id TEXT DEFAULT ''",
+                "zone_id": "zone_id INTEGER DEFAULT 0",
             })
             # 软删 / 幂等列（跨表统一补齐，兼容旧库）
             for table in ("memories", "core_memories", "rag_memories", "expressions"):
@@ -148,10 +164,15 @@ def get_profile(uid: str) -> dict | None:
         conn.close()
 
 
-def list_profiles() -> list[dict]:
+def list_profiles(kind: str | None = None) -> list[dict]:
     conn = _conn()
     try:
-        rows = conn.execute("SELECT * FROM profiles ORDER BY uid").fetchall()
+        sql = "SELECT * FROM profiles"
+        args: tuple = ()
+        if kind:
+            sql += " WHERE kind=?"
+            args = (kind,)
+        rows = conn.execute(sql + " ORDER BY uid", args).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -163,9 +184,19 @@ def list_profiles() -> list[dict]:
         conn.close()
 
 
+def get_profile_kind(uid: str) -> str:
+    """唯一权威的角色判定依据（R1）：admin 不在 profiles 里 → 返回 ''。"""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT kind FROM profiles WHERE uid=?", (uid,)).fetchone()
+        return (row["kind"] or "elder") if row else ""
+    finally:
+        conn.close()
+
+
 def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
                    profile=None, style="", preferences=None, notes="",
-                   gender="", birthday="") -> dict:
+                   gender="", birthday="", kind="elder", zone_id=0) -> dict:
     profile = profile or {}
     preferences = preferences or {}
     ts = now_iso()
@@ -173,23 +204,43 @@ def upsert_profile(uid: str, name="", nickname="", bed="", age=0,
         conn = _conn()
         try:
             conn.execute(
-                """INSERT INTO profiles (uid,name,nickname,bed,age,gender,birthday,profile_json,style,preferences_json,notes,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO profiles (uid,name,nickname,bed,age,gender,birthday,profile_json,style,preferences_json,notes,kind,zone_id,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(uid) DO UPDATE SET
                      name=excluded.name, nickname=excluded.nickname, bed=excluded.bed, age=excluded.age,
                      gender=excluded.gender, birthday=excluded.birthday,
                      profile_json=excluded.profile_json, style=excluded.style,
-                     preferences_json=excluded.preferences_json, notes=excluded.notes, updated_at=excluded.updated_at""",
+                     preferences_json=excluded.preferences_json, notes=excluded.notes,
+                     kind=COALESCE(profiles.kind, excluded.kind),
+                     zone_id=excluded.zone_id,
+                     updated_at=excluded.updated_at""",
                 (uid, name, nickname, bed, age, gender, birthday,
                  json.dumps(profile, ensure_ascii=False),
                  style,
                  json.dumps(preferences, ensure_ascii=False),
-                 notes, ts, ts),
+                 notes, kind, int(zone_id or 0), ts, ts),
             )
             conn.commit()
         finally:
             conn.close()
     return get_profile(uid)
+
+
+def upsert_ward(uid: str, name: str = "", zone_id: int = 0) -> dict:
+    """新建/更新病房 profile；病房几何不在这里存，只存关联的 zones.id（唯一真相在 zones）。"""
+    upsert_profile(uid, name=name, kind="ward", zone_id=int(zone_id or 0))
+    return get_profile(uid) or {}
+
+
+def set_profile_ward(uid: str, ward_id: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE profiles SET ward_id=?, updated_at=? WHERE uid=?",
+                         (ward_id, now_iso(), uid))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------- memories
@@ -973,6 +1024,133 @@ def update_memory_content(mid: int, content: str) -> None:
             conn.close()
 
 
+# ---- 病房区域最小集（zones 表 = 唯一真相；与一期《地图编辑器》任务 1 同一份实现）----
+# 依赖说明：一期任务 1 也会实现这些函数，先落地者建表、后落地者复用
+# （CREATE TABLE IF NOT EXISTS 幂等）；与 locator.py / mapserver.py 同一约定。
+# 降级（D17 fail-safe）：表不存在 / 无 kind='ward' 区域 / zone_id=0 → 一律返回空，绝不抛异常。
+
+def add_zone(map_name: str, name: str, kind: str = "room", shape: str = "polygon",
+             polygon_json: list | None = None, parent_id: int = 0, note: str = "") -> int:
+    """写入一条区域记录并返回其 id；同 (map_name, name) 已存在则覆盖几何（幂等，适配 UNIQUE）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            ts = now_iso()
+            cur = conn.execute(
+                "INSERT INTO zones (map_name,name,kind,shape,polygon_json,parent_id,note,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(map_name, name) DO UPDATE SET kind=excluded.kind, "
+                "shape=excluded.shape, polygon_json=excluded.polygon_json, "
+                "parent_id=excluded.parent_id, note=excluded.note, updated_at=excluded.updated_at",
+                (map_name, name, kind, shape,
+                 json.dumps(polygon_json or [], ensure_ascii=False),
+                 int(parent_id or 0), note or "", ts, ts))
+            conn.commit()
+            if cur.lastrowid:
+                return int(cur.lastrowid)
+            row = conn.execute("SELECT id FROM zones WHERE map_name=? AND name=?",
+                               (map_name, name)).fetchone()
+            return int(row["id"]) if row else 0
+        finally:
+            conn.close()
+
+
+def get_zone(zone_id: int) -> dict | None:
+    """按主键查 zones 行（唯一真相）；不存在或表未建 → None。"""
+    try:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM zones WHERE id=?", (int(zone_id or 0),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:                        # 表不存在等 → 降级
+        return None
+
+
+def list_zones(map_name: str | None = None, kind: str | None = None) -> list[dict]:
+    """按地图名 / 类型列出区域；表未建 → []（降级）。"""
+    conds, args = [], []
+    if map_name:
+        conds.append("map_name=?")
+        args.append(map_name)
+    if kind:
+        conds.append("kind=?")
+        args.append(kind)
+    sql = "SELECT * FROM zones"
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY id"
+    try:
+        conn = _conn()
+        try:
+            return [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
+        finally:
+            conn.close()
+    except Exception:                        # 表不存在等 → 降级
+        return []
+
+
+def _point_in_polygon(x: float, y: float, poly: list) -> bool:
+    """射线法：点是否在多边形内（poly=[[x,y], ...] 米坐标）。"""
+    inside, n = False, len(poly)
+    for i in range(n):
+        x1, y1 = float(poly[i][0]), float(poly[i][1])
+        x2, y2 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
+        if (y1 > y) != (y2 > y):
+            if x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+
+def zone_contains_point(map_name: str, x: float, y: float, kind: str | None = None) -> list[dict]:
+    """点落在哪些区域里：polygon 用射线法；rect 用 polygon_json 的**外接矩形**。
+
+    降级（D17）：表不存在 / 该地图没有区域 / polygon_json 为空 → []，
+    调用方据此保持手动选病房，绝不误判、绝不阻塞对话。
+    """
+    out = []
+    for z in list_zones(map_name=map_name, kind=kind):
+        try:
+            poly = json.loads(z.get("polygon_json") or "[]")
+        except (TypeError, ValueError):
+            poly = []
+        if not poly:
+            continue
+        try:
+            if str(z.get("shape") or "polygon") == "rect":
+                xs = [float(p[0]) for p in poly]
+                ys = [float(p[1]) for p in poly]
+                if min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys):
+                    out.append(z)
+            elif _point_in_polygon(x, y, poly):
+                out.append(z)
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue        # 几何数据损坏/坐标非数值 → 视为不在区域内（D17 fail-safe，绝不阻塞对话）
+    return out
+
+
+def get_ward_zone(ward_uid: str) -> dict | None:
+    """取该病房 profile 的 zone_id，再查 zones 表（病房几何的唯一真相在 zones）。
+
+    zone_id=0（未关联）或 zones 行缺失 → None，调用方按"拿不到病房区域"降级处理。
+    """
+    p = get_profile(ward_uid) or {}
+    zid = int(p.get("zone_id") or 0)
+    return get_zone(zid) if zid else None
+
+
+def list_wards_with_zone() -> list[dict]:
+    """列出**已关联区域**的病房：{"uid","name","zone_id","zone"}；未关联的病房不返回。"""
+    out = []
+    for w in list_profiles(kind="ward"):
+        zid = int(w.get("zone_id") or 0)
+        zone = get_zone(zid) if zid else None
+        if zone:
+            out.append({"uid": w["uid"], "name": w.get("name", ""), "zone_id": zid, "zone": zone})
+    return out
+
+
 # ---------------------------------------------------------------- settings
 def get_settings() -> dict:
     from .conf import DEFAULT_SETTINGS
@@ -988,6 +1166,11 @@ def get_settings() -> dict:
             elif isinstance(out.get(r["key"]), int):
                 try:
                     v = int(v)
+                except ValueError:
+                    v = out[r["key"]]
+            elif isinstance(out.get(r["key"]), float):
+                try:
+                    v = float(v)
                 except ValueError:
                     v = out[r["key"]]
             out[r["key"]] = v
@@ -1014,3 +1197,55 @@ def set_settings(patch: dict) -> dict:
         finally:
             conn.close()
     return cur
+
+
+# ---- 管理员口令（PBKDF2，绝不落明文）----
+def _get_setting_raw(key: str, default: str = "") -> str:
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def _set_setting_raw(key: str, value: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("INSERT INTO settings (key,value) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _hash_pw(pw: str, salt: str) -> str:
+    import hashlib
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def get_admin_auth() -> dict:
+    return {
+        "required": _get_setting_raw("admin_auth_required", "1").lower() in ("1", "true", "yes"),
+        "hash": _get_setting_raw("admin_password_hash"),
+        "salt": _get_setting_raw("admin_password_salt"),
+    }
+
+
+def set_admin_password(pw: str) -> None:
+    import os
+    salt = os.urandom(16).hex()
+    _set_setting_raw("admin_password_salt", salt)
+    _set_setting_raw("admin_password_hash", _hash_pw(pw, salt))
+
+
+def verify_admin_password(pw: str) -> bool:
+    a = get_admin_auth()
+    if not a["hash"] or not a["salt"]:
+        return False
+    return _hash_pw(pw, a["salt"]) == a["hash"]
+
+
+def set_admin_auth_required(required: bool) -> None:
+    _set_setting_raw("admin_auth_required", "1" if required else "0")
