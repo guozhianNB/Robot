@@ -70,6 +70,15 @@ def test_upsert_ward_does_not_wipe_linkage_on_rename(d):
     assert p["ward_map"] == "my_map" and p["ward_zone"] == "z1"
 
 
+def test_upsert_ward_keeps_name_when_omitted(d):
+    """**回归**：只改关联（不传名字）时，已有病房名不许被抹成空串。"""
+    d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
+    d.upsert_ward("ward_101", ward_map="my_map2", ward_zone="z9")
+    p = d.get_profile("ward_101")
+    assert p["name"] == "101 病房"
+    assert (p["ward_map"], p["ward_zone"]) == ("my_map2", "z9")
+
+
 def test_upsert_profile_never_touches_ward_linkage(d):
     """**核心回归**：档案编辑（upsert_profile）绝不许清掉病房关联（f6f6e54 的教训）。"""
     d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
@@ -170,4 +179,11 @@ def test_get_settings_never_leaks_password_keys(d):
 
 
 def test_verify_admin_password_without_hash_is_false(d):
+    assert d.verify_admin_password("任意") is False
+
+
+def test_verify_password_with_corrupt_salt_is_false(d):
+    """盐被写坏（非十六进制）也必须只回"拒绝"，不许抛异常把登录端点打成 500。"""
+    d._set_setting_raw("admin_password_hash", "deadbeef")
+    d._set_setting_raw("admin_password_salt", "不是十六进制")
     assert d.verify_admin_password("任意") is False

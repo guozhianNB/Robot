@@ -280,9 +280,22 @@ def upsert_ward(uid: str, name: str = "", ward_map: str = "", ward_zone: str = "
 
     **只由本函数与 set_ward_zone 写 kind/ward_map/ward_zone**：upsert_profile 不碰这三列，
     否则管理台编辑老人档案时会静默清掉病房关联（见 git f6f6e54）。
-    传空串 = 保持原值（避免"只改个名字"把关联清掉）。
+    **三个字段一律"传空串 = 保持原值"，名字也一样**——`upsert_profile` 的 ON CONFLICT 是
+    `name=excluded.name`，直接把空串喂进去会把已有名字抹成空（静默数据丢失），
+    所以名字只在"行不存在"或"传了非空名字"时才写。
     """
-    upsert_profile(uid, name=name)          # 先保证行存在（用现有签名，不加参数）
+    exists = bool(get_profile(uid))
+    if not exists:
+        upsert_profile(uid, name=name)      # 建行（行不存在时名字允许为空）
+    elif name:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute("UPDATE profiles SET name=?, updated_at=? WHERE uid=?",
+                             (name, now_iso(), uid))
+                conn.commit()
+            finally:
+                conn.close()
     with _lock:
         conn = _conn()
         try:
@@ -1230,10 +1243,15 @@ def set_admin_password(pw: str) -> None:
 
 
 def verify_admin_password(pw: str) -> bool:
+    import hmac
     a = get_admin_auth()
     if not a["hash"] or not a["salt"]:
         return False
-    return _hash_pw(pw, a["salt"]) == a["hash"]
+    try:
+        return hmac.compare_digest(_hash_pw(pw, a["salt"]), a["hash"])
+    except ValueError:
+        # 盐被写坏（非十六进制）→ 一律拒绝。绝不让它变成 500（登录端点必须只回"口令错误"）。
+        return False
 
 
 def set_admin_auth_required(required: bool) -> None:
