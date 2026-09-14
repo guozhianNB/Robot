@@ -16,6 +16,8 @@ from . import tools as tool_mod
 from .conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
                    LLM_TIMEOUT, PROMPT_FILE)
+# 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/policy.py
+from .policy import role_policy
 
 # 导入MCP客户端会话类：ClientSession封装全部MCP协议逻辑（initialize、list_tools、call_tool）
 from mcp.client.session import ClientSession
@@ -106,6 +108,48 @@ def _load_prompt_base() -> str:
         raw = "\n".join(raw.splitlines()[marker_idx + 1:])
     return raw.strip()
 
+
+# ---- 角色片段（分层用户体系）：LLM/prompt/{ward,elder,admin}.md ----
+# 与 prompt.md（共用 base：人设 + 安全红线）叠加：base 管"怎么说"，角色片段管"现在跟谁说话"。
+_prompt_role_warned: set[str] = set()   # 某个角色片段缺失只告警一次，避免刷审计日志
+_ROLE_PROMPT_DIR_OVERRIDE = None        # 测试用：指向不存在的目录以验证降级
+
+
+def _load_role_prompt(role: str) -> str:
+    """读 `LLM/prompt/<role>.md` 角色片段；缺失 → 空串 + 告警一次（**不阻断对话**）。
+
+    文件名取自 `role_policy(role)["prompt_file"].name`（而不是拼 `f"{role}.md"`）：未知角色
+    在 role_policy 里已 fail-closed 落到集体层，这里必须跟着落到 ward.md —— 否则一个没见过的
+    role 会把整层角色提示词都丢掉，只剩共用 base（fail-open 的反面：看起来没崩，实际没规矩）。
+    """
+    pol = role_policy(role)
+    base_dir = _ROLE_PROMPT_DIR_OVERRIDE or pol["prompt_file"].parent
+    path = base_dir / pol["prompt_file"].name
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        if role not in _prompt_role_warned:
+            _prompt_role_warned.add(role)
+            audit.log("chat", action="prompt_role_missing", role=role, file=str(path))
+        return ""
+
+
+def _ward_context(ward_uid: str, limit: int) -> str:
+    """本病房集体层最近 N 条（R5 单向：**只从这里往外读**，绝不把私聊灌进来）。
+
+    取数来源只有 `ward_uid` 这一个 uid（= principal["ward_uid"]，由 session 层推导/校验），
+    不读任何老人 uid 的历史，也不做跨病房聚合 —— 病房之间互不可见。
+    """
+    if not ward_uid:
+        return ""
+    rows = db.load_history(ward_uid, limit=limit)
+    lines = [f"{r['role']}: {r['content']}" for r in rows if (r.get("content") or "").strip()]
+    if not lines:
+        return ""
+    return ("【病房里刚说过的事（这位老人在场听过；只读参考，别当私事追问）】\n"
+            + "\n".join(lines))
+
+
 ROUTER_HIT = (
     "【思考说明】这个问题涉及健康/药物/敏感或需要慎重的话题，请先仔细思考再回答，"
     "语气要格外谨慎，不确定就建议问护士。"
@@ -192,21 +236,45 @@ def _expression_hint(uid: str) -> str:
             "你始终是护工'小护'，保持亲切得体的身份，不逐字模仿）】\n" + "\n".join(lines))
 
 
-def build_system(uid: str, settings: dict, query: str = "") -> str:
-    """组装 System Prompt：LLM/prompt.md（人设+安全红线）+ 记忆（recall_v3 已含档案 style/画像与核心记忆 persona）+ 摘要。
+def build_system(uid: str, settings: dict, query: str = "", principal: dict | None = None) -> str:
+    """组装 System Prompt：base（人设+安全红线）+ 角色片段 + 记忆/上下文 + 当前时间。
+
+    principal 缺省时取 kiosk 槽（兼容旧调用点）；**权限相关的取舍只看 principal（R1）**：
+      - elder：本人档案/记忆/画像 + 本病房集体上下文（只读、单向，R5）
+      - ward ：**不注入任何老人档案**，只有本病房集体上下文
+      - admin：全量数据（不做 RAG 注入），无集体上下文
     query 用于向量检索相关记忆；为空时只注入结构化档案（兼容无上下文场景）。
-    P2a：RAG 召回走短 TTL 缓存（同 uid 15s 内复用），避免短时间多轮重复向量检索。"""
-    recall_ctx = _recall_cached(uid, query) if query else rag.recall_v3(uid, "")["context"]
-    parts = [
-        _load_prompt_base(),
-        f"\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n{recall_ctx}",
-    ]
-    summary = db.get_summary(uid)
-    if summary:
-        parts.append(f"\n【更早对话的历史摘要】\n{summary}")
-    expr_hint = _expression_hint(uid)
-    if expr_hint:
-        parts.append("\n" + expr_hint)
+    P2a：RAG 召回走短 TTL 缓存（同 uid 15s 内复用），避免短时间多轮重复向量检索。
+    """
+    from . import session as session_mod
+    p = principal or session_mod.get_principal("kiosk")
+    pol = role_policy(p.get("role"))
+    scope = pol["data_scope"]
+
+    parts = [_load_prompt_base()]
+    role_txt = _load_role_prompt(p.get("role"))
+    if role_txt:
+        parts.append("\n" + role_txt)
+
+    if scope == "self":                      # 老人层：本人档案/记忆/画像
+        recall_ctx = _recall_cached(uid, query) if query else rag.recall_v3(uid, "")["context"]
+        parts.append("\n【我了解到的关于这位老人的信息（来自档案/记忆，可能不全或过时，仅供参考）】\n"
+                     + recall_ctx)
+
+    if pol["ward_context"]:                  # 老人层：本病房集体上下文（只读、单向）
+        ward_txt = _ward_context(p.get("ward_uid", ""),
+                                 int(settings.get("ward_context_window", 10)))
+        if ward_txt:
+            parts.append("\n" + ward_txt)
+
+    if scope == "self":
+        summary = db.get_summary(uid)
+        if summary:
+            parts.append(f"\n【更早对话的历史摘要】\n{summary}")
+        expr_hint = _expression_hint(uid)
+        if expr_hint:
+            parts.append("\n" + expr_hint)
+
     parts.append(
         "\n【当前时间】" + time.strftime("%Y-%m-%d %H:%M (%A)") +
         "\n如果老人问'现在几点/今天星期几'，按上面的时间回答。"
@@ -214,10 +282,12 @@ def build_system(uid: str, settings: dict, query: str = "") -> str:
     return "\n".join(parts)
 
 
-def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict) -> list[dict]:
+def build_messages(uid: str, user_text: str, thinking_on: bool, settings: dict,
+                   principal: dict | None = None) -> list[dict]:
     """上下文管理：滚动窗口取最近 N 条 + System Prompt + 本次用户消息。"""
     history = db.load_history(uid, limit=HISTORY_WINDOW)
-    system = build_system(uid, settings, query=_build_query(user_text, history))
+    system = build_system(uid, settings, query=_build_query(user_text, history),
+                          principal=principal)
     if thinking_on:
         system += "\n" + ROUTER_HIT
     return [{"role": "system", "content": system}, *history,
@@ -303,7 +373,8 @@ async def mcp_init(client, model: str):
 
             _mcp_session = session
 
-def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict):
+def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
+                principal: dict | None = None):
     """
     核心生成器：逐条 yield SSE 事件 dict。
       {"type":"reasoning"|"content"|"tool_start"|"tool_result"|"done"|"error", ...}
@@ -319,7 +390,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
 
     yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method, "uid": uid}}
 
-    messages = build_messages(uid, user_text, thinking_on, settings)
+    messages = build_messages(uid, user_text, thinking_on, settings, principal=principal)
+    # TODO(任务 9)：改成 tool_mod.effective_tools(settings, principal) —— 待 tools.py 支持角色白名单
     tools = tool_mod.effective_tools(settings)
 
     full_assistant = ""
