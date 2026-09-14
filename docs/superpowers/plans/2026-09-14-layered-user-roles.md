@@ -356,6 +356,28 @@ def test_upsert_ward_promotes_existing_profile(d):
     assert d.get_profile("ward_101")["ward_map"] == "my_map"
 
 
+def test_upsert_ward_keeps_name_when_omitted(d):
+    """**回归**：只改关联（不传名字）时，已有病房名不许被抹成空串。
+
+    `upsert_profile` 的 ON CONFLICT 是 `name=excluded.name`，把空串喂进去会**静默清掉名字**；
+    `/api/wards/{uid}/zone` 这类"只改区域关联"的端点最自然的写法就是不传名字。
+    """
+    d.upsert_ward("ward_101", name="101 病房", ward_map="my_map", ward_zone="z1")
+    d.upsert_ward("ward_101", ward_map="my_map2", ward_zone="z9")
+    p = d.get_profile("ward_101")
+    assert p["name"] == "101 病房"
+    assert (p["ward_map"], p["ward_zone"]) == ("my_map2", "z9")
+
+
+def test_get_settings_never_leaks_password_keys(d):
+    """口令哈希/盐存在 settings 表里，但绝不许随 get_settings() 外泄（GET /api/settings 会透出）。"""
+    d.set_admin_password("246810")
+    leaked = [k for k in d.get_settings() if k.startswith("admin_password_")]
+    assert leaked == []
+    # 口令通路本身仍然可用（别把通路一起切断）
+    assert d.get_admin_auth()["hash"] and d.verify_admin_password("246810") is True
+
+
 def test_list_zones_kind_filter_and_get_zone_with_map(d):
     _seed_zones("my_map", [
         _zone("z1", "101", [[0, 0], [2, 0], [2, 2], [0, 2]], kind="ward"),
@@ -406,6 +428,13 @@ def test_admin_password_hash_roundtrip(d):
 
 
 def test_verify_admin_password_without_hash_is_false(d):
+    assert d.verify_admin_password("任意") is False
+
+
+def test_verify_password_with_corrupt_salt_is_false(d):
+    """盐被写坏（非十六进制）也必须只回"拒绝"，不许抛异常把登录端点打成 500。"""
+    d._set_setting_raw("admin_password_hash", "deadbeef")
+    d._set_setting_raw("admin_password_salt", "不是十六进制")
     assert d.verify_admin_password("任意") is False
 ```
 
@@ -482,9 +511,22 @@ def upsert_ward(uid: str, name: str = "", ward_map: str = "", ward_zone: str = "
 
     **只由本函数与 set_ward_zone 写 kind/ward_map/ward_zone**：upsert_profile 不碰这三列，
     否则管理台编辑老人档案时会静默清掉病房关联（见 git f6f6e54）。
-    传空串 = 保持原值（避免"只改个名字"把关联清掉）。
+    **三个字段一律"传空串 = 保持原值"，名字也一样**——`upsert_profile` 的 ON CONFLICT 是
+    `name=excluded.name`，直接把空串喂进去会把已有名字抹成空（静默数据丢失），
+    所以名字只在"行不存在"或"传了非空名字"时才写。
     """
-    upsert_profile(uid, name=name)          # 先保证行存在（用现有签名，不加参数）
+    exists = bool(get_profile(uid))
+    if not exists:
+        upsert_profile(uid, name=name)      # 建行（行不存在时名字允许为空）
+    elif name:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute("UPDATE profiles SET name=?, updated_at=? WHERE uid=?",
+                             (name, now_iso(), uid))
+                conn.commit()
+            finally:
+                conn.close()
     with _lock:
         conn = _conn()
         try:
@@ -616,10 +658,15 @@ def set_admin_password(pw: str) -> None:
 
 
 def verify_admin_password(pw: str) -> bool:
+    import hmac
     a = get_admin_auth()
     if not a["hash"] or not a["salt"]:
         return False
-    return _hash_pw(pw, a["salt"]) == a["hash"]
+    try:
+        return hmac.compare_digest(_hash_pw(pw, a["salt"]), a["hash"])
+    except ValueError:
+        # 盐被写坏（非十六进制）→ 一律拒绝。绝不让它变成 500（登录端点必须只回"口令错误"）。
+        return False
 
 
 def set_admin_auth_required(required: bool) -> None:
@@ -640,7 +687,7 @@ def set_admin_auth_required(required: bool) -> None:
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_ward_db.py -q`
-预期：`13 passed`
+预期：`16 passed`
 
 - [ ] **步骤 5：跑既有回归 + Commit**
 
