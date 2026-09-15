@@ -98,7 +98,7 @@ python -m uvicorn LLM.mapeditor_server:app --host 0.0.0.0 --port 8010
 3. `mapapi.mount_editor(app)`；
 4. `GET /` → 302 到 `/mapeditor/`；
 5. `GET /api/mapeditor/service` → `{"ok": True, "running": True, "pid": os.getpid(), "port": conf.MAP_EDITOR_PORT}`（本服务总由主后端以该端口拉起，此字段只作回显；主后端探活只看 HTTP 200）；
-6. `POST /api/mapeditor/service/stop` → 返回 `{"ok": True, "message": "地图编辑器服务正在退出…"}`，随后走模块级 `_delayed_exit()`：daemon 线程 `sleep(0.5)` → `os._exit(0)`（**与 `server.py::_delayed_exit` 同款做法**——先把响应发出去再退，避免前端拿到空响应）。测试 monkeypatch 掉 `_delayed_exit`，只断言"被调用了一次"。
+6. `POST /api/mapeditor/service/stop` → 返回 `{"ok": True, "message": "地图编辑器服务正在退出…"}`，随后走模块级 `_schedule_exit()`：它起一个 daemon 线程执行 `_delayed_exit()`（`sleep(0.5)` → `os._exit(0)`，**与 `server.py::_delayed_exit` 同款做法**——先把响应发出去再退，避免前端拿到空响应）。测**只**注入 `_schedule_exit`（断言"被调用了一次"），**绝不**让真实 `os._exit` 在 pytest 里跑起来。
 
 > **降级要求（AGENTS「系统稳健性」）：** 本进程是"可选能力"，起不来不许影响主后端（主后端只用 `Popen` + HTTP 探活，失败就报错给 admin）。
 
@@ -152,7 +152,7 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 - **`frontend/packages/mapeditor/src/App.vue`（顶部工具条）**：
   - `保存并退出`：弹一次确认（"退出后地图编辑器服务会停止，需要再点『启动』才能进来"）→ `POST /api/mapeditor/service/stop`（**同源 8010**）→ 成功后 `window.close()`；若还有未保存的像素改动，提示"像素修图请在其窗口点『保存并退出』"（主编辑器不掌握那个窗口的状态，不假装能替它保存）。
   - `仅关窗（保留服务）`：直接 `window.close()`，不停服务（给"开了两个窗口"兜底）。
-  - 新增 `frontend/packages/mapeditor/src/lib/service.ts`：`serviceStatus()` / `stopService()`；当探测到服务已停（fetch 失败）→ 顶部显示红条「地图编辑器服务已停止，请关闭本页」，并停掉 2.5 秒的状态轮询（省得刷错误）。
+  - 新增 `frontend/packages/mapeditor/src/lib/service.ts`：只有两件事——`stopService()`（打同源 `POST /api/mapeditor/service/stop`）与 `closeSelf()`（`window.close()`）。**不另封 `serviceStatus()`**：`App.vue` 的 `statusTick` 本来就在轮询 `/api/mapeditor/status`，`http === 0` 即"服务没了" → 顶部显示红条「地图编辑器服务已停止，请关闭本页」并停掉 2.5 秒轮询（省得刷错误）；再封一个状态函数只会成为没人用的死代码（YAGNI）。
 - **`frontend/packages/mapeditor/public/pixel-netio.js`（工具栏第二行）**：
   - 新增 `保存并退出`：复用既有那条链路——挂一个"退出意图"标志，再触发 `manualSave()` → `saveToServer()`，在**既有成功回调 `renderSaveOk(data, mode)` 里**追加分支：只有保存成功才继续 `POST /api/mapeditor/service/stop` + `window.close()`。保存失败（含 409 需 `confirm`）则**清掉退出意图、不停不关**，照旧显示错误与处理按钮。
   - 既有「保存到服务器」按钮保持不变（不带退出意图）。
@@ -202,7 +202,7 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 |---|---|
 | `LLM/tests/test_map_service_split.py`（新） | 主 app 的 `app.routes` 里**没有** `/api/map/list`、`/api/mapeditor/status`，也**没有** `/mapeditor` 挂载；`LLM.mapeditor_server.app` 里**有**；主 app **有** `/api/mapeditor/service` |
 | `LLM/tests/test_mapctl.py`（新） | 假 `Popen` + 假端口探测：start 幂等（external 不重复拉起）、就绪超时、进程提前退出、stop 三态（managed→terminate / external→自停接口 / none→幂等 ok）、非 admin 403、审计落盘 |
-| `LLM/tests/test_mapeditor_server.py`（新） | `GET /api/mapeditor/service` 形状（pid=os.getpid()）；`POST .../stop` 回包后**确实**安排退出（monkeypatch 掉真实 `os._exit`，只断言"被调用了一次"） |
+| `LLM/tests/test_mapeditor_server.py`（新） | `GET /api/mapeditor/service` 形状（pid=os.getpid()）；`POST .../stop` 回包后**确实**安排了退出（注入 `_schedule_exit`，断言"被调用了一次"——真实 `os._exit` 绝不能进 pytest） |
 | `frontend/packages/mapeditor/scripts/test-startup-contract.mjs`（改） | 见 §4.2 的三条断言 |
 | 手工（用户侧） | §六 的 1–8 条；`pnpm -r build` |
 
