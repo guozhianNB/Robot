@@ -204,6 +204,23 @@ def change_admin_password(old: str, new: str) -> dict:
     return {"ok": True}
 
 
+def restore_factory_password() -> dict:
+    """把管理员口令恢复为 `.env` 的 PASSWORD，并立即作废全部管理员会话。"""
+    from . import conf
+    password = conf.FACTORY_PASSWORD
+    if len(password) < 4:
+        audit.log("admin_password_restored", ok=False, reason="factory_password_unavailable")
+        return {"ok": False, "error": ".env 的 PASSWORD 未配置或少于 4 位"}
+    db.set_admin_password(password)
+    for slot in SLOTS:
+        if _slot(slot)["role"] == "admin":
+            _slot(slot).update({"role": "ward", "until": None,
+                                "source": "factory_password_restored"})
+            bus.publish("session_expired", slot=slot, reason="factory_password_restored")
+    audit.log("admin_password_restored", ok=True)
+    return {"ok": True}
+
+
 def set_admin_auth(required: bool) -> dict:
     """开关口令门（D13）。
 
@@ -301,6 +318,21 @@ def _zone_hit(ward: dict, map_name: str, pose: dict) -> bool:
 def current_ward() -> str:
     """当前病房（集体层主体）的 uid；空串 = 还不知道在哪个病房。"""
     return _shared.get("ward_uid") or ""
+
+
+def forget_ward(ward_uid: str) -> None:
+    """病房被删除后清掉会话中的悬空引用，不影响正在进行的老人私聊。"""
+    if _shared.get("ward_uid") == ward_uid:
+        _shared["ward_uid"] = ""
+        _shared["manual_until"] = 0.0
+        _candidate.clear()
+    if _shared.get("uid") == ward_uid:
+        _shared["uid"] = ""
+        _shared["locked"] = False
+        for s in _state.values():
+            if s.get("role") != "admin":
+                s["role"] = "ward"
+                s["source"] = "ward_deleted"
 
 
 def manual_set_ward(ward_uid: str) -> dict:

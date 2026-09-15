@@ -288,6 +288,10 @@ class WardAssignIn(BaseModel):
     ward_id: str = ""
 
 
+class WardSwitchIn(BaseModel):
+    ward_uid: str
+
+
 class AlarmIn(BaseModel):
     type: str = "sos"          # sos / fall / health / no_activity ...
     uid: str = ""
@@ -441,17 +445,36 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
 
 
 @app.get("/api/chat/history")
-async def chat_history(uid: str = Query("elder_001"), limit: int = Query(200)):
-    """回读某位老人的历史对话（前端刷新后恢复显示）。"""
-    return {"ok": True, "history": db.load_history_full(uid=uid, limit=limit)}
+async def chat_history(uid: str = Query(""), limit: int = Query(200),
+                       x_surface: str = Header(default="kiosk")):
+    """回读某人的历史对话。
+
+    主体口径与 `/api/chat` 同源：**非管理员只能读自己**（传别人的 uid 一律 400）；管理员可以
+    指定 uid（管理台要按老人查看），但要落审计。
+    """
+    principal = session.get_principal(_surface(x_surface))
+    target = uid or principal["uid"]
+    if principal["role"] != "admin":
+        if uid and uid != principal["uid"]:
+            raise HTTPException(status_code=400, detail="只能读取自己的会话历史")
+        target = principal["uid"]
+    else:
+        audit.log("chat", action="history_read", uid=target, by="admin")
+    history = db.load_history_full(uid=target, limit=limit) if target else []
+    return {"ok": True, "history": history}
 
 
 @app.delete("/api/chat/history")
-async def chat_history_clear(uid: str = Query("elder_001")):
-    """清空某位老人的对话历史。"""
-    n = db.clear_history(uid)
-    from . import log as audit
-    audit.log("chat", action="clear_history", uid=uid, count=n, by="nurse")
+async def chat_history_clear(uid: str = Query(""), x_surface: str = Header(default="kiosk")):
+    """清空某人的对话历史（主体口径同 `GET`：非管理员只能删自己）。"""
+    principal = session.get_principal(_surface(x_surface))
+    target = uid or principal["uid"]
+    if principal["role"] != "admin":
+        if uid and uid != principal["uid"]:
+            raise HTTPException(status_code=400, detail="只能清空自己的会话历史")
+        target = principal["uid"]
+    n = db.clear_history(target) if target else 0
+    audit.log("chat", action="clear_history", uid=target, count=n, by=principal["role"])
     return {"ok": True, "cleared": n}
 
 
@@ -942,6 +965,22 @@ async def session_user_set(s: SessionUserIn, x_surface: str = Header(default="ki
     return res
 
 
+@app.post("/api/session/ward")
+async def session_set_ward(body: WardSwitchIn, x_surface: str = Header(default="kiosk")):
+    """手动切当前病房（D18）：带 `manual_until`，这段时间内位置判定不覆盖。
+
+    与"锁定主体"不同：这里只切**集体层背景变量**，正在老人私聊时不抢会话。
+    广播与审计都在 `session.manual_set_ward()` 内部完成（`ward_changed` / action=manual），
+    路由层**不再重复 publish**（否则前端会收到双事件）。
+    """
+    _surface(x_surface)                      # 本族的公共入口：兜底建表 + 非法端槽位显式 400
+    if db.get_profile_kind(body.ward_uid) != "ward":
+        raise HTTPException(status_code=400, detail=f"病房 uid 不存在：{body.ward_uid}")
+    res = dict(session.manual_set_ward(body.ward_uid))
+    res["ok"] = True                         # 与 `/api/session/user` 同款返回形状
+    return res
+
+
 @app.post("/api/session/login")
 async def session_login(body: LoginIn | None = None, x_surface: str = Header(default="kiosk")):
     slot = _surface(x_surface)
@@ -970,6 +1009,14 @@ async def session_password(body: PasswordIn, x_surface: str = Header(default="ki
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可改口令")
     return session.change_admin_password(body.old, body.new)
+
+
+@app.post("/api/session/password/restore-factory")
+async def session_password_restore_factory(x_surface: str = Header(default="kiosk")):
+    """恢复 `.env` 的 PASSWORD；只允许已登录管理员，成功后全部管理员槽位立即降权。"""
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可恢复出厂口令")
+    return session.restore_factory_password()
 
 
 @app.get("/api/session/admin-auth")
@@ -1015,6 +1062,19 @@ async def wards_upsert(w: WardIn, x_surface: str = Header(default="kiosk")):
     return {"ok": True, "ward": _ward_payload(db.get_profile(w.uid) or {"uid": w.uid})}
 
 
+@app.delete("/api/wards/{ward_uid}")
+async def ward_delete(ward_uid: str, x_surface: str = Header(default="kiosk")):
+    """删除病房档案并解除老人归属；关联的地图区域保留。"""
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    if not db.delete_ward(ward_uid):
+        return {"ok": False, "error": f"病房不存在：{ward_uid}"}
+    session.forget_ward(ward_uid)
+    audit.log("ward_change", source="admin", action="delete", ward=ward_uid)
+    bus.publish("ward_changed", uid=ward_uid, action="delete")
+    return {"ok": True, "uid": ward_uid}
+
+
 @app.post("/api/wards/{ward_uid}/zone")
 async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk")):
     """便捷录入：以当前位姿为圆心、`ward_zone_default_r` 为半径采样 16 边形写入**该图的
@@ -1023,6 +1083,9 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
     """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    ward = db.get_profile(ward_uid) or {}
+    if ward.get("kind") != "ward":
+        return {"ok": False, "error": f"uid 不存在：{ward_uid}"}
     pose = locator.get_pose()
     if not pose or pose.get("x") is None:
         return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪）；可到地图编辑器手绘区域"}
@@ -1031,7 +1094,6 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
         return {"ok": False,
                 "error": f"认不出当前地图（{why}）：请确认导航在跑且 /map 指纹能唯一命中，"
                          f"或把设置 ward_map_source 改成 setting 并选好 current_map"}
-    ward = db.get_profile(ward_uid) or {}
     name = ward.get("name") or ward_uid
     r = float(db.get_settings().get("ward_zone_default_r", 3.0))
     try:
@@ -1039,7 +1101,9 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
                                           radius_m=r, kind="ward")
     except Exception as e:                 # noqa: BLE001  板卡不可达/名字非法等 → 只降级不 500
         return {"ok": False, "error": f"写地图标记失败：{e}"}
-    db.set_ward_zone(ward_uid, map_name, res["uid"])
+    n = db.set_ward_zone(ward_uid, map_name, res["uid"])
+    if not n:                              # 0 行 = uid 不存在：别把静默 no-op 报成 ok
+        return {"ok": False, "error": f"uid 不存在：{ward_uid}"}
     audit.log("ward_change", source="admin", action="zone", ward=ward_uid,
               map=map_name, zone=res["uid"])
     bus.publish("ward_changed", uid=ward_uid, action="zone")
@@ -1056,7 +1120,8 @@ async def profile_set_ward(uid: str, body: WardAssignIn,
     """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可分配病房")
-    db.set_profile_ward(uid, body.ward_id)
+    if not db.set_profile_ward(uid, body.ward_id):   # 0 行 = uid 不存在
+        return {"ok": False, "error": f"uid 不存在：{uid}"}
     audit.log("ward_change", source="admin", action="assign", elder=uid, ward=body.ward_id)
     bus.publish("ward_changed", uid=body.ward_id, action="assign")
     return {"ok": True, "uid": uid, "ward_id": body.ward_id}

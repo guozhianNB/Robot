@@ -190,3 +190,38 @@ def test_unknown_tool_is_not_counted_as_denied(monkeypatch):
     res = tools.run_tool("__nope__", {}, _p("ward"))
     assert res["ok"] is False and "未知工具" in (res.get("message") or "")
     assert [ev for ev, _ in seen if ev == "policy_deny"] == []
+
+
+def test_run_tool_respects_mcp_global_switch(monkeypatch):
+    """MCP schema 即使还在快照里，总开关关闭后也不能被缓存调用。"""
+    called = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "mcp_probe": {"server": "srv", "schema": {"type": "function",
+                      "function": {"name": "mcp_probe", "description": "", "parameters": {}}}}})
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr(tools.mcp_client, "call_tool",
+                        lambda name, args: called.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.db.get_settings", lambda: {"mcp_enabled": False})
+
+    res = tools.run_tool("mcp_probe", {}, _p("admin"))
+
+    assert res["ok"] is False and called == []
+    assert "总开关" in res["error"]
+
+
+def test_run_tool_uses_one_mcp_registry_snapshot(monkeypatch):
+    """MCP 注册表在断线重连时会变化；一次分发只能读取同一份快照。"""
+    calls = []
+
+    def registry():
+        calls.append(1)
+        return {"mcp_probe": {"server": "srv", "schema": {"type": "function",
+                              "function": {"name": "mcp_probe", "parameters": {}}}}}
+
+    monkeypatch.setattr(tools.mcp_client, "tools", registry)
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda name, args: {"ok": True})
+    monkeypatch.setattr("LLM.db.get_settings", lambda: {"mcp_enabled": True})
+
+    assert tools.run_tool("mcp_probe", {}, _p("admin"))["ok"] is True
+    assert len(calls) == 1

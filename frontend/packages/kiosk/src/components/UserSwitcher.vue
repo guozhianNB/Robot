@@ -8,7 +8,7 @@
 import { computed, onMounted, ref } from "vue";
 import {
   changePassword, getAdminAuth, listWards, login, logout,
-  recordWardZone, setSessionUser, type SessionUser, type Ward,
+  recordWardZone, setSessionUser, setWard, type SessionUser, type Ward,
 } from "shared";
 
 interface Profile { uid: string; name?: string; nickname?: string; bed?: string }
@@ -106,6 +106,18 @@ async function pick(uid: string) {
   } catch (e) { errMsg.value = await fail(e, "切换失败"); }
 }
 
+/** 点病房 = **手动切病房**（D18），不是锁定主体：走 `/api/session/ward` 只切集体层背景变量
+ *  并带 10 分钟覆盖窗口；锁定会让 `_holds_session()` 为 False，自动切换被"锁定"挡住而不是被
+ *  "覆盖窗口"挡住，语义就错了。老人行仍走 `pick()`（锁定切换）。 */
+async function pickWard(uid: string) {
+  errMsg.value = "";
+  try {
+    await setWard(uid, "kiosk");
+    emit("changed");                                 // 让 App 重新拉 /api/session/user
+    emit("close");
+  } catch (e) { errMsg.value = await fail(e, "切换病房失败"); }
+}
+
 /** 解锁 = 回当前病房的集体层 + 恢复声纹自动判定（规格 §4.5）。
  *  后端已忽略传入 uid（语义与 uid 无关），故按约定的空串调用即可。 */
 async function unlock() {
@@ -180,7 +192,7 @@ onMounted(refresh);
       </p>
       <ul>
         <li v-for="w in wards" :key="w.uid" :class="{ active: w.uid === session.ward_uid }">
-          <span class="name" @click="pick(w.uid)">{{ w.name || w.uid }}</span>
+          <span class="name" @click="pickWard(w.uid)">{{ w.name || w.uid }}</span>
           <button v-if="isAdmin" class="mini" title="把当前房间记为这个病房的区域"
                   @click="markZone(w)">记录位置</button>
         </li>

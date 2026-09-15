@@ -248,3 +248,31 @@ def test_ttl_expiry_broadcasts_session_expired(d, monkeypatch):
     monkeypatch.setattr(session.time, "monotonic", lambda: base + 5)
     session.get_principal("kiosk")                      # 触发懒 tick 过期
     assert ("session_expired", {"slot": "kiosk"}) in seen
+
+
+def test_restore_factory_password_replaces_hash_and_kills_admin_sessions(d, monkeypatch):
+    """恢复出厂口令后旧口令失效，两个管理员槽都必须重新登录。"""
+    from LLM import conf
+    d.set_admin_password("old-password")
+    session.login_admin("old-password", slot="kiosk", ttl_s=600)
+    session.login_admin("old-password", slot="admin", ttl_s=600)
+    monkeypatch.setattr(conf, "FACTORY_PASSWORD", "factory-123")
+
+    result = session.restore_factory_password()
+
+    assert result == {"ok": True}
+    assert d.verify_admin_password("factory-123") is True
+    assert d.verify_admin_password("old-password") is False
+    assert session.get_principal("kiosk")["role"] == "ward"
+    assert session.get_principal("admin")["role"] == "ward"
+
+
+def test_restore_factory_password_rejects_missing_or_short_value(d, monkeypatch):
+    """无有效 PASSWORD 时不修改数据库里的当前口令。"""
+    from LLM import conf
+    d.set_admin_password("old-password")
+    for value in ("", "123"):
+        monkeypatch.setattr(conf, "FACTORY_PASSWORD", value)
+        result = session.restore_factory_password()
+        assert result["ok"] is False and "PASSWORD" in result["error"]
+        assert d.verify_admin_password("old-password") is True

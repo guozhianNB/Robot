@@ -87,6 +87,29 @@ def test_wards_crud_and_admin_auth_toggle(c):
     assert r.json()["required"] is False
 
 
+def test_delete_ward_detaches_elders_and_clears_current_session(c):
+    """删病房只删档案/关联，不留下老人归属与当前会话悬空引用。"""
+    from LLM import db
+
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    assert c.post("/api/profiles/elder_101_1/ward",
+                  json={"ward_id": "ward_101"}, headers=A).json()["ok"] is True
+    assert c.post("/api/session/ward", json={"ward_uid": "ward_101"}, headers=K).status_code == 200
+
+    r = c.delete("/api/wards/ward_101", headers=A)
+
+    assert r.status_code == 200 and r.json() == {"ok": True, "uid": "ward_101"}
+    assert db.get_profile("ward_101") is None
+    assert db.get_profile("elder_101_1")["ward_id"] == ""
+    assert c.get("/api/session/user", headers=K).json()["ward_uid"] == ""
+    assert c.delete("/api/wards/ward_101", headers=A).json()["ok"] is False
+
+
+def test_non_admin_cannot_delete_ward(c):
+    assert c.delete("/api/wards/ward_101", headers=K).status_code == 403
+    assert c.get("/api/wards", headers=K).json()["wards"][0]["uid"] == "ward_101"
+
+
 def test_non_admin_cannot_manage_wards(c):
     assert c.post("/api/wards", json={"uid": "ward_999", "name": "越权"}, headers=K).status_code == 403
     assert c.post("/api/session/admin-auth", json={"required": False}, headers=K).status_code == 403
@@ -101,6 +124,20 @@ def test_password_change_flow(c):
                   json={"old": "111111", "new": "654321"}, headers=A).json()["ok"] is True
     c.post("/api/session/logout", headers=A)
     assert c.post("/api/session/login", json={"password": "654321"}, headers=A).json()["ok"] is True
+
+
+def test_factory_password_restore_requires_admin_and_logs_out(c, monkeypatch):
+    """恢复接口只允许管理员；成功后当前槽立即降权并可用出厂口令重新登录。"""
+    from LLM import conf
+    monkeypatch.setattr(conf, "FACTORY_PASSWORD", "factory-123")
+    assert c.post("/api/session/password/restore-factory", headers=K).status_code == 403
+
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    r = c.post("/api/session/password/restore-factory", headers=A)
+
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert c.get("/api/session/user", headers=A).json()["role"] == "ward"
+    assert c.post("/api/session/login", json={"password": "factory-123"}, headers=A).json()["ok"] is True
 
 
 def test_policy_roles_visibility(c):
@@ -244,3 +281,71 @@ def test_ward_turn_does_not_touch_core_memory(c, monkeypatch):
     # 对照组：老人本人的轮次仍然走完整管线（否则"整条早退"会被误判成通过）
     server._post_chat_jobs("elder_101_1", "我今天有点闷", "我陪您说说话", "elder")
     assert calls == ["note_turn", "correct"]
+
+
+def test_chat_history_requires_matching_principal(c):
+    """**回归**：非管理员不许用别人的 uid 读/删历史（CORS 全开的隐私口子）。"""
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    c.post("/api/session/user", json={"uid": "elder_101_1", "locked": True}, headers=K)
+    assert c.get("/api/chat/history?uid=elder_999", headers=K).status_code == 400
+    assert c.delete("/api/chat/history?uid=elder_999", headers=K).status_code == 400
+    assert c.get("/api/chat/history", headers=K).status_code == 200   # 不带 uid → 读自己
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    assert c.get("/api/chat/history?uid=elder_999", headers=A).status_code == 200  # admin 可查
+
+
+def test_chat_history_without_principal_does_not_fall_back_to_an_elder(c):
+    """未选主体时返回空结果，不能沿用旧默认值去读删 elder_001。"""
+    from LLM import db
+    db.append_history("elder_001", "user", "private")
+
+    assert c.get("/api/chat/history", headers=K).json()["history"] == []
+    assert c.delete("/api/chat/history", headers=K).json()["cleared"] == 0
+    assert db.history_count("elder_001") == 1
+
+
+def test_session_ward_manual_switch(c):
+    """**D18 的 HTTP 入口**：手动切病房只切集体层背景变量（不锁主体），并带覆盖窗口。
+
+    `manual_set_ward` 内部已 publish `ward_changed`（action=manual），路由层不许再发一次。
+    """
+    r = c.post("/api/session/ward", json={"ward_uid": "ward_101"}, headers=K)
+    assert r.status_code == 200
+    body = c.get("/api/session/user", headers=K).json()
+    assert body["ward_uid"] == "ward_101"
+    assert body["locked"] is False           # 与"锁定主体"不同：手动切病房不锁
+    assert c.post("/api/session/ward", json={"ward_uid": "ward_101"},
+                  headers={"X-Surface": "bogus"}).status_code == 400
+
+
+def test_session_ward_rejects_non_ward_uid(c):
+    """ward_uid 必须指向真实病房，不能把老人或不存在主体写进病房上下文。"""
+    assert c.post("/api/session/ward", json={"ward_uid": "elder_101_1"}, headers=K).status_code == 400
+    assert c.post("/api/session/ward", json={"ward_uid": "ward_missing"}, headers=K).status_code == 400
+    assert c.get("/api/session/user", headers=K).json()["ward_uid"] == ""
+
+
+def test_ward_assign_unknown_uid_is_not_ok(c):
+    """**回归**：uid 不存在时 0 行更新 → 不许报 ok（原先静默 no-op 却返回 ok:True）。"""
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    r = c.post("/api/profiles/elder_999/ward", json={"ward_id": "ward_101"}, headers=A)
+    assert r.status_code == 200              # 与同族其它业务失败分支一致：HTTP 200 + ok:false
+    assert r.json()["ok"] is False and "elder_999" in r.json()["error"]
+    assert c.post("/api/profiles/elder_101_1/ward",
+                  json={"ward_id": "ward_101"}, headers=A).json()["ok"] is True
+
+
+def test_record_zone_checks_ward_before_writing_map(c, monkeypatch):
+    """未知病房必须在地图写入前失败，避免产生无人引用的 tags 区域。"""
+    from LLM import locator, maptags, session
+    writes = []
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    monkeypatch.setattr(locator, "get_pose", lambda: {"x": 1.0, "y": 2.0})
+    monkeypatch.setattr(session, "running_map_name", lambda: ("demo", "setting"))
+    monkeypatch.setattr(maptags, "record_room_polygon",
+                        lambda *args, **kwargs: writes.append((args, kwargs)) or {"uid": "z1"})
+
+    r = c.post("/api/wards/ward_missing/zone", headers=A)
+
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert writes == []

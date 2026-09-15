@@ -311,26 +311,54 @@ def upsert_ward(uid: str, name: str = "", ward_map: str = "", ward_zone: str = "
     return get_profile(uid) or {}
 
 
-def set_ward_zone(uid: str, map_name: str, zone_uid: str) -> None:
-    """把病房关联到「某张图上的某个区域 uid」（几何真相在 <图名>.tags.json，这里只存引用）。"""
+def set_ward_zone(uid: str, map_name: str, zone_uid: str) -> int:
+    """把病房关联到「某张图上的某个区域 uid」（几何真相在 <图名>.tags.json，这里只存引用）。
+
+    **返回受影响行数**：uid 不存在时命中 0 行，调用方（REST）据此报 `ok:false`，
+    不再把"静默 no-op"当成成功（既有调用点忽略返回值即可）。
+    """
     with _lock:
         conn = _conn()
         try:
-            conn.execute("UPDATE profiles SET ward_map=?, ward_zone=?, updated_at=? WHERE uid=?",
-                         (map_name or "", zone_uid or "", now_iso(), uid))
+            cur = conn.execute(
+                "UPDATE profiles SET ward_map=?, ward_zone=?, updated_at=? WHERE uid=?",
+                (map_name or "", zone_uid or "", now_iso(), uid))
             conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 
 
-def set_profile_ward(uid: str, ward_id: str) -> None:
-    """老人归入病房（写 profiles.ward_id；空串 = 移出病房）。"""
+def set_profile_ward(uid: str, ward_id: str) -> int:
+    """老人归入病房（写 profiles.ward_id；空串 = 移出病房）。返回受影响行数（0 = uid 不存在）。"""
     with _lock:
         conn = _conn()
         try:
-            conn.execute("UPDATE profiles SET ward_id=?, updated_at=? WHERE uid=?",
-                         (ward_id or "", now_iso(), uid))
+            cur = conn.execute("UPDATE profiles SET ward_id=?, updated_at=? WHERE uid=?",
+                               (ward_id or "", now_iso(), uid))
             conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def delete_ward(uid: str) -> bool:
+    """删除病房档案，并在同一事务内解除所有老人的病房归属。
+
+    地图区域的真相在 ``<map>.tags.json``，这里只删除 profiles 中的病房及其引用，
+    不删除地图区域。uid 不存在或不是病房时返回 False。
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT kind FROM profiles WHERE uid=?", (uid,)).fetchone()
+            if not row or row["kind"] != "ward":
+                return False
+            ts = now_iso()
+            conn.execute("UPDATE profiles SET ward_id='', updated_at=? WHERE ward_id=?", (ts, uid))
+            conn.execute("DELETE FROM profiles WHERE uid=? AND kind='ward'", (uid,))
+            conn.commit()
+            return True
         finally:
             conn.close()
 

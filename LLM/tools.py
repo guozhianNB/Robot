@@ -168,14 +168,27 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     allow = role_policy(role)["allowed_tools"]
     reg = _TOOL_REGISTRY.get(name)
     is_local = reg is not None
-    if not is_local and name not in mcp_client.tools():
+    # MCP 侧取**一次快照**：`mcp_client.tools()` 会拷贝注册表，两次查表之间工具若消失
+    # （服务器断开/重连），裸下标会抛 KeyError 穿透到对话链路。
+    snapshot = mcp_client.tools() if not is_local else {}
+    entry = snapshot.get(name)
+    if not is_local and entry is None:
         # 未知工具（模型幻觉/拼错）：走未知分支，**不落越权审计**（别污染越权统计）
         return {"ok": False, "message": f"未知工具 {name}"}
+    if not is_local:
+        # 总开关：`effective_tools()` 看不见的 MCP 工具，这里同样不许被直调
+        # （模型可能凭上一轮/缓存里的 schema 点名调用）。
+        from . import db
+        if not db.get_settings().get("mcp_enabled"):
+            audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
+                      uid=p.get("uid"), slot=p.get("slot"),
+                      decision="deny", args=args or {}, reason="mcp_disabled")
+            return {"ok": False, "error": f"MCP 工具总开关已关闭，不允许调用工具 {name}"}
     allow_ok = allow is None or name in allow
     if is_local:
         roles_ok = reg.get("roles") is None or resolved in reg["roles"]
     else:
-        roles_ok = resolved in _mcp_roles(mcp_client.tools()[name].get("server", ""))
+        roles_ok = resolved in _mcp_roles(entry.get("server", ""))
     if not (allow_ok and roles_ok):
         # 同时记 `role`（原始，可能缺省/未知/带大小写）与 `resolved_role`（归一后真正参与判定的
         # 那个角色）：只记原始值时，`role=None`/`"??"` 的拒绝记录与 `"ward"` 混在一起，按 role

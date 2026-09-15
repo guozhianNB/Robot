@@ -9,7 +9,7 @@
 // 精确形状（多边形/矩形）请到 /mapeditor 画（类型选「ward 病区」）。
 import { onMounted, ref } from "vue";
 import {
-  assignElderWard, listWards, recordWardZone, upsertWard, type Ward,
+  assignElderWard, deleteWard, listWards, recordWardZone, upsertWard, type Ward,
 } from "shared";
 
 interface Profile { uid: string; name?: string; nickname?: string; bed?: string; ward_id?: string }
@@ -125,6 +125,22 @@ async function markHere(w: Ward) {
   }
 }
 
+async function remove(w: Ward) {
+  const label = w.name || w.uid;
+  if (!window.confirm(`确定删除病房“${label}”吗？\n该病房内的老人会自动移出，地图区域会保留。`)) return;
+  err.value = ""; msg.value = ""; busy.value = true;
+  try {
+    const r = await deleteWard(w.uid, "admin");
+    if (!r.ok) { err.value = r.error ?? "删除失败"; return; }
+    msg.value = `已删除病房 ${label}`;
+  } catch (e) {
+    err.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    busy.value = false;
+    await load();
+  }
+}
+
 async function assign(elderUid: string, wardId: string, ev?: Event) {
   err.value = ""; msg.value = "";
   busy.value = true;
@@ -196,6 +212,7 @@ onMounted(load);
           <td class="acts">
             <button :disabled="busy" @click="markHere(w)">记录当前房间为病房区域</button>
             <button :disabled="busy" @click="bind(w)">关联已画区域</button>
+            <button class="danger" :disabled="busy" @click="remove(w)">删除</button>
           </td>
         </tr>
         <tr v-if="loaded && !wards.length"><td colspan="5">还没有病房，先用上面的表单建一个</td></tr>
@@ -259,5 +276,6 @@ th { color: #94a3b8; font-weight: normal; }
 .row button, .acts button { padding: 8px 14px; border-radius: 8px; border: none;
   background: #1e3a5f; color: #e2e8f0; cursor: pointer; font-size: 13px; }
 .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.acts .danger { background: #7f1d1d; }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>

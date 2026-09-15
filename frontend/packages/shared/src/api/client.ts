@@ -22,3 +22,10 @@ export function apiPost<T = any>(url: string, body?: unknown, surface?: Surface)
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }
+
+export function apiDelete<T = any>(url: string, surface?: Surface): Promise<T> {
+  return request<T>(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json", ...(surface ? { "X-Surface": surface } : {}) },
+  });
+}

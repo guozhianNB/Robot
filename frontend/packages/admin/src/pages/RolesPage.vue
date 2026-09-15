@@ -7,7 +7,7 @@
 // 这两个接口的失败语义（403 非管理员 / 400 口令太短 / 口令门冷却）恰恰都靠响应体表达，
 // 所以这里自带一层 `req()` 把 X-Surface 头和响应体错误一起处理。
 import { onMounted, ref } from "vue";
-import { changePassword, getAdminAuth, setAdminAuth } from "shared";
+import { changePassword, getAdminAuth, restoreFactoryPassword, setAdminAuth } from "shared";
 
 interface RolePolicy {
   prompt_file?: string;
@@ -67,6 +67,17 @@ async function savePw() {
   else { say(`❌ ${r.error ?? "改口令失败（非管理员会话会 403）"}`, false); }
 }
 
+async function restorePw() {
+  if (!confirm("确定恢复为 .env 中 PASSWORD 配置的出厂口令？恢复后所有管理员会话都会退出。")) return;
+  try {
+    const r = await restoreFactoryPassword("admin");
+    if (r.ok) say("出厂口令已恢复，管理层会话已退出，请重新登录");
+    else say(`恢复失败：${r.error ?? "请检查 .env 的 PASSWORD"}`, false);
+  } catch (e) {
+    say(`恢复失败：${e}`, false);
+  }
+}
+
 async function toggleAuth() {
   try {
     const r = await setAdminAuth(!authRequired.value, "admin");
@@ -123,6 +134,7 @@ onMounted(load);
       <input v-model="newPw" type="password" placeholder="新口令（后端要求 ≥4 位）" />
       <button @click="savePw">改口令</button>
       <button @click="toggleAuth">{{ authRequired ? "关闭口令门" : "开启口令门" }}</button>
+      <button class="danger" @click="restorePw">恢复出厂口令</button>
     </div>
     <p class="hint">
       只要系统已设过口令，<b>无论口令门开着还是关着，改口令都必须填旧口令</b>
@@ -163,4 +175,5 @@ code { background: #1e293b; padding: 1px 5px; border-radius: 4px; }
 .row label { color: #94a3b8; font-size: 13px; display: flex; gap: 6px; align-items: center; }
 .row button { padding: 8px 16px; border-radius: 8px; border: none; background: #1e3a5f;
   color: #e2e8f0; cursor: pointer; font-size: 14px; }
+.row button.danger { background: #7f1d1d; }
 </style>
