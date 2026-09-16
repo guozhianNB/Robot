@@ -726,7 +726,15 @@
     var btn = document.getElementById('btnDownloadMap');
     if (!btn) { msg('error', '找不到 #btnDownloadMap（上游页面结构可能已变）。'); exitAfterSave = false; return; }
     // 上游按钮自带 `if(!pgm || !yamlObj){ alert('Load YAML and PGM first.'); return; }`
-    btn.click();
+    // `click()` 会**同步**跑完上游回调，它一旦抛异常，这里就必须自己清掉退出意图：
+    // 否则 `exitAfterSave` 残留到下一次普通保存 —— 那次保存成功会**误停服务 + 误关窗**
+    // （本批次的红线：退出意图绝不泄漏）。
+    try {
+      btn.click();
+    } catch (e) {
+      msg('error', '触发 Download Map 失败：' + errText(e));
+      exitAfterSave = false;
+    }
     // 上游在未加载 yaml/pgm 时只 alert 一句就返回、不产生任何下载；补丁失效时也会退回原生下载。
     // 这类「一次提交都没发生」的空点击同样要清掉退出意图，否则意图会残留到下一次普通保存。
     if (exitAfterSave && !pending.timer) {
