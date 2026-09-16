@@ -6,11 +6,15 @@
 //   1) 建病房档案；2) 把病房**关联**到已画好的区域（地图名 + 区域 uid）；
 //   3) 便捷入口「记录当前房间为病房区域」= 以小车当前位姿为圆心采样 16 边形写进该图 tags.json；
 //   4) 老人归入/移出病房（写 profiles.ward_id）。
-// 精确形状（多边形/矩形）请到 /mapeditor 画（类型选「ward 病区」）。
+// 精确形状（多边形/矩形）请到本壳的「地图编辑器」页签里画（类型选「ward 病区」）。
 import { onMounted, ref } from "vue";
 import {
   assignElderWard, deleteWard, listWards, recordWardZone, upsertWard, type Ward,
 } from "shared";
+
+// 跳到同壳的「地图编辑器」页签（admin 没有路由表，只有 App.vue 的 active ref）。
+// 不能再用硬链 `<a href>` 指向编辑器：主后端已不再挂载该路径，硬链会 404。
+const emit = defineEmits<{ (e: "goto-mapeditor"): void }>();
 
 interface Profile { uid: string; name?: string; nickname?: string; bed?: string; ward_id?: string }
 
@@ -177,7 +181,7 @@ onMounted(load);
       一个病房 = 一个「病房用户」（uid 形如 <code>ward_101</code>），它既是集体主体，也承载"车在哪间屋"
       的位置判定。区域几何的<b>唯一真相</b>在地图文件夹的 <code>&lt;图名&gt;.tags.json</code>：
       「记录当前房间为病房区域」按当前位姿生成 16 边形近似圆，精确形状请到
-      <a href="/mapeditor/" target="_blank" rel="noopener">地图编辑器</a> 画多边形/矩形（类型选「ward 病区」），
+      <button class="link" @click="emit('goto-mapeditor')">地图编辑器</button> 画多边形/矩形（类型选「ward 病区」），
       本页负责把病房关联到那个区域。
     </p>
 
@@ -221,7 +225,7 @@ onMounted(load);
 
     <h4>关联已画好的区域</h4>
     <p class="hint">
-      先在下面填「地图名 + 区域 uid」（区域在地图编辑器里画好后从它的列表里抄 uid），
+      先在下面填「地图名 + 区域 uid」（区域在<button class="link" @click="emit('goto-mapeditor')">地图编辑器</button>里画好后从它的列表里抄 uid），
       再点目标病房那一行的「关联已画区域」。
     </p>
     <div class="row">
@@ -277,5 +281,7 @@ th { color: #94a3b8; font-weight: normal; }
   background: #1e3a5f; color: #e2e8f0; cursor: pointer; font-size: 13px; }
 .acts { display: flex; gap: 6px; flex-wrap: wrap; }
 .acts .danger { background: #7f1d1d; }
+button.link { background: none; border: none; color: #7dd3fc; padding: 0; font-size: inherit;
+  text-decoration: underline; cursor: pointer; }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>
