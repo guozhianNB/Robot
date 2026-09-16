@@ -252,7 +252,7 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 
 > **本节在实现落地时填写**（逐任务提交号、与本文的偏差、未验项）；本设计阶段的 §〇～§十 即为定稿口径。
 >
-> **填写状态（2026-09-15）：任务 1–7 已落地并提交、任务 8（口径 + 文档同步）本轮完成；任务 9（端到端验收）的实跑结果见账本 `.superpowers/sdd/progress.md` 及本节末尾（**新增于其后**）。**
+> **填写状态（2026-09-15 收口）：9 个任务全部落地并提交，任务 9 的端到端验收已实跑（见 11.4）；与设计的 12 条偏差见 11.2；只有用户侧/真机项留在 11.3。**
 
 ### 11.1 逐任务提交号（批次 BASE `f8fd004`，文档基线 `0015a8d`）
 
@@ -265,8 +265,8 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 | 5 | admin 新页签「地图编辑器」 | `1d7dd7d`，修 `7e01cd4` | `e570236` | SFC 编译三文件 OK + 4 条静态自查（沙箱 esbuild EPERM，build/tsc 归用户侧） |
 | 6 | 编辑器主界面「保存并退出」/「仅关窗」 + 掉线提示 | `e162ef3` | `7e01cd4` | RED（ENOENT `lib/service.ts`）→ GREEN（`mapeditor startup contract: ok`）+ 变异验证 |
 | 7 | 像素修图页「保存并退出」 | `2365ac0` | `e162ef3` | DOM-stub 脚手架 12/12 PASS（反向对照 10/12）+ `node --check` OK |
-| 8 | `start_UI.py` 口径 + 文档同步 | 见 `git log`（本任务提交） | `2365ac0` | 无新增测试；`Select-String start_UI.py -Pattern 'mapeditor'` 仅剩说明文字 |
-| 9 | 端到端验收 | 待落地 | `2365ac0` | **待补：见 11.3** |
+| 8 | `start_UI.py` 口径 + 文档同步 | `8ccd315` | `2365ac0` | 无新增测试；`Select-String start_UI.py -Pattern 'mapeditor'` 仅剩说明文字 |
+| 9 | 端到端验收 | 验收记录随本节提交 | `8ccd315` | §六 1/2/4/5/6/8/9 逐条实跑通过，见 **11.4**；`4 failed · 455 passed · 1 skipped` |
 
 **全量测试判据（本任务复跑）**：`4 failed · 455 passed · 1 skipped`，4 个失败 = `test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3（**既有红态，不许修**）；基线里那条环境相关的 `tests/test_vision.py` 本轮为绿（红的具体是哪一条会飘）。**无新增红态。**
 
@@ -294,7 +294,21 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 3. **真机联动**：`MAPS_IO=ssh` 下编辑器经 SSH 读写板卡 `ros2_car/maps/` 的地图；本文不改地图 IO 口径，仍需板卡可达（`ssh sunrise@100.65.82.93`）。
 4. **`remote` MCP / car 工具链**：本批次无关，未动。
 
-### 11.4 任务 9 端到端验收（占位）
+### 11.4 任务 9 端到端验收（**2026-09-15 实跑，逐条通过**）
 
-**任务 9 端到端验收结果见账本 `.superpowers/sdd/progress.md`（本批次段落）与本规格本节的后续追补**——任务 9 会按本文 §六 的 1–9 条逐条实跑（起 8000、验 404/8010 无人监听、非管理员 403、start/stop 三条路径、主后端退出带走服务、全量回归），并把结果**新增于本节之后**。
+环境：本机 Windows，`uvicorn LLM.server:app --port 8000` 前台起（后台作业），管理员用 `.env` 的 `PASSWORD` 走正规 `POST /api/session/login` 登录（`ok=true, role=admin`）。验收脚本 `.superpowers/sdd/acceptance.ps1`（未入库）。
+
+| §六 | 检查 | 实测 |
+|---|---|---|
+| 1 | 主后端不再承载编辑器 | `GET /api/map/list` **404**、`/api/zones` **404**、`/api/robot/pose` **404**、`/mapeditor/` **404**、8010 无人监听（TCP 拒绝） |
+| 1 | 陪护功能照旧 | `GET /api/health` **200**、`GET /api/wards` **200**、`GET /api/robot/pose`→404 但 `/api/wards/{uid}/zone` 仍能命中 `locator`/`maptags` |
+| 2 | 启动编辑器服务 | `POST /api/mapeditor/service/start` → `ok=true, running=true, source=managed, pid=32432, port=8010`；8010 上 `GET /api/mapeditor/service` **200**、`GET /mapeditor/` **200**、`GET /mapeditor/pixel-editor.html` **200**、`GET /api/map/list` **200** |
+| 2 | start 幂等 | 再 start → `source=managed`、**同 pid 32432**（未重复拉起） |
+| 4 | 编辑器自停（＝点「保存并退出」） | `POST :8010/api/mapeditor/service/stop` → `{"ok":true,"message":"地图编辑器服务正在退出…"}`；2 秒后 8010 **连接被拒**；主后端状态变 `{running:false, source:"none", pid:null}` |
+| 5 | admin 侧 stop + 幂等 | 重启后 8010 有监听 → `POST :8000/api/mapeditor/service/stop` → `ok=true, running=false`、8010 关闭；再 stop 一次仍 `ok=true` |
+| 6 | 主后端退出不留下孤儿 | `POST /api/system/shutdown` → `{"ok":true,"message":"系统正在退出…"}`；4 秒后 **8010 与 8000 都已关闭**，主后端进程 exit code **0** |
+| 8 | 鉴权 | `X-Surface: kiosk` 打 start/service → **403**；`X-Surface: nope` → **400** |
+| 9 | 全量回归 | `pytest LLM/tests tests -q` → **4 failed / 455 passed / 1 skipped**，失败集合 = 4 个既有红态，**无新增** |
+
+**未覆盖**：§六 第 3 条（"编辑器里逐项功能与拆分前一致"）与第 7 条以外的浏览器交互，只有真实浏览器能验 —— 见 §11.3 第 1 条。
 
