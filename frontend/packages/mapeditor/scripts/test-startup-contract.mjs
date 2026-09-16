@@ -25,4 +25,11 @@ assert.match(app, /getJson<[^>]+>\("\/api\/mapeditor\/status"\)/,
 assert.doesNotMatch(app, /getJson<[^>]+>\("\/api\/robot\/pose"\)/,
   "前端不应与当前地图接口并发读取 rosbridge");
 
+const service = fs.readFileSync(path.join(root, "src", "lib", "service.ts"), "utf8");
+assert.match(app, /保存并退出/, "编辑器顶部必须有「保存并退出」");
+assert.match(app, /仅关窗/, "编辑器顶部必须有「仅关窗（保留服务）」");
+assert.match(app, /stopService\(\)/, "「保存并退出」必须调用 stopService()");
+assert.match(service, /\/api\/mapeditor\/service\/stop/, "service.ts 必须打同源自停接口");
+assert.match(service, /window\.close\(\)/, "service.ts 必须能关窗");
+
 console.log("mapeditor startup contract: ok");
