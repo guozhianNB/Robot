@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""编辑器服务的进程管理（规格 §3.3）—— 全程假 Popen / 假探活，不真起进程。"""
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -79,10 +81,47 @@ def test_start_is_idempotent_for_external(clean_state, monkeypatch):
     """8010 上有外部实例（孤儿）→ 不重复拉起。"""
     called = []
     monkeypatch.setattr(mapctl, "_probe", lambda timeout=2.0: True)
+    # `port_alive` 也必须桩掉：本机真跑着编辑器（开发时的常态）时它会去连真 8010，
+    # 让"不重复拉起"这条断言依赖环境（探到真端口 → 走的是另一条分支/甚至真 POST）。
+    monkeypatch.setattr(mapctl, "port_alive", lambda port=None, timeout=0.5: False)
     monkeypatch.setattr(mapctl.subprocess, "Popen", lambda *a, **k: called.append(1))
     st = mapctl.start()
     assert st["source"] == "external" and st["running"] is True
     assert called == []
+
+
+def test_start_judges_and_spawns_under_one_lock(clean_state, monkeypatch):
+    """「判活 + spawn」必须在同一段 `_lock` 临界区里。
+
+    判据取得很直接：把 `_lock` 换成**非重入**锁，于是在 `_probe()` / `port_alive()` /
+    `Popen()` 里用 `lock.locked()` 就能看见"此刻是否有人握着这把锁"。为什么不用多线程复现
+    竞态：GIL 下两个线程的探活极容易错开（第二个线程常在第一段临界区之后才进来），那样的
+    用例时红时绿；而"spawn 与判活是否同锁"是那条竞态唯一的根因，且完全确定。
+    """
+    lock = threading.Lock()              # 非重入：只要有人在临界区里，locked() 就说真话
+    seen = []
+    spawned = []
+    monkeypatch.setattr(mapctl, "_lock", lock)
+
+    def fake_probe(timeout=2.0):
+        seen.append(("probe", lock.locked()))
+        return bool(spawned)
+
+    def fake_port_alive(port=None, timeout=0.5):
+        seen.append(("port_alive", lock.locked()))
+        return False
+
+    def fake_popen(cmd, cwd=None):
+        seen.append(("spawn", lock.locked()))
+        spawned.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(mapctl, "_probe", fake_probe)
+    monkeypatch.setattr(mapctl, "port_alive", fake_port_alive)
+    monkeypatch.setattr(mapctl.subprocess, "Popen", fake_popen)
+    st = mapctl.start()
+    assert st["source"] == "managed" and st["running"] is True
+    assert seen[:3] == [("probe", True), ("port_alive", True), ("spawn", True)], seen
 
 
 def test_start_reports_failure_when_process_exits(clean_state, monkeypatch):
@@ -153,6 +192,49 @@ def test_stop_uses_self_stop_for_external(clean_state, monkeypatch):
     st = mapctl.stop()
     assert st["ok"] is True and st["running"] is False
     assert posted and posted[0].endswith("/api/mapeditor/service/stop")
+
+
+def test_stop_hard_kills_without_grace(clean_state, monkeypatch):
+    """`hard=True` → 直接 kill（不走 5 秒优雅期）。
+
+    这条形态对应 `/api/system/shutdown`：那条路径只留 1 秒就要 `os._exit(0)`，
+    POSIX 上 `terminate()` 只是发 SIGTERM、uvicorn 还要排干连接，等不到就把编辑器
+    留成孤儿（reparent 后只能靠 external 状态事后收）。
+    """
+    proc = FakeProc()
+    ready = {"spawned": False}
+
+    def fake_probe(timeout=2.0):
+        return ready["spawned"]
+
+    def fake_popen(cmd, cwd=None):
+        ready["spawned"] = True
+        return proc
+
+    monkeypatch.setattr(mapctl, "_probe", fake_probe)
+    monkeypatch.setattr(mapctl, "port_alive", lambda port=None, timeout=0.5: False)
+    monkeypatch.setattr(mapctl.subprocess, "Popen", fake_popen)
+    mapctl.start()
+    st = mapctl.stop(hard=True)
+    assert proc.killed is True and proc.terminated is False
+    assert st["ok"] is True and st["running"] is False
+
+
+def test_stop_reports_foreign_port_occupier(clean_state, monkeypatch):
+    """无句柄 + 端口活 + 探活假 = **陌生监听者**：不发 POST，直接说清怎么收敛。
+
+    为什么不能发 POST：那个 POST 是编辑器自己的自停接口，陌生服务看不懂、半死的编辑器
+    也不会应答；失败后给"请到它的终端按 Ctrl+C"这种指引对陌生服务毫无意义。
+    """
+    posted = []
+    monkeypatch.setattr(mapctl, "_probe", lambda timeout=2.0: False)
+    monkeypatch.setattr(mapctl, "port_alive", lambda port=None, timeout=0.5: True)
+    monkeypatch.setattr(mapctl.urllib.request, "urlopen",
+                        lambda *a, **k: posted.append(a))
+    st = mapctl.stop()
+    assert st["ok"] is False and st["running"] is True and st["source"] == "external"
+    assert "MAP_EDITOR_PORT" in st["error"]
+    assert posted == [], "对陌生监听者不该发 /api/mapeditor/service/stop"
 
 
 def test_stop_is_idempotent_when_none(clean_state, monkeypatch):

@@ -798,6 +798,20 @@ def test_api_meta_change_requires_confirm(client, env):
                        json={"origin": [0, 0, 0.5], "confirm": True}).status_code == 400
 
 
+def test_api_meta_read_ok(client):
+    """GET /api/map/{name}/meta 必须 200 且带 meta（回归：曾因 asyncio.to_thread 丢参而恒 500）。
+
+    为什么值得一条测试：编辑器每次选图都会调它（`App.vue::loadMeta()`），而全仓此前只有
+    **POST** `/{name}/meta`（改元数据）的用例，GET 一次都没有 —— 于是 ``_map_meta_sync``
+    少传 ``store``、函数体里又引用了未定义的 ``source`` 这两处必炸点，在搬迁那次逐字复制时
+    一起潜进 `mapapi.py`，一路没被任何断言照到。
+    """
+    r = client.get("/api/map/my_map/meta")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] is True and d["meta"] and d["meta"]["width"] > 0
+
+
 def test_api_save_saveas_then_overwrite(client, env):
     maps = env["maps"]
     yaml_disk = (maps / "my_map.yaml").read_text(encoding="utf-8")

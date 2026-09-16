@@ -9,7 +9,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import conf, mapeditor_server
+from LLM import conf, mapapi, mapeditor_server
 
 
 def test_editor_app_serves_all_editor_routes(app_paths):
@@ -21,7 +21,24 @@ def test_editor_app_serves_all_editor_routes(app_paths):
 
 
 def test_editor_app_mounts_mapeditor_page(app_paths):
+    """/mapeditor 挂上了**且真能取到页面**。
+
+    只断言"路径前缀存在"是空断言：`StaticFiles` 挂错目录（例如挂到没有 index.html 的
+    目录）时路径照样在，页面却 404。`dist/` 不入库（.gitignore），所以"两个候选目录都没有
+    index.html"的裸检出上，`/mapeditor/` 本来就该 404（mount_editor 的既有降级口径：
+    至少让原生页 `pixel-editor.html` 可达）—— 那种情形下改为断言这条降级仍然成立，
+    绝不让断言静默空过。
+    """
     assert any(p.startswith("/mapeditor") for p in app_paths(mapeditor_server.app))
+    c = TestClient(mapeditor_server.app)
+    has_index = any((d / "index.html").exists()
+                    for d in (mapapi._MAPEDITOR_DIST, mapapi._MAPEDITOR_PUBLIC))
+    if has_index:
+        r = c.get("/mapeditor/")
+        assert r.status_code == 200, r.text
+    else:
+        r = c.get("/mapeditor/pixel-editor.html")
+        assert r.status_code == 200, r.text
 
 
 def test_service_status_reports_self():

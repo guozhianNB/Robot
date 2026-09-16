@@ -223,6 +223,7 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 | 风险 | 处置 |
 |---|---|
 | 主后端被强杀 → 编辑器成孤儿 | `external` 状态可识别、可一键收掉（§3.3）；`stop()` 挂在 `lifespan` 与 `/api/system/shutdown` 两处 |
+| `POST /api/system/shutdown` 只留 1 秒就要 `os._exit(0)`，POSIX 上 `terminate()`（SIGTERM）等不到 uvicorn 排干连接 → 编辑器被 reparent 成孤儿 | 该路径改调 `mapctl.stop(hard=True)`：对 managed 句柄**直接 `kill()`**（不再等 5 秒优雅期，随后仍 `wait(3)` 兜底），审计里带 `hard=True`。`lifespan` 收尾没有这条死线，仍走优雅 `stop()`。Windows 上 `terminate()` 本就立即生效，这条形参把两平台行为拉齐 |
 | 多一个端口（8010）与防火墙/端口占用 | 端口写死 `conf.MAP_EDITOR_PORT` 且可由 `.env`… **注意**：本轮不加 `.env` 覆盖（YAGNI），端口冲突时 `start` 会明确报错并提示改 `conf.py` |
 | 编辑器与主后端共享 `brain.db` | 两者都用 WAL + 线程锁，且编辑器写的是"文件→索引缓存"单向路径，与既有并发口径一致 |
 | 拆分后"感觉更复杂" | 收益是**可杀、可隔离、接口面缩小**（§1.1）；若哪天嫌麻烦，把 `mapapi.router` 重新 include 回主后端即可回退（不影响前端） |
