@@ -13,6 +13,7 @@ r"""地图编辑器独立服务（FastAPI app）—— 按需启动。
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 
@@ -34,7 +35,16 @@ mapapi.mount_editor(app)
 
 
 def _delayed_exit(delay: float = 0.5) -> None:
-    """延迟退出：先把响应发回去，再退（与 server.py::_delayed_exit 同款做法）。"""
+    """延迟退出：先把响应发回去，再退（与 server.py::_delayed_exit 同款做法）。
+
+    **测试进程里绝不真退**：`os._exit(0)` 会让 pytest 以成功码猝死（无 traceback、
+    输出被截断），失败不可归因 —— 这是本模块最强的红线之一，所以让它由代码守卫，
+    而不是靠"每个调用点都记得注入 `_schedule_exit`"的纪律。
+    判据刻意**只**看 `sys.modules`：`PYTEST_CURRENT_TEST` 会被 `subprocess.Popen`
+    继承给真实的 uvicorn 子进程，用它会把生产路径也一起拦住。
+    """
+    if "pytest" in sys.modules:
+        raise RuntimeError("拒绝在测试进程里执行 os._exit(0)：请注入 _schedule_exit")
     time.sleep(delay)
     os._exit(0)
 
@@ -61,6 +71,6 @@ async def service_status():
 @app.post("/api/mapeditor/service/stop")
 async def service_stop():
     """自杀：编辑器页「保存并退出」调它。先回响应，0.5 秒后退出。"""
-    audit.log("map_editor_service", action="self_stop", pid=os.getpid())
     _schedule_exit()
+    audit.log("map_editor_service", action="self_stop", pid=os.getpid())
     return {"ok": True, "message": "地图编辑器服务正在退出…"}

@@ -6,6 +6,7 @@ r"""独立编辑器服务 app 的外壳行为（规格 §3.2）。
 """
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 from LLM import conf, mapeditor_server
@@ -46,3 +47,13 @@ def test_self_stop_schedules_exit(monkeypatch):
     d = c.post("/api/mapeditor/service/stop").json()
     assert d["ok"] is True
     assert calls == [1]
+
+
+def test_delayed_exit_refuses_to_kill_pytest():
+    """护栏本身要有测试：在 pytest 进程里调 `_delayed_exit` 必须抛，而不是 os._exit。
+
+    为什么值得一条测试：这个函数的误用形态是"pytest 以 0 码猝死"，任何断言都跑不到，
+    只能靠护栏自己红/抛来暴露。
+    """
+    with pytest.raises(RuntimeError, match="拒绝在测试进程里"):
+        mapeditor_server._delayed_exit(delay=0)
