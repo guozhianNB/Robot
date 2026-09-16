@@ -23,7 +23,7 @@ docs/      需求/教程/接口契约/开发日志
   ```
 - **前端**（`frontend/`，pnpm monorepo，Vue3+Vite+TS，后端 CORS 全开）：
   - **开发**：`cd frontend && pnpm install`；后端 8000 先启，再开 `pnpm dev:admin`（管理端 http://127.0.0.1:5173，vite 代理 `/api`→8000）、`pnpm dev:kiosk`（车载端 :5174）或 `pnpm dev:mapeditor`（地图编辑器 :5175）。
-  - **生产**：跑 `scripts/build_frontend.ps1` 构建产物；后端启动时自动把 `admin`/`kiosk`/`mapeditor` 的 dist 用 StaticFiles 挂到 `/admin`、`/kiosk`、`/mapeditor`（同 8000 端口；`/mapeditor` 未构建时**回退到 `packages/mapeditor/public/`**，这样原生静态页 `pixel-editor.html` 不经 Vite 打包也能直接打开）。
+  - **生产**：跑 `scripts/build_frontend.ps1` 构建产物；后端启动时自动把 `admin`/`kiosk` 的 dist 用 StaticFiles 挂到 `/admin`、`/kiosk`（同 8000 端口）。**`/mapeditor` 不再由主后端挂载**（2026-09-15 起）：地图编辑器是**独立进程** `LLM.mapeditor_server:app`（默认端口 `conf.MAP_EDITOR_PORT`=8010），按需由 admin →「地图编辑器」页签拉起，编辑器 dist 由它自己静态托管（未构建时同样回退到 `packages/mapeditor/public/`，这样原生静态页 `pixel-editor.html` 不经 Vite 打包也能直接打开）。
 - **虚拟环境**：`.venv/`（Windows 用 `Scripts/python.exe`）。核心依赖 openai / fastapi / uvicorn / pydantic / python-dotenv；语音链路额外依赖 numpy / sherpa-onnx / sounddevice / modelscope / torch（见 `requirement.txt`）。**注意：`requirement.txt` 声明 ≠ 环境已装齐，后端必须容忍可选依赖缺失、降级运行（见「系统稳健性」）。**
 - **配置**：API key 在根 `.env`（`DEEPSEEK_API_KEY`），`LLM/conf.py` 用 `load_dotenv(BASE_DIR/".env")` 加载。
 
@@ -65,7 +65,7 @@ docs/      需求/教程/接口契约/开发日志
 - 告警/系统：`POST /api/alarm`（kiosk SOS）｜ `POST /api/system/shutdown`
 - 工具/设置：`GET /api/tools` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings`
 - 广播：`GET /api/events`（SSE）
-- **地图编辑器**（第三个前端 `/mapeditor`，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md`）：
+- **地图编辑器**（第三个前端 `/mapeditor`，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md`）—— ⚠️ **以下路由 2026-09-15 起已搬到 `LLM/mapapi.py`，只在独立进程 `LLM.mapeditor_server`（`conf.MAP_EDITOR_PORT`=8010）上挂载，主后端（8000）不再暴露它们**（主后端只留 3 条仅管理员的 `GET|POST /api/mapeditor/service{,/start,/stop}` 做进程启停）：
   - `/api/map/*`：`GET list` ｜ `GET current`｜ `GET|POST {name}/meta` ｜ `POST {name}/rename` ｜ `POST {name}/copy` ｜ `DELETE {name}` ｜ `GET {name}/download`（`file=yaml|pgm|tags`，默认 `yaml`）｜ `GET {name}/image.png`（灰度 PNG，断连时带 `X-Map-Stale` 头）｜ `POST {name}/save`（像素修图落盘）｜ `GET|PUT {name}/tags` ｜ `POST {name}/tags/reindex` ｜ `POST /api/map/reindex-all/tags`
   - `/api/destinations*`：`GET`（`?map=`）｜ `POST`｜ `POST /validate` ｜ `POST {uid}` ｜ `DELETE {uid}`（`?map=`）｜ `POST /learn`
   - `/api/zones*`：`GET`（`?map=`）｜ `POST`｜ `POST {uid}` ｜ `DELETE {uid}`（`?map=`）
@@ -109,7 +109,7 @@ docs/      需求/教程/接口契约/开发日志
   - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
   - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`），admin/kiosk 都从它引入。
-  - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产挂 `/mapeditor`；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
+  - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产由编辑器自己的进程挂 `/mapeditor`（主后端 8000 不再挂载，见「快速上手 → 前端」）；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
 - 工程细节：vite `base` 与后端挂载路径一致（admin→`/admin/`、kiosk→`/kiosk/`，见 vite.config 注释 C-1）；`shared` 包 alias 到 TS 源码（monorepo 已知坑）。
 - **功能齐平是渐进迁移**：个别旧功能尚未搬入 Vue admin——典型如**老人注册向导**（旧入口在 `UI(old)/index.html`「➕ 注册老人」4 步向导，规格 `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`，后端 `/api/profiles` + `/api/voice/enroll` 一直可用）。要动此类功能先看旧实现 + 规格，别从零重造。
 
@@ -136,6 +136,6 @@ docs/      需求/教程/接口契约/开发日志
 - `requirement.txt` 声明的语音依赖（numpy / sherpa-onnx / sounddevice / modelscope 等）在目标环境可能未装齐：新依赖记得固化进去，且后端必须容忍缺失、降级运行（见「系统稳健性」）。
 - 后端 run 用包方式 `LLM.server:app`（`server.py` 里路径基于 `Path(__file__).parent.parent` 定位 `.env`）。
 - **前端已在 2026-08-27 从 `UI/` 单文件迁至 `frontend/`**：改前端先看 `docs/superpowers/specs/2026-08-27-frontend-multi-end-design.md` 与 shared 的 events.ts；`UI(old)/`（git 跟踪）为旧实现参考；根目录 `UI/`、`Front/` 是空残留目录，勿当现役前端。
-- **后端运行位置（2026-09-14 起）**：LLM 后端**默认跑在 PC 上**（板卡 RDK X5 性能有限，重活不下放板卡）。**地图编辑器已落地**：`MAPS_IO` 默认 `ssh`，地图文件的真相仍在板卡 `ros2_car/maps/`，经 SSH 读写（`GET /api/map/list` 已排除备份目录 `maps/.backup/`）；板卡上跑后端时用 `MAPS_IO=local`。相关规格：`docs/superpowers/specs/2026-09-14-map-editor-design.md` 的 **B 篇**（§B四～§B十二）。
+- **后端运行位置（2026-09-14 起）**：LLM 后端**默认跑在 PC 上**（板卡 RDK X5 性能有限，重活不下放板卡）。**地图编辑器已落地**：`MAPS_IO` 默认 `ssh`，地图文件的真相仍在板卡 `ros2_car/maps/`，经 SSH 读写（`GET /api/map/list` 已排除备份目录 `maps/.backup/`）；板卡上跑后端时用 `MAPS_IO=local`。主后端**只保留** `locator`（病房位置自动切换）与 `maptags`（`POST /api/wards/{uid}/zone` 的「记录当前房间为病房区域」）；**编辑器自己的路由（`/api/map/*`、`/api/destinations*`、`/api/zones*`、`/api/robot/pose`、`/api/mapeditor/{status,io,io/test,pose/inject}`）已搬到 `LLM/mapapi.py`**，只在独立进程 `LLM.mapeditor_server`（:8010）里挂载，主后端不再暴露。相关规格：`docs/superpowers/specs/2026-09-14-map-editor-design.md` 的 **B 篇**（§B四～§B十二）、`docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md`（按需启动）。
 - **地图标记存在地图文件夹里（2026-09-14 起）**：地点与区域（哪间是 101、护士办公室在哪）的**唯一真相是 `<地图名>.tags.json`**（与 `.pgm`/`.yaml` 同级同前缀，含 `resolution`/`origin` 指纹）；`brain.db` 的 `destinations`/`zones` 两表**只是索引缓存**，单向（文件→库）、可丢弃可重建。**不要把它们当真相去写** —— 违反就重演"两套真相"事故。规格：`docs/superpowers/specs/2026-09-14-map-editor-design.md` §4。
-- **地图像素修图入口**：`/mapeditor/pixel-editor.html` —— 它是**在开源工程 `ROS-SLAM-Map-Editor/`（GyroPalm/ROS-SLAM-Map-Editor，MIT，定版 `646104e`，已 gitignore）上改进**的产物，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md` **§B〇**（上游位置/目录清单/四条使用约定）与 **§B6.1**（相对上游原文件**只改 6 处**）。保存前自动备份到 `maps/.backup/`（故 `GET /api/map/list` 必须排除该目录）；改完地图**必须重启导航才生效**（`~/tools/nav_screen.sh nav <地图名>`）。
+- **地图像素修图入口**：`/mapeditor/pixel-editor.html`（由编辑器独立进程 :8010 提供，主后端 8000 上不可达）—— 它是**在开源工程 `ROS-SLAM-Map-Editor/`（GyroPalm/ROS-SLAM-Map-Editor，MIT，定版 `646104e`，已 gitignore）上改进**的产物，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md` **§B〇**（上游位置/目录清单/四条使用约定）与 **§B6.1**（相对上游原文件**只改 6 处**）。保存前自动备份到 `maps/.backup/`（故 `GET /api/map/list` 必须排除该目录）；改完地图**必须重启导航才生效**（`~/tools/nav_screen.sh nav <地图名>`）。

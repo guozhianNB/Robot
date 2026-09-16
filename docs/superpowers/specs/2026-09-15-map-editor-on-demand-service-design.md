@@ -250,4 +250,51 @@ MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
 
 ## 十一、实现台账与偏差
 
-**本节在实现落地时填写**（逐任务提交号、与本文的偏差、未验项）；本设计阶段的 §〇～§十 即为定稿口径。
+> **本节在实现落地时填写**（逐任务提交号、与本文的偏差、未验项）；本设计阶段的 §〇～§十 即为定稿口径。
+>
+> **填写状态（2026-09-15）：任务 1–7 已落地并提交、任务 8（口径 + 文档同步）本轮完成；任务 9（端到端验收）的实跑结果见账本 `.superpowers/sdd/progress.md` 及本节末尾（**新增于其后**）。**
+
+### 11.1 逐任务提交号（批次 BASE `f8fd004`，文档基线 `0015a8d`）
+
+| # | 任务 | 提交 | 前置 | 实测（聚焦 / 全量 `pytest LLM/tests tests -q`） |
+|---|---|---|---|---|
+| 1 | 后端搬迁：编辑器路由搬进 `LLM/mapapi.py` | `a544046`（计划修正 `d58e2f6`） | `0015a8d` | 54 passed（`test_map_service_split` 4 + `tests/test_mapeditor.py` 50）/ 5 failed · 433 passed · 1 skipped |
+| 2 | `conf` 常量 + 独立服务 app `LLM/mapeditor_server.py` | `f6402a2`，修 `5bb8a5a` / `f9193e3` / `50033ee` | `d58e2f6` | `test_mapeditor_server.py` 6 passed / 4 failed · 442 passed · 1 skipped |
+| 3 | 主后端侧进程管理 `LLM/mapctl.py` + 接线 | `981841e`，修 `e3f2aa1` | `50033ee` | `test_mapctl.py` 11 + `test_map_service_split.py` 6 passed / 4 failed · 455 passed · 1 skipped |
+| 4 | shared 的编辑器服务客户端 + 单测 | `e570236` | `e3f2aa1` | shared vitest 19 passed（基线 16 + 新 3） |
+| 5 | admin 新页签「地图编辑器」 | `1d7dd7d`，修 `7e01cd4` | `e570236` | SFC 编译三文件 OK + 4 条静态自查（沙箱 esbuild EPERM，build/tsc 归用户侧） |
+| 6 | 编辑器主界面「保存并退出」/「仅关窗」 + 掉线提示 | `e162ef3` | `7e01cd4` | RED（ENOENT `lib/service.ts`）→ GREEN（`mapeditor startup contract: ok`）+ 变异验证 |
+| 7 | 像素修图页「保存并退出」 | `2365ac0` | `e162ef3` | DOM-stub 脚手架 12/12 PASS（反向对照 10/12）+ `node --check` OK |
+| 8 | `start_UI.py` 口径 + 文档同步 | 见 `git log`（本任务提交） | `2365ac0` | 无新增测试；`Select-String start_UI.py -Pattern 'mapeditor'` 仅剩说明文字 |
+| 9 | 端到端验收 | 待落地 | `2365ac0` | **待补：见 11.3** |
+
+**全量测试判据（本任务复跑）**：`4 failed · 455 passed · 1 skipped`，4 个失败 = `test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3（**既有红态，不许修**）；基线里那条环境相关的 `tests/test_vision.py` 本轮为绿（红的具体是哪一条会飘）。**无新增红态。**
+
+### 11.2 与设计的偏差（逐条：原设计怎么说 / 实际怎么做 / 为什么）
+
+> 以下 12 条是本批次执行中发现的**计划缺陷/偏差**，已同步回填进计划文档 `docs/superpowers/plans/2026-09-15-map-editor-on-demand-service.md` 文末「计划回填与偏差」一节（不改写任务正文的历史文本）。
+
+1. **任务 1 步骤 6 的目标模块尚不存在**：计划让任务 1 直接把 `tests/test_mapeditor.py` 的 fixture 改成 `from LLM.mapeditor_server import app`，但该模块由任务 2 创建 → 照抄会让 17 例接口测试全红。**实际**：任务 1 改用"临时桥"（`try: from LLM.mapeditor_server import app / except ModuleNotFoundError: 临时 FastAPI + `include_router(mapapi.router)`"），任务 2 新增步骤 5.5 收敛为单一 import。**为什么**：搬迁的必然中间态，宁可在任务 1 内保持有测试锚点，也不让 17 例空红。
+2. **任务 1 搬迁必须核查"被搬走的模块级 import 还有谁在用"**：搬走模块级 `from fastapi.responses import Response` 连带打断 `/api/vision/snapshot`（相机可用时 `NameError` → 500）。**实际**：`5bb8a5a` 改为函数内 import + 补一条确定性回归测试（monkeypatch `get_jpeg`，不依赖摄像头）；计划原文的文件清单漏了这条传递依赖。
+3. **跑既有测试会真停掉本机正在跑的编辑器服务**（任务 3 审查发现）：`tests/test_modules_status.py` 用 `with TestClient(app)` 跑完整 `lifespan` → 收尾 `mapctl.stop()` 走 `external` 分支 → 未打桩的 `port_alive` 探到真 8010 就 `POST` 自停；`mapeditor_server` 的 pytest 护栏只管测试进程自己。**实际**：`e3f2aa1` 在 `tests/conftest.py` 加 autouse 护栏 + 留一条回归用例（RED 实证真打到 `.../service/stop`，GREEN 零调用）。**为什么**：测试不得有外部副作用。
+4. **任务 2 的路由内省必须用带 prefix 展开的 fixture**（fastapi 0.141.1 的 `include_router` 惰性）：朴素遍历 `app.routes` 只看得到 9 条。**实际**：新增 `LLM/tests/conftest.py::app_paths` fixture；`f9193e3` 修「展开带 prefix 的 include 时漏前缀」→ 改用 `context.path` + 守卫测试。**为什么**：路由锁若自己数漏了路由，就成了假绿。
+5. **任务 2 的自停护栏**：`_delayed_exit` 加"`pytest` in `sys.modules` → 抛错"护栏（把"测试进程绝不真退"从纪律变成代码），`service_stop` 改为先排退出再写审计。**实际**：`50033ee`（RED 实测 pytest 以 0 码猝死 → 加固后 6 passed）。
+6. **任务 3 简报的两条用例互斥**：`test_start_spawns_and_reports_managed` 与 `test_start_is_idempotent_for_external` 在同一套桩下要求相反结果（探活 True、无句柄、同一干净态：前者要 managed + `Popen` 被调，后者要 external + `Popen` 不被调），不可同时满足。**实际**：按 §3.3 与 §5 的 probe-first 口径判定**测试错**，把两例的 `_probe` 桩改成时间线（spawn 前 `False`、就绪后 `True`）；断言语义与例数（11）未变，**不改实现**。
+7. **任务 4 简报断言 `init.method === "GET"` 永假**：shared 的 `apiGet` 从不设 `method`（fetch 默认即 GET）→ 逐字照抄必红。**实际**：测试内加 `methodOf(init) = init.method ?? "GET"`，断言语义不变。**为什么**：备选方案（给 `apiGet` 显式补 `method`）要动范围外且多窗口共用的 `client.ts`，冲突风险更高。
+8. **任务 5 的 `window.open` 位置会被弹窗拦截**：计划骨架把 `window.open` 放在 `await startMapEditor()` **之后**（已离开用户手势同步栈），冷启动慢时会被拦，而那一刻按钮已 disabled、页面无补救入口。**实际**：`7e01cd4` 改「同步栈里先开 `about:blank` 再导航」+ 补「打开编辑器窗口」兜底按钮，顺带 `refresh(force)` 补跑意图 + 状态文案字面化 `managed`/`external`。**为什么不改成 `<a href>`**：编辑器里的 `window.close()` 会失效。
+9. **任务 6 的「仅关窗」原本零反馈**（自审发现）：`closeWindowOnly()` 只调 `closeSelf()`；而它恰恰是给"关不掉的标签页"兜底的按钮，被拒时页面毫无变化。**实际**：`e162ef3` 里补 `exitNote` 文案（关得掉时看不见，无副作用）。
+10. **任务 7 的像素修图页需要 17 处清位、不是 12 处**：计划只列了 12 处「没保存成功」的出口，遗漏了上游"未加载 yaml/pgm 时只 `alert` 就返回（一次提交都没发生）"以及 `flushDownloads`/`saveToServer` 的 `catch` 路径 → 退出意图会残留、下一次普通保存成功会**误停服务 + 误关窗**。**实际**：`2365ac0` 补齐 5 处（共 17 处），并用 12/12 vs 10/12 的反向对照实验证明这些补丁是承重的。
+11. **任务 8 的三处文档漂移（本任务处理）**：①任务简报要求 `start_UI.py` 头 docstring 写成「一键启动程序（**UI 前端 + 后端**）」，而实际文件是「（后端 + 前端双端）」——采用了简报的措辞；②简报让提示里提"全量启动器是另有其脚本（`start.py`）"，但 `start.py` 本批次**不做**（§八 第 1 条），故 prompt 里同时点明"本脚本只管陪护 UI"、不假装它已存在；③`AGENTS.md` 里除简报点名的两段外，**「API 端点（server.py）」一节仍把编辑器路由列在主后端名下**、「前端」节 `packages/mapeditor` 仍写「生产挂 `/mapeditor`」——已一并就地标注真实归属（都只是加限定语，不删原清单）。
+12. **`app_paths` / conftest 等测试基础设施是计划外新增**（计划「文件结构」表里没有）：`LLM/tests/conftest.py::app_paths`、`tests/conftest.py` 的 autouse 护栏，均属"为让 TDD 断言有意义"的必要增量。
+
+### 11.3 未验项（**只有用户侧/真机能做**，不算本批次未完成）
+
+1. **浏览器里真正走一遍**：admin →「启动地图编辑器」→ 弹窗打开 → 划线/标点 → 像素修图「保存并退出」；`window.open` → `window.close()` 这条链路**只有真实浏览器能验**（沙箱里无浏览器，任务 6/7 只做了源码级契约断言 + DOM-stub 脚手架）。
+2. **`cd frontend && pnpm -r build` 三包构建 + 前端单测**：本沙箱 esbuild EPERM（`spawn EPERM`）；mapeditor 只有 `pnpm build:sandbox` 的等价产物。
+3. **真机联动**：`MAPS_IO=ssh` 下编辑器经 SSH 读写板卡 `ros2_car/maps/` 的地图；本文不改地图 IO 口径，仍需板卡可达（`ssh sunrise@100.65.82.93`）。
+4. **`remote` MCP / car 工具链**：本批次无关，未动。
+
+### 11.4 任务 9 端到端验收（占位）
+
+**任务 9 端到端验收结果见账本 `.superpowers/sdd/progress.md`（本批次段落）与本规格本节的后续追补**——任务 9 会按本文 §六 的 1–9 条逐条实跑（起 8000、验 404/8010 无人监听、非管理员 403、start/stop 三条路径、主后端退出带走服务、全量回归），并把结果**新增于本节之后**。
+

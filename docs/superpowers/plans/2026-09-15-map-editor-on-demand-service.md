@@ -1768,3 +1768,35 @@ register("./packages/mapeditor/scripts/esbuild-shim.mjs", pathToFileURL(import.m
 - **必须带 pathspec**：`git commit -m "..." -- <exact files>`。本仓多个窗口在同一工作区并行开发，裸 `git commit` 会把别人暂存/在途的改动一起提交（有"误含 49 文件"前科）。
 - 提交前跑一次全量 pytest，确认**失败集合**没有新增（passed 数会随并行窗口变动，不作为判据）。
 - 基线（2026-09-15 实测）：`pytest LLM/tests tests -q` → **5 failed / 429 passed / 1 skipped**；5 个失败 = `test_modules_status`、`test_unlock_switch`×3、`tests/test_vision.py::test_end_to_end_webcam_source_serves_decodable_jpeg`，**均不许修**。
+
+---
+
+## 附录 C：计划回填与偏差（2026-09-15 实现后追加，非计划原文）
+
+> **这一节是事后追加的**：任务 1–8 执行过程中发现下列偏差（在 `LLM/tests` 与前端里真实踩到）。
+> **任务正文的历史文本一律未改写**（那是执行记录，保留原样才能看出"当时是怎么写的"）；
+> 本节只做一件事——让后来读计划的人**不会被上面那些旧文本误导**。规格 §十一 有同源的逐任务台账。
+
+### C.1 逐条：原计划怎么说 / 实际怎么做 / 为什么
+
+| # | 原计划怎么说 | 实际怎么做 | 为什么 |
+|---|---|---|---|
+| 1 | **任务 1 步骤 6**：把 `tests/test_mapeditor.py` 的 `client` fixture 改成 `from LLM.mapeditor_server import app`；**任务 2** 创建该模块 | 任务 1 先用**临时桥**（`try: from LLM.mapeditor_server import app / except ModuleNotFoundError:` 临时 `FastAPI()` + `include_router(mapapi.router)`），任务 2 新增步骤 5.5 收敛为单一 import。计划修正提交 `d58e2f6` | `tests/test_mapeditor.py` 有 17 例走该 fixture；任务 1 的目标模块那时**尚不存在**，照抄会让 17 例全红 → 任务 1 自己的步骤 7/8（全 passed、失败集合不变）不可达 |
+| 2 | **任务 1**：搬迁 = 删 3 块 + 改 1 行 import（文件清单 = `mapapi.py`/`server.py`/`test_map_service_split.py`/`tests/test_mapeditor.py`） | 还必须核查"**被搬走的模块级 import 还有谁在用**"：`from fastapi.responses import Response` 搬走后 `/api/vision/snapshot` 在相机可用时 `NameError`→500。修复 `5bb8a5a`：函数内 import + 确定性回归测试（monkeypatch `get_jpeg`，不依赖摄像头） | 计划的文件清单漏了这条**传递依赖**——搬迁的边界不是"我删了什么"，而是"谁在用我删的东西" |
+| 3 | **任务 2/3**：路由内省朴素遍历 `app.routes`；`_paths()` 助手逐字照抄 | fastapi 0.141.1 的 `include_router` **惰性**，朴素遍历只看得到 **9/35** 条路由 → 新增 `LLM/tests/conftest.py::app_paths` fixture；`f9193e3` 修「展开带 prefix 的 include 时漏前缀」→ 改用 `context.path` + 守卫测试 | 路由锁若自己就数漏了路由，锁出来的是**假绿** |
+| 4 | **任务 2**：`_delayed_exit` 直接 `os._exit`；`service_stop` 先写审计再排退出 | `50033ee`：`_delayed_exit` 加 **`"pytest" in sys.modules → RuntimeError` 护栏**（把"测试进程绝不真退"从纪律变成代码）；`service_stop` 改为**先排退出再写审计** | RED 实测：pytest 进程以**0 码猝死**、无 summary 行 → 静默假绿；纪律靠不住，护栏才靠得住 |
+| 5 | **任务 3 简报**：`test_start_spawns_and_reports_managed` 要 `managed`+`Popen` 被调；`test_start_is_idempotent_for_external` 要 `external`+`Popen` 不被调（**同一套桩、同一干净态**） | 两例互斥、不可同时满足 → 判**测试错**（规格 §3.3「幂等：已在跑 → 直接返回现状」+ §5「探到 8010 活着 → 报 external，不重复拉起」），把两例 `_probe` 桩改成**时间线**（spawn 前 `False`、就绪后 `True`）；断言语义与例数（11）未变，**不改实现** | probe-first 是规格明确口径；"探活 True 却必须 spawn"在生产里不存在 |
+| 6 | **任务 4 简报**：测试断言 `expect(init.method).toBe("GET")` | `apiGet` **从不设** `method`（fetch 默认即 GET）→ 必红 → 测试内加 `methodOf(init) = init.method ?? "GET"`，断言语义不变 | 备选（给 `apiGet` 显式补 `method`）要动范围外且多窗口共用的 `client.ts`，冲突风险更高；包内既有约定就是"`apiGet` 不带 method" |
+| 7 | **任务 5 骨架**：`await startMapEditor()` **之后**再 `window.open(...)` | 改「同步栈里先 `window.open('about:blank')` 占位、拿到 port 后再导航」+ 补「打开编辑器窗口」兜底按钮（`7e01cd4`） | 离开用户手势同步栈后 `window.open` **可能被弹窗拦截**，而那一刻按钮已 disabled、页面无任何补救入口。仍是脚本 `window.open`，**不能**改成 `<a href>`（编辑器里 `window.close()` 会失效） |
+| 8 | **任务 6 步骤 4**：兜底文案只接在 `saveAndExit` 成功路径；`closeWindowOnly()` 仅调 `closeSelf()` | 给 `closeWindowOnly()` 补 `exitNote` 文案（`e162ef3` 内） | 它恰恰是给"关不掉的标签页/单独打开的页"兜底的按钮，被拒时页面毫无变化、看起来像坏了；关得掉时这行看不见，零副作用 |
+| 9 | **任务 7 目标**：12 处「没保存成功」的出口清掉退出意图 | 实际补了 **17 处**：多出 `flushDownloads` 的 `catch`、`saveToServer` 的结果异常/`fetch` 异常、以及上游"未加载 yaml/pgm 时只 `alert` 就返回（一次提交都没发生）" | 意图残留 → 下一次**普通**保存成功会**误停服务 + 误关窗**；用 12/12 vs 10/12 反向对照证实这几处是承重的，不是防御性冗余 |
+| 10 | **任务 8 的启动器口径**：docstring 写「一键启动程序（**UI 前端 + 后端**）」；提示里写"全量启动器是另有其脚本（`start.py`）" | ①采用简报措辞（原文件是"后端 + 前端双端"）；②提示同时点明"**本脚本只管陪护 UI**"，且 `start.py` **本批次不做**（§八 第 1 条），不假装它已存在 | 避免读者以为 `start.py` 已可用 |
+| 11 | **任务 8 的 AGENTS.md 同步范围**：只点「快速上手 → 前端」与「后端运行位置」两段 | 另**就地标注**两处：本文档「API 端点（server.py）」一节仍把编辑器路由列在主后端名下（加⚠️说明它们现在只在 :8010）；「前端」节 `packages/mapeditor` 仍写「生产挂 `/mapeditor`」（改为"由编辑器自己的进程挂"） | 只改点名两段会留下**自相矛盾**的文档（同一份 AGENTS.md 里两处说法打架）；只加限定语、不删原清单，改动仍是最小的 |
+| 12 | **文件结构表**：未列测试基础设施 | 新增计划外文件 `LLM/tests/conftest.py::app_paths` fixture（见 #3） | 锁路由若自己数漏了路由，锁出来的是假绿 |
+| 13 | **任务 3 验收**：「跑全量 → 失败集合不变」即可（对"测试会碰外部进程"无要求） | 发现**跑既有测试会真停掉本机正在跑的编辑器服务**：`tests/test_modules_status.py` 用 `with TestClient(app)` 跑完整 `lifespan` → 收尾 `mapctl.stop()` 走 `external` 分支 → 未打桩的 `port_alive` 探到真 8010 就 `POST` 自停。修复 `e3f2aa1`：**`tests/conftest.py` 加 autouse 护栏** + 一条回归用例（RED 实证真打到 `.../service/stop` 5.63s，GREEN 零调用 1.44s） | 测试进程里的"只读验收"不该有**进程级外部副作用**；`mapeditor_server` 的 pytest 护栏只管测试进程自己，管不了被别人拉起的独立进程 |
+
+### C.2 本批次的测试判据更新（C.1 之外，交代给后续批次）
+
+- **基线数字会漂**：计划附录 B 钉的 `5 failed / 429 passed / 1 skipped` 只是**2026-09-15 某一刻**的读数；随本批次自身新增用例与其他窗口并行提交，passed 数一路上升（实测轨迹：429（计划写基线时）→ 433 → 437 → 440/441/442 → 453 → 455（任务 7 收尾时跑全量：`4 failed / 455 passed / 1 skipped`））。**唯一稳的判据是"失败集合"**：`test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3 这 4 个既有红一条不多一条不少；`tests/test_vision.py` 的那 2 条（取帧/快照，未装 opencv）**红的是哪一条会飘**，不计入判据。
+- **新增的 pytest 护栏是默认生效的**：`tests/conftest.py` 有一个 **autouse** 护栏，防止任何跑完整 `lifespan` 的测试在收尾时把**本机真在跑的编辑器服务**（:8010）停掉。若将来有人删除或改写它，先读 C.1 的 #13 与 #4。
+- **任务 9 的验收命令**（本计划 §任务 9）**不需要改**，照跑即可；其未验项（浏览器 `window.open`→`window.close()`、`pnpm -r build`、真机 `MAPS_IO=ssh`）只可能由**用户侧**完成。

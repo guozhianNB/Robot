@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-养老陪护机器人 —— 一键启动程序（后端 + 前端双端）。
+养老陪护机器人 —— 一键启动程序（**UI 前端 + 后端**）。
 
 在项目根目录执行（Windows / Linux 通用）：
     python start.py                 # 生产模式：构建产物由 FastAPI 静态托管（8000 端口）
@@ -24,6 +24,10 @@ r"""
   5. 轮询各服务就绪
   6. 浏览器打开 http://localhost:5173/admin/ 与 http://localhost:5174/kiosk/
   7. 常驻前台，Ctrl+C 全部停止
+
+**地图编辑器（像素修图 + 划线/标点）不在本脚本的启动清单里**：它由后端按需以
+独立进程（:8010）拉起，入口是 admin →「地图编辑器」页签 →「启动地图编辑器」。
+要连前后端一起带 ROS 的全量启动器是另有其脚本（`start.py`），本脚本只管陪护 UI。
 
 只依赖标准库（subprocess / socket / urllib / webbrowser），与项目
 "依赖用 stdlib" 的风格一致。前端构建/开发需要 pnpm（可选，缺失时降级）。
@@ -453,6 +457,7 @@ def main():
         open_pages(urls)
 
     # ---- 7. 常驻前台 ----
+    info("地图编辑器按需启动：admin →「地图编辑器」页签 →「启动地图编辑器」（独立进程 :8010）")
     info("服务运行中。按 Ctrl+C 停止全部进程……")
     try:
         while True:

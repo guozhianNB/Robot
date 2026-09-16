@@ -787,3 +787,47 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
   地点白名单解析、风险分级与二次确认状态机、admin「地点白名单」页签（规格 §6.3/§7）——**本轮未做**，
   待 MCP 线重启后另立计划。
 - **真实语音链路未联调**：声纹→角色→提示词分层这条链在本机只有单测覆盖，未接麦克风实测。
+
+---
+
+## 2026-09-15 · 地图编辑器改为独立进程按需启动（`LLM.mapeditor_server:app` :8010 + admin 启停页签）
+
+- 规格：`docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md`（9 任务计划 `docs/superpowers/plans/2026-09-15-map-editor-on-demand-service.md`，台账见规格 §十一 / 计划附录 C）。**目标**：把地图编辑器（像素修图 + 划线/标点）从主后端拆成**独立进程**，默认不跑，按需由 admin 拉起、用完在编辑器里「保存并退出」停掉——主后端因此**可杀、可隔离、接口面缩小**（被强杀的编辑器不再拖住陪护功能）。
+
+### 后端（`LLM/`，新增 3 个模块）
+
+- `LLM/mapapi.py`（新，1031 行）：编辑器专属后端 = 9 个 pydantic 模型 + **34 条路由**（`@router.`）+ 5 个助手 + `mount_editor(app)`；**不 import `server`**，可被任意 app 复用。搬迁是**逐字**的（对 `HEAD:LLM/server.py` 原两段做逐字比对：`37876 == 37876`、`IDENTICAL: True`，唯一差异是 34 处 `@app.` → `@router.`）。
+- `LLM/mapeditor_server.py`（新）：独立进程薄壳 app —— 建 app、挂 CORS、`include_router(mapapi.router)`、`mount_editor`、`GET /` → `/mapeditor/` 跳转，外加两条服务自身接口 `GET /api/mapeditor/service`（状态）与 `POST /api/mapeditor/service/stop`（**自停**，先回响应、0.5s 后退出）。`_delayed_exit` 带 `pytest` 护栏（测试进程绝不真退）。
+- `LLM/mapctl.py`（新，主后端侧，**纯 stdlib**）：`status()/start()/stop()/reset_for_test()` + **3 条仅管理员接口** `GET /api/mapeditor/service` ｜ `POST /api/mapeditor/service/start` ｜ `POST /api/mapeditor/service/stop`（`X-Surface: admin`，非管理员 **403**）。probe-first：8010 已有东西在应答 → 报 `source="external"`、**不重复拉起**（这是"主后端被 kill -9 后留下的孤儿"能被识别与一键收掉的关键）。`stop()` 同时挂在 `lifespan` 收尾与 `/api/system/shutdown`，**主后端退出会把编辑器一起带走**。
+- `LLM/server.py`：**瘦身 995 行**（2210 → 1215）；顶层 import 改为 `from . import locator, maptags`（**保留**：`locator` 管病房位置自动切换、`maptags` 管 `POST /api/wards/{uid}/zone` 的「记录当前房间为病房区域」）；删掉编辑器模型/路由/`/mapeditor` 静态挂载；接上 `mapctl.router`。
+- `LLM/conf.py`：`MAP_EDITOR_PORT = 8010`、`MAP_EDITOR_START_TIMEOUT = 20.0`（**不加 `.env` 覆盖**，端口冲突时 `start` 明确报错并提示改 `conf.py`）。
+
+### 前端（admin 启停 + 编辑器两个「退出」）
+
+- `packages/shared`：`src/api/mapService.ts`（3 个客户端函数，全部透传 `X-Surface`）+ 单测 3 例。
+- `packages/admin`：新 `pages/MapEditorPage.vue`（状态卡 + 启动/停止 + 5 秒轮询 + `onUnmounted` 清定时器）；`App.vue` 加「地图编辑器」页签（共 **11** 个）；`WardsPage.vue` 两处硬链 `/mapeditor/` 改为 `goto-mapeditor` 事件（主后端已不挂该路径，硬链会 404）。
+- `packages/mapeditor`：`src/lib/service.ts`（同源自停 + 关窗 + 掉线探测）；主界面加「保存并退出」/「仅关窗（保留服务）」+ 服务掉线红条；`public/pixel-netio.js`（像素修图页）加「保存并退出」——**只有后端返回 `ok:true` 才停服务 + 关窗**，保存失败/409/空提交/网络异常一律只清退出意图，共 **17 处**清位出口（比计划多 5 处：`flushDownloads` 的 catch、`saveToServer` 的结果异常/`fetch` 异常、上游"未加载 yaml/pgm 只 alert"路径）。
+
+### 验证
+
+- 后端：`pytest LLM/tests tests -q` → **4 failed / 455 passed / 1 skipped**，判据是**失败集合不变**——4 个失败＝`test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3（**既有红态，本批次一例未修**）；基线里那条环境相关的 `tests/test_vision.py`（未装 opencv / 取帧时序）本轮为绿（**红的具体是哪一条会飘**，不计入判据）。新增测试全绿：`test_map_service_split.py` 6 + `test_mapeditor_server.py` 6 + `test_mapctl.py` 11 + `tests/test_mapeditor.py` 50 + conftest 护栏回归用例。
+- 前端：shared vitest **19 passed**（基线 16 + 新 3）；mapeditor `pnpm test:startup` → `mapeditor startup contract: ok`（含 3 条新契约断言，变异验证证明断言非空转）；三个 admin SFC 编译 OK；像素修图页用一次性 DOM-stub 脚手架跑 **12/12 PASS**（删掉那 5 处补丁的反向对照 **10/12**，证明补丁承重）。
+- 本机真实进程冒烟：`uvicorn LLM.mapeditor_server:app --port 8011` → `GET /api/mapeditor/service` 200、`GET /mapeditor/` 200、`POST .../service/stop` 200 后端口连接被拒（进程真退）。
+
+### 本批次修掉的 3 个真缺陷（都不是"新功能没写好"，而是踩到了既有代码/测试的雷）
+
+1. **搬走模块级 `from fastapi.responses import Response` 打断 `/api/vision/snapshot`**（相机可用时 `NameError`→500）→ 改函数内 import + 补确定性回归测试（monkeypatch `get_jpeg`，不依赖摄像头）。
+2. **跑既有测试会真停掉本机正在跑的编辑器服务**（`tests/test_modules_status.py` 跑完整 `lifespan` → 收尾 `mapctl.stop()` 走 external 分支 → 探到真 8010 就 POST 自停）→ `tests/conftest.py` 加 **autouse 护栏** + 回归用例（RED 实证真打到 `.../service/stop`，GREEN 零调用）。
+3. **像素修图页退出意图泄漏**：计划只列 12 处「没保存成功」出口，实测 17 处——残留意图会让**下一次普通保存成功**误停服务 + 误关窗（反向对照实验 10/12 vs 12/12 证实）。
+
+### 已知限制与未做（**用户侧/真机项**）
+
+- **真实浏览器链路未验**：admin 点「启动地图编辑器」→ 弹窗打开 → 划线/标点 →「保存并退出」→ 自动关窗，这条 `window.open` → `window.close()` 链路只有真实浏览器能验（本机无浏览器；任务 5 的 `window.open` 已被改成"同步栈里先开 `about:blank` 再导航"以规避弹窗拦截）。
+- **`cd frontend && pnpm -r build` 三包构建 + 前端全量单测未在本机跑**（沙箱 esbuild `spawn EPERM`）；mapeditor 只跑了 `pnpm build:sandbox` 的等价产物（与 `vite build` 逐字节相同）。
+- **真机联动未验**：`MAPS_IO=ssh` 下编辑器经 SSH 读写板卡 `ros2_car/maps/` 的地图（本轮**不改地图 IO 口径**）；仍需板卡可达（`ssh sunrise@100.65.82.93`）。
+- **本轮明确不做**：新的全量一键 `start.py`（前后端 + ROS）、编辑器服务登录鉴权（与拆分前 `/mapeditor` 在 8000 上同样无鉴权，绑内网/本机）、"编辑器空闲 N 分钟自动退出"（YAGNI）。
+- **文档同步**：`AGENTS.md`（快速上手·前端 / 后端运行位置 / API 端点节的编辑器归属 / 地图修图入口）、规格 `2026-09-14-map-editor-design.md` 顶部口径表（追加**第 8 条**）、`start_UI.py`（定位改为**纯 UI 启动器**：`后端 + kiosk + admin`，**不含**地图编辑器；启动完成后打印一行"按需启动"提示）本轮已做；计划文档另追加「附录 C：计划回填与偏差」（让后来读者不被旧文本误导）。
+
+### 未纳入本条的并行项
+
+- `LLM/vision_mcp/`、`frontend/temp-esbuild-register.mjs`：本批次的未跟踪在途文件，**未提交**（提交一律带 pathspec）。
