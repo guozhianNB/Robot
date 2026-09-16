@@ -10,7 +10,8 @@ r"""地图编辑器独立服务的进程管理（主后端侧，规格 §3.3）�
 
 ``external`` = 端口上有服务，但不是本进程拉起的（例如主后端被 kill -9 后留下的孤儿）：
 这种情况**不重复拉起**；停止时调它自己的 ``POST /api/mapeditor/service/stop``
-（比"按端口找 PID 再 kill"更安全、且跨平台）。
+（比"按端口找 PID 再 kill"更安全、且跨平台）。端口上若是**陌生监听者**（端口活但探活不通），
+不发那个 POST —— 它看不懂，属于"只能人工释放端口/换端口"的情形，见 ``stop()``。
 """
 from __future__ import annotations
 
@@ -75,13 +76,17 @@ def status() -> dict:
         if proc is not None and not managed:
             _proc = None            # 进程已退出：清掉句柄，下次重新拉
             _started_at = 0.0
+        # pid / started_at 与 managed 一起在锁内快照：锁外再读 `_proc` 可能已被
+        # 并发的 stop() 置成 None（→AttributeError）或换了新句柄（→pid 张冠李戴）
+        pid = proc.pid if managed else None
+        started_at = _started_at if managed else 0.0
     running = managed or _probe(0.5)
     return {"ok": True,
             "running": bool(running),
             "source": "managed" if managed else ("external" if running else "none"),
-            "pid": proc.pid if managed else None,
+            "pid": pid,
             "port": _port(),
-            "uptime_s": round(time.time() - _started_at, 1) if managed and _started_at else None}
+            "uptime_s": round(time.time() - started_at, 1) if started_at else None}
 
 
 def start() -> dict:
@@ -94,16 +99,33 @@ def start() -> dict:
       2. 再看**探活**：既没句柄又探到 8010 有应答 = 外部实例（孤儿，规格 §3.3 / 孤儿表：
          报 ``source="external"``、**不重复拉起**），这种情况没有句柄可查，只能靠探活。
     两步都不中、且端口**另有非编辑器监听者**时才是"端口被占用"（点明改 MAP_EDITOR_PORT）。
+
+    **「判活 + spawn」整段在同一把 `_lock` 里**：否则两个并发的 admin `POST /start`
+    （两个页签 / 连点）会各自探活一次、都得出"没起"，然后各 Popen 一个 uvicorn 去争同一个
+    8010。就绪轮询则**放在锁外**——那段最长要等 `MAP_EDITOR_START_TIMEOUT`，含在锁里会
+    连 `stop()` 一起堵住（stop 也要这把锁）。
     """
     global _proc, _started_at
     with _lock:
         proc = _proc
         managed = proc is not None and proc.poll() is None
-    if managed:
+        if managed:
+            action = "already"           # 我们拉起的孩子还活着（判据优先于探活，见上）
+        elif _probe(2.0):
+            action = "already"           # 端口上有外部实例（孤儿）：不重复拉起
+        elif port_alive():
+            action = "port_in_use"
+        else:
+            action = "spawn"
+            cmd = [sys.executable, "-m", "uvicorn", "LLM.mapeditor_server:app",
+                   "--host", "0.0.0.0", "--port", str(_port())]
+            child = subprocess.Popen(cmd, cwd=str(BASE_DIR))     # 输出透传，便于排障
+            _proc = child
+            _started_at = time.time()
+
+    if action == "already":
         return status()
-    if _probe(2.0):
-        return status()                  # 端口上有外部实例（孤儿）：不重复拉起
-    if port_alive():
+    if action == "port_in_use":
         audit.log("map_editor_service", action="start_failed",
                   reason="port_in_use", port=_port())
         return {"ok": False, "running": False, "source": "none", "pid": None,
@@ -111,16 +133,11 @@ def start() -> dict:
                 "error": "端口 {} 被占用且不是地图编辑器服务：请释放该端口，"
                          "或改 conf.MAP_EDITOR_PORT".format(_port())}
 
-    cmd = [sys.executable, "-m", "uvicorn", "LLM.mapeditor_server:app",
-           "--host", "0.0.0.0", "--port", str(_port())]
-    with _lock:
-        _proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))     # 输出透传，便于排障
-        _started_at = time.time()
-
+    # ↓ 就绪轮询在锁外；`child` 是本地句柄（不读模块级 `_proc`：并发 stop() 会把它置 None）
     deadline = time.monotonic() + float(conf.MAP_EDITOR_START_TIMEOUT)
     while time.monotonic() < deadline:
-        if _proc.poll() is not None:
-            rc = _proc.returncode
+        if child.poll() is not None:
+            rc = child.returncode
             reset_for_test()
             audit.log("map_editor_service", action="start_failed",
                       reason="exited", code=rc, port=_port())
@@ -130,7 +147,7 @@ def start() -> dict:
                              "请看主后端终端里的 uvicorn 日志".format(rc)}
         if _probe(1.0):
             audit.log("map_editor_service", action="start",
-                      pid=_proc.pid, port=_port(), source="managed")
+                      pid=child.pid, port=_port(), source="managed")
             return status()
         time.sleep(0.4)
 
@@ -142,8 +159,15 @@ def start() -> dict:
                      "uvicorn 日志".format(int(conf.MAP_EDITOR_START_TIMEOUT))}
 
 
-def stop() -> dict:
-    """幂等停止：有句柄→terminate（5s 后 kill）；无句柄但端口活→调它自己的 stop。"""
+def stop(hard: bool = False) -> dict:
+    """幂等停止：有句柄→terminate（5s 后 kill）；无句柄但端口活→调它自己的 stop。
+
+    ``hard=True``：不去等那句优雅期，对 managed 句柄**直接 ``kill()``**（随后仍 ``wait(3)``
+    兜一下）。给 ``/api/system/shutdown`` 用：那条路径只留 1 秒就要 ``os._exit(0)``，而
+    POSIX 上 ``terminate()`` 只是发 SIGTERM、uvicorn 还要排干连接，等不到就会把编辑器
+    reparent 成孤儿（只能靠 ``external`` 状态事后收）。Windows 上 terminate 本就是立即的，
+    这条形参把两个平台拉齐。``lifespan`` 收尾仍走优雅路径（那里没有 1 秒死线）。
+    """
     global _proc, _started_at
     with _lock:
         proc = _proc
@@ -151,21 +175,38 @@ def stop() -> dict:
         _started_at = 0.0
 
     if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        if hard:
             proc.kill()
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
         audit.log("map_editor_service", action="stop",
-                  pid=proc.pid, port=_port(), source="managed")
+                  pid=proc.pid, port=_port(), source="managed", hard=hard)
         return {"ok": True, "running": False, "source": "none", "pid": None,
                 "port": _port(), "uptime_s": None}
 
     if port_alive():
+        # 端口活但**探活不通** = 陌生服务或半死的编辑器：它不认识 `/api/mapeditor/service/stop`，
+        # POST 过去只会拿到一个看不懂的响应，再报"请到它的终端按 Ctrl+C"对陌生服务毫无意义。
+        # 这种情况**不发 POST**，直接说清唯一可执行的收敛方式（释放端口 / 换端口）。
+        if not _probe(2.0):
+            audit.log("map_editor_service", action="stop_failed",
+                      reason="port_foreign", source="external", port=_port())
+            return {"ok": False, "running": True, "source": "external", "pid": None,
+                    "port": _port(), "uptime_s": None,
+                    "error": "{} 上的监听者不是本后端拉起的编辑器，也不是可自停的编辑器实例："
+                             "请释放该端口，或改 conf.MAP_EDITOR_PORT".format(_port())}
         url = "http://127.0.0.1:{}/api/mapeditor/service/stop".format(_port())
         try:
             req = urllib.request.Request(

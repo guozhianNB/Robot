@@ -1123,7 +1123,8 @@ async def system_shutdown():
     from . import log as audit
     audit.log("system", action="shutdown", by="nurse")
     try:
-        mapctl.stop()                        # 编辑器服务（独立进程）一起带走
+        mapctl.stop(hard=True)               # 编辑器服务（独立进程）一起带走；马上 os._exit，
+                                             # 只留 1 秒，等不起 POSIX 上的 SIGTERM 优雅期（会留孤儿）
         reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
         voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
         bus.stop()                           # 3. 事件总线扇出

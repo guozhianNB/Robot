@@ -302,11 +302,16 @@ async def map_current(source: str = Query("", alias="source"), store=Depends(_st
 
 
 @router.get("/api/map/{name}/meta")
-async def map_meta(name: str):
-    return await asyncio.to_thread(_map_meta_sync, name)
+async def map_meta(name: str, source: str = Query("", alias="source")):
+    """读某图的元数据 + 标记计数 + 指纹（编辑器画布与状态条的地基）。
+
+    ``store`` 必须**由本函数按 ``source`` 现取**、作为参数交给线程体：``_store`` 是 FastAPI
+    依赖函数，丢进 ``asyncio.to_thread`` 里再取会让"未知源 → 400"变成线程内的 500。
+    """
+    return await asyncio.to_thread(_map_meta_sync, name, source)
 
 
-def _map_meta_sync(name: str, store):
+def _map_meta_sync(name: str, source: str = ""):
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:

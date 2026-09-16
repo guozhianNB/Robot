@@ -65,6 +65,8 @@ async def root():
 @app.get("/api/mapeditor/service")
 async def service_status():
     """本服务自身状态（主后端用它探活；编辑器页也可用它判断"服务还在不在"）。"""
+    # port 只是**回显**配置常量（编辑器页拿它拼自身地址），不作事实来源：本进程到底绑在哪个
+    # 端口，由 uvicorn 启动参数决定。探活方（mapctl._probe）只看这条接口是否 HTTP 200。
     return {"ok": True, "running": True, "pid": os.getpid(), "port": MAP_EDITOR_PORT}
 
 
