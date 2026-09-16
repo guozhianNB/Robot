@@ -59,6 +59,10 @@ DEFAULT_SETTINGS = {
     "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=/map 指纹反查（默认）；setting=用 current_map
 }
 
+# ---- 地图编辑器独立服务（按需启动，见 docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md）----
+MAP_EDITOR_PORT = 8010            # 编辑器服务端口（主后端 mapctl 用它拉起/探活/停止）
+MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
+
 # ---------------------------------------------------------------------------
 # 地图文件（规格 §B十）：MarkStore / maptags / locator 共用的路径与远程 IO 配置
 # ---------------------------------------------------------------------------

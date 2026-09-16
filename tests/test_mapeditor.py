@@ -667,18 +667,11 @@ def client(env):
     在无音频设备的开发机上会长时间挂住；本文件测的是路由与数据层，不需要那些副作用
     （`db.init_db()` 已由 `env` 调过）。
 
-    被测 app：编辑器路由已拆到独立服务 `LLM.mapeditor_server`（规格 2026-09-15）。
-    该模块由「任务 2」创建，在它落地之前退回到用 `mapapi.router` 现搭一个等价 app
-    （与 `mapeditor_server.app` 的路由表一致）；任务 2 落地后应删掉这段回退。
+    被测 app：编辑器路由已拆到独立服务（规格 2026-09-15）；原「用 mapapi.router 现搭一个
+    等价 app」的临时回退已删，见下方 import。
     """
     from fastapi.testclient import TestClient
-    try:
-        from LLM.mapeditor_server import app
-    except ModuleNotFoundError:          # 任务 2 尚未落地（本拆分任务 1 的中间态）
-        from fastapi import FastAPI
-        from LLM import mapapi
-        app = FastAPI()
-        app.include_router(mapapi.router)
+    from LLM.mapeditor_server import app   # 编辑器路由已拆到独立 app（规格 2026-09-15）
     return TestClient(app)
 
 
