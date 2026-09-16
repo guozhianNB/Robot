@@ -34,6 +34,7 @@ from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_a
 from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
 from . import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
 from . import locator, maptags   # 病房位置自动切换 / 记录病房区域要用（编辑器路由已搬走）
+from . import mapctl         # 地图编辑器服务（独立进程）的启停管理
 from . import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
 from .conf import MODEL, BASE_DIR
 from . import conf
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
     tick_task = asyncio.create_task(_role_tick())
 
     yield
+    mapctl.stop()             # 编辑器服务是本进程拉起的：主后端退出不该留孤儿
     mcp_client.stop()
     voice_api.stop_voice()
     drain_task.cancel()
@@ -112,6 +114,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(mapctl.router)   # /api/mapeditor/service{,/start,/stop}（仅管理员）
 
 
 def _seed_demo():
@@ -1120,6 +1123,7 @@ async def system_shutdown():
     from . import log as audit
     audit.log("system", action="shutdown", by="nurse")
     try:
+        mapctl.stop()                        # 编辑器服务（独立进程）一起带走
         reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
         voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
         bus.stop()                           # 3. 事件总线扇出

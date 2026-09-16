@@ -73,3 +73,11 @@ def test_main_app_keeps_wards_and_chat(app_paths):
     for kept in ("/api/chat", "/api/wards", "/api/wards/{ward_uid}/zone",
                  "/api/session/user", "/api/health"):
         assert kept in paths
+
+
+def test_main_app_mounted_map_editor_service_control(app_paths):
+    """主后端新增的 3 条服务控制路由（编辑器本身跑在别的进程）。"""
+    paths = app_paths(main_app)
+    assert "/api/mapeditor/service" in paths
+    assert "/api/mapeditor/service/start" in paths
+    assert "/api/mapeditor/service/stop" in paths
