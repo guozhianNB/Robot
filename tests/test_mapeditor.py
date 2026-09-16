@@ -666,9 +666,19 @@ def client(env):
     **刻意不进入 context manager**：那会触发 `lifespan`（拉起语音 worker / MCP / 提醒线程），
     在无音频设备的开发机上会长时间挂住；本文件测的是路由与数据层，不需要那些副作用
     （`db.init_db()` 已由 `env` 调过）。
+
+    被测 app：编辑器路由已拆到独立服务 `LLM.mapeditor_server`（规格 2026-09-15）。
+    该模块由「任务 2」创建，在它落地之前退回到用 `mapapi.router` 现搭一个等价 app
+    （与 `mapeditor_server.app` 的路由表一致）；任务 2 落地后应删掉这段回退。
     """
     from fastapi.testclient import TestClient
-    from LLM.server import app
+    try:
+        from LLM.mapeditor_server import app
+    except ModuleNotFoundError:          # 任务 2 尚未落地（本拆分任务 1 的中间态）
+        from fastapi import FastAPI
+        from LLM import mapapi
+        app = FastAPI()
+        app.include_router(mapapi.router)
     return TestClient(app)
 
 
@@ -910,7 +920,7 @@ def test_map_list_does_not_block_event_loop(monkeypatch):
     import asyncio
     import time
 
-    from LLM import server
+    from LLM import mapapi as server   # map_list/_store 已随编辑器路由搬到 mapapi（任务 1）
 
     class SlowStore:
         root = "slow-test"
