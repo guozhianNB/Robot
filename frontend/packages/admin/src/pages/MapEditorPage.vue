@@ -12,9 +12,10 @@ const note = ref("");
 const err = ref("");
 let timer: number | null = null;
 let pending = false;
+let queued = false;          // 命中 pending 时的"补跑"意图
 
-async function refresh() {
-  if (pending) return;
+async function refresh(force = false) {
+  if (pending) { if (force) queued = true; return; }
   pending = true;
   try {
     const r = await getMapEditorService("admin");
@@ -25,6 +26,7 @@ async function refresh() {
     err.value = e instanceof Error ? e.message : String(e);
   } finally {
     pending = false;
+    if (queued) { queued = false; void refresh(); }
   }
 }
 
@@ -33,18 +35,35 @@ function editorUrl(port: number) {
   return `http://${window.location.hostname}:${port}/mapeditor/`;
 }
 
+/** 兜底入口：被拦截 / 窗口被误关后，仍能从本页把编辑器叫回来。
+ *  同样必须是脚本 window.open —— 编辑器里的 window.close() 只对脚本开的窗口生效。 */
+function openEditor() {
+  if (!st.value?.port) return;
+  window.open(editorUrl(st.value.port), "_blank");
+}
+
 async function start() {
   busy.value = true; note.value = ""; err.value = "";
+  // 先在点击的同步栈里开一个空窗口：这样浏览器不会判为"非用户手势弹窗"。
+  // 启动最长要等 20s（后端轮询就绪），远超 transient activation 的 ~5s 窗口。
+  const w = window.open("about:blank", "_blank");
   try {
     const r = await startMapEditor("admin");
     st.value = r;
-    if (!r.ok) { err.value = r.error ?? "启动失败（详情见后端终端）"; return; }
+    if (!r.ok) {
+      w?.close();
+      err.value = r.error ?? "启动失败（详情见后端终端）";
+      return;
+    }
     note.value = r.source === "external"
       ? "已有外部实例在跑，直接打开。"
       : `已启动（PID ${r.pid ?? "?"}）。`;
-    window.open(editorUrl(r.port), "_blank");   // 必须是脚本打开，编辑器里的 window.close() 才生效
-    await refresh();
+    if (w) w.location.href = editorUrl(r.port);
+    await refresh(true);
+    // 放在 refresh 之后：refresh 成功会清 err，否则这句提示只会闪现几毫秒。
+    if (!w) err.value = "浏览器拦截了新窗口 —— 请点下面「打开编辑器窗口」手动打开。";
   } catch (e) {
+    w?.close();
     err.value = e instanceof Error ? e.message : String(e);
   } finally {
     busy.value = false;
@@ -59,6 +78,7 @@ async function stop() {
     st.value = r;
     if (!r.ok) { err.value = r.error ?? "停止失败"; return; }
     note.value = "已停止。";
+    await refresh(true);
   } catch (e) {
     err.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -69,7 +89,7 @@ async function stop() {
 function label(s: MapEditorService | null) {
   if (!s) return "读取中…";
   if (!s.running) return "未启动";
-  const who = s.source === "managed" ? `PID ${s.pid ?? "?"}` : "外部实例";
+  const who = s.source === "managed" ? `PID ${s.pid ?? "?"}（managed）` : "外部实例（external）";
   const up = s.uptime_s != null ? `，已运行 ${Math.round(s.uptime_s)} 秒` : "";
   return `运行中（${who}，端口 ${s.port}${up}）`;
 }
@@ -98,8 +118,9 @@ onUnmounted(() => {
         <button :disabled="busy || st?.running === true" @click="start">
           {{ busy ? "处理中…" : "启动地图编辑器" }}
         </button>
+        <button v-if="st?.running && st?.port" :disabled="busy" @click="openEditor()">打开编辑器窗口</button>
         <button class="danger" :disabled="busy || !st?.running" @click="stop">停止服务</button>
-        <button :disabled="busy" @click="refresh">刷新状态</button>
+        <button :disabled="busy" @click="refresh(true)">刷新状态</button>
       </div>
       <p v-if="note" class="ok">{{ note }}</p>
       <p v-if="err" class="bad">{{ err }}</p>
