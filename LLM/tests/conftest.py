@@ -19,6 +19,11 @@ def app_paths():
         ``_effective_*``，照抄旧写法会展开出空集）；
       * ``.routes`` / ``.router.routes``：旧版 fastapi 当场拷贝子路由的形态，
         以及 ``Mount`` 等其它容器。
+
+    注意：``effective_route_contexts()`` 里取的是 **context 自身的 ``path``**
+    （如 ``include_router(sub, prefix="/pre")`` 时为 ``/pre/a``），
+    ``original_route.path`` 是**未加 prefix** 的原始子路由路径（``/a``），只作兜底 ——
+    取错了会让「带前缀的 include」展开成未加前缀的路径，否定断言照样空过。
     """
     def _expand(routes, out):
         for r in routes:
@@ -28,7 +33,8 @@ def app_paths():
             ctxs = getattr(r, "effective_route_contexts", None)
             if callable(ctxs):
                 for c in ctxs():
-                    cp = getattr(getattr(c, "original_route", None), "path", None)
+                    cp = getattr(c, "path", None) or getattr(
+                        getattr(c, "original_route", None), "path", None)
                     if isinstance(cp, str) and cp:
                         out.add(cp)
             sub = getattr(r, "routes", None)

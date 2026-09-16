@@ -3,7 +3,9 @@ r"""编辑器后端从主后端拆出去的边界测试（规格 docs/superpower
 
 路由内省一律走 ``app_paths`` fixture（见 conftest.py）：fastapi 0.141 +
 starlette 1.6 的 ``include_router()`` 是惰性的，直接遍历 ``app.routes`` 会漏掉
-全部子路由 —— 本文件的否定断言曾经因此**空过**。
+全部子路由。当前主 app 从未 ``include_router``，旧的朴素遍历本来就能看见全部路径，
+那些否定断言是有效的；换成 ``app_paths`` 是**面向未来的加固** —— 防"将来主 app 用
+带前缀的 include 引入编辑器路由时，否定断言静默空过"。
 """
 from LLM.server import app as main_app
 from LLM import mapapi
@@ -22,7 +24,7 @@ def test_main_app_has_no_mapeditor_mount(app_paths):
     assert not any(p.startswith("/mapeditor") for p in app_paths(main_app))
 
 
-def test_mapapi_router_carries_all_editor_routes(app_paths):
+def test_mapapi_router_carries_all_editor_routes():
     paths = {r.path for r in mapapi.router.routes}
     for kept in ("/api/map/list", "/api/map/current", "/api/map/{name}/meta",
                  "/api/map/{name}/save", "/api/destinations", "/api/zones",
@@ -41,6 +43,28 @@ def test_mapapi_router_carries_all_editor_routes(app_paths):
     for kept in ("/api/map/sources", "/api/map/sources/{sid}",
                  "/api/map/sources/{sid}/default", "/api/map/sources/{sid}/test"):
         assert kept in sources, "地图来源路由丢了：{}".format(kept)
+
+
+def test_app_paths_expands_prefixed_include(app_paths):
+    """守卫：`app_paths` 必须看得见 include 进来的路由，且要带上 include 时给的 prefix。
+
+    为什么需要这条：fastapi 0.141 的 `include_router()` 是惰性的（`app.routes` 里只有
+    占位对象），若 fixture 退化成只遍历 `app.routes`，本批次所有"主 app 没有编辑器路由"
+    类的断言都会静默变绿。
+    """
+    from fastapi import APIRouter, FastAPI
+
+    sub = APIRouter()
+
+    @sub.get("/a")
+    def _a():
+        return {}
+
+    app = FastAPI()
+    app.include_router(sub, prefix="/pre")
+    paths = app_paths(app)
+    assert "/pre/a" in paths, "带 prefix 的 include 没被展开（fixture 退化）：{}".format(sorted(paths))
+    assert "/a" not in paths, "路径没带上 include 的 prefix：{}".format(sorted(paths))
 
 
 def test_main_app_keeps_wards_and_chat(app_paths):
