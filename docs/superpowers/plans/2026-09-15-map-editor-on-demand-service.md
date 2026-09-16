@@ -239,7 +239,7 @@ Select-String -Path LLM/server.py -Pattern 'locator\.|maptags\.' | ForEach-Objec
 # 期望只剩：locator.available() / locator.get_pose() / maptags.record_room_polygon() / maptags.get_zone()
 ```
 
-- [ ] **步骤 6：把接口层测试改挂新 app**
+- [ ] **步骤 6：把接口层测试改挂新 app（临时桥，任务 2 收敛）**
 
 `tests/test_mapeditor.py` 的 `client` fixture（第 662–672 行）里，把：
 
@@ -247,11 +247,23 @@ Select-String -Path LLM/server.py -Pattern 'locator\.|maptags\.' | ForEach-Objec
     from LLM.server import app
 ```
 
-改成：
+改成**临时桥**：
 
 ```python
-    from LLM.mapeditor_server import app   # 编辑器路由已拆到独立 app（规格 2026-09-15）
+    # 编辑器路由已不在主后端（规格 2026-09-15）。独立服务 app `LLM.mapeditor_server`
+    # 由任务 2 创建；在那之前这里现场拼一个等价 app（同 router + 同静态挂载）。
+    # ⚠️ 任务 2 建好 mapeditor_server 后，把本段收敛成一句 `from LLM.mapeditor_server import app`。
+    try:
+        from LLM.mapeditor_server import app
+    except ModuleNotFoundError:
+        from fastapi import FastAPI
+        from LLM import mapapi
+        app = FastAPI()
+        app.include_router(mapapi.router)
+        mapapi.mount_editor(app)
 ```
+
+> 为什么不用一句 import：任务 1 结束时 `LLM.mapeditor_server` 还不存在（它在任务 2），照抄一句 import 会让本文件 50 例接口测试全红。
 
 - [ ] **步骤 7：跑新测试 + 接口层测试**
 
@@ -432,10 +444,28 @@ async def service_stop():
 运行：`.venv\Scripts\python.exe -m pytest LLM/tests/test_mapeditor_server.py -q`
 预期：5 passed
 
+- [ ] **步骤 5.5：收敛任务 1 留下的临时桥**
+
+`tests/test_mapeditor.py` 的 `client` fixture 里那段
+`try: from LLM.mapeditor_server import app / except ModuleNotFoundError: ...`（任务 1 步骤 6 的临时桥），
+现在 `LLM.mapeditor_server` 已存在，**必须收敛成一句**：
+
+```python
+    from LLM.mapeditor_server import app   # 编辑器路由已拆到独立 app（规格 2026-09-15）
+```
+
+验证：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_mapeditor.py -q
+Select-String -Path tests/test_mapeditor.py -Pattern 'mapeditor_server|ModuleNotFoundError'
+# 期望：测试全 passed；grep 只剩 1 处（from LLM.mapeditor_server import app）
+```
+
 - [ ] **步骤 6：Commit**
 
 ```powershell
-git commit -m "feat(llm): 地图编辑器独立服务 app（:8010）+ 自停接口 + conf 常量" -- LLM/conf.py LLM/mapeditor_server.py LLM/tests/test_mapeditor_server.py
+git commit -m "feat(llm): 地图编辑器独立服务 app（:8010）+ 自停接口 + conf 常量" -- LLM/conf.py LLM/mapeditor_server.py LLM/tests/test_mapeditor_server.py tests/test_mapeditor.py
 ```
 （先 `git add -- LLM/conf.py LLM/mapeditor_server.py LLM/tests/test_mapeditor_server.py`）
 
@@ -822,22 +852,25 @@ def _require_admin(x_surface: str) -> None:
         raise HTTPException(status_code=403, detail="仅管理员可启停地图编辑器服务")
 
 
+# 三条都用**同步 `def`**：FastAPI 会把同步处理函数丢进线程池跑，而 `status()` 里的 `_probe()`
+# 是同步 HTTP（最长 0.5s）；写成 `async def` 会把事件循环卡住（本仓既有约定：会阻塞的活儿
+# 不进事件循环，见 server.py 里 `asyncio.to_thread` 的用法）。
 @router.get("/api/mapeditor/service")
-async def map_editor_service(x_surface: str = Header(default="kiosk")):
+def map_editor_service(x_surface: str = Header(default="kiosk")):
     """编辑器服务状态（仅管理员）。"""
     _require_admin(x_surface)
     return status()
 
 
 @router.post("/api/mapeditor/service/start")
-async def map_editor_service_start(x_surface: str = Header(default="kiosk")):
+def map_editor_service_start(x_surface: str = Header(default="kiosk")):
     """拉起编辑器服务（幂等）。"""
     _require_admin(x_surface)
     return start()
 
 
 @router.post("/api/mapeditor/service/stop")
-async def map_editor_service_stop(x_surface: str = Header(default="kiosk")):
+def map_editor_service_stop(x_surface: str = Header(default="kiosk")):
     """停掉编辑器服务（幂等）。"""
     _require_admin(x_surface)
     return stop()
