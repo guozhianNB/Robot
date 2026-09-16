@@ -79,6 +79,7 @@
   var sourceId = '';           // URL 参数 ?source=（地图源 id；空=后端默认源）
   var ui = null;               // 状态条元素句柄（ensureBar 里填）
   var busy = false;            // 保存/加载进行中（防重复提交）
+  var exitAfterSave = false;   // 「保存并退出」按下后的意图：保存**成功**才停服务 + 关窗
   var staleSeen = false;       // 读通道是否见到 X-Map-Stale: 1
 
   // 写通道补丁的原始句柄（失败时要还原）
@@ -135,7 +136,7 @@
   function setBusy(on, text) {
     busy = !!on;
     if (!ui) return;
-    ['reload', 'test', 'save'].forEach(function (k) {
+    ['reload', 'test', 'save', 'saveExit'].forEach(function (k) {
       if (ui[k]) ui[k].disabled = !!on;
     });
     if (text) msg('info', text);
@@ -197,9 +198,13 @@
     var save = el('button', ST_BTN, '保存到服务器');
     save.type = 'button';
     save.title = '触发编辑器自身的「Download Map」，由本接线层截获像素与 yaml 后回传后端';
+    var saveExit = el('button', ST_BTN, '保存并退出');
+    saveExit.type = 'button';
+    saveExit.title = '保存到服务器，成功后关闭地图编辑器服务并关本窗口（失败则不停不关）';
     row2.appendChild(reload);
     row2.appendChild(test);
     row2.appendChild(save);
+    row2.appendChild(saveExit);
 
     var msgSpan = el('div', ST_MSG, '');
     row2.appendChild(msgSpan);
@@ -218,6 +223,7 @@
       reload: reload,
       test: test,
       save: save,
+      saveExit: saveExit,
       msg: msgSpan
     };
 
@@ -234,6 +240,7 @@
     });
     test.addEventListener('click', function () { ioTest(); });
     save.addEventListener('click', function () { manualSave(); });
+    saveExit.addEventListener('click', function () { exitAfterSave = true; manualSave(); });
 
     return ui;
   }
@@ -391,16 +398,19 @@
     // 只有 pgm 也要能发：yaml_text 传空串（后端允许，且一律以磁盘原文为本）。
     if (!pgmBlob) {
       if (yamlBlob) msg('warn', '只截获到 yaml，没有 pgm 像素数据，本次不提交。');
+      exitAfterSave = false;
       return;
     }
     if (busy) {
       msg('warn', '上一次保存尚未结束，本次改动未提交，请稍后重试。');
+      exitAfterSave = false;
       return;
     }
     readBlobText(yamlBlob).then(function (txt) {
       return saveToServer(pgmBlob, txt || '');
     }).catch(function (e) {
       msg('error', '保存失败：' + errText(e));
+      exitAfterSave = false;              // 读取/提交异常同样是「没保存成功」
     });
   }
 
@@ -434,6 +444,7 @@
   function saveToServer(pgmBlob, yamlText) {
     if (!mapName) {
       msg('error', '未指定地图（URL 缺 ?map=<地图名>），无法保存。');
+      exitAfterSave = false;
       return Promise.resolve();
     }
     var mode = ui && ui.mode ? ui.mode.value : 'saveas';
@@ -443,10 +454,12 @@
       // 前端预校验（后端仍会再校验一次，见规格 §B7.1 红线）
       if (!NAME_RE.test(newName)) {
         msg('error', '新图名不合法：' + newName + '（只允许字母/数字/下划线/连字符，1~64 字符）');
+        exitAfterSave = false;
         return Promise.resolve();
       }
       if (newName.toLowerCase().indexOf(NAME_BANNED) >= 0) {
         msg('error', '新图名不得含 "' + NAME_BANNED + '"（会被上游编辑器误判为掩膜文件）');
+        exitAfterSave = false;
         return Promise.resolve();
       }
     }
@@ -475,10 +488,12 @@
           else renderSaveErr(res.status, data);
         } catch (e2) {
           msg('error', '保存结果处理异常：' + errText(e2));   // 保证下面的 setBusy(false) 一定会执行
+          exitAfterSave = false;                            // 结果没走通成功分支 → 不停不关
         }
       });
     }).catch(function (e) {
       msg('error', '保存请求失败：' + errText(e));
+      exitAfterSave = false;              // 网络/编码异常同样没保存成功
     }).then(function () {
       setBusy(false);
     });
@@ -505,6 +520,29 @@
     if (data.warnings && data.warnings.length) {
       appendLine(box, COLOR.warn, '提醒：\n· ' + data.warnings.join('\n· '));
     }
+
+    if (exitAfterSave) {
+      exitAfterSave = false;
+      stopServiceAndClose();
+    }
+  }
+
+  /** 「保存并退出」的收尾：停编辑器服务（同源）→ 关窗。失败只提示，不假装成功。 */
+  function stopServiceAndClose() {
+    setBusy(true, '已保存。正在停止地图编辑器服务…');
+    fetch('/api/mapeditor/service/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      window.close();
+      msg('good', '已保存，地图编辑器服务已停止。若本页未自动关闭，请手动关闭。');
+    }).catch(function (e) {
+      msg('warn', '保存成功，但停止服务失败（' + errText(e) + '）：请回地图编辑器主页点「保存并退出」。');
+    }).then(function () {
+      setBusy(false);
+    });
   }
 
   /** 在同一消息区追加一「行」（换行 + 指定颜色），用于 warnings 等补充信息。 */
@@ -515,6 +553,7 @@
   }
 
   function renderSaveErr(status, data) {
+    exitAfterSave = false;             // 保存失败：清掉退出意图，不停不关
     var text = '保存失败（HTTP ' + status + '）：' + ((data && data.error) || '后端未返回 error 字段');
     if (data && data.diffs && data.diffs.length) {
       text += '\n与磁盘原值不一致的字段（只允许改 image）：\n· ' + data.diffs.join('\n· ');
@@ -680,14 +719,20 @@
 
   /** 手动触发当前编辑内容保存：点编辑器自己的「Download Map」，由写通道截获。 */
   function manualSave() {
-    if (!mapName) { msg('error', '未指定地图（URL 缺 ?map=<地图名>），无法保存。'); return; }
+    if (!mapName) { msg('error', '未指定地图（URL 缺 ?map=<地图名>），无法保存。'); exitAfterSave = false; return; }
     if (!patch.installed) {
       msg('error', '网络 IO 补丁未生效：点击将退回浏览器原生下载（请检查状态条上方的错误原因）。');
     }
     var btn = document.getElementById('btnDownloadMap');
-    if (!btn) { msg('error', '找不到 #btnDownloadMap（上游页面结构可能已变）。'); return; }
+    if (!btn) { msg('error', '找不到 #btnDownloadMap（上游页面结构可能已变）。'); exitAfterSave = false; return; }
     // 上游按钮自带 `if(!pgm || !yamlObj){ alert('Load YAML and PGM first.'); return; }`
     btn.click();
+    // 上游在未加载 yaml/pgm 时只 alert 一句就返回、不产生任何下载；补丁失效时也会退回原生下载。
+    // 这类「一次提交都没发生」的空点击同样要清掉退出意图，否则意图会残留到下一次普通保存。
+    if (exitAfterSave && !pending.timer) {
+      msg('warn', '编辑器未产生可提交的产物，本次未保存。请先加载 yaml/pgm 再点「保存并退出」。');
+      exitAfterSave = false;
+    }
   }
 
   // ===================== 十二、缺 ?map= 时的选图提示 =====================
