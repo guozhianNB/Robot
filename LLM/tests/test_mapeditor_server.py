@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-r"""独立编辑器服务 app 的外壳行为（规格 §3.2）。"""
+r"""独立编辑器服务 app 的外壳行为（规格 §3.2）。
+
+路由内省走 ``app_paths`` fixture（见 conftest.py）—— 本机 fastapi 0.141 的
+``include_router()`` 是惰性的，``app.routes`` 里只有 ``_IncludedRouter`` 占位对象。
+"""
 import os
 
 from fastapi.testclient import TestClient
@@ -7,33 +11,16 @@ from fastapi.testclient import TestClient
 from LLM import conf, mapeditor_server
 
 
-def _paths(app) -> set:
-    """app 的全部路径（含 ``include_router`` 进来的子路由）。
-
-    本机 fastapi 0.141/starlette 1.6 起 ``include_router()`` 是**惰性**的：它往
-    ``app.routes`` 里放一个 ``_IncludedRouter`` 占位对象，子路由不在 ``app.routes`` 里
-    逐条列出（旧版是当场拷一份）。所以这里遇到占位对象就展开一次；旧版没有该方法时
-    行为与 ``{r.path for r in app.routes}`` 完全一致。
-    """
-    out = set()
-    for r in app.routes:
-        out.add(getattr(r, "path", "") or "")
-        contexts = getattr(r, "effective_route_contexts", None)
-        if callable(contexts):
-            out |= {getattr(c.original_route, "path", "") or "" for c in contexts()}
-    return out
-
-
-def test_editor_app_serves_all_editor_routes():
-    paths = _paths(mapeditor_server.app)
+def test_editor_app_serves_all_editor_routes(app_paths):
+    paths = app_paths(mapeditor_server.app)
     for kept in ("/api/map/list", "/api/destinations", "/api/zones",
                  "/api/robot/pose", "/api/mapeditor/status",
                  "/api/mapeditor/service", "/api/mapeditor/service/stop"):
         assert kept in paths, "独立服务缺路由：{}".format(kept)
 
 
-def test_editor_app_mounts_mapeditor_page():
-    assert any(p.startswith("/mapeditor") for p in _paths(mapeditor_server.app))
+def test_editor_app_mounts_mapeditor_page(app_paths):
+    assert any(p.startswith("/mapeditor") for p in app_paths(mapeditor_server.app))
 
 
 def test_service_status_reports_self():

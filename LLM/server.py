@@ -1158,7 +1158,7 @@ async def vision_snapshot(channel: int = Query(1), quality: int = Query(80),
                           token: str = Query(None)):
     """单帧 JPEG 快照。`<img src="/api/vision/snapshot?channel=1">` 可直接显示。"""
     from . import log as audit
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     from vision import webbridge
     try:
         jpg, _w, _h, source = await asyncio.to_thread(
