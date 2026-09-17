@@ -15,7 +15,8 @@ from . import memory as rag
 from . import tools as tool_mod
 from ..conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
-                   LLM_TIMEOUT, PROMPT_FILE, REACT_PROMPT_FILE, DEFAULT_SETTINGS)
+                   LLM_TIMEOUT, PROMPT_FILE, REACT_PROMPT_FILE, DEFAULT_SETTINGS,
+                   REACT_MAX_TOOL_ROUNDS)
 # 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/agent/policy.py
 from .policy import role_policy
 
@@ -475,6 +476,10 @@ async def mcp_init(client, model: str):
             _mcp_session = session
 
 _VISION_LOG_SNIPPET = "[视觉结果未写入日志]"
+_REACT_FINALIZE_PROMPT = (
+    "工具调用次数已达上限。不要再调用工具；请仅根据已有工具结果直接回答用户，"
+    "并如实说明尚未完成或无法确认的部分。"
+)
 
 
 def _tool_log_fields(name: str, args, snippet: str):
@@ -536,15 +541,19 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     reasoning_text = ""          # 思维链累计（只用于审计字数，不落库、不播报）
     retried_no_thinking = False   # 空回复兜底只允许降级一次（防死循环）
     tool_rounds = 0
+    finalizing = False
+    final_response_content = ""
+    finalize_protocol_violation = False
     try:
         #--------------------------
         # 1、调用模型生成器，stream=True 流式输出
         while True:
             extra = _thinking_extra(effort)
+            request_tools = None if finalizing else (tools or None)
             try:
                 stream = client.chat.completions.create(
                     model=model, messages=messages, stream=True,
-                    tools=tools or None, tool_choice="auto" if tools else None,
+                    tools=request_tools, tool_choice="auto" if request_tools else None,
                     reasoning_effort=effort,
                     extra_body=extra,
                 )
@@ -558,7 +567,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     extra = _thinking_extra(None)
                     stream = client.chat.completions.create(
                         model=model, messages=messages, stream=True,
-                        tools=tools or None, tool_choice="auto" if tools else None,
+                        tools=request_tools, tool_choice="auto" if request_tools else None,
                         extra_body=extra,
                     )
                 else:
@@ -567,6 +576,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
             # 解析流式输出，逐条 yield SSE 事件
             tool_calls = {}
             finish = None
+            response_content = ""
+            response_start = len(full_assistant)
             for chunk in stream:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -576,6 +587,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     yield {"type": "reasoning", "content": reasoning}
                 if delta.content:
                     full_assistant += delta.content
+                    response_content += delta.content
                     yield {"type": "content", "content": delta.content}
                 for tc in (delta.tool_calls or []):
                     slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
@@ -588,6 +600,13 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 if choice.finish_reason:
                     finish = choice.finish_reason
                     break
+
+            if finalizing:
+                final_response_content = response_content
+                finalize_protocol_violation = finish == "tool_calls" and bool(tool_calls)
+                if finalize_protocol_violation:
+                    full_assistant = full_assistant[:response_start]
+                break
 
             if finish == "tool_calls" and tool_calls:
                 tool_rounds += 1
@@ -632,6 +651,11 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                                       "reason": "已取得工具结果，自动加深思考",
                                       "method": "tool_observation", "mode": "auto",
                                       "uid": data_uid}}
+                if tool_rounds >= REACT_MAX_TOOL_ROUNDS:
+                    messages.append({"role": "system", "content": _REACT_FINALIZE_PROMPT})
+                    audit.log("chat", action="react_budget_exhausted", uid=data_uid,
+                              tool_rounds=tool_rounds, effort=effort)
+                    finalizing = True
                 continue  # 下一轮：把工具结果交给模型
 
             break  # 正常结束
@@ -639,7 +663,10 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
         # 空回复兜底：思考档位下，思维链也吃 max_tokens，极端情况下（如敏感问题在 max 档
         # 长时间自问）会"只想不说"——reasoning 有内容、content 为空，老人那边什么都听不到。
         # 一轮没出正文就降级成不思考重来一次（只降一次，防死循环）。
-        if effort and not full_assistant.strip() and not retried_no_thinking:
+        empty_final_response = finalizing and (
+            finalize_protocol_violation or not final_response_content.strip()
+        )
+        if ((effort and not full_assistant.strip()) or empty_final_response) and not retried_no_thinking:
             retried_no_thinking = True
             audit.log("chat", action="thinking_empty_fallback", uid=data_uid, mode=mode, effort=effort)
             yield {"type": "meta",

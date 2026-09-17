@@ -133,6 +133,44 @@ def _prepare_tool_stream(monkeypatch, result=None):
     monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: None)
 
 
+_FINALIZE_PROMPT = (
+    "工具调用次数已达上限。不要再调用工具；请仅根据已有工具结果直接回答用户，"
+    "并如实说明尚未完成或无法确认的部分。"
+)
+
+
+def _budget_streams(final_stream, fourth_calls=None):
+    streams = [
+        [_chunk(tool_calls=[_tool_call(call_id=f"call-{round_no}")],
+                finish_reason="tool_calls")]
+        for round_no in range(1, 4)
+    ]
+    streams.append([_chunk(
+        tool_calls=fourth_calls or [_tool_call(call_id="call-4")],
+        finish_reason="tool_calls",
+    )])
+    streams.append(final_stream)
+    return streams
+
+
+def _prepare_budget_stream(monkeypatch, streams):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools",
+                        lambda *args: [{"type": "function"}])
+    calls = []
+    monkeypatch.setattr(chat.tool_mod, "run_tool",
+                        lambda name, args, principal: calls.append((name, args)) or
+                        {"ok": True, "result": name})
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    audits = []
+    monkeypatch.setattr(chat.audit, "log",
+                        lambda *args, **kwargs: audits.append((args, kwargs)))
+    completions = _SequenceCompletions(streams)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    return client, completions, calls, audits
+
+
 def test_auto_tool_observation_escalates_next_request_to_high(monkeypatch):
     _prepare_tool_stream(monkeypatch)
     client = _client_with_tool_then_answer()
@@ -434,3 +472,135 @@ def test_empty_content_fallback_disables_tools(monkeypatch):
     assert completions.requests[1]["reasoning_effort"] is None
     assert completions.requests[1]["tools"] is None
     assert completions.requests[1]["tool_choice"] is None
+
+
+def test_budget_allows_four_tool_rounds_then_forces_tool_free_finalize(monkeypatch):
+    client, completions, calls, audits = _prepare_budget_stream(
+        monkeypatch, _budget_streams([_chunk(content="根据四次结果，已经完成")]))
+    history = []
+    monkeypatch.setattr(chat.db, "append_history",
+                        lambda uid, role, content: history.append((uid, role, content)))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(calls) == 4
+    assert len(completions.requests) == 5
+    finalize_request = completions.requests[4]
+    assert finalize_request["tools"] is None
+    assert finalize_request["tool_choice"] is None
+    assert finalize_request["reasoning_effort"] == "high"
+    assert any(message == {"role": "system", "content": _FINALIZE_PROMPT}
+               for message in finalize_request["messages"])
+    assert events[-1] == {"type": "done", "assistant": "根据四次结果，已经完成"}
+    assert history == [
+        ("elder-1", "user", "连续执行"),
+        ("elder-1", "assistant", "根据四次结果，已经完成"),
+    ]
+    exhausted = [kwargs for args, kwargs in audits
+                 if args == ("chat",) and kwargs.get("action") == "react_budget_exhausted"]
+    assert exhausted == [{"action": "react_budget_exhausted", "uid": "elder-1",
+                          "tool_rounds": 4, "effort": "high"}]
+
+
+def test_budget_fourth_round_executes_all_calls_before_finalize(monkeypatch):
+    fourth_calls = [
+        _tool_call(name="fourth-a", arguments='{"part":"a"}',
+                   call_id="call-4a", index=0),
+        _tool_call(name="fourth-b", arguments='{"part":"b"}',
+                   call_id="call-4b", index=1),
+    ]
+    client, completions, calls, _ = _prepare_budget_stream(
+        monkeypatch,
+        _budget_streams([_chunk(content="第四轮两个调用都已处理")], fourth_calls),
+    )
+
+    list(chat.chat_stream(client, "m", "elder-1", "批量执行", "auto", {}))
+
+    assert calls[-2:] == [("fourth-a", {"part": "a"}),
+                          ("fourth-b", {"part": "b"})]
+    assert len(calls) == 5
+    assert len(completions.requests) == 5
+    observations = [message for message in completions.requests[4]["messages"]
+                    if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in observations[-2:]] == [
+        "call-4a", "call-4b",
+    ]
+
+
+def test_budget_reasoning_only_finalize_falls_back_once_without_tools(monkeypatch):
+    streams = _budget_streams([_chunk(reasoning="还在整理", finish_reason="stop")])
+    streams.append([_chunk(content="兜底回答")])
+    client, completions, calls, audits = _prepare_budget_stream(monkeypatch, streams)
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(calls) == 4
+    assert len(completions.requests) == 6
+    fallback_request = completions.requests[5]
+    assert fallback_request["tools"] is None
+    assert fallback_request["tool_choice"] is None
+    assert fallback_request["reasoning_effort"] is None
+    assert fallback_request["extra_body"] == chat._thinking_extra(None)
+    assert any(message == {"role": "system", "content": _FINALIZE_PROMPT}
+               for message in fallback_request["messages"])
+    assert [event["content"] for event in events if event["type"] == "reasoning"] == [
+        "还在整理",
+    ]
+    assert events[-1] == {"type": "done", "assistant": "兜底回答"}
+    fallbacks = [kwargs for args, kwargs in audits
+                 if args == ("chat",) and kwargs.get("action") == "thinking_empty_fallback"]
+    assert len(fallbacks) == 1
+
+
+def test_budget_finalize_tool_calls_are_not_executed_and_fall_back(monkeypatch):
+    streams = _budget_streams([
+        _chunk(content="这段违规收尾不得落入最终回答",
+               tool_calls=[_tool_call(name="forbidden", call_id="call-5")],
+               finish_reason="tool_calls"),
+    ])
+    streams.append([_chunk(content="不再调用工具，直接回答")])
+    client, completions, calls, _ = _prepare_budget_stream(monkeypatch, streams)
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(calls) == 4
+    assert all(name != "forbidden" for name, _ in calls)
+    assert len(completions.requests) == 6
+    assert completions.requests[5]["tools"] is None
+    assert completions.requests[5]["tool_choice"] is None
+    observations = [message for message in completions.requests[5]["messages"]
+                    if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in observations] == [
+        "call-1", "call-2", "call-3", "call-4",
+    ]
+    assert events[-1] == {"type": "done", "assistant": "不再调用工具，直接回答"}
+
+
+def test_budget_manual_low_finalize_preserves_low_effort(monkeypatch):
+    client, completions, calls, audits = _prepare_budget_stream(
+        monkeypatch, _budget_streams([_chunk(content="轻度思考后回答")]))
+
+    list(chat.chat_stream(client, "m", "elder-1", "连续执行", "low", {}))
+
+    assert len(calls) == 4
+    assert completions.requests[4]["reasoning_effort"] == "low"
+    exhausted = next(kwargs for args, kwargs in audits
+                     if args == ("chat",) and kwargs.get("action") ==
+                     "react_budget_exhausted")
+    assert exhausted["effort"] == "low"
+
+
+def test_non_budget_plain_answer_does_not_add_finalize_prompt(monkeypatch):
+    monkeypatch.setattr(chat, "build_messages",
+                        lambda *args, **kwargs: [{"role": "user", "content": "你好"}])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [])
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: None)
+    completions = _SequenceCompletions([[_chunk(content="你好")]])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    list(chat.chat_stream(client, "m", "elder-1", "你好", "none", {}))
+
+    assert len(completions.requests) == 1
+    assert not any(message.get("content") == _FINALIZE_PROMPT
+                   for message in completions.requests[0]["messages"])
