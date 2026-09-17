@@ -489,9 +489,12 @@ def _tool_log_fields(name: str, args, snippet: str):
 
 def _parse_tool_arguments(raw: str) -> tuple[dict | None, dict | None]:
     """Parse model-provided arguments without allowing non-object JSON into tools."""
+    def reject_non_finite(value: str):
+        raise ValueError(f"不允许非有限数值 {value}")
+
     try:
-        args = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as exc:
+        args = json.loads(raw or "{}", parse_constant=reject_non_finite)
+    except (ValueError, TypeError) as exc:
         return None, {
             "ok": False,
             "type": "invalid_arguments",
@@ -599,12 +602,17 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     for i, slot, call_id in resolved_calls
                 ]}
                 messages.append(assistant_msg)
+                executed_tool = False
                 for i, slot, call_id in resolved_calls:
                     args, invalid_result = _parse_tool_arguments(slot["args"])
                     name = slot["name"]
                     yield {"type": "tool_start", "tool": name, "args": args or {}}
                     t0 = time.time()
-                    result = invalid_result or tool_mod.run_tool(name, args, principal)
+                    if invalid_result is not None:
+                        result = invalid_result
+                    else:
+                        executed_tool = True
+                        result = tool_mod.run_tool(name, args, principal)
                     latency = int((time.time() - t0) * 1000)
                     snippet = (result.get("result") or result.get("message")
                                or result.get("error") or "")[:500]
@@ -617,7 +625,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                            "snippet": snippet}
                     messages.append({"role": "tool", "tool_call_id": call_id,
                                      "content": json.dumps(result, ensure_ascii=False)})
-                if mode == "auto" and effort != "high":
+                if mode == "auto" and executed_tool and effort != "high":
                     effort, thinking_on = "high", True
                     yield {"type": "meta",
                            "router": {"on": True, "effort": "high",

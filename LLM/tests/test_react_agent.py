@@ -275,7 +275,40 @@ def test_failed_tool_is_observed_then_replanned_with_new_arguments(monkeypatch):
     assert turn_audit["tool_rounds"] == 2
 
 
-@pytest.mark.parametrize("raw", ['{"value":', "[]", '"not an object"'])
+def test_empty_arguments_execute_as_empty_object(monkeypatch):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
+    calls = []
+    monkeypatch.setattr(chat.tool_mod, "run_tool",
+                        lambda name, args, principal: calls.append((name, args)) or
+                        {"ok": True, "result": "done"})
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: None)
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[_tool_call(arguments="", call_id="call-empty")],
+                finish_reason="tool_calls")],
+        [_chunk(content="执行完成")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "执行无参数工具", "none", {}))
+
+    assert calls == [("search", {})]
+    assistant = next(message for message in completions.requests[1]["messages"]
+                     if message["role"] == "assistant")
+    assert assistant["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert next(event for event in events if event["type"] == "tool_result")["ok"] is True
+
+
+@pytest.mark.parametrize("raw", [
+    '{"value":',
+    "[]",
+    '"not an object"',
+    '{"value":NaN}',
+    '{"value":Infinity}',
+    '{"value":-Infinity}',
+])
 def test_invalid_arguments_are_observed_without_executing_tool(monkeypatch, raw):
     monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
     monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
@@ -315,12 +348,38 @@ def test_invalid_arguments_are_observed_without_executing_tool(monkeypatch, raw)
 
 def test_invalid_arguments_parser_contract():
     assert chat._parse_tool_arguments('{"value":1}') == ({"value": 1}, None)
-    for raw in ('{"value":', "[]", '"not an object"'):
+    assert chat._parse_tool_arguments("") == ({}, None)
+    for raw in ('{"value":', "[]", '"not an object"', '{"value":NaN}',
+                '{"value":Infinity}', '{"value":-Infinity}'):
         args, error = chat._parse_tool_arguments(raw)
         assert args is None
         assert error["ok"] is False
         assert error["type"] == "invalid_arguments"
         assert error["error"]
+
+
+def test_all_invalid_arguments_do_not_escalate_auto_effort(monkeypatch):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
+    calls = []
+    monkeypatch.setattr(chat.tool_mod, "run_tool",
+                        lambda *args: calls.append(args) or {"ok": True})
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: None)
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[_tool_call(arguments='{"value":NaN}', call_id="call-invalid")],
+                finish_reason="tool_calls")],
+        [_chunk(content="参数不合法")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "执行一下", "auto", {}))
+
+    assert calls == []
+    assert [request["reasoning_effort"] for request in completions.requests] == [None, None]
+    assert not [event for event in events if event.get("type") == "meta" and
+                event["router"].get("method") == "tool_observation"]
 
 
 def test_multiple_tools_keep_index_order_ids_and_count_as_one_round(monkeypatch):
