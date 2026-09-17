@@ -21,7 +21,8 @@ async function ack() {
     await ackNotice(props.notice.id);
     emit("acked", props.notice.id);          // 本地立刻标记（不等 SSE 回包）
   } catch (e) {
-    err.value = `处理失败：${e}`;              // 失败必须说出来，绝不假装成功
+    console.error("[nurse] 标记通知已处理失败", e);   // 原始错误只进控制台，不上屏
+    err.value = "这条没能标记成功，请再点一次";        // 失败必须说出来，绝不假装成功
   } finally {
     busy.value = false;
   }

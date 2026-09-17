@@ -34,6 +34,9 @@ const loginErr = ref("");
 const loading = ref(true);
 const loggingIn = ref(false);
 
+/** 登录门判据的唯一真相：不是 admin 一律视为未登录 —— 未登录绝不开实时连接。 */
+const isAdmin = computed(() => session.value?.role === "admin");
+
 // ---- 面板状态 ----
 const notices = ref<Notice[]>([]);
 const counts = ref<NoticeCounts>({ unread: 0, critical: 0 });
@@ -98,16 +101,25 @@ async function loadNotices() {
     loadErr.value = "";
   } catch (e) {
     if (isAuthError(e)) { dropSession(); return; }   // 401/403 → 回登录门
-    loadErr.value = `读取通知失败：${e}`;              // 不静默（规格 §5.2 空态/错误态）
+    console.error("[nurse] 读取通知失败", e);          // 原始错误只进控制台，不上屏
+    loadErr.value = "暂时读不到通知，正在自动重试";      // 不静默（规格 §5.2 空态/错误态）
   }
+}
+
+/** 丢掉会话 / 回登录门 / 卸载的唯一收口：关掉实时连接 + 清掉**全部**计时器
+ *  （含 3 秒重连计时器）—— 否则 SSE 报错排下的 connect() 会在登出后照旧打开
+ *  `/api/events`，违反「未登录不得连 SSE」。 */
+function stopRealtime() {
+  es?.close(); es = null;
+  connected.value = false;
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 }
 
 /** 会话失效：退回登录门（重新拉一次会话，让口令门状态也是新的）。 */
 function dropSession() {
-  es?.close(); es = null;
-  connected.value = false;
+  stopRealtime();
   session.value = null;
-  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   void loadSession();
 }
 
@@ -128,7 +140,8 @@ async function loadSession() {
     session.value = await getSessionUser("admin");
     loginErr.value = "";
   } catch (e) {
-    if (!session.value) loginErr.value = `读取会话失败：${e}`;
+    console.error("[nurse] 读取登录状态失败", e);      // 原始错误只进控制台，不上屏
+    if (!session.value) loginErr.value = "读取登录状态失败，请刷新页面重试";
   } finally {
     loading.value = false;
   }
@@ -146,7 +159,8 @@ async function doLogin() {
     await loadNotices();
     schedulePoll();
   } catch (e) {
-    loginErr.value = `登录失败：${e}`;
+    console.error("[nurse] 登录失败", e);              // 原始错误只进控制台，不上屏
+    loginErr.value = "登录没能成功，请检查网络后重试";
   } finally {
     loggingIn.value = false;
   }
@@ -154,9 +168,7 @@ async function doLogin() {
 
 async function doLogout() {
   try { await logout("admin"); } catch { /* 忽略：下面照样刷新会话 */ }
-  es?.close(); es = null;
-  connected.value = false;
-  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  stopRealtime();                     // 关实时连接 + 清轮询/重连计时器（登出后不重连）
   notices.value = [];
   counts.value = { unread: 0, critical: 0 };
   loadErr.value = "";
@@ -165,6 +177,7 @@ async function doLogout() {
 
 // ---- SSE ----
 function connect() {
+  if (!isAdmin.value) return;          // 未登录不连 SSE（登录卡上不该有告警声）
   if (es) return;
   es = new EventSource("/api/events");
   es.onopen = () => { connected.value = true; schedulePoll(); };
@@ -177,6 +190,7 @@ function connect() {
     es?.close(); es = null;
     connected.value = false;
     schedulePoll();                  // 断线期间切到 5s 兜底轮询
+    if (!isAdmin.value) return;      // 会话已丢 → 绝不排重连
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = window.setTimeout(connect, RECONNECT_MS);
   };
@@ -263,7 +277,7 @@ onMounted(async () => {
   clockTimer = window.setInterval(tick, 1000);                 // 顶栏实时时钟
   nowTimer = window.setInterval(() => { nowMs.value = Date.now(); }, 15000);   // 相对时间刷新
   await loadSession();
-  if (session.value?.role === "admin") {
+  if (isAdmin.value) {
     connect();
     await loadNotices();
     schedulePoll();
@@ -271,11 +285,9 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  es?.close(); es = null;
+  stopRealtime();                    // 与 dropSession/doLogout 同一口径：连接 + 轮询 + 重连计时器
   if (clockTimer) clearInterval(clockTimer);
   if (nowTimer) clearInterval(nowTimer);
-  if (pollTimer) clearTimeout(pollTimer);
-  if (reconnectTimer) clearTimeout(reconnectTimer);
 });
 </script>
 
