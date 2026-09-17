@@ -1,0 +1,24 @@
+import { defineConfig } from "vite";
+import vue from "@vitejs/plugin-vue";
+import { fileURLToPath, URL } from "node:url";
+
+export default defineConfig({
+  // base 必须与后端挂载路径一致（server.py app.mount("/nurse", StaticFiles)），
+  // 否则产物引用 /assets/* 绝对路径 → 部署白屏（同 admin/kiosk 的 C-1 注释）
+  base: "/nurse/",
+  plugins: [vue()],
+  resolve: {
+    // shared 包 main 指向 TS 源码（src/index.ts），必须 alias 到源码路径，
+    // 否则 Vite build 无法解析 workspace 包（monorepo 已知坑）
+    alias: {
+      shared: fileURLToPath(new URL("../shared/src/index.ts", import.meta.url)),
+    },
+  },
+  server: {
+    // ★ 规格 D8（用户硬要求）：dev server 必须显式监听 0.0.0.0，
+    // 否则 Vite 默认只绑 localhost，局域网内别的 PC 打不开护士台
+    host: true,
+    port: 5176,
+    proxy: { "/api": "http://127.0.0.1:8000" },
+  },
+});

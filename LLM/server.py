@@ -135,7 +135,7 @@ async def _no_store_entry_html(request: Request, call_next):
     带 hash 的 assets 可以放心长期缓存，所以只对 html 入口加 no-store。"""
     resp = await call_next(request)
     path = request.url.path.rstrip("/") or "/"
-    if path in ("", "/", "/admin", "/kiosk") or path.endswith("/index.html"):
+    if path in ("", "/", "/admin", "/kiosk", "/nurse") or path.endswith("/index.html"):
         resp.headers["Cache-Control"] = "no-store, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
     return resp
@@ -1324,6 +1324,7 @@ from fastapi.responses import FileResponse
 _FRONTEND_DIST = BASE_DIR / "frontend" / "packages"
 _KIOSK_DIST = _FRONTEND_DIST / "kiosk" / "dist"
 _ADMIN_DIST = _FRONTEND_DIST / "admin" / "dist"
+_NURSE_DIST = _FRONTEND_DIST / "nurse" / "dist"      # 护士台（模块 11 面板，规格 2026-09-18）
 
 
 def _serve_dist(dist: Path, path: str):
@@ -1335,6 +1336,8 @@ if _KIOSK_DIST.exists():
     _serve_dist(_KIOSK_DIST, "/kiosk")
 if _ADMIN_DIST.exists():
     _serve_dist(_ADMIN_DIST, "/admin")
+if _NURSE_DIST.exists():
+    _serve_dist(_NURSE_DIST, "/nurse")
 
 
 @app.get("/")

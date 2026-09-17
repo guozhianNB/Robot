@@ -91,6 +91,25 @@ export interface WardChangedEvent {
   action: string;
 }
 
+/** 新通知（或去重合并后的一版），由 `LLM/agent/notify.py::ingest()` 广播（规格 §4.5）。
+ *
+ *  ⚠️ **通知类型在 `kind` 里，不是 `type`**（规格 D6）：`bus.publish` 内部是
+ *  `{"type": event_type, **payload}`，payload 里再用 `type` 会把**事件类型**覆盖成业务类型
+ *  （sos/task_done…），前端 `parseBusPayload` 会因未知事件类型而整条丢弃
+ *  —— `/api/alarm` 用 `alarm_type` 同理。`uid_name` 一并带出（前端不必再拉一次档案）。 */
+export interface NotificationEvent {
+  type: "notification";
+  id: number; level: string; source: string; kind: string;
+  uid?: string; uid_name?: string; title?: string; body?: string;
+  count?: number; last_at?: string;
+}
+
+/** 通知已被处理（单条 `id`，或 `all: true` 全量）——多屏同步用。 */
+export interface NotificationAckEvent {
+  type: "notification_ack";
+  id?: number; all?: boolean; by?: string; n?: number;
+}
+
 export type BusEvent =
   | ReminderEvent
   | ReminderConfirmedEvent
@@ -103,7 +122,9 @@ export type BusEvent =
   | VoiceStatusEvent
   | SessionExpiredEvent
   | AdminAuthChangedEvent
-  | WardChangedEvent;
+  | WardChangedEvent
+  | NotificationEvent
+  | NotificationAckEvent;
 
 const KNOWN_TYPES = new Set([
   "reminder",
@@ -118,6 +139,8 @@ const KNOWN_TYPES = new Set([
   "session_expired",
   "admin_auth_changed",
   "ward_changed",
+  "notification",
+  "notification_ack",
 ]);
 
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */

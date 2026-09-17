@@ -4,7 +4,7 @@
 
 ```
 LLM/       Python FastAPI 后端 —— 大模型端"大脑与嘴"（最活跃，优先看这里）
-frontend/  前端 —— pnpm workspace（Vue3+Vite+TS）：packages/admin 管理端 + packages/kiosk 车载端 + packages/shared 共享层
+frontend/  前端 —— pnpm workspace（Vue3+Vite+TS）：packages/admin 管理端 + packages/kiosk 车载端 + packages/nurse 护士台 + packages/mapeditor 地图编辑器 + packages/shared 共享层
 UI(old)/   旧单文件 HTML 前端（历史参考，勿改；工作区根目录 UI/、Front/ 为空残留，勿当现役）
 stm32/     底盘下位机固件（STM32F103ZETX，C/CMake/HAL）→ 见 stm32/control/AGENTS.md
 docs/      需求/教程/接口契约/开发日志
@@ -22,8 +22,8 @@ docs/      需求/教程/接口契约/开发日志
   .venv\Scripts\python.exe -m uvicorn LLM.server:app --host 0.0.0.0 --port 8000
   ```
 - **前端**（`frontend/`，pnpm monorepo，Vue3+Vite+TS，后端 CORS 全开）：
-  - **开发**：`cd frontend && pnpm install`；后端 8000 先启，再开 `pnpm dev:admin`（管理端 http://127.0.0.1:5173，vite 代理 `/api`→8000）、`pnpm dev:kiosk`（车载端 :5174）或 `pnpm dev:mapeditor`（地图编辑器 :5175）。
-  - **生产**：跑 `scripts/build_frontend.ps1` 构建产物；后端启动时自动把 `admin`/`kiosk` 的 dist 用 StaticFiles 挂到 `/admin`、`/kiosk`（同 8000 端口）。**`/mapeditor` 不再由主后端挂载**（2026-09-15 起）：地图编辑器是**独立进程** `LLM.mapeditor_server:app`（默认端口 `conf.MAP_EDITOR_PORT`=8010），按需由 admin →「地图编辑器」页签拉起，编辑器 dist 由它自己静态托管（未构建时同样回退到 `packages/mapeditor/public/`，这样原生静态页 `pixel-editor.html` 不经 Vite 打包也能直接打开）。
+  - **开发**：`cd frontend && pnpm install`；后端 8000 先启，再开 `pnpm dev:admin`（管理端 http://127.0.0.1:5173，vite 代理 `/api`→8000）、`pnpm dev:kiosk`（车载端 :5174）、`pnpm dev:nurse`（护士台 :5176，`server.host: true` 监听 0.0.0.0，局域网 PC 可直接访问）或 `pnpm dev:mapeditor`（地图编辑器 :5175）。
+  - **生产**：跑 `scripts/build_frontend.ps1` 构建产物；后端启动时自动把 `admin`/`kiosk`/`nurse` 的 dist 用 StaticFiles 挂到 `/admin`、`/kiosk`、`/nurse`（同 8000 端口）。**`/mapeditor` 不再由主后端挂载**（2026-09-15 起）：地图编辑器是**独立进程** `LLM.mapeditor_server:app`（默认端口 `conf.MAP_EDITOR_PORT`=8010），按需由 admin →「地图编辑器」页签拉起，编辑器 dist 由它自己静态托管（未构建时同样回退到 `packages/mapeditor/public/`，这样原生静态页 `pixel-editor.html` 不经 Vite 打包也能直接打开）。
 - **虚拟环境**：`.venv/`（Windows 用 `Scripts/python.exe`）。核心依赖 openai / fastapi / uvicorn / pydantic / python-dotenv；语音链路额外依赖 numpy / sherpa-onnx / sounddevice / modelscope / torch（见 `requirement.txt`）。**注意：`requirement.txt` 声明 ≠ 环境已装齐，后端必须容忍可选依赖缺失、降级运行（见「系统稳健性」）。**
 - **配置**：API key 在根 `.env`（`DEEPSEEK_API_KEY`），`LLM/conf.py` 用 `load_dotenv(BASE_DIR/".env")` 加载。
 
@@ -87,6 +87,7 @@ LLM/
 - 记忆：`/api/memories` 一族 —— `GET|POST`、`/{mid}/confirm|reject|delete`、`/recycle`(+restore/purge)、`/correct`、`/import`、`/portrait`(护士手动画像)、`/suggest`、`/health`；`/api/memories/core`(+confirm/unconfirm/pin/unpin/{mid}delete)、`/rag`(+delete)、`/graph`、`/expressions`(+approve/reject)
 - 语音（可选，依赖缺失时降级，见「系统稳健性」）：`GET /api/voice/status` ｜ `POST /api/voice/enroll` ｜ `GET /api/voice/speakers` ｜ `DELETE /api/voice/speakers/{uid}` ｜ `POST /api/voice/record`(+`/{id}/audio`) ｜ `GET /api/face/status`
 - 告警/系统：`POST /api/alarm`（kiosk SOS）｜ `POST /api/system/shutdown`
+- 通知中心（模块 11，护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`）：`POST /api/notifications`（**免鉴权**投递口，任何模块/小车都能上报）｜ `GET /api/notifications`（`?state=all|unread&limit&before_id`，返回 `{items, counts}`）｜ `POST /api/notifications/{nid}/ack` ｜ `POST /api/notifications/ack-all` ｜ `DELETE /api/notifications/{nid}`（**后四条仅管理员**，走 `X-Surface: admin`）；广播总线事件 `notification`（新通知/去重合并，**通知类型在 `kind` 键里**）与 `notification_ack`
 - 工具/设置：`GET /api/tools` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings`
 - 广播：`GET /api/events`（SSE）
 - **地图编辑器**（第三个前端 `/mapeditor`，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md`）—— ⚠️ **以下路由 2026-09-15 起已搬到 `LLM/maps/mapapi.py`，只在独立进程 `LLM.mapeditor_server`（`conf.MAP_EDITOR_PORT`=8010）上挂载，主后端（8000）不再暴露它们**（主后端只留 3 条仅管理员的 `GET|POST /api/mapeditor/service{,/start,/stop}` 做进程启停）：
@@ -129,9 +130,10 @@ LLM/
 
 ## 前端（frontend/）
 
-- pnpm workspace（Vue3 + Vite + TS），三个包：
+- pnpm workspace（Vue3 + Vite + TS），四个包：
   - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
+  - `packages/nurse` — **护士台**（PC 浏览器，模块 11 告警面板）：只做三件事 = 看通知 / 点「处理了」/ 一眼看清未处理条数（不做对话、设置、记忆、地图、身份权限）；dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
   - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 思考档位工具 `src/thinking.ts`（五档 `ThinkingMode` / `THINKING_MODE_ORDER` / `normalizeThinkingMode`（含 on/off 兼容）/ `thinkingModeLabel`），admin/kiosk 都从它引入。
   - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产由编辑器自己的进程挂 `/mapeditor`（主后端 8000 不再挂载，见「快速上手 → 前端」）；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
 - 工程细节：vite `base` 与后端挂载路径一致（admin→`/admin/`、kiosk→`/kiosk/`，见 vite.config 注释 C-1）；`shared` 包 alias 到 TS 源码（monorepo 已知坑）。
@@ -148,6 +150,7 @@ LLM/
 - `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md` — 老人注册向导设计（尚未迁入 Vue admin，见「前端（frontend/）」节）。
 - `docs/superpowers/specs/2026-09-14-map-editor-design.md` — **地图编辑器设计（A 篇：看图/标地点/划区域/管地图文件；B 篇：像素修图）**，**2026-09-14 已落地**（实现台账与偏差见文末「实现台账与偏差（2026-09-14 落地）」一节）。改地图相关代码前必读。
 - `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md` — **思考档位手动切换（五档：自动/不思考/轻/中/重度）+ 思维链上屏**（2026-09-17 落地，含 D5「`reasoning_effort` 必须是顶层参数、塞 extra_body 会被静默忽略」这条实测坑）：`none` 关不掉敏感词安全网、档位落 `settings.thinking_mode`、思维链只上屏绝不进 TTS。改 `chat_stream`/`voice/worker.py` 前必读。
+- `docs/superpowers/specs/2026-09-18-nurse-console-design.md` — **护士台 + 后端通知中心设计**（模块 11 落地：`notifications` 表 + 5 条路由 + 总线 `notification`/`notification_ack` + 第四个前端包 `packages/nurse`）：含 D6「payload 里通知类型用 `kind`、绝不能用 `type`」与 D7 视觉尺度（不做大按钮/大字号）、D8（`server.host: true` + `--host 0.0.0.0` 保证局域网可达）。改通知链路前必读。
 - 历史档案：`docs/superpowers/specs/2026-08-18-ai-chat-frontend-design.md` 等 8 月旧规格描述的是单文件 `UI/index.html` 时代的实现，仅作过程参考（其 `/api/chat` 请求体已过时，实际为 `{uid, message, thinking}`）。
 
 ## 固件（stm32/）
