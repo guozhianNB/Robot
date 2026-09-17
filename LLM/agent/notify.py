@@ -17,6 +17,12 @@ from ..core import log as audit
 from .. import conf
 
 LEVELS = ("info", "warning", "critical")
+_LEVEL_RANK = {lvl: i for i, lvl in enumerate(LEVELS)}     # info=0 < warning=1 < critical=2
+
+
+def _higher_level(a: str, b: str) -> str:
+    """取更紧急的那个级别（未知值按 info 计）。合并时必须**只升不降**，见 `ingest` 注释。"""
+    return b if _LEVEL_RANK.get(b, 0) > _LEVEL_RANK.get(a, 0) else a
 
 DEFAULT_LEVEL = {
     "sos": "critical", "fall": "critical", "help": "critical",
@@ -79,33 +85,40 @@ def ingest(source: str, type: str, *, level: str = "", uid: str = "",
     # 4. 服务器时间，同时写 created_at 与 last_at
     now = db.now_iso()
 
-    # 5. 去重合并：窗口内同 (source,type,uid) 的未处理通知
+    # 5. 去重合并：窗口内同 (source,type,uid,正文) 的未处理通知
     since = (datetime.now() - timedelta(seconds=conf.NOTIFY_DEDUP_S)).strftime("%Y-%m-%d %H:%M:%S")
-    old = db.find_unacked_notification(source, type, uid_, since)
+    old = db.find_unacked_notification(source, type, uid_, since, body_)
+    # 合并级别**只升不降**：同正文的同一件事由 info 改报 critical 时，降级会把红卡+蜂鸣一起抹掉。
+    eff = _higher_level(old.get("level") or "", lvl) if old else lvl
     # 竞态守卫：find 与 bump 各自持锁、不在同一临界区 —— 护士可能在这两步之间把该行 ack 了。
     # bump 的 UPDATE 带 `ack_at=''`，rowcount=0 即"刚被处理"：此时**必须回落到新增一行**，
     # 否则新上报会被并进"已处理"行（不出未读卡、不响蜂鸣、角标不变）→ 静默丢失。
-    deduped = bool(old) and db.bump_notification(old["id"], now) > 0
+    deduped = bool(old) and db.bump_notification(old["id"], now, level=eff) > 0
     if deduped:
         nid = old["id"]
         cnt = int(old.get("count") or 1) + 1        # 不改 body/title：保留最早原文
+        # 广播与**库里那一行**对齐（规格 M1）：合并时正文/标题/级别一律取库里的值，
+        # 否则实时 toast 与 30s 后的列表刷新会给出两套内容（护士看到卡片自己变了）。
+        title_ = old.get("title") or title_
+        body_ = old.get("body") or body_
     else:
-        nid = db.add_notification(lvl, source, type, uid=uid_, title=title_,
+        eff = lvl                                   # 新行就用本次上报的级别（别继承那个没被合并的旧行）
+        nid = db.add_notification(eff, source, type, uid=uid_, title=title_,
                                   body=body_, ref=ref_, ts=now)
         cnt = 1
 
     # 6. 审计 + 广播
-    audit.log("notify_ingest", source=source, type=type, level=lvl, uid=uid_,
-              id=nid, deduped=deduped)
+    audit.log("notify_ingest", source=source, type=type, level=lvl, stored_level=eff,
+              uid=uid_, id=nid, deduped=deduped)
     # 注意：payload 键必须是 `kind` 而非 `type` —— bus.publish 内部构造
     # {"type": event_type, **payload}，payload 里再用 type 会把事件类型覆盖成业务类型，
     # 前端会丢弃该事件（同 `/api/alarm` 的 alarm_type 注释）。
     # `uid_name` 一并带出（规格 §4.5）：前端收到实时事件不必再拉一次档案就能显示老人。
-    bus.publish("notification", id=nid, level=lvl, source=source, kind=type, uid=uid_,
+    bus.publish("notification", id=nid, level=eff, source=source, kind=type, uid=uid_,
                 uid_name=uid_name(uid_), title=title_, body=body_, count=cnt, last_at=now)
 
-    # 7. 返回
-    return {"ok": True, "id": nid, "deduped": deduped, "level": lvl}
+    # 7. 返回（level 是**库里实际生效**的级别：合并升级后与本次上报可能不同）
+    return {"ok": True, "id": nid, "deduped": deduped, "level": eff}
 
 
 def list_notices(state: str = "all", limit: int = 0, before_id: int = 0) -> list[dict]:

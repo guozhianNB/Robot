@@ -35,7 +35,7 @@
 | D2 | 护士身份（**2026-09-18 二次修订，见 D11**） | 初版＝**复用管理台口令**（`X-Surface: admin`）。因管理员会话是 300s 绝对超时、无续期，被动挂着的护士台每 5 分钟被弹回口令页；用户 2026-09-18 拍板「**护士台不再需要登录、也不会被弹**」→ 改为 **D11**。**始终不变**：不新增护士角色、不动 `session.derive_role` / `policy.POLICY_DEFAULTS` / `X-Surface` 取值域（R1–R5 红线区一行不改） |
 | D3 | 通知持久化 | 新增 `notifications` 表作**唯一存储**；`/api/alarm` 的既有契约（审计 + 广播）**保持不变**，只增加"落库"这一路 |
 | D4 | 上报口权限 | `POST /api/notifications` **不校验身份**（模块 11 原文"任何模块发现异常都往该端口 POST"，且雷达/视觉未必持有口令），但每次上报写审计；`ack` / `ack-all` / `DELETE` / `GET` 必须 admin |
-| D5 | 防刷屏 | 同 `(source, type, uid)` 且**尚未处理**的通知，`NOTIFY_DEDUP_S`（默认 60s）内再次上报 → 合并为一条、`count + 1`、刷新 `last_at`，不新增行 |
+| D5 | 防刷屏 | 同 `(source, type, uid, body)` 且**尚未处理**的通知，`NOTIFY_DEDUP_S`（默认 60s）内再次上报 → 合并为一条、`count + 1`、刷新 `last_at`，不新增行；合并时级别**只升不降**（`info` 行被 `critical` 复报 → 升级为红卡）；广播字段与库里那一行对齐。（**2026-09-18 修订**：初版键不含 `body`、不升级级别 —— 会让同一分钟内的不同事情互相吞掉，见 §4.2 注） |
 | D6 | 总线事件 | 新增 `notification`（新通知/合并）与 `notification_ack`（已被处理，多端同步）。**payload 里的一级键用 `kind`，绝不能用 `type`**——`bus.publish` 内部是 `{"type": event_type, **payload}`，payload 里的 `type` 会把事件类型覆盖掉（`/api/alarm` 正是因此才叫 `alarm_type`，见 `LLM/server.py:1096` 注释） |
 | D7 | 视觉尺度 | **不做大按钮、不放大字号**。用户原话："护士端就不用大按钮了吧，人家护士眼睛又不瞎"→ 按普通 PC 控制台尺寸（正文 14–15px、按钮 padding 6px 14px），浅色主题、零术语即可 |
 | D8 | 监听地址 | **必须监听 0.0.0.0**。用户原话："这个前端一定要放在 0.0.0.0 上，这样局域网内 PC 就能访问"→ 生产由后端 8000 托管（启动即 `--host 0.0.0.0`）；**dev server 必须显式 `server.host: true`**（Vite 默认只绑 localhost，这是局域网打不开的常见原因） |
@@ -135,7 +135,19 @@ def prune(days: int = 0) -> int
 - `body` 截断 500 字符、`title` 截断 80、`ts` 非法或为空 → 服务器当前时间（`db.now_iso()`）。
 - `uid` 不校验存在性（上报方可能是视觉/雷达，未必有档案）；列表返回时由路由层补 `uid_name`。
 
-**去重合并：** 查最近 `NOTIFY_DEDUP_S` 秒内、`ack_at=''`、`(source, type, uid)` 相同的行；命中则 `count+1`、`last_at=now`（**不改 `body`**——保留最早那条原文，避免被后续嘈杂文本覆盖），仍然广播一次 `notification`。
+**去重合并：** 查最近 `NOTIFY_DEDUP_S` 秒内、`ack_at=''`、`(source, type, uid, **body**)` 相同的行；命中则 `count+1`、`last_at=now`（**不改 `body`** —— 保留最早那条原文，避免被后续嘈杂文本覆盖），仍然广播一次 `notification`。
+
+> **2026-09-18 修订（由「小车 LLM → 护士后台」MCP 工具批次带出，见
+> `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md` §9 M1）**：初版的合并键只有
+> `(source, type, uid)`，且合并**不动 `level`**、广播却用新正文。当上报方拿不到 uid（新工具
+> `notify_nurse` 的常态，模型不知道 uid 字面量）时，键退化成"所有同源同类型消息"，于是同一分钟内的
+> 「李奶奶摔倒了」(critical) 会被并进「张爷爷想喝水」(info)：实时 toast 一闪，≤30s 后被列表轮询覆盖回
+> 最早那条，**critical 计数不涨、重开页面不再蜂鸣** —— 紧急事件被静默降级。三条改动：
+> ① 合并键加 `body`（合并 = 真正的"同一件事重复上报"，防刷屏口径不变）；
+> ② 合并时级别**只升不降**（`notify._higher_level` 取两者更紧急者；词表留在 agent 层，`store` 只按传入值落库）；
+> ③ 合并时的广播改用**库里那一行**的 `title/body/level`，让实时卡片与 30s 后的列表刷新一致（前端一行未动）。
+> 影响的旧口径：`（source,type,uid）相同但正文不同` 的两条上报**不再合并**（各自成条）——
+> 对 `/api/alarm`、`reminder._escalate` 这类"同一次事件重复上报"（正文相同）无行为变化。
 
 ### 4.3 路由（`LLM/server.py`）
 

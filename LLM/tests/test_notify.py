@@ -117,11 +117,12 @@ def test_ingest_level_fallback_and_empty_type_raises():
 
 
 # ------------------------------------------------------------------ 3 去重合并
-def test_ingest_dedups_within_window_and_keeps_earliest_body():
+def test_ingest_dedups_same_report_within_window():
+    """**同一件事**（同 source/type/uid/**正文**）60s 内重复上报 → 1 行、count+1、保留最早原文。"""
     old = _init_tmp_db()
     try:
         a = notify.ingest("car", "offline", uid="elder_1", body="第一次失联")
-        b = notify.ingest("car", "offline", uid="elder_1", body="第二次失联", title="改写标题")
+        b = notify.ingest("car", "offline", uid="elder_1", body="第一次失联", title="改写标题")
 
         assert b["deduped"] is True and b["id"] == a["id"]
         rows = db.list_notifications()
@@ -134,6 +135,55 @@ def test_ingest_dedups_within_window_and_keeps_earliest_body():
         db.DB_PATH = old
 
 
+def test_ingest_does_not_merge_different_bodies(monkeypatch):
+    """**同一分钟内不同的两件事**不许合并（规格 2026-09-18‑llm-notify-nurse-mcp-design M1）。
+
+    合并键只含 (source,type,uid) 时，uid 为空的新通知工具（`notify_nurse`）会让**所有小车消息**
+    塌成一条，且合并保留最早那条的正文与级别 ⇒ 后来的跌倒(critical)被并进"想喝水"(info)，
+    护士台列表只剩"想喝水"、critical 计数不涨 = 紧急事件静默降级。正文进合并键即修此。
+    """
+    old = _init_tmp_db()
+    evts = []
+    monkeypatch.setattr(notify.bus, "publish", lambda ev, **kw: evts.append((ev, kw)))
+    try:
+        a = notify.ingest("cart", "message", level="info", body="张爷爷想喝水")
+        b = notify.ingest("cart", "message", level="critical", body="李奶奶摔倒了")
+
+        assert b["deduped"] is False and b["id"] != a["id"]
+        rows = {r["id"]: r for r in db.list_notifications(state="unread")}
+        assert len(rows) == 2
+        assert rows[b["id"]]["level"] == "critical"      # 红卡没有被并掉
+        assert rows[b["id"]]["body"] == "李奶奶摔倒了"
+        assert [e[1]["level"] for e in evts] == ["info", "critical"]
+    finally:
+        _cleanup_tmp_db()
+        db.DB_PATH = old
+
+
+def test_merge_upgrades_level_never_downgrades(monkeypatch):
+    """同正文的同一件事由 info 改报 critical → 库里的级别**升**到 critical（红卡与蜂鸣不许被抹掉）。"""
+    old = _init_tmp_db()
+    evts = []
+    monkeypatch.setattr(notify.bus, "publish", lambda ev, **kw: evts.append((ev, kw)))
+    try:
+        a = notify.ingest("cart", "message", level="info", body="老人摔倒了")
+        b = notify.ingest("cart", "message", level="critical", body="老人摔倒了")
+
+        assert b["deduped"] is True and b["id"] == a["id"]
+        assert b["level"] == "critical"
+        row = db.get_notification(a["id"])
+        assert row["level"] == "critical" and row["count"] == 2
+        # 广播与库里那一行对齐（否则实时 toast 与 30s 后的列表刷新会给出两套内容）
+        assert evts[-1][1]["level"] == "critical" and evts[-1][1]["body"] == row["body"]
+
+        # 反向：已经 critical 的行不许被后来的 info 降级
+        notify.ingest("cart", "message", level="info", body="老人摔倒了")
+        assert db.get_notification(a["id"])["level"] == "critical"
+    finally:
+        _cleanup_tmp_db()
+        db.DB_PATH = old
+
+
 # ------------------------------------------------------------------ 4 已 ack 的不许并入
 def test_acked_notification_is_not_merged_again():
     old = _init_tmp_db()
@@ -141,7 +191,7 @@ def test_acked_notification_is_not_merged_again():
         a = notify.ingest("car", "offline", uid="elder_1", body="失联")
         assert notify.ack(a["id"]) is True
 
-        b = notify.ingest("car", "offline", uid="elder_1", body="又失联")
+        b = notify.ingest("car", "offline", uid="elder_1", body="失联")   # 同正文才走得到合并分支
 
         assert b["deduped"] is False and b["id"] != a["id"]
         assert len(db.list_notifications(state="all")) == 2
@@ -175,9 +225,9 @@ def test_ingest_adds_new_row_when_bump_loses_ack_race(monkeypatch):
     old = _init_tmp_db()
     try:
         a = notify.ingest("car", "offline", uid="elder_1", body="第一次失联")
-        monkeypatch.setattr(db, "bump_notification", lambda nid, ts: 0)
+        monkeypatch.setattr(db, "bump_notification", lambda nid, ts, **kw: 0)
 
-        b = notify.ingest("car", "offline", uid="elder_1", body="第二次失联")
+        b = notify.ingest("car", "offline", uid="elder_1", body="第一次失联")   # 同正文才走合并分支
 
         assert b["deduped"] is False and b["id"] != a["id"]
         assert len(db.list_notifications(state="all")) == 2

@@ -1525,25 +1525,41 @@ def get_notification(nid: int) -> dict | None:
         conn.close()
 
 
-def find_unacked_notification(source: str, ntype: str, uid: str, since_iso: str) -> dict | None:
-    """查去重合并目标：同 (source,type,uid) 且**未处理**、`last_at >= since_iso` 的最新一条。
+def find_unacked_notification(source: str, ntype: str, uid: str, since_iso: str,
+                              body: str | None = None) -> dict | None:
+    """查去重合并目标：同 (source,type,uid,**正文**) 且**未处理**、`last_at >= since_iso` 的最新一条。
 
     只认未处理的（已 ack 的通知不许被新事件并入 —— 那会把护士刚处理完的条目又翻成未读）。
+
+    **正文是合并键的一部分**（2026-09-18 加，规格
+    `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md` M1）：只按
+    (source,type,uid) 合并时，同一分钟内「张爷爷想喝水」与「李奶奶摔倒了」会并成一条，而合并
+    只 `count+1`、**保留最早那条的正文与级别** ⇒ 护士台列表最终只剩「想喝水」、critical 计数也
+    不涨，紧急事件被静默降级。正文参与合并键后，合并 = 真正的"同一件事重复上报"。
+    `body=None` 保留旧口径（只给迁移/测试用，业务调用一律传正文）。
     """
+    sql = ("""SELECT * FROM notifications
+              WHERE source=? AND type=? AND uid=? AND ack_at='' AND last_at>=? """)
+    args: list = [source or "", ntype, uid or "", since_iso]
+    if body is not None:
+        sql += "AND body=? "
+        args.append(body or "")
+    sql += f"{_NOTIFY_ORDER} LIMIT 1"
     conn = _conn()
     try:
-        r = conn.execute(
-            f"""SELECT * FROM notifications
-                WHERE source=? AND type=? AND uid=? AND ack_at='' AND last_at>=?
-                {_NOTIFY_ORDER} LIMIT 1""",
-            (source or "", ntype, uid or "", since_iso)).fetchone()
+        r = conn.execute(sql, tuple(args)).fetchone()
         return dict(r) if r else None
     finally:
         conn.close()
 
 
-def bump_notification(nid: int, ts: str) -> int:
-    """合并：count+1、last_at=ts（**不动 body/title** —— 保留最早原文），返回受影响行数。
+def bump_notification(nid: int, ts: str, level: str = "") -> int:
+    """合并：count+1、last_at=ts、必要时提级别（**只升不降**）；**不动 body/title**（保留最早原文）。
+
+    `level` 传空串 = 不改级别；非空则覆盖。**由调用方算出"两者中更紧急的那个"**：级别词表住在
+    agent 层（`notify.LEVELS`），store 层不认识它，故不在这里做比较。
+    升级而非"保留最早级别"的原因同上：同正文的同一件事由 info 改报 critical（"老人摔倒了"先当
+    一般通知、后确认是跌倒）时，降级会把红卡与蜂鸣一起抹掉。
 
     **`AND ack_at=''` 是竞态守卫**：`find_unacked_notification` 与本事不在同一临界区，
     护士可能正好在这两步之间 ack 掉该行。此时 rowcount=0，调用方（`notify.ingest`）
@@ -1554,8 +1570,10 @@ def bump_notification(nid: int, ts: str) -> int:
         conn = _conn()
         try:
             cur = conn.execute(
-                "UPDATE notifications SET count=count+1, last_at=? WHERE id=? AND ack_at=''",
-                (ts, nid))
+                "UPDATE notifications SET count=count+1, last_at=?, "
+                "level=CASE WHEN ?='' THEN level ELSE ? END "
+                "WHERE id=? AND ack_at=''",
+                (ts, level or "", level or "", nid))
             conn.commit()
             return cur.rowcount
         finally:
