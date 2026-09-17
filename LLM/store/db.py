@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from datetime import datetime
 
-from .conf import DB_PATH, HISTORY_WINDOW
+from ..conf import DB_PATH, HISTORY_WINDOW
 
 _lock = threading.RLock()
 
@@ -463,7 +463,7 @@ def import_memories(uid: str, text: str, by: str = "nurse",
             conn.commit()
         finally:
             conn.close()
-    from . import log as audit
+    from ..core import log as audit
     audit.log("memory_change", action="import", uid=uid, count=imported, by=by)
     return {"ok": True, "imported": imported, "skipped": skipped}
 
@@ -1175,8 +1175,8 @@ def update_memory_content(mid: int, content: str) -> None:
 
 # ---------------------------------------------------------------- settings
 def get_settings() -> dict:
-    from .conf import DEFAULT_SETTINGS
-    from .tools import TOOL_DEFAULTS
+    from ..conf import DEFAULT_SETTINGS
+    from ..agent.tools import TOOL_DEFAULTS
     out = dict(DEFAULT_SETTINGS)
     out.update(TOOL_DEFAULTS)   # per-tool 开关默认值（已保存的随后覆盖）
     conn = _conn()
@@ -1206,8 +1206,8 @@ def get_settings() -> dict:
 
 
 def set_settings(patch: dict) -> dict:
-    from .conf import DEFAULT_SETTINGS
-    from .tools import TOOL_DEFAULTS
+    from ..conf import DEFAULT_SETTINGS
+    from ..agent.tools import TOOL_DEFAULTS
     cur = get_settings()
     allowed = set(DEFAULT_SETTINGS) | set(TOOL_DEFAULTS)
     cur.update({k: v for k, v in patch.items() if k in allowed})

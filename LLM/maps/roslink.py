@@ -17,7 +17,7 @@ import json
 import threading
 import time
 
-from . import conf
+from .. import conf
 
 # ---- 可选依赖：websocket-client ----
 try:                                       # pragma: no cover - 取决于运行环境

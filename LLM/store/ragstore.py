@@ -8,8 +8,8 @@ import uuid
 
 from . import db
 from . import embed
-from . import log as audit
-from .conf import DATA_DIR
+from ..core import log as audit
+from ..conf import DATA_DIR
 
 _AVAILABLE = True
 _PATH = str(DATA_DIR / "chroma")

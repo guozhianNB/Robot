@@ -31,7 +31,8 @@ import time
 
 import numpy as np
 
-from .. import db, log as audit
+from ..store import db
+from ..core import log as audit
 from . import config
 from . import audio, vad as vad_mod, kws as kws_mod, asr as asr_mod, tts as tts_mod
 from . import speaker as spk_mod, identity as id_mod, session as session_mod
@@ -80,7 +81,7 @@ class VoiceWorker(threading.Thread):
         self.sub_status = {}
         self.current_uid = None
         # 手动锁定用户（规格 D11）——**兼容属性，不参与任何判定**：锁定语义的唯一真相是
-        # 会话层 `LLM/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
+        # 会话层 `LLM/agent/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
         # 语音可用时被 `voice_api.set_session_uid` 同步，语音降级/管理台登出后会永久粘住，
         # 拿它判定就等于"陈旧的锁定一直带下去、只能重启恢复"。判定处一律读会话层。
         self.locked_uid = None
@@ -350,7 +351,7 @@ class VoiceWorker(threading.Thread):
         * **没认出来 → 主体不动**（集体层已由位置/手动维持，这里不许回写、更不许把旧主体
           当成"刚认出来的"——那会把位置自动切换的结果回退掉）。
 
-        注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
+        注意：这里引的是**顶层角色会话层** `LLM/agent/session.py`（≠ `LLM.voice.session`
         语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
 
         **锁定语义读会话层**（不读 `self.locked_uid` 镜像）：镜像只在语音可用时被
@@ -362,7 +363,7 @@ class VoiceWorker(threading.Thread):
         退回上一主体（本方法不改任何内存态）。
         """
         try:
-            from LLM import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
+            from ..agent import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
             principal = role_session.get_principal("kiosk")
             if principal["role"] == "admin":
                 return
@@ -377,7 +378,7 @@ class VoiceWorker(threading.Thread):
         self.session.note_speech()
         audit.log("voice_asr", text=text[:200])
 
-        from LLM import session as role_session
+        from ..agent import session as role_session
         # 读会话层（= 读库）异常（`database is locked` 等）不许从 try 之外抛穿到 `run()` 的
         # except —— 那会 `_reconnect()` 掉这一整句：没有应答、没有 TTS。出问题只记审计，
         # 并用"上一次已知主体"（取 prev 失败时用空主体）继续把这一句答完。

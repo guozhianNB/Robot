@@ -7,7 +7,7 @@ import json
 import threading
 from datetime import datetime
 
-from .conf import AUDIT_LOG
+from ..conf import AUDIT_LOG
 
 _lock = threading.Lock()
 

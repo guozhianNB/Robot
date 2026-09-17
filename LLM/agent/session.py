@@ -19,11 +19,11 @@ r"""
 """
 import time
 
-from . import bus
-from . import db
-from . import locator
-from . import log as audit
-from . import zonegeo
+from ..core import bus
+from ..store import db
+from ..maps import locator
+from ..core import log as audit
+from ..core import zonegeo
 
 SLOTS = ("kiosk", "admin")
 ADMIN_UID = "admin"
@@ -206,7 +206,7 @@ def change_admin_password(old: str, new: str) -> dict:
 
 def restore_factory_password() -> dict:
     """把管理员口令恢复为 `.env` 的 PASSWORD，并立即作废全部管理员会话。"""
-    from . import conf
+    from .. import conf
     password = conf.FACTORY_PASSWORD
     if len(password) < 4:
         audit.log("admin_password_restored", ok=False, reason="factory_password_unavailable")

@@ -22,7 +22,8 @@ import json
 import os
 import time
 
-from . import db, log as audit
+from ..store import db
+from ..core import log as audit
 from . import mapserver
 from .mapstore import MapStoreError, check_name, get_store
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Kuzu 图谱封装测试：实体/边去重 + 一跳查询 + 降级。"""
 import pytest
-from LLM import graph
+from LLM.store import graph
 
 
 @pytest.fixture

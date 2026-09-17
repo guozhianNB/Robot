@@ -13,7 +13,7 @@ r"""MCP 集成冒烟测试（独立脚本，下划线前缀 → 不会被 tools.
 真实部署请把服务器配置写进 conf.py 的 MCP_SERVERS（而不是这里临时注入）。
 """
 from .. import conf
-from .. import mcp_client
+from ..agent import mcp_client
 
 FETCH_URL = "https://example.com"
 

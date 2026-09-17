@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """embed.py 测试：回退维度统一 + 无 key 降级。"""
-from LLM import embed
+from LLM.store import embed
 
 
 def test_fallback_dim_is_embed_dim(monkeypatch):

@@ -12,8 +12,8 @@ A = {"X-Surface": "admin"}
 
 @pytest.fixture()
 def c():
-    from LLM import db
-    from LLM import session
+    from LLM.store import db
+    from LLM.agent import session
     tmp = tempfile.mkdtemp()
     old = db.DB_PATH
     db.DB_PATH = os.path.join(tmp, "t.db")
@@ -89,7 +89,7 @@ def test_wards_crud_and_admin_auth_toggle(c):
 
 def test_delete_ward_detaches_elders_and_clears_current_session(c):
     """删病房只删档案/关联，不留下老人归属与当前会话悬空引用。"""
-    from LLM import db
+    from LLM.store import db
 
     c.post("/api/session/login", json={"password": "111111"}, headers=A)
     assert c.post("/api/profiles/elder_101_1/ward",
@@ -205,7 +205,9 @@ def test_chat_takes_principal_from_surface(c, monkeypatch):
     管理员说的话是**管理层**的话（不沉淀成老人记忆），不能因为浏览器走的是 kiosk 槽就降级成
     集体层；反之车前屏也不该因为管理台登录了而提权。
     """
-    from LLM import chat, server, voice_api
+    from LLM.agent import chat
+    from LLM import server
+    from LLM.voice import voice_api
     seen = {}
 
     def stream(*args, **kwargs):
@@ -296,7 +298,7 @@ def test_chat_history_requires_matching_principal(c):
 
 def test_chat_history_without_principal_does_not_fall_back_to_an_elder(c):
     """未选主体时返回空结果，不能沿用旧默认值去读删 elder_001。"""
-    from LLM import db
+    from LLM.store import db
     db.append_history("elder_001", "user", "private")
 
     assert c.get("/api/chat/history", headers=K).json()["history"] == []
@@ -337,7 +339,8 @@ def test_ward_assign_unknown_uid_is_not_ok(c):
 
 def test_record_zone_checks_ward_before_writing_map(c, monkeypatch):
     """未知病房必须在地图写入前失败，避免产生无人引用的 tags 区域。"""
-    from LLM import locator, maptags, session
+    from LLM.maps import locator, maptags
+    from LLM.agent import session
     writes = []
     c.post("/api/session/login", json={"password": "111111"}, headers=A)
     monkeypatch.setattr(locator, "get_pose", lambda: {"x": 1.0, "y": 2.0})

@@ -9,7 +9,8 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import conf, mapapi, mapeditor_server
+from LLM import conf, mapeditor_server
+from LLM.maps import mapapi
 
 
 def test_editor_app_serves_all_editor_routes(app_paths):

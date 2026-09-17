@@ -21,12 +21,12 @@ import threading
 import time
 import re
 
-from . import db
-from . import log as audit
-from . import vectors
-from . import graph
-from . import ragstore
-from .conf import (MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS,
+from ..store import db
+from ..core import log as audit
+from ..core import vectors
+from ..store import graph
+from ..store import ragstore
+from ..conf import (MEMORY_RULES, EVENT_TTL_DAYS, EPISODE_TTL_DAYS,
                    CORE_IMPORTANCE_THRESHOLD, IDENTITY_KEYWORDS)
 
 # 医疗字段关键词：命中即判定为医疗信息，禁止模型写入
@@ -127,7 +127,7 @@ def recall(uid: str, query: str) -> dict:
 
 def recall_v3(uid: str, query: str) -> dict:
     """v3 检索组装：只读档案 + 核心记忆（cap）+ RAG Top-K + 图谱一跳关系。"""
-    from .conf import MEMORY_TOP_K, CORE_MEMORY_CAP, CORE_MEMORY_CHAR_CAP
+    from ..conf import MEMORY_TOP_K, CORE_MEMORY_CAP, CORE_MEMORY_CHAR_CAP
     parts = []
     sources = []
     profile = db.get_profile(uid)
@@ -650,7 +650,7 @@ def correct_from_feedback(uid: str, old_content: str, new_content: str,
     - 新内容按 authority 语义写入 core（nurse 定稿）；无旧条目命中则当作新增
     - 全程审计留痕；纯服务端实现，不依赖 LLM
     """
-    from . import ragstore as _rs
+    from ..store import ragstore as _rs
     results = db.find_memories_by_content(uid, old_content,
                                           tables=("core_memories", "rag_memories"))
     stats = {"core_softdel": 0, "rag_softdel": 0, "added": 0, "redline": 0}

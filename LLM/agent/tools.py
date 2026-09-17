@@ -60,6 +60,16 @@ def _run_fn(fn, args: dict):
     return fn(**kwargs)
 
 
+def _audit_args(name: str, args: dict | None):
+    """Keep image and prompt payloads out of policy-denial audit records."""
+    if name == "see_what":
+        channel = args.get("channel") if isinstance(args, dict) else None
+        if isinstance(channel, int) and not isinstance(channel, bool) and 1 <= channel <= 255:
+            return {"channel": channel}
+        return {}
+    return args or {}
+
+
 
 
 
@@ -71,12 +81,15 @@ def _run_fn(fn, args: dict):
 
 # ---------------------------------------------------------------- 自动加载工具实现
 # 遍历 LLM/tool/ 子包，import 所有模块触发 @tool 装饰器注册（下划线开头为共享辅助，跳过）。
-from . import tool as _tool_pkg
+from .. import tool as _tool_pkg
 
 for _mod in pkgutil.iter_modules(_tool_pkg.__path__):
     if _mod.name.startswith("_"):
         continue
-    importlib.import_module(f"{__package__}.tool.{_mod.name}")
+    # 必须用 `_tool_pkg.__name__`（= "LLM.tool"）拼绝对模块名，**不要**用 `__package__`：
+    # 本模块已从 LLM 根搬到 LLM/agent/，`__package__` 会是 "LLM.agent"，拼出
+    # "LLM.agent.tool.*" 这个不存在的路径（2026-09-17 分包时踩过）。
+    importlib.import_module(f"{_tool_pkg.__name__}.{_mod.name}")
 
 
 # ---------------------------------------------------------------- 注册表导出
@@ -92,7 +105,7 @@ def _mcp_roles(server: str) -> set[str]:
     注意区分"未声明"与"显式声明为空"：`.get("roles") is None` = 未声明（给 admin）；
     `roles=[]` = 作者明确表示"谁都不给"，就真的给谁都不给。
     """
-    from .conf import MCP_SERVERS
+    from ..conf import MCP_SERVERS
     declared = MCP_SERVERS.get(server, {}).get("roles")
     return {"admin"} if declared is None else set(declared)
 
@@ -161,7 +174,7 @@ def tools_with_state(settings: dict) -> list[dict]:
 def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     """统一分发。**执行前再校验一次角色白名单**（闸门 2 第二道）。"""
     from .policy import POLICY_DEFAULTS, role_policy
-    from . import log as audit
+    from ..core import log as audit
     p = principal or {}
     role = p.get("role")
     resolved = role if role in POLICY_DEFAULTS else "ward"
@@ -178,11 +191,11 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     if not is_local:
         # 总开关：`effective_tools()` 看不见的 MCP 工具，这里同样不许被直调
         # （模型可能凭上一轮/缓存里的 schema 点名调用）。
-        from . import db
+        from ..store import db
         if not db.get_settings().get("mcp_enabled"):
             audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
                       uid=p.get("uid"), slot=p.get("slot"),
-                      decision="deny", args=args or {}, reason="mcp_disabled")
+                      decision="deny", args=_audit_args(name, args), reason="mcp_disabled")
             return {"ok": False, "error": f"MCP 工具总开关已关闭，不允许调用工具 {name}"}
     allow_ok = allow is None or name in allow
     if is_local:
@@ -195,7 +208,7 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
         # 聚合的越权统计会把 fail-closed 的兜底算成"集体层越权"。
         audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
                   uid=p.get("uid"), slot=p.get("slot"),
-                  decision="deny", args=args or {},
+                  decision="deny", args=_audit_args(name, args),
                   reason="out_of_role_whitelist" if not allow_ok else "tool_roles_mismatch")
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not is_local:

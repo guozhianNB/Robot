@@ -30,7 +30,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import conf
+from .. import conf
 
 VERSION = 1
 KINDS = ("local", "ssh")

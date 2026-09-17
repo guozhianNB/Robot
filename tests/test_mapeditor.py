@@ -20,7 +20,10 @@ import pytest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
-from LLM import conf, db, locator, log as audit_log, mapserver, mapsources, mapstore, maptags  # noqa: E402
+from LLM import conf
+from LLM.store import db
+from LLM.maps import locator, mapserver, mapsources, mapstore, maptags
+from LLM.core import log as audit_log  # noqa: E402
 
 SAMPLE_YAML = """image: my_map.pgm
 mode: trinary
@@ -559,7 +562,7 @@ def test_pose_injection_and_degrade(env):
 
 
 def test_rosbridge_connection_failure_has_retry_backoff(monkeypatch):
-    from LLM import roslink
+    from LLM.maps import roslink
 
     calls = 0
 
@@ -927,7 +930,7 @@ def test_map_list_does_not_block_event_loop(monkeypatch):
     import asyncio
     import time
 
-    from LLM import mapapi as server   # map_list/_store 已随编辑器路由搬到 mapapi（任务 1）
+    from LLM.maps import mapapi as server   # map_list/_store 已随编辑器路由搬到 mapapi（任务 1）
 
     class SlowStore:
         root = "slow-test"

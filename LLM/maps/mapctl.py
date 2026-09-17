@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""地图编辑器独立服务的进程管理（主后端侧，规格 §3.3）。
 
-主后端**不 import 编辑器业务**（那是 ``LLM.mapapi``，且跑在另一个进程里）：本模块只用 stdlib
+主后端**不 import 编辑器业务**（那是 ``LLM.maps.mapapi``，且跑在另一个进程里）：本模块只用 stdlib
 拉起 / 探活 / 停止它，对外暴露 3 条**仅管理员**可用接口：
 
     GET  /api/mapeditor/service          状态（none | managed | external）
@@ -24,10 +24,10 @@ import urllib.request
 
 from fastapi import APIRouter, Header, HTTPException
 
-from . import conf
-from . import log as audit
-from . import session
-from .conf import BASE_DIR
+from .. import conf
+from ..core import log as audit
+from ..agent import session
+from ..conf import BASE_DIR
 
 router = APIRouter()
 
@@ -239,7 +239,7 @@ def stop(hard: bool = False) -> dict:
 # --------------------------------------------------------------------------- 路由
 def _require_admin(x_surface: str) -> None:
     """仅管理员可启停编辑器服务；X-Surface 非法值 → 400（与 server._surface 同口径）。"""
-    from .server import _surface        # 延迟导入：server 反过来 import 本模块，顶层导入会成环
+    from ..server import _surface        # 延迟导入：server 反过来 import 本模块，顶层导入会成环
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可启停地图编辑器服务")
 

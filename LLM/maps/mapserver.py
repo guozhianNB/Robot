@@ -24,7 +24,7 @@ import struct
 import zlib
 from pathlib import Path
 
-from . import conf
+from .. import conf
 from .mapstore import MapStoreError, get_store
 
 # 像素分类

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from LLM import policy
+from LLM.agent import policy
 
 
 def test_policy_keys_cover_three_roles():

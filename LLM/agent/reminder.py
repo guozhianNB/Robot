@@ -10,10 +10,10 @@ r"""
 import threading
 from datetime import datetime, timedelta
 
-from . import db
-from . import bus
-from . import log as audit
-from .conf import REMINDER_STATUS
+from ..store import db
+from ..core import bus
+from ..core import log as audit
+from ..conf import REMINDER_STATUS
 
 _tick = 15          # 扫描间隔（秒）
 _miss_window = 300  # 错过判定窗口：超过触发点 5 分钟后才触发 → 视为错过补报

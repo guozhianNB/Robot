@@ -31,8 +31,8 @@ import asyncio       # 跨线程桥接：run_coroutine_threadsafe / wait_for / n
 import os            # env 懒加载：子进程缺的环境变量从 os.environ 运行时补全
 import threading     # 后台守护线程，承载 MCP 专属 asyncio 事件循环
 
-from . import log as audit                 # 审计日志：所有状态变更落 JSONL（事件类型 mcp / mcp_degraded）
-from .conf import (
+from ..core import log as audit                 # 审计日志：所有状态变更落 JSONL（事件类型 mcp / mcp_degraded）
+from ..conf import (
     MCP_SERVERS,        # dict[str, dict]：服务器名 -> {"command","args","env","enabled"}，MCP 服务器清单
     MCP_TOOL_TIMEOUT,   # int：单次工具调用超时（秒），防 MCP 子进程卡死拖死对话
     MCP_CONNECT_TIMEOUT # int：单台服务器连接/握手超时（秒），防坏配置阻塞启动
@@ -43,7 +43,7 @@ from .conf import (
 #  - _MCP_AVAILABLE = False 时，mcp 相关名字（ClientSession 等）在 try 块外不可用，
 #    所有对外函数必须先判断 _MCP_AVAILABLE 再使用，否则 NameError；
 #  - _MISSING_DEPS 逐个收集缺失原因（缺多个时别只报第一个），供审计/健康接口展示。
-# 这是 AGENTS.md「系统稳健性」要求的统一降级模式，与 LLM/voice_api.py 保持一致。
+# 这是 AGENTS.md「系统稳健性」要求的统一降级模式，与 LLM/voice/voice_api.py 保持一致。
 # ---------------------------------------------------------------------------
 _MCP_AVAILABLE = True       # 依赖层可用性标志：True = mcp SDK 可 import
 _MISSING_DEPS = []          # 缺失依赖原因列表（每个异常一条），为空 = 依赖齐全

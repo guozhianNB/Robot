@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Protocol
 
-from . import conf
+from .. import conf
 
 # 允许在 store 里收发的地图扩展名（tags.json 是"标记边车"，与 pgm/yaml 同级同前缀）
 EXTS = ("yaml", "pgm", "tags")

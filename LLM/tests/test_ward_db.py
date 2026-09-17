@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from LLM import db
+from LLM.store import db
 
 
 @pytest.fixture()

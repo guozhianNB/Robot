@@ -3,7 +3,7 @@ r"""
 位姿与「车此刻在跑哪张图」（规格 §5.3 / §5.4）—— 只读，且**默认降级可用**。
 
 分工：
-  * :mod:`LLM.roslink` 负责"连接 rosbridge + 降级 + 假数据注入"；
+  * :mod:`LLM.maps.roslink` 负责"连接 rosbridge + 降级 + 假数据注入"；
   * 本模块负责"位姿从哪来、当前地图是哪张"这两件业务。
 
 降级口径（AGENTS「系统稳健性」）：
@@ -21,7 +21,8 @@ import threading
 import time
 import copy
 
-from . import conf, mapserver, roslink
+from .. import conf
+from . import mapserver, roslink
 from .mapstore import MapStoreError, get_store
 
 _lock = threading.RLock()
@@ -192,7 +193,7 @@ def current_map(store=None) -> dict:
     global _current_cache
     settings = None
     try:
-        from . import db as _db
+        from ..store import db as _db
         settings = _db.get_settings()
     except Exception:      # noqa: BLE001  拿不到设置就用默认（不影响只读识别）
         settings = None

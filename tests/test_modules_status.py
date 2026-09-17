@@ -36,7 +36,7 @@ def test_modules_status_shape(monkeypatch):
     # `mapctl.stop()`：测试进程里没有句柄，不桩就落到 external 分支去 POST 真实
     # 127.0.0.1:8010 的自停接口。这里显式再桩一次（`tests/conftest.py` 的
     # `no_real_mapeditor_stop` 已全目录兜底，这一条是就地可见的意图声明）。
-    from LLM import mapctl
+    from LLM.maps import mapctl
     monkeypatch.setattr(mapctl, "stop", lambda: {"ok": True, "running": False,
                                                  "source": "none", "pid": None,
                                                  "port": 8010, "uptime_s": None})
@@ -70,7 +70,7 @@ def test_lifespan_shutdown_does_not_hit_real_editor_service(monkeypatch):
     "本目录进 lifespan 的用例都已被护栏罩住"这件事的可观测后果 —— 摘掉 conftest 那条
     fixture，本用例立刻回红。`port_alive` 恒 True 也是刻意的：模拟"本机真有编辑器在听"。
     """
-    from LLM import mapctl
+    from LLM.maps import mapctl
 
     seen = []
 

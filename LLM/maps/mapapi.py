@@ -19,9 +19,10 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import conf, db
-from . import log as audit
-from .conf import BASE_DIR
+from .. import conf
+from ..store import db
+from ..core import log as audit
+from ..conf import BASE_DIR
 
 router = APIRouter()
 
@@ -190,7 +191,8 @@ async def map_sources_list(test: bool = Query(False)):
 @router.post("/api/map/sources")
 async def map_sources_upsert(body: dict = None):
     """新增/修改一条源。**这是配置入口，不是给界面自由填路径用的**：界面只做选择。"""
-    from . import log as audit, mapsources
+    from ..core import log as audit
+    from . import mapsources
     body = body or {}
     src = body.get("source") if isinstance(body.get("source"), dict) else body
     try:
@@ -205,7 +207,8 @@ async def map_sources_upsert(body: dict = None):
 @router.post("/api/map/sources/{sid}/default")
 async def map_sources_set_default(sid: str):
     """把某源设为默认源（不传 ``?source=`` 时用它）。"""
-    from . import log as audit, mapsources
+    from ..core import log as audit
+    from . import mapsources
     try:
         doc = mapsources.set_default(sid)
     except mapsources.SourceError as e:
@@ -229,7 +232,8 @@ async def map_sources_test(sid: str):
 @router.delete("/api/map/sources/{sid}")
 async def map_sources_delete(sid: str):
     """删一条源（默认源不允许删，见 mapsources.remove 的说明）。"""
-    from . import log as audit, mapsources
+    from ..core import log as audit
+    from . import mapsources
     try:
         mapsources.remove(sid)
     except mapsources.SourceError as e:
@@ -247,7 +251,7 @@ async def map_list(source: str = Query("", alias="source")):
 
 def _map_list_sync(source: str = ""):
     """同步地图扫描在线程池执行，避免 SSH/PGM 工作阻塞 ASGI 事件循环。"""
-    from . import log as audit
+    from ..core import log as audit
     from . import mapsources
     try:
         store = mapstore.get_store(source)
@@ -333,7 +337,7 @@ def _map_meta_sync(name: str, source: str = ""):
 @router.post("/api/map/{name}/meta")
 def map_meta_set(name: str, body: MapMetaIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """改 resolution/origin 等元数据：**先返回将失效的标记数并要求 confirm=true**（规格 §7.2）。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
@@ -439,7 +443,7 @@ def _rewrite_yaml_fields(text: str, patch: dict) -> str:
 @router.post("/api/map/{name}/rename")
 def map_rename(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """重命名成对文件（.pgm/.yaml/.tags.json）并同步改 yaml 的 image: 与 tags 的 map:。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n, new = _name_of(name), mapstore.check_name(body.new_name)
     except mapstore.MapStoreError as e:
@@ -482,7 +486,7 @@ def map_rename(name: str, body: MapNameIn, source: str = Query("", alias="source
 @router.post("/api/map/{name}/copy")
 def map_copy(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """复制成对文件 → **标记随行**（指纹一致才复制，规格 §B5.2 第 6 步 / §B九 坑 13）。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n, new = _name_of(name), mapstore.check_name(body.new_name)
     except mapstore.MapStoreError as e:
@@ -542,7 +546,7 @@ def map_copy(name: str, body: MapNameIn, source: str = Query("", alias="source")
 @router.delete("/api/map/{name}")
 def map_delete(name: str, confirm: bool = Query(False), source: str = Query("", alias="source"), store=Depends(_store)):
     """删除成对文件（含 .tags.json）。本图有标记时必须 ``confirm=true``（规格 §5.1）。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(name)
     except mapstore.MapStoreError as e:
@@ -631,7 +635,7 @@ async def destinations_list(map: str = Query("", alias="map"), source: str = Que
 @router.post("/api/destinations")
 def destinations_add(d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """新增地点：服务端完整校验（名称唯一、坐标在地图内、障碍检查）并返回 ``warnings[]``。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(d.map_name)
         out = maptags.upsert_destination(n, d.model_dump(), store=store)
@@ -658,7 +662,7 @@ def destinations_validate(v: ValidateIn, source: str = Query("", alias="source")
 
 @router.post("/api/destinations/{uid}")
 def destinations_update(uid: str, d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(d.map_name)
         out = maptags.upsert_destination(n, d.model_dump(), uid=uid, store=store)
@@ -671,7 +675,7 @@ def destinations_update(uid: str, d: DestinationIn, source: str = Query("", alia
 
 @router.delete("/api/destinations/{uid}")
 def destinations_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
+    from ..core import log as audit
     if not map:
         return _err("缺少 map 参数")
     try:
@@ -686,7 +690,7 @@ def destinations_delete(uid: str, map: str = Query("", alias="map"), source: str
 @router.post("/api/destinations/learn")
 def destinations_learn(body: LearnIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """取**当前位姿**写入该图 tags.json（位姿不可用 → 明确失败并提示"可改为在图上点选"）。"""
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(body.map_name)
         pose = locator.get_pose()
@@ -713,7 +717,7 @@ async def zones_list(map: str = Query("", alias="map"), source: str = Query("", 
 
 @router.post("/api/zones")
 def zones_add(z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
+    from ..core import log as audit
     try:
         n = _name_of(z.map_name)
         out = maptags.upsert_zone(n, z.model_dump(), store=store)
@@ -735,7 +739,7 @@ def zones_update(uid: str, z: ZoneIn, source: str = Query("", alias="source"), s
 
 @router.delete("/api/zones/{uid}")
 def zones_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
+    from ..core import log as audit
     if not map:
         return _err("缺少 map 参数")
     try:
@@ -790,7 +794,7 @@ def map_tags_reindex_all(source: str = Query("", alias="source"), store=Depends(
 
     路径特意避开 ``/api/map/{name}/...`` 前缀，免得和 ``{name}`` 参数路由抢匹配。
     """
-    from . import log as audit
+    from ..core import log as audit
     try:
         out = maptags.reindex_all(store)
     except mapstore.MapStoreError as e:
@@ -845,7 +849,7 @@ def mapeditor_pose_inject(body: PoseInjectIn, source: str = Query("", alias="sou
 @router.post("/api/map/{name}/save")
 def map_save(name: str, body: MapSaveIn, source: str = Query("", alias="source"), store=Depends(_store)):
     """保存像素改动：白名单 → 体积 → yaml 白名单校验 → 备份 → 标记随行 → 原子写 → 审计。"""
-    from . import log as audit
+    from ..core import log as audit
     import base64
     try:
         n = _name_of(name)

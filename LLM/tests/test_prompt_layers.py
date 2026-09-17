@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """三层提示词分层 + 集体上下文单向注入（R5）测试。"""
+import json
 import os
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from LLM import chat
-from LLM import db
+from LLM.agent import chat
+from LLM.store import db
 
 
 @pytest.fixture()
@@ -157,3 +158,212 @@ def test_chat_stream_writes_history_to_principal_uid(d):
     assert any(e["type"] == "meta" and e["router"]["uid"] == "elder_102_1" for e in events)
     assert [r["content"] for r in db.load_history("elder_102_1")] == ["在吗", "好的"]
     assert db.load_history("elder_101_1") == []
+
+
+@pytest.mark.parametrize("result", [
+    {"ok": True, "answer": "camera answer"},
+    {"ok": False, "error": "permission denied: private prompt"},
+])
+def test_see_what_tool_log_fields_never_persist_result_or_prompt(result):
+    args = {"image": "camera", "prompt": "private prompt", "channel": 3}
+    secret_result = result.get("answer") or result.get("error")
+
+    log_args, log_snippet = chat._tool_log_fields(
+        "see_what", args, secret_result
+    )
+
+    assert log_args == {"channel": 3}
+    assert log_snippet == "[视觉结果未写入日志]"
+    assert "private prompt" not in str(log_args)
+    assert secret_result not in log_snippet
+
+
+@pytest.mark.parametrize("channel", [None, 0, 256, True, False, 3.0, "3"])
+def test_see_what_tool_log_fields_rejects_invalid_channel(channel):
+    args = {"image": "camera", "prompt": "private prompt", "channel": channel}
+
+    log_args, log_snippet = chat._tool_log_fields("see_what", args, "secret result")
+
+    assert log_args == {}
+    assert log_snippet == "[视觉结果未写入日志]"
+
+
+def test_non_vision_tool_log_fields_are_unchanged():
+    args = {"query": "normal query"}
+    snippet = "normal result"
+
+    log_args, log_snippet = chat._tool_log_fields("search", args, snippet)
+
+    assert log_args is args
+    assert log_snippet == snippet
+
+
+@pytest.mark.parametrize(
+    "raw_result, expected_snippet",
+    [
+        (
+            {
+                "ok": True,
+                "result": "cloud result containing private prompt",
+                "answer": "real answer",
+                "image": "data:image/jpeg;base64,secret-image",
+            },
+            "cloud result containing private prompt",
+        ),
+        (
+            {
+                "ok": False,
+                "error": "permission denied: private prompt",
+                "answer": "real denied answer",
+                "image": "data:image/jpeg;base64,secret-image",
+            },
+            "permission denied: private prompt",
+        ),
+    ],
+)
+def test_chat_stream_sanitizes_only_persisted_vision_logs(
+    d, monkeypatch, raw_result, expected_snippet
+):
+    class _Function:
+        name = "see_what"
+        arguments = '{"image":"camera","prompt":"private prompt","channel":7}'
+
+    class _ToolCall:
+        index = 0
+        id = "call-1"
+        function = _Function()
+
+    class _Delta:
+        content = None
+        reasoning_content = None
+        tool_calls = [_ToolCall()]
+
+    class _Choice:
+        delta = _Delta()
+        finish_reason = "tool_calls"
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    class _FinalDelta:
+        content = "最终回答"
+        reasoning_content = None
+        tool_calls = None
+
+    class _FinalChoice:
+        delta = _FinalDelta()
+        finish_reason = "stop"
+
+    class _FinalChunk:
+        choices = [_FinalChoice()]
+
+    class _Completions:
+        def __init__(self):
+            self.calls = 0
+            self.requests = []
+
+        def create(self, **kwargs):
+            self.calls += 1
+            self.requests.append(kwargs)
+            return [_Chunk()] if self.calls == 1 else [_FinalChunk()]
+
+    class _Client:
+        def __init__(self):
+            self.chat = type("C", (), {"completions": _Completions()})()
+
+    logged_db = []
+    logged_audit = []
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *_args: [{"type": "function"}])
+    monkeypatch.setattr(chat.tool_mod, "run_tool", lambda *_args: raw_result)
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: logged_db.append((args, kwargs)))
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: logged_audit.append((args, kwargs)))
+
+    client = _Client()
+    events = list(chat.chat_stream(client, "m", "elder_101_1", "看一下", "off", {}))
+
+    tool_result = next(event for event in events if event["type"] == "tool_result")
+    assert tool_result["snippet"] == expected_snippet
+    assert logged_db[0][0][2] == {"channel": 7}
+    assert logged_db[0][0][3] == "[视觉结果未写入日志]"
+    tool_audits = [entry for entry in logged_audit if entry[0] and entry[0][0] == "tool"]
+    assert tool_audits[0][1]["args"] == {"channel": 7}
+    persisted = json.dumps(
+        {"db": logged_db[0], "audit": tool_audits[0]}, ensure_ascii=False
+    )
+    for secret in ("private prompt", "secret-image", "real answer", expected_snippet):
+        assert secret not in persisted
+
+    second_messages = client.chat.completions.requests[1]["messages"]
+    tool_message = next(message for message in second_messages if message["role"] == "tool")
+    assert raw_result["image"] in tool_message["content"]
+    assert (raw_result.get("result") or raw_result.get("error")) in tool_message["content"]
+    assert raw_result["answer"] in tool_message["content"]
+    assert events[-1] == {"type": "done", "assistant": "最终回答"}
+
+
+def test_chat_stream_keeps_non_vision_tool_log_fields_unchanged(d, monkeypatch):
+    class _Function:
+        name = "search"
+        arguments = '{"query":"normal query"}'
+
+    class _ToolCall:
+        index = 0
+        id = "call-search"
+        function = _Function()
+
+    class _Delta:
+        content = None
+        reasoning_content = None
+        tool_calls = [_ToolCall()]
+
+    class _Choice:
+        delta = _Delta()
+        finish_reason = "tool_calls"
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    class _FinalDelta:
+        content = "搜索完成"
+        reasoning_content = None
+        tool_calls = None
+
+    class _FinalChoice:
+        delta = _FinalDelta()
+        finish_reason = "stop"
+
+    class _FinalChunk:
+        choices = [_FinalChoice()]
+
+    class _Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            return [_Chunk()] if self.calls == 1 else [_FinalChunk()]
+
+    class _Client:
+        def __init__(self):
+            self.chat = type("C", (), {"completions": _Completions()})()
+
+    original_args = {"query": "normal query"}
+    original_snippet = "normal result"
+    logged_db = []
+    logged_audit = []
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *_args: [{"type": "function"}])
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: logged_db.append((args, kwargs)))
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: logged_audit.append((args, kwargs)))
+
+    monkeypatch.setattr(
+        chat.tool_mod,
+        "run_tool",
+        lambda *_args: {"ok": True, "result": original_snippet},
+    )
+    events = list(chat.chat_stream(_Client(), "m", "elder_101_1", "搜索", "off", {}))
+
+    assert events[-1] == {"type": "done", "assistant": "搜索完成"}
+    assert logged_db[0][0][2] == original_args
+    assert logged_db[0][0][3] == original_snippet
+    tool_audits = [entry for entry in logged_audit if entry[0] and entry[0][0] == "tool"]
+    assert tool_audits[0][1]["args"] == original_args

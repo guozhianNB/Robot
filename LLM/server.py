@@ -30,12 +30,15 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
-from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
-from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
-from . import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
-from . import locator, maptags   # 病房位置自动切换 / 记录病房区域要用（编辑器路由已搬走）
-from . import mapctl         # 地图编辑器服务（独立进程）的启停管理
-from . import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
+from .store import db
+from .core import bus
+from .agent import chat, memory as rag, reminder, tools as tool_mod
+from .voice import voice_api
+from .agent import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
+from .agent import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
+from .maps import locator, maptags   # 病房位置自动切换 / 记录病房区域要用（编辑器路由已搬走）
+from .maps import mapctl         # 地图编辑器服务（独立进程）的启停管理
+from .core import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
 from .conf import MODEL, BASE_DIR
 from . import conf
 
@@ -55,17 +58,17 @@ _shutting_down = False                    # 退出中标志：幂等防重入（
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from . import log as audit
+    from .core import log as audit
     db.init_db()
 
     # 记忆 v3 迁移（幂等）+ 依赖自检
     try:
-        from . import migrate
+        from .store import migrate
         migrate.run()
     except Exception as e:
         audit.log("memory_change", action="migrate_error", error=str(e))
 
-    from . import embed as embed_mod, ragstore, graph
+    from .store import embed as embed_mod, ragstore, graph
     audit.log("memory_degraded", embed=embed_mod.status(),
               ragstore=ragstore.status(), graph=graph.status())
 
@@ -135,7 +138,7 @@ def _seed_demo():
         db.upsert_medication_reminder("elder_001", med["name"], med["dose"], med["time"])
     db.add_reminder("elder_001", "nurse", "护士建议", "今天记得多喝水，天气转凉注意保暖",
                     "once", "18:00", db.now_iso()[:10], created_by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="seed", uid="elder_001", note="示例数据")
 
 
@@ -165,10 +168,10 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
         # 异常会被 future 吞成静默失败 → 整条 post-chat 管线（记忆沉淀/摘要）一起丢。
         # fail-closed：取不到就按最保守的集体层（ward）处理——宁可不沉淀。
         try:
-            from . import session as role_session
+            from .agent import session as role_session
             role = role_session.get_principal("kiosk")["role"]
         except Exception as e:
-            from . import log as audit
+            from .core import log as audit
             audit.log("memory_change", action="role_lookup_failed", uid=uid, error=str(e))
             role = "ward"
     if str(role or "").strip().lower() not in ("elder", "admin"):
@@ -179,7 +182,7 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
     try:
         rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
     except Exception as e:
-        from . import log as audit
+        from .core import log as audit
         audit.log("memory_change", action="note_error", uid=uid, error=str(e))
     try:
         if db.history_count(uid) >= chat.SUMMARY_THRESHOLD:
@@ -315,7 +318,7 @@ async def health():
 async def modules_status():
     """可选模块状态聚合：语音 / embedding / RAG 存储 / 知识图谱 / MCP 工具。
     各模块缺失依赖时自行降级（available=False / status=unavailable），接口照常返回。"""
-    from . import embed as e, ragstore, graph as g
+    from .store import embed as e, ragstore, graph as g
     return {"ok": True, "modules": {
         "voice":    voice_api.get_status(),
         "embed":    e.status(),
@@ -328,7 +331,7 @@ async def modules_status():
 @app.get("/api/logs/warnings")
 async def logs_warnings(limit: int = Query(50)):
     """最近警告/错误审计日志（服务端过滤，供前端排查用）。"""
-    from . import log as audit
+    from .core import log as audit
     return {"ok": True, "logs": audit.read_warnings(limit=limit)}
 
 
@@ -418,7 +421,7 @@ async def profiles_upsert(p: ProfileIn):
     for m in meds:
         if isinstance(m, dict) and m.get("name") and m.get("time"):
             db.upsert_medication_reminder(p.uid, m["name"], m.get("dose", ""), m["time"])
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="profile_upsert", uid=p.uid, name=p.name, by="nurse")
     return {"ok": True, "profile": prof}
 
@@ -432,7 +435,7 @@ async def memories_list(uid: str = Query(""), status: str = Query("")):
 @app.post("/api/memories")
 async def memories_add(m: MemoryIn):
     mid = db.add_memory(m.uid, m.type, m.content, status=m.status, source="manual")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="manual_add", uid=m.uid, mid=mid, type=m.type,
               content=m.content, by="nurse")
     return {"ok": True, "id": mid}
@@ -442,7 +445,7 @@ async def memories_add(m: MemoryIn):
 async def memories_confirm(mid: int):
     m = db.get_memory(mid)
     db.set_memory_status(mid, "confirmed")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="confirm", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True}
 
@@ -451,7 +454,7 @@ async def memories_confirm(mid: int):
 async def memories_reject(mid: int):
     m = db.get_memory(mid)
     op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="reject", by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="reject", mid=mid, op_id=op_id,
               uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id, "note": "已软删，可在回收站恢复"}
@@ -483,13 +486,13 @@ async def recycle_restore(op_id: int):
     if table == "rag_memories":
         row = db.get_rag_memory(op["target_id"])
         if row and row.get("chroma_id"):
-            from . import ragstore as _rs
+            from .store import ragstore as _rs
             new_cid = _rs.reindex_row(row["uid"], row["type"], row["content"],
                                       importance=row.get("importance", 0),
                                       source=row.get("source", ""), old_chroma_id=row["chroma_id"])
             if new_cid and new_cid != row["chroma_id"]:
                 db.set_rag_chroma_id(op["target_id"], new_cid)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="restore", op_id=op_id, uid=op.get("uid", ""),
               table=table, by="nurse")
     return {"ok": True, "table": table, "op_id": op_id}
@@ -498,7 +501,7 @@ async def recycle_restore(op_id: int):
 @app.post("/api/memories/recycle/purge")
 async def recycle_purge(days: float = Query(30.0)):
     n = db.purge_soft_deleted(days=days)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="purge", count=n, days=days, by="nurse")
     return {"ok": True, "purged": n}
 
@@ -537,7 +540,7 @@ async def memories_portrait_set(p: PortraitIn):
 async def core_memories_delete(mid: int):
     m = db.get_core_memory(mid)
     op_id = db.delete_core_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_delete", mid=mid, op_id=op_id,
               uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id}
@@ -556,9 +559,9 @@ async def rag_memories_delete(rid: int):
         return {"ok": False, "error": "不存在"}
     op_id = db.delete_rag_memory(rid, uid=row.get("uid", ""), reason="manual_delete", by="nurse")
     if row.get("chroma_id"):
-        from . import ragstore as _rs
+        from .store import ragstore as _rs
         _rs.delete_by_chroma_id(row.get("uid", ""), row["chroma_id"])
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="rag_delete", mid=rid, op_id=op_id,
               uid=row.get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id}
@@ -597,7 +600,7 @@ async def core_memories_confirm(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_authority(mid, "nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_confirm", mid=mid, uid=m.get("uid", ""),
               authority="nurse", by="nurse")
     return {"ok": True}
@@ -610,7 +613,7 @@ async def core_memories_unconfirm(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_authority(mid, "llm")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_unconfirm", mid=mid, uid=m.get("uid", ""),
               authority="llm", by="nurse")
     return {"ok": True}
@@ -623,7 +626,7 @@ async def core_memories_pin(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_pinned(mid, True)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_pin", mid=mid, uid=m.get("uid", ""), by="nurse")
     return {"ok": True}
 
@@ -635,14 +638,14 @@ async def core_memories_unpin(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_pinned(mid, False)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_unpin", mid=mid, uid=m.get("uid", ""), by="nurse")
     return {"ok": True}
 
 
 @app.get("/api/memories/graph")
 async def graph_view(uid: str = Query("elder_001")):
-    from . import graph as g
+    from .store import graph as g
     return {"ok": True, "status": g.status(),
             "entities": g.list_entities(uid), "relations": g.list_relations(uid)}
 
@@ -657,7 +660,7 @@ async def expressions_list(uid: str = Query("elder_001")):
 async def expressions_approve(eid: int):
     """护士审核通过 → 该语录参与对话注入（对标 MaiBot checked_only）。"""
     db.set_expression_checked(eid, True)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="expression_approve", eid=eid, by="nurse")
     return {"ok": True}
 
@@ -666,7 +669,7 @@ async def expressions_approve(eid: int):
 async def expressions_reject(eid: int):
     """护士拒绝 → 软删（进回收站可恢复）。"""
     db.soft_delete_expression(eid)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="expression_reject", eid=eid, by="nurse")
     return {"ok": True}
 
@@ -676,7 +679,7 @@ async def expressions_reject(eid: int):
 
 @app.get("/api/memories/health")
 async def memories_health():
-    from . import embed as e, ragstore, graph as g
+    from .store import embed as e, ragstore, graph as g
     return {"ok": True, "embed": e.status(), "ragstore": ragstore.status(), "graph": g.status()}
 
 
@@ -695,7 +698,7 @@ async def reminders_add(r: ReminderIn):
         r.uid, r.kind, r.title or (r.content[:12]), r.content,
         r.trigger_type, r.trigger_time, r.trigger_date,
         confirm_timeout_min=r.confirm_timeout_min, created_by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("reminder", action="create", rid=rid, uid=r.uid, kind=r.kind,
               content=r.content[:200], by="nurse")
     return {"ok": True, "id": rid}
@@ -1053,7 +1056,7 @@ async def profile_set_ward(uid: str, body: WardAssignIn,
 @app.get("/api/policy/roles")
 async def policy_roles(x_surface: str = Header(default="kiosk")):
     """策略矩阵：管理员看全量，其它角色只拿自己那份摘要。"""
-    from .policy import POLICY_DEFAULTS
+    from .agent.policy import POLICY_DEFAULTS
     role = session.get_principal(_surface(x_surface))["role"]
     if role != "admin":
         return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
@@ -1064,7 +1067,7 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
 @app.post("/api/alarm")
 async def alarm_report(a: AlarmIn):
     """紧急呼叫上报（规格 D6）：审计 + 广播；微信推送留给模块 11。"""
-    from . import log as audit
+    from .core import log as audit
     audit.log("alarm", action="report", type=a.type, uid=a.uid,
               message=a.message[:200], by="nurse")
     # 注意：payload 键用 alarm_type 而非 type —— bus.publish 内部构造
@@ -1120,7 +1123,7 @@ async def system_shutdown():
     if _shutting_down:
         return {"ok": True, "message": "系统正在退出…"}
     _shutting_down = True
-    from . import log as audit
+    from .core import log as audit
     audit.log("system", action="shutdown", by="nurse")
     try:
         mapctl.stop(hard=True)               # 编辑器服务（独立进程）一起带走；马上 os._exit，
@@ -1162,7 +1165,7 @@ async def vision_status():
 async def vision_snapshot(channel: int = Query(1), quality: int = Query(80),
                           token: str = Query(None)):
     """单帧 JPEG 快照。`<img src="/api/vision/snapshot?channel=1">` 可直接显示。"""
-    from . import log as audit
+    from .core import log as audit
     from fastapi.responses import JSONResponse, Response
     from vision import webbridge
     try:

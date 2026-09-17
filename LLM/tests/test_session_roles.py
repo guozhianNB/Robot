@@ -5,8 +5,8 @@ import tempfile
 
 import pytest
 
-from LLM import db
-from LLM import session
+from LLM.store import db
+from LLM.agent import session
 
 
 @pytest.fixture()

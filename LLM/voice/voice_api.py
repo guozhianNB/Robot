@@ -14,8 +14,10 @@ import uuid
 import wave
 from pathlib import Path
 
-from . import db, bus, chat, log as audit
-from .conf import VOICE_PENDING_TTL_S
+from ..store import db
+from ..core import bus, log as audit
+from ..agent import chat
+from ..conf import VOICE_PENDING_TTL_S
 
 # ---------------------------------------------------------------------------
 # 可选能力降级：外部依赖逐个尝试引入，收集所有缺失项。
@@ -32,8 +34,8 @@ except ImportError as _exc:
     _MISSING_DEPS.append(str(_exc))
 
 try:
-    from .voice import worker as worker_mod, speaker as spk_mod, vad as vad_mod
-    from .voice import audio as audio_mod, config as voice_config
+    from . import worker as worker_mod, speaker as spk_mod, vad as vad_mod
+    from . import audio as audio_mod, config as voice_config
 except ImportError as _exc:
     _VOICE_AVAILABLE = False
     _MISSING_DEPS.append(str(_exc))
@@ -92,7 +94,7 @@ def set_session_uid(uid: str, locked: bool) -> dict:
 
     返回体在 principal 之上补 `ok`：老接口形状（`{"ok": True, "uid", "locked"}`）
     有既有调用点与用例依赖，不能少。"""
-    from . import session as role_session
+    from ..agent import session as role_session
     _ensure_schema()
     if locked:
         res = dict(role_session.set_subject(uid, True, slot="kiosk", source="manual"))
@@ -118,7 +120,7 @@ def get_session_uid() -> dict:
 
     `uid` 的老语义保留：**没有主体时仍是 None**（老前端靠 null 判断"没选人"），
     此时兼容旧行为看一眼声纹判定结果。"""
-    from . import session as session_mod
+    from ..agent import session as session_mod
     _ensure_schema()
     p = session_mod.get_principal("kiosk")
     uid = p["uid"] or None
@@ -158,7 +160,7 @@ def _stream_fn(client, model):
     故用 role_session 别名避免误读。"""
     def _fn(uid, text):
         settings = db.get_settings()
-        from . import session as role_session
+        from ..agent import session as role_session
         return chat.chat_stream(client, model, uid, text, "auto", settings,
                                 principal=role_session.get_principal("kiosk"))
     return _fn

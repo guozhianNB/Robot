@@ -15,9 +15,11 @@
    那样该探针永不可见。故此处按同一意图改判：**第二道闸门只对未被角色白名单裁剪的 admin 可观测**，
    并对 elder 断言其被白名单挡住 —— 判别力落在 `test_mcp_tools_default_to_admin_only`（MCP admin-only）。
 """
+import json
+
 import pytest
 
-from LLM import tools
+from LLM.agent import tools
 
 
 def _p(role):
@@ -142,11 +144,12 @@ def test_run_tool_denies_mcp_outside_server_roles(monkeypatch):
 def test_policy_deny_audit_has_decision_field(monkeypatch, probe):
     """规格 §9：策略判定至少要带 decision 字段（否则下游按 decision 聚合会漏统计）。"""
     seen = []
-    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
     tools.run_tool("__probe__", {"a": 1}, _p("ward"))
     assert seen and seen[-1][0] == "policy_deny"
     assert seen[-1][1]["decision"] == "deny"
     assert seen[-1][1]["tool"] == "__probe__" and seen[-1][1]["role"] == "ward"
+    assert seen[-1][1]["args"] == {"a": 1}
     # Minor：原始 role 与归一后的 resolved_role 一起记（否则 fail-closed 的兜底会被算成
     # "集体层越权"）。未知取值：role 保留原样，resolved_role 归一成 ward。
     seen.clear()
@@ -164,7 +167,7 @@ def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
     角色白名单里，拒因落在**白名单**（`allow_ok=False`）而非服务器 roles，判别力弱。
     这里用 **elder 白名单内**的 `robot_stop`，只有"服务器 roles 也参与判定"才会被拒。
     """
-    from LLM import policy
+    from LLM.agent import policy
     called = []
     seen = []
     monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
@@ -173,7 +176,7 @@ def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool",
                         lambda name, args: called.append(name) or {"ok": True})
-    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
     assert "robot_stop" in policy.role_policy("elder")["allowed_tools"]   # 前提：白名单内
     assert "robot_stop" not in _names({"mcp_enabled": True}, _p("elder"))  # 看不见
     res = tools.run_tool("robot_stop", {}, _p("elder"))                   # 也调不到
@@ -186,7 +189,7 @@ def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
 def test_unknown_tool_is_not_counted_as_denied(monkeypatch):
     """未知工具名不该落 policy_deny（别把模型拼错算成越权）。"""
     seen = []
-    monkeypatch.setattr("LLM.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
     res = tools.run_tool("__nope__", {}, _p("ward"))
     assert res["ok"] is False and "未知工具" in (res.get("message") or "")
     assert [ev for ev, _ in seen if ev == "policy_deny"] == []
@@ -201,7 +204,7 @@ def test_run_tool_respects_mcp_global_switch(monkeypatch):
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool",
                         lambda name, args: called.append(name) or {"ok": True})
-    monkeypatch.setattr("LLM.db.get_settings", lambda: {"mcp_enabled": False})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": False})
 
     res = tools.run_tool("mcp_probe", {}, _p("admin"))
 
@@ -221,7 +224,145 @@ def test_run_tool_uses_one_mcp_registry_snapshot(monkeypatch):
     monkeypatch.setattr(tools.mcp_client, "tools", registry)
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool", lambda name, args: {"ok": True})
-    monkeypatch.setattr("LLM.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
 
     assert tools.run_tool("mcp_probe", {}, _p("admin"))["ok"] is True
     assert len(calls) == 1
+
+
+def test_vision_mcp_visibility_and_direct_call_are_role_symmetric(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "see_what": {"server": "vision", "schema": {
+            "type": "function",
+            "function": {"name": "see_what", "description": "", "parameters": {}}}},
+    })
+    monkeypatch.setattr(tools.mcp_client, "call_tool",
+                        lambda name, args: calls.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+
+    assert "see_what" in _names({"mcp_enabled": True}, _p("elder"))
+    assert "see_what" in _names({"mcp_enabled": True}, _p("admin"))
+    assert "see_what" not in _names({"mcp_enabled": True}, _p("ward"))
+
+    assert tools.run_tool("see_what", {}, _p("elder"))["ok"] is True
+    assert tools.run_tool("see_what", {}, _p("admin"))["ok"] is True
+    denied = tools.run_tool("see_what", {}, _p("ward"))
+    assert denied["ok"] is False
+    assert calls == ["see_what", "see_what"]
+
+
+def test_vision_mcp_configuration():
+    import sys
+
+    from LLM import conf
+
+    vision = conf.MCP_SERVERS["vision"]
+    assert vision["command"] == sys.executable
+    assert vision["args"] == [str(conf.BASE_DIR / "LLM" / "vision_mcp" / "see_server.py")]
+    assert vision["env"] == conf._vision_mcp_env()
+    assert vision["env"]["VISION_PORT"] == str(conf.VISION_PORT)
+    assert vision["env"]["VISION_PORT"] != ""
+    assert vision["enabled"] is True
+    assert vision["roles"] == ["elder", "admin"]
+
+
+def test_vision_policy_deny_audit_redacts_args_when_mcp_disabled(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "see_what": {"server": "vision", "schema": {
+            "type": "function",
+            "function": {"name": "see_what", "description": "", "parameters": {}}}},
+    })
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": False})
+    monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
+
+    secret_prompt = "PRIVATE_PROMPT_7f3a"
+    secret_image = "/private/vision/secret-image.jpg"
+    result = tools.run_tool(
+        "see_what",
+        {"image": secret_image, "prompt": secret_prompt, "channel": 7},
+        _p("elder"),
+    )
+
+    assert result["ok"] is False
+    assert seen[-1][0] == "policy_deny"
+    fields = seen[-1][1]
+    assert fields["args"] == {"channel": 7}
+    serialized = json.dumps(fields, ensure_ascii=False)
+    assert secret_prompt not in serialized and secret_image not in serialized
+    assert "prompt" not in fields["args"] and "image" not in fields["args"]
+
+
+def test_vision_policy_deny_audit_drops_malicious_channel(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "see_what": {"server": "vision", "schema": {
+            "type": "function",
+            "function": {"name": "see_what", "description": "", "parameters": {}}}},
+    })
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": False})
+    monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
+
+    secret_channel = "PRIVATE_CHANNEL_3c4e"
+    result = tools.run_tool(
+        "see_what",
+        {"image": "/private/secret.jpg", "prompt": "PRIVATE_PROMPT_55aa", "channel": secret_channel},
+        _p("elder"),
+    )
+
+    assert result["ok"] is False
+    assert seen[-1][1]["args"] == {}
+    assert secret_channel not in json.dumps(seen[-1][1], ensure_ascii=False)
+
+
+def test_vision_policy_deny_audit_redacts_out_of_role_whitelist_for_ward(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "see_what": {"server": "vision", "schema": {
+            "type": "function",
+            "function": {"name": "see_what", "description": "", "parameters": {}}}},
+    })
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
+
+    result = tools.run_tool(
+        "see_what",
+        {"image": "/private/ward-secret.jpg", "prompt": "PRIVATE_WARD_PROMPT_62ef", "channel": 5},
+        _p("ward"),
+    )
+
+    assert result["ok"] is False
+    assert seen[-1][1]["reason"] == "out_of_role_whitelist"
+    assert seen[-1][1]["args"] == {"channel": 5}
+    serialized = json.dumps(seen[-1][1], ensure_ascii=False)
+    assert "PRIVATE_WARD_PROMPT_62ef" not in serialized
+    assert "/private/ward-secret.jpg" not in serialized
+
+
+def test_vision_policy_deny_audit_redacts_args_on_role_mismatch(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        "see_what": {"server": "vision", "schema": {
+            "type": "function",
+            "function": {"name": "see_what", "description": "", "parameters": {}}}},
+    })
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
+
+    secret_prompt = "PRIVATE_PROMPT_91bd"
+    secret_image = "/private/vision/another-secret.png"
+    result = tools.run_tool(
+        "see_what",
+        {"image": secret_image, "prompt": secret_prompt, "channel": 3},
+        _p("elder"),
+    )
+
+    assert result["ok"] is False
+    assert seen[-1][0] == "policy_deny"
+    fields = seen[-1][1]
+    assert fields["args"] == {"channel": 3}
+    serialized = json.dumps(fields, ensure_ascii=False)
+    assert secret_prompt not in serialized and secret_image not in serialized
+    assert "prompt" not in fields["args"] and "image" not in fields["args"]

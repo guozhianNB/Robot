@@ -12,9 +12,9 @@ P1 的 check_action()（动作风险分级/二次确认）依赖 car MCP，**不
 """
 from pathlib import Path
 
-from .conf import BASE_DIR
+from ..conf import BASE_DIR
 
-PROMPT_DIR = BASE_DIR / "LLM" / "prompt"
+PROMPT_DIR = BASE_DIR / "LLM" / "agent" / "prompt"
 
 POLICY_DEFAULTS: dict[str, dict] = {
     # ---- 集体层：一屋子人。读得到本病房公开对话，读不到任何个人档案 ----
@@ -31,7 +31,7 @@ POLICY_DEFAULTS: dict[str, dict] = {
     "elder": {
         "prompt_file": PROMPT_DIR / "elder.md",
         # R3：急停/呼救类工具永远在列（当前仅有 robot_stop 是安全动作）
-        "allowed_tools": ["robot_status", "robot_stop"],
+        "allowed_tools": ["robot_status", "robot_stop", "see_what"],
         "data_scope": "self",
         "ward_context": True,
     },

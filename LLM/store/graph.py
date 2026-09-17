@@ -5,8 +5,8 @@ Kuzu 知识图谱封装：实体/关系 upsert（去重）+ 一跳关系查询�
 """
 import threading
 
-from .conf import DATA_DIR
-from . import log as audit
+from ..conf import DATA_DIR
+from ..core import log as audit
 
 _AVAILABLE = True
 _DB_PATH = str(DATA_DIR / "graph")

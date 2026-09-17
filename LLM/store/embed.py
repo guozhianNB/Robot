@@ -6,8 +6,8 @@ Embedding 封装：阿里 text-embedding-v3（DashScope OpenAI 兼容端点）�
 import math
 import os
 
-from . import vectors
-from .conf import BASE_DIR, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM, EMBED_TIMEOUT
+from ..core import vectors
+from ..conf import BASE_DIR, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM, EMBED_TIMEOUT
 
 _AVAILABLE = True
 _MISSING = []

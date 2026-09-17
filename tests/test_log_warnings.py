@@ -2,7 +2,7 @@
 """log.read_warnings 过滤逻辑测试。"""
 import json
 
-from LLM import log
+from LLM.core import log
 
 
 def _write(tmp_path, records):

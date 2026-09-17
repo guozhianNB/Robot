@@ -8,7 +8,7 @@ starlette 1.6 的 ``include_router()`` 是惰性的，直接遍历 ``app.routes`
 带前缀的 include 引入编辑器路由时，否定断言静默空过"。
 """
 from LLM.server import app as main_app
-from LLM import mapapi
+from LLM.maps import mapapi
 
 
 def test_main_app_no_longer_serves_map_editor(app_paths):

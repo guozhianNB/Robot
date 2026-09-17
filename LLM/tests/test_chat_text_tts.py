@@ -4,7 +4,9 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import chat, server, voice_api
+from LLM.agent import chat
+from LLM import server
+from LLM.voice import voice_api
 
 
 def _patch_request_side_effects(monkeypatch):

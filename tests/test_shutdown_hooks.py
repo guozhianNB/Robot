@@ -2,7 +2,8 @@
 """系统退出相关停止钩子测试（reminder / bus）。"""
 import threading
 
-from LLM import reminder, bus
+from LLM.agent import reminder
+from LLM.core import bus
 
 
 def test_reminder_start_clears_then_stop_sets_event():

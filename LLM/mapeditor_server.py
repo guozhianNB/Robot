@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""地图编辑器独立服务（FastAPI app）—— 按需启动。
 
-入口（由主后端 ``LLM.mapctl`` 拉起）：
+入口（由主后端 ``LLM.maps.mapctl`` 拉起）：
     python -m uvicorn LLM.mapeditor_server:app --host 0.0.0.0 --port 8010
 
 它的全部业务 = ``mapapi.router``（地图文件 / 标记 / 区域 / 位姿）+ ``/mapeditor`` 静态页，
@@ -21,8 +21,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
-from . import log as audit
-from . import mapapi
+from .core import log as audit
+from .maps import mapapi
 from .conf import MAP_EDITOR_PORT
 
 app = FastAPI(title="地图编辑器服务")

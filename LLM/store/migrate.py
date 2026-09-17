@@ -4,7 +4,7 @@ r"""一次性幂等迁移：旧 memories/portraits/summaries/style/preferences �
 即使标记未落盘（中途崩溃）也不会产生重复数据。"""
 from . import db
 from . import ragstore
-from . import log as audit
+from ..core import log as audit
 
 
 def _core_exists(uid: str, mtype: str, content: str) -> bool:

@@ -6,9 +6,9 @@ import tempfile
 
 import pytest
 
-from LLM import db
-from LLM import locator
-from LLM import session
+from LLM.store import db
+from LLM.maps import locator
+from LLM.agent import session
 
 _MAP = "my_map"
 

@@ -9,12 +9,12 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_paths(tmp_path, monkeypatch):
-    from LLM import db
+    from LLM.store import db
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test.db"))
     yield tmp_path
 
 
-# 与 LLM/mapctl.py::stop() 的"没在跑"返回值同形（/api/mapeditor/service 的状态载荷）。
+# 与 LLM/maps/mapctl.py::stop() 的"没在跑"返回值同形（/api/mapeditor/service 的状态载荷）。
 _IDLE_MAPCTL_STOP = {"ok": True, "running": False, "source": "none", "pid": None,
                      "port": 8010, "uptime_s": None}
 
@@ -40,5 +40,5 @@ def no_real_mapeditor_stop(monkeypatch):
     只作用于 `tests/`：`LLM/tests/test_mapctl.py`（另一目录、自带 conftest）测的正是
     `stop()` 的真实分支（managed / external），不受本护栏影响，也不该受影响。
     """
-    from LLM import mapctl
+    from LLM.maps import mapctl
     monkeypatch.setattr(mapctl, "stop", lambda: dict(_IDLE_MAPCTL_STOP))

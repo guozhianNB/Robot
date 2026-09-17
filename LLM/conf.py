@@ -16,7 +16,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
-PROMPT_FILE = Path(__file__).resolve().parent / "prompt.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+PROMPT_FILE = Path(__file__).resolve().parent / "agent" / "prompt" / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
 FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
@@ -114,8 +114,47 @@ MAP_CURRENT_CACHE_TTL_S = 5.0           # 大于前端轮询周期；从扫描�
 #     PC（usb 摄像头）和板卡（MIPI）上都可能跑，默认本机才不会让"PC 调试"要先改配置。
 # 「后端跑在 PC、摄像头在板卡」时：把 VISION_HOST 设成板卡地址（同 MAPS_SSH_HOST），
 # 并在板卡上以 `--bind 0.0.0.0` 启动服务。
-VISION_HOST = os.environ.get("VISION_HOST", "127.0.0.1")
-VISION_PORT = int(os.environ.get("VISION_PORT", "9540"))
+def _parse_vision_port(raw, default: int = 9540) -> int:
+    """Parse a TCP port without allowing malformed environment input to abort import."""
+    try:
+        port = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+VISION_HOST = (os.environ.get("VISION_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+VISION_PORT = _parse_vision_port(os.environ.get("VISION_PORT"))
+
+# vision MCP 子进程需要显式继承的视觉参数。可选项仅在环境变量实际设置时
+# 传入，避免用空串覆盖 vision_client 内的默认值。
+_VISION_SEE_ENV_NAMES = (
+    "VISION_SEE_MODEL",
+    "VISION_SEE_BASE_URL",
+    "VISION_SEE_TIMEOUT",
+    "VISION_SEE_MAX_TOKENS",
+    "VISION_SEE_MAX_WIDTH",
+    "VISION_SEE_QUALITY",
+    "VISION_SEE_MAX_BYTES",
+    "VISION_SEE_IMAGE_DIRS",
+    "VISION_SEE_GRAB_TIMEOUT",
+    "VISION_SEE_CONNECT_TIMEOUT",
+    "VISION_SEE_CHANNEL",
+)
+
+
+def _vision_mcp_env() -> dict[str, str]:
+    """Build the environment overrides for the vision MCP child process."""
+    env = {
+        # An empty key is intentional: see_server reports cloud unavailability.
+        "DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", ""),
+        "VISION_HOST": str(VISION_HOST),
+        "VISION_PORT": str(VISION_PORT),
+    }
+    for name in _VISION_SEE_ENV_NAMES:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
 
 
 # 声纹录制
@@ -201,6 +240,13 @@ MCP_SERVERS: dict[str, dict] = {
         # env 值留空串 = 运行时从 os.environ 继承（.env 由 server.py 加载后才有值）
         "env": {"TAVILY_API_KEY": ""},
         "enabled": True,
+    },
+    "vision": {
+        "command": _sys.executable,
+        "args": [str(BASE_DIR / "LLM" / "vision_mcp" / "see_server.py")],
+        "env": _vision_mcp_env(),
+        "enabled": True,
+        "roles": ["elder", "admin"],
     },
 }
 

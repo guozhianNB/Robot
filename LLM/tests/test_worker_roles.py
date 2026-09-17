@@ -4,9 +4,9 @@ import tempfile
 
 import pytest
 
-from LLM import db
-from LLM import session
-from LLM import voice_api
+from LLM.store import db
+from LLM.agent import session
+from LLM.voice import voice_api
 
 
 @pytest.fixture()

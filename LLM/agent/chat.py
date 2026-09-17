@@ -9,14 +9,14 @@ r"""
 import json
 import time
 
-from . import db
-from . import log as audit
+from ..store import db
+from ..core import log as audit
 from . import memory as rag
 from . import tools as tool_mod
-from .conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
+from ..conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
                    LLM_TIMEOUT, PROMPT_FILE)
-# 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/policy.py
+# 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/agent/policy.py
 from .policy import role_policy
 
 # 导入MCP客户端会话类：ClientSession封装全部MCP协议逻辑（initialize、list_tools、call_tool）
@@ -51,9 +51,9 @@ def _recall_cached(uid: str, query: str) -> str:
             _mem_cache.pop(k, None)
     return ctx
 
-# ---- System Prompt 基础文本（人设 + 安全红线）：外置 LLM/prompt.md ----
-# 改提示词措辞直接编辑 LLM/prompt.md 即可（每条请求实时读取，改完即生效、无需重启）。
-# _DEFAULT_PROMPT_BASE 仅作文件缺失时的保底副本，内容须与 prompt.md 保持同步。
+# ---- System Prompt 基础文本（人设 + 安全红线）：外置 LLM/agent/prompt/base.md ----
+# 改提示词措辞直接编辑 LLM/agent/prompt/base.md 即可（每条请求实时读取，改完即生效、无需重启）。
+# _DEFAULT_PROMPT_BASE 仅作文件缺失时的保底副本，内容须与 base.md 保持同步。
 _DEFAULT_PROMPT_BASE = (
     "你是'小护'，一部照顾老人的陪护小车，跟老人处得像老熟人：像家人一样搭把手，像朋友一样唠嗑。"
     "自称'我'即可，不要自称'AI'。\n"
@@ -84,11 +84,11 @@ _DEFAULT_PROMPT_BASE = (
     "4. 健康类信息要注明'仅供参考，具体问医生'。"
 )
 
-_prompt_warned = False  # prompt.md 缺失只告警一次，避免刷审计日志
+_prompt_warned = False  # base.md 缺失只告警一次，避免刷审计日志
 
 
 def _load_prompt_base() -> str:
-    """读取 LLM/prompt.md 中最后一个单独成行的 `<!-- PROMPT -->` 标记之下的正文，
+    """读取 LLM/agent/prompt/base.md 中最后一个单独成行的 `<!-- PROMPT -->` 标记之下的正文，
     作为 System Prompt 基础文本（标记上方是给人看的说明，不会发给模型）。
     文件缺失/读取失败 → 告警一次并退回 _DEFAULT_PROMPT_BASE，保证对话链路不中断。"""
     global _prompt_warned
@@ -109,14 +109,14 @@ def _load_prompt_base() -> str:
     return raw.strip()
 
 
-# ---- 角色片段（分层用户体系）：LLM/prompt/{ward,elder,admin}.md ----
-# 与 prompt.md（共用 base：人设 + 安全红线）叠加：base 管"怎么说"，角色片段管"现在跟谁说话"。
+# ---- 角色片段（分层用户体系）：LLM/agent/prompt/{ward,elder,admin}.md ----
+# 与 base.md（共用 base：人设 + 安全红线）叠加：base 管"怎么说"，角色片段管"现在跟谁说话"。
 _prompt_role_warned: set[str] = set()   # 某个角色片段缺失只告警一次，避免刷审计日志
 _ROLE_PROMPT_DIR_OVERRIDE = None        # 测试用：指向不存在的目录以验证降级
 
 
 def _load_role_prompt(role: str) -> str:
-    """读 `LLM/prompt/<role>.md` 角色片段；缺失 → 空串 + 告警一次（**不阻断对话**）。
+    """读 `LLM/agent/prompt/<role>.md` 角色片段；缺失 → 空串 + 告警一次（**不阻断对话**）。
 
     文件名取自 `role_policy(role)["prompt_file"].name`（而不是拼 `f"{role}.md"`）：未知角色
     在 role_policy 里已 fail-closed 落到集体层，这里必须跟着落到 ward.md —— 否则一个没见过的
@@ -388,6 +388,19 @@ async def mcp_init(client, model: str):
 
             _mcp_session = session
 
+_VISION_LOG_SNIPPET = "[视觉结果未写入日志]"
+
+
+def _tool_log_fields(name: str, args, snippet: str):
+    """Return fields safe to persist without changing tool/SSE payloads."""
+    if name != "see_what":
+        return args, snippet
+    channel = args.get("channel") if isinstance(args, dict) else None
+    if type(channel) is int and 1 <= channel <= 255:
+        return {"channel": channel}, _VISION_LOG_SNIPPET
+    return {}, _VISION_LOG_SNIPPET
+
+
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
                 principal: dict | None = None):
     """
@@ -486,9 +499,10 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     latency = int((time.time() - t0) * 1000)
                     snippet = (result.get("result") or result.get("message")
                                or result.get("error") or "")[:500]
-                    db.log_tool(data_uid, name, args, snippet,
+                    log_args, log_snippet = _tool_log_fields(name, args, snippet)
+                    db.log_tool(data_uid, name, log_args, log_snippet,
                                 status="ok" if result.get("ok") else "error", latency_ms=latency)
-                    audit.log("tool", uid=data_uid, tool=name, args=args,
+                    audit.log("tool", uid=data_uid, tool=name, args=log_args,
                               ok=result.get("ok"), latency_ms=latency)
                     yield {"type": "tool_result", "tool": name, "ok": result.get("ok"),
                            "snippet": snippet}

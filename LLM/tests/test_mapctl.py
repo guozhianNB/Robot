@@ -5,7 +5,8 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import mapctl, session
+from LLM.maps import mapctl
+from LLM.agent import session
 from LLM.server import app
 
 

@@ -15,7 +15,7 @@ r"""MCP 车控工具冒烟自测（独立脚本，下划线前缀 → 不会被 
 并把 command/args 指向目标机装有 mcp+rclpy 的解释器。
 """
 from .. import conf
-from .. import mcp_client
+from ..agent import mcp_client
 import sys
 
 _SCRIPT = str(conf.BASE_DIR / "LLM" / "car_mcp" / "car_server.py")
