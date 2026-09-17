@@ -577,7 +577,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
             tool_calls = {}
             finish = None
             response_content = ""
-            response_start = len(full_assistant)
+            response_content_chunks = []
             for chunk in stream:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -586,9 +586,12 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     reasoning_text += reasoning
                     yield {"type": "reasoning", "content": reasoning}
                 if delta.content:
-                    full_assistant += delta.content
                     response_content += delta.content
-                    yield {"type": "content", "content": delta.content}
+                    if finalizing:
+                        response_content_chunks.append(delta.content)
+                    else:
+                        full_assistant += delta.content
+                        yield {"type": "content", "content": delta.content}
                 for tc in (delta.tool_calls or []):
                     slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                     if tc.id:
@@ -603,9 +606,11 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
 
             if finalizing:
                 final_response_content = response_content
-                finalize_protocol_violation = finish == "tool_calls" and bool(tool_calls)
-                if finalize_protocol_violation:
-                    full_assistant = full_assistant[:response_start]
+                finalize_protocol_violation = bool(tool_calls)
+                if not finalize_protocol_violation:
+                    for content in response_content_chunks:
+                        full_assistant += content
+                        yield {"type": "content", "content": content}
                 break
 
             if finish == "tool_calls" and tool_calls:

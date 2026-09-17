@@ -553,8 +553,9 @@ def test_budget_reasoning_only_finalize_falls_back_once_without_tools(monkeypatc
 
 
 def test_budget_finalize_tool_calls_are_not_executed_and_fall_back(monkeypatch):
+    forbidden_content = "这段违规收尾不得落入最终回答"
     streams = _budget_streams([
-        _chunk(content="这段违规收尾不得落入最终回答",
+        _chunk(content=forbidden_content,
                tool_calls=[_tool_call(name="forbidden", call_id="call-5")],
                finish_reason="tool_calls"),
     ])
@@ -573,7 +574,31 @@ def test_budget_finalize_tool_calls_are_not_executed_and_fall_back(monkeypatch):
     assert [message["tool_call_id"] for message in observations] == [
         "call-1", "call-2", "call-3", "call-4",
     ]
+    assert forbidden_content not in [event["content"] for event in events
+                                     if event["type"] == "content"]
     assert events[-1] == {"type": "done", "assistant": "不再调用工具，直接回答"}
+
+
+def test_budget_finalize_detects_tool_calls_even_when_finish_reason_is_stop(monkeypatch):
+    forbidden_content = "finish_reason 不是 tool_calls 也不能泄漏"
+    streams = _budget_streams([
+        _chunk(content=forbidden_content,
+               tool_calls=[_tool_call(name="forbidden-stop", call_id="call-5")],
+               finish_reason="stop"),
+    ])
+    streams.append([_chunk(content="协议违规后兜底回答")])
+    client, completions, calls, _ = _prepare_budget_stream(monkeypatch, streams)
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(calls) == 4
+    assert all(name != "forbidden-stop" for name, _ in calls)
+    assert len(completions.requests) == 6
+    assert completions.requests[5]["tools"] is None
+    assert completions.requests[5]["tool_choice"] is None
+    assert forbidden_content not in [event["content"] for event in events
+                                     if event["type"] == "content"]
+    assert events[-1] == {"type": "done", "assistant": "协议违规后兜底回答"}
 
 
 def test_budget_manual_low_finalize_preserves_low_effort(monkeypatch):
