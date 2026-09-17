@@ -596,6 +596,13 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                            "snippet": snippet}
                     messages.append({"role": "tool", "tool_call_id": slot["id"] or f"call_{round_i}_{i}",
                                      "content": json.dumps(result, ensure_ascii=False)})
+                if mode == "auto" and effort != "high":
+                    effort, thinking_on = "high", True
+                    yield {"type": "meta",
+                           "router": {"on": True, "effort": "high",
+                                      "reason": "已取得工具结果，自动加深思考",
+                                      "method": "tool_observation", "mode": "auto",
+                                      "uid": data_uid}}
                 continue  # 下一轮：把工具结果交给模型
 
             break  # 正常结束
@@ -612,7 +619,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
             effort, thinking_on = None, False
             stream = client.chat.completions.create(
                 model=model, messages=messages, stream=True,
-                tools=tools or None, tool_choice="auto" if tools else None,
+                tools=None, tool_choice=None, reasoning_effort=None,
                 extra_body=_thinking_extra(None),
             )
             for chunk in stream:
