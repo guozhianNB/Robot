@@ -32,7 +32,7 @@
 | # | 决策点 | 结论 |
 |---|---|---|
 | D1 | 端形态 | 新增**第四个前端包** `frontend/packages/nurse`，由主后端 8000 挂 `/nurse`；`admin`/`kiosk`/`mapeditor` 一律不动 |
-| D2 | 护士身份 | **复用管理台口令**（`X-Surface: admin`）。不新增护士角色、不动 `session.derive_role` / `policy.POLICY_DEFAULTS` / `X-Surface` 取值域（R1–R5 红线区一行不改） |
+| D2 | 护士身份（**2026-09-18 二次修订，见 D11**） | 初版＝**复用管理台口令**（`X-Surface: admin`）。因管理员会话是 300s 绝对超时、无续期，被动挂着的护士台每 5 分钟被弹回口令页；用户 2026-09-18 拍板「**护士台不再需要登录、也不会被弹**」→ 改为 **D11**。**始终不变**：不新增护士角色、不动 `session.derive_role` / `policy.POLICY_DEFAULTS` / `X-Surface` 取值域（R1–R5 红线区一行不改） |
 | D3 | 通知持久化 | 新增 `notifications` 表作**唯一存储**；`/api/alarm` 的既有契约（审计 + 广播）**保持不变**，只增加"落库"这一路 |
 | D4 | 上报口权限 | `POST /api/notifications` **不校验身份**（模块 11 原文"任何模块发现异常都往该端口 POST"，且雷达/视觉未必持有口令），但每次上报写审计；`ack` / `ack-all` / `DELETE` / `GET` 必须 admin |
 | D5 | 防刷屏 | 同 `(source, type, uid)` 且**尚未处理**的通知，`NOTIFY_DEDUP_S`（默认 60s）内再次上报 → 合并为一条、`count + 1`、刷新 `last_at`，不新增行 |
@@ -41,6 +41,7 @@
 | D8 | 监听地址 | **必须监听 0.0.0.0**。用户原话："这个前端一定要放在 0.0.0.0 上，这样局域网内 PC 就能访问"→ 生产由后端 8000 托管（启动即 `--host 0.0.0.0`）；**dev server 必须显式 `server.host: true`**（Vite 默认只绑 localhost，这是局域网打不开的常见原因） |
 | D9 | 面板职责 | **只读 + 确认**：拉列表、订阅事件、标记已处理。不发消息、不操作小车、不派车、不改任何设置 |
 | D10 | 明确不做 | 地图编辑器、老人注册、记忆、设置、工具日志、身份与权限、对话、微信推送、小车位置地图——一个都不放进护士台（用户原话点名了前两个） |
+| D11 | 护士台免登录（2026-09-18 二次修订，取代 D2） | 用户原话：「**护士台不再需要登录、也不会被弹**」。落地＝① 前端**去掉登录门**，打开 `/nurse` 直接是通知列表；② 后端三条读/确认端点 **`GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` 改为免鉴权**（与投递口同口径）；③ **`DELETE /api/notifications/{nid}` 仍仅管理员**（删记录是数据损失，不放宽）；④ **管理台 `/admin` 的口令门一点不放宽**（不采用"关口令门"的全局做法——那会让局域网内谁都能进管理台）。**仍不动** `session`/`policy`/`X-Surface` 取值域（不新增 surface、不新增角色） |
 
 ## 3. 架构与数据流
 
@@ -141,10 +142,10 @@ def prune(days: int = 0) -> int
 | 方法 | 路径 | 身份 | 说明 |
 |---|---|---|---|
 | POST | `/api/notifications` | **免鉴权**（D4） | 通用上报口，小车/视觉/雷达/任何模块。体见 §4.4；返回 `{ok, id, deduped}` |
-| GET | `/api/notifications` | admin | `?state=all\|unread&limit=50&before_id=`；返回 `{ok, items, counts}`，`items[].uid_name` 由 `db.get_profile(uid)` 补齐（姓名 + 床号） |
-| POST | `/api/notifications/{nid}/ack` | admin | 标记已处理；广播 `notification_ack` |
-| POST | `/api/notifications/ack-all` | admin | 一次全标已处理；返回 `{ok, acked}`；广播 `notification_ack`（`all: true`） |
-| DELETE | `/api/notifications/{nid}` | admin | 删单条（误报清理） |
+| GET | `/api/notifications` | **免鉴权**（D11） | `?state=all\|unread&limit=50&before_id=`；返回 `{ok, items, counts}`，`items[].uid_name` 由 `db.get_profile(uid)` 补齐（姓名 + 床号） |
+| POST | `/api/notifications/{nid}/ack` | **免鉴权**（D11） | 标记已处理；广播 `notification_ack` |
+| POST | `/api/notifications/ack-all` | **免鉴权**（D11） | 一次全标已处理；返回 `{ok, acked}`；广播 `notification_ack`（`all: true`） |
+| DELETE | `/api/notifications/{nid}` | admin（**不放宽**） | 删单条（误报清理）——删记录是数据损失，仍要口令 |
 
 **`/api/alarm` 改造（契约不变）：** 保留现有 `audit.log("alarm", …)` 与 `bus.publish("alarm", …)`（kiosk 的 toast 依赖后者），**在其后追加**一次 `notify.ingest(source="kiosk", type=a.type, uid=a.uid, body=a.message)`。`source` 默认 `kiosk`，请求体可带 `source` 覆盖（视觉/雷达将来直接发 `/api/notifications`，不必挤 `/api/alarm`）。
 
@@ -227,8 +228,8 @@ packages/nurse/
 - **顶栏**：实时时钟（1s tick）、`● 实时在线` / `○ 连接已断`、未处理计数徽章。
 - **提示音**：收到 `level=critical` 且未处理的通知 → `beep()` 两声；`document.title` 加前缀 `(3) 护士台`，处理完清零。
 - **断线降级**：SSE `onerror` → 3s 自动重连（沿用 admin 的 `connect()` 逻辑），同时切到**5 秒轮询**兜底，顶栏挂红条"实时连接断开，正在自动刷新"；在线时保留 30s 兜底轮询（防 SSE 静默丢帧）。
-- **登录门**：复用 `shared` 的 `login(pw, "admin")` / `getSessionUser("admin")`，判据**必须是 `role !== "admin"`**（写成 `=== "ward"` 会在后端新增角色时漏门，`admin/src/App.vue:5` 已注明）；文案"护士台登录"，附现有 3 次错口令冷却提示。
-- **空态**：无数据 → "目前没有通知"；拉取失败 → "读取通知失败：<原因>"（不静默）。
+- **无登录门**（D11，2026-09-18 二次修订）：打开 `/nurse` 直接就是通知列表，**不调用** `login`/`getSessionUser`、**不连会话**、没有"会话过期"概念——因此也不存在被弹回登录页的问题。原设计（复用管理台口令 + 判据 `role !== "admin"`）已作废；`X-Surface` 头在通知三端点上不再有意义（后端不读 principal）。
+- **空态**：无数据 → "目前没有通知"；拉取失败 → 大白话提示（不把原始错误串上屏，也不静默）。
 
 ### 5.3 shared 层新增
 
@@ -281,8 +282,8 @@ packages/nurse/
 3. kiosk 按 SOS → 面板出红卡（且 kiosk 原有 toast 不退化）
 4. 在 A 屏幕点「处理了」→ B 屏幕同一张卡同步变灰
 5. 停后端 → 页面显示断线红条；重启后端 → 自动恢复且**之前的通知还在**（持久化验收）
-6. **把护士台开着 ≥6 分钟不动**（口令门开启时）→ 观察是否被弹回登录门。这是已知限制（§9「每 5 分钟弹回登录门」），验收目的是确认你接受这一行为、或决定改部署方式
-7. **第二台 PC 同时打开 `/nurse/`** → 验证登录门的真实语义（D2 复用进程级 admin 槽：第一台登录后，第二台**不会**看到登录门）
+6. **把护士台开着 ≥6 分钟不动** → 全程**不被弹回、也不要求登录**（D11 验收）
+7. **第二台 PC 同时打开 `/nurse/`** → 同样直接进；同时打开 `/admin/` → **仍然要口令**（验证改动只放宽了护士台、没放宽管理台）
 
 ## 9. 风险与已知限制
 
@@ -295,7 +296,8 @@ packages/nurse/
 | 通知表长期膨胀 | `prune()` + 30 天保留已处理 |
 | 用户 9-18 踩过的"页面还在跑旧 JS" | `_no_store_entry_html` 的入口路径白名单**必须加 `/nurse`**（§10 落点清单第 4 条） |
 | **读边界被 SSE 旁路**（2026-09-18 最终审查 I4） | `GET /api/notifications` 要 admin，但同一份 `uid_name`（老人姓名·床号）/`title`/`body` 由 `notification` 事件广播在**完全免鉴权**的 `/api/events` 上，且 CORS `allow_origins=["*"]`（跨源 EventSource 也能读）。**裁定：记入已知限制**——既有 `alarm`/`reminder` 早已同样暴露（本分支只是新增了老人身份字段），给 SSE 加闸门会波及 kiosk/admin 两个既有消费方，属另一份规格的范围。收紧路径：给 `/api/events` 加 `X-Surface` 校验，或把身份字段从广播里摘掉（后者与 §4.5 冲突，需改规格） |
-| **护士台每 5 分钟被弹回登录门**（2026-09-18 最终审查 I5） | `login_admin` 的 TTL 是**绝对**值（`conf` 默认 300s）且**无续期路径**；护士台被动挂着时基本每 5 分钟回一次口令页。**裁定：本版不改会话层**——给 admin 槽加"活动即续期"会削弱"无人看管自动降权"这条既有安全属性，且它在 `session.py` 红线区附近。部署建议：护士站常驻屏**关闭口令门**（`admin_auth_required=false`）或接受每 5 分钟重登；已列入 §8 人工验收清单第 6 条，由用户拍板 |
+| **~~护士台每 5 分钟被弹回登录门~~（已解决）** | 2026-09-18 最终审查 I5 提出；用户同日拍板 D11「护士台不再需要登录、也不会被弹」→ **前端去掉登录门、三条端点免鉴权**，问题不再存在。**未采用**"给 admin 槽加活动续期"的改法（会削弱"无人看管自动降权"）。管理台 `/admin` 的口令门与 TTL 行为**完全不变** |
+| **谁都能标记"已处理"**（D11 的代价） | `ack`/`ack-all` 免鉴权 → 局域网内任何人打开 `/nurse` 都能看通知并清空待办角标（**删单条仍要口令**）。相对本分支之前没有增量式恶化：通知内容本来就经免鉴权 SSE 广播公开（见下一行），且阈值低（LAN、内部系统）。要收紧就加 token 或恢复登录门，属另一份规格 |
 | **多台 PC 共享一个进程级 admin 槽**（D2 的直接后果） | 第一台 PC 登录后，第二台 PC 打开 `/nurse/`（或 `/admin/`）**不会**看到登录门——会话是后端进程级的，不是每浏览器一份。局域网内多屏共用一个管理员身份；要按人隔离需独立护士角色（另立规格，见上一行） |
 | **角标数可能大于可见卡片数** | 角标是**未处理总数**（全表 COUNT），列表默认上限 50 且面板**不做加载更多**（`before_id` 后端已留、面板不用）→ 未处理 >50 时"未处理 60"但只看到 50 张卡。符合 YAGNI，记此说明 |
 | **持续复报长期合并为一行** | 去重窗口锚在 `last_at`：同一 `(source,type,uid)` 每 <60s 复报会一直被合并、`count` 无限增长（一个持续故障 = 一行 + 次数），**ack 之后自然新开一行**。经裁定符合 D5 防刷屏本意 |
@@ -360,5 +362,13 @@ packages/nurse/
 
 **审查抓出的真问题（值得留档）**：最终整分支审查找出 `find → bump` 竞态会让**新告警被并进已 ack 的行、静默不出卡不响铃**（救命通路，逐任务审查未发现）；以及免鉴权投递口在事件循环上做同步 SQLite 写（可被廉价请求堵死后端）。两者均已修并有测试锁定。
 
-**留作后续（§12 与 §9 已记）**：面板通知分页、`/api/events` 鉴权、admin 会话活动续期、通知限流/签名、护士独立角色、微信推送、`(source,type,uid)` 部分唯一索引闭合并发重复窗口、`AlarmIn.source`/`AckIn.by` 长度与取值约束、`notify.py` 去重窗口边界改用 `db.now_iso()`。
+**留作后续（§12 与 §9 已记）**：面板通知分页、`/api/events` 鉴权、通知限流/签名、护士独立角色、微信推送、`(source,type,uid)` 部分唯一索引闭合并发重复窗口、`AlarmIn.source`/`AckIn.by` 长度与取值约束、`notify.py` 去重窗口边界改用 `db.now_iso()`。
+
+### 二次修订（2026-09-18，D11 护士台免登录）
+
+- **起因**：最终审查 I5 指出护士台每 5 分钟被弹回登录门；用户拍板「护士台不再需要登录、也不会被弹」。
+- **改动**：前端去掉登录门（`App.vue` 不再调 `login`/`getSessionUser`/`logout`，无"会话过期"路径）；后端 `GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` 由「必须 admin」改为**免鉴权**（`DELETE` 保持 admin）；规格 D2 标注作废、新增 D11。
+- **未动**：`session.py`/`policy.py`/`X-Surface` 取值域、`/admin` 的口令门与 TTL、`admin`/`kiosk`/`mapeditor` 三个包、通知三端点以外的任何鉴权。
+- **测试与验证**：见 `.superpowers/sdd/task-4-report.md`（新增/调整用例：三端点免鉴权、`DELETE` 仍 403、前端无登录门）。
+
 
