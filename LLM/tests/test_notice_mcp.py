@@ -157,6 +157,13 @@ def test_push_backend_error_body_returns_ok_false(stub):
     assert r["ok"] is False and "type 不能为空" in r["error"]
 
 
+def test_push_reports_effective_level_from_backend(stub):
+    """返回的 level 是**库里实际生效**的级别：合并升级后可能高于/低于本次传的值。"""
+    stub(body={"ok": True, "id": 9, "deduped": True, "level": "critical"})
+    r = nc.push("老人摔倒了", level="info")          # 本次报 info，但库里那行已是 critical
+    assert r["ok"] is True and r["level"] == "critical"
+
+
 def test_push_requires_explicit_backend_success(stub):
     """只有"后端明确说成功"（`{"ok": true}`）才算成功：别的响应形状一律当没投出去。
 

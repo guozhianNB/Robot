@@ -177,8 +177,11 @@ def push(message: str, level: str = DEFAULT_LEVEL, uid: str = "",
                              or "护士后台没有确认收到这条通知")}
 
     deduped = bool(result.get("deduped"))
+    # 返回**库里实际生效**的级别（合并升级后可能高于本次传的 —— 例如同一件事先按 info 报过、
+    # 这次按 critical 复报，或反过来；后端 `notify.ingest` 返回的就是那一行的级别）。
+    eff = result.get("level") or lvl
     detail = "已通知护士" + ("（同一件事已合并为一条，护士台只显示一条）" if deduped else "")
     if truncated:
         detail += f"（内容超过 {MESSAGE_MAX} 字，已截断）"
-    return {"ok": True, "id": result.get("id"), "level": lvl,
+    return {"ok": True, "id": result.get("id"), "level": eff,
             "deduped": deduped, "detail": detail}

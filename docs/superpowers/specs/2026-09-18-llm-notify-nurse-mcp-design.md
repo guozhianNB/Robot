@@ -165,6 +165,7 @@ def notify_nurse(message: str, level: str = "info", uid: str = "") -> str
 | S5 | 闸门拒绝用例只断言子串"不允许"，与总开关分支文案撞车（会因错误原因变绿） | 已收紧为精确文案 + 审计 `reason == "tool_roles_mismatch"` |
 | S6 | `_post` 兜底只留异常类名，叠加 M2 后线上无从排查 | 已带 `str(e)[:120]` |
 | 死代码 | `main()` 里 `if server is None: sys.exit(2)` 与其它降级分支不一致 | 已改为记日志 + 写 stderr 再退 |
+| 复审后残余清理 | 二轮复审（定向）裁定**通过**，另列 8 条非阻断残余 | 已清：`notify.py`/`db.py`/护士台规格两处旧口径注释、`docs/log.md` 的 `urgent→info` 笔误；**工具回话的 `level` 改为回显后端生效级别**（合并升级时不再自说自话）+ 用例；`_higher_level` 先把未知级别归一到词表；`NOTICE_MCP_LOG=""` 不再让文件日志静默失效；补"竞态回落的新行不许继承旧行级别"用例（钉住 `else: eff = lvl`）。**未采纳**：`normalize_level` 收录 `alert/error` 等词（规格口径是"未知兜底 info"，加词属猜测，留给后续按实测补） |
 
 ## 10. 实现台账与偏差
 
@@ -176,10 +177,10 @@ def notify_nurse(message: str, level: str = "info", uid: str = "") -> str
 | §4.2 MCP 层 | `LLM/notice_mcp/notice_server.py`（`build_server()` 注册 `notify_nurse`） |
 | §4.3 接线 | `LLM/conf.py`（`NOTICE_BACKEND_URL` + `_notice_mcp_env()` + `MCP_SERVERS["notice"]`）、`LLM/agent/policy.py`（ward/elder 白名单；admin 是 `None` 无需改）、`LLM/agent/tools.py::_audit_args` |
 | §8 M1 根因修复（跨批次） | `LLM/store/db.py`（`find_unacked_notification` 合并键加 `body`、`bump_notification` 支持提级别）、`LLM/agent/notify.py`（`_higher_level` + 广播与库对齐）、`LLM/tests/test_notify.py`（+2 例净增）、护士台规格 D5/§4.2 修订 |
-| §6 测试 | `LLM/tests/test_notice_mcp.py`（30 例）+ `LLM/tests/test_policy_roles.py`（断言随策略演进，抽 `WARD_TOOLS` 常量） |
+| §6 测试 | `LLM/tests/test_notice_mcp.py`（31 例）+ `LLM/tests/test_policy_roles.py`（断言随策略演进，抽 `WARD_TOOLS` 常量） |
 | 文档 | `LLM/notice_mcp/README.md`、`AGENTS.md`（树/notify 条目/文档导航）、`docs/log.md` 2026-09-18 条目、`.gitignore`（`/LLM/notice_mcp/*.log`） |
 
-**验证（本机，2026-09-18，修复轮之后）：** `pytest LLM/tests` = **4 failed / 231 passed / 135 errors** vs 基线（`git worktree` 于 `1bad0c2` 独立重跑）**4 failed / 199 passed / 135 errors**：失败集合逐条一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件 `db.DB_PATH` 顺序污染/沙箱环境红态），净增 32 例全绿（新文件 30 例 + `test_notify.py` 净增 2 例）。
+**验证（本机，2026-09-18，含复审后的残余清理）：** `pytest LLM/tests` = **4 failed / 233 passed / 135 errors** vs 基线（`git worktree` 于 `1bad0c2` 独立重跑）**4 failed / 199 passed / 135 errors**：失败集合逐条一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件 `db.DB_PATH` 顺序污染/沙箱环境红态），净增 34 例全绿（新文件 31 例 + `test_notify.py` 净增 3 例）。
 
 **端到端实测（临时后端 8099 + 独立库 `.tmp/e2e_notice.db`，不碰用户的 8000 与真 `brain.db`）：**
 - `notice_client.push("张爷爷说胸口疼，想找护士", level="critical", uid="elder_001")` → `{"ok": true, "id": 1, "level": "critical", "deduped": false}`；库里落成 `source="cart" / type="message" / title="通知" / uid_name="张建国 · 3-12"`（姓名·床号按 `notify.uid_name()` 解析）。

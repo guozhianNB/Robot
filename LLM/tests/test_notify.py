@@ -238,6 +238,28 @@ def test_ingest_adds_new_row_when_bump_loses_ack_race(monkeypatch):
         db.DB_PATH = old
 
 
+def test_race_new_row_does_not_inherit_stale_level(monkeypatch):
+    """竞态回落到新增行时，新行必须用**本次上报**的级别（不许继承那个没能合并进去的旧行）。
+
+    这是 `ingest` 里 `else: eff = lvl` 的唯一判别点：老行 critical + 同正文新报 info + bump→0
+    ⇒ 新行必须是 info（把 stale 的 critical 抄过来就会虚报一张红卡）。
+    """
+    old = _init_tmp_db()
+    try:
+        a = notify.ingest("car", "offline", uid="elder_1", level="critical", body="失联")
+        assert db.get_notification(a["id"])["level"] == "critical"
+        monkeypatch.setattr(db, "bump_notification", lambda nid, ts, **kw: 0)
+
+        b = notify.ingest("car", "offline", uid="elder_1", level="info", body="失联")
+
+        assert b["deduped"] is False and b["level"] == "info"
+        assert db.get_notification(b["id"])["level"] == "info"
+        assert db.get_notification(a["id"])["level"] == "critical"   # 老行不动
+    finally:
+        _cleanup_tmp_db()
+        db.DB_PATH = old
+
+
 # ------------------------------------------------------------------ 5 列表与计数
 def test_unread_filter_and_counts():
     old = _init_tmp_db()

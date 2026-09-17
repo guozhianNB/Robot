@@ -53,7 +53,7 @@ else:
     _INIT_ERR = None
 
 # 日志落盘（MCP 走 stdio，**绝不能 print 到 stdout** 污染协议）
-_LOG_PATH = os.environ.get("NOTICE_MCP_LOG", os.path.join(_HERE, "notice_mcp.log"))
+_LOG_PATH = os.environ.get("NOTICE_MCP_LOG") or os.path.join(_HERE, "notice_mcp.log")
 
 
 def _log(msg: str):

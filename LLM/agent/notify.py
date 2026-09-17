@@ -2,8 +2,9 @@
 r"""
 通知中心（护士台数据底座，需求文档模块 11）：
   - **任何模块**发现异常都往 `POST /api/notifications` 投递（该口有意免鉴权）；
-  - 同 `(source,type,uid)` 在 `conf.NOTIFY_DEDUP_S` 窗口内的**未处理**通知做合并
-    （count+1、last_at 刷新，**保留最早原文**），避免"同一次失联刷 80 条"；
+  - 同 `(source,type,uid,正文)` 在 `conf.NOTIFY_DEDUP_S` 窗口内的**未处理**通知做合并
+    （count+1、last_at 刷新，**保留最早原文**、级别**只升不降**），避免"同一次失联刷 80 条"；
+    正文进合并键是 2026-09-18 的修订（少了它，同一分钟内**不同的事**会互相吞掉、紧急级别被静默降级）。
   - 所有状态变更写审计（`notify_ingest` / `notify_ack` / `notify_delete`），
     并广播总线事件（`notification` / `notification_ack`）让护士台实时收到。
 
@@ -21,8 +22,14 @@ _LEVEL_RANK = {lvl: i for i, lvl in enumerate(LEVELS)}     # info=0 < warning=1 
 
 
 def _higher_level(a: str, b: str) -> str:
-    """取更紧急的那个级别（未知值按 info 计）。合并时必须**只升不降**，见 `ingest` 注释。"""
-    return b if _LEVEL_RANK.get(b, 0) > _LEVEL_RANK.get(a, 0) else a
+    """取更紧急的那个级别（未知值按 info 计）。合并时必须**只升不降**，见 `ingest` 注释。
+
+    `a` 会先归一到 `LEVELS`：库里若存着词表外的级别（今天不可达 —— 写入侧只由 `ingest` 传校验过的
+    值、列默认 `'info'`），也不能把它当"更紧急"原样返回再写回库。
+    """
+    a = a if a in _LEVEL_RANK else "info"
+    b = b if b in _LEVEL_RANK else "info"
+    return b if _LEVEL_RANK[b] > _LEVEL_RANK[a] else a
 
 DEFAULT_LEVEL = {
     "sos": "critical", "fall": "critical", "help": "critical",

@@ -128,8 +128,8 @@ CREATE TABLE IF NOT EXISTS zones (
   UNIQUE(map_name, name)
 );
 -- ===== 通知中心（护士台数据底座，模块 11）=====
--- 任何模块发现异常都往 POST /api/notifications 投递（免鉴权）。同 (source,type,uid) 在
--- NOTIFY_DEDUP_S 窗口内命中的未处理通知做合并（count+1、last_at 刷新，保留最早原文）。
+-- 任何模块发现异常都往 POST /api/notifications 投递（免鉴权）。同 (source,type,uid,正文) 在
+-- NOTIFY_DEDUP_S 窗口内命中的未处理通知做合并（count+1、last_at 刷新，保留最早原文、级别只升不降）。
 CREATE TABLE IF NOT EXISTS notifications (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   level      TEXT NOT NULL DEFAULT 'info',
