@@ -26,6 +26,13 @@ DEFAULT_SETTINGS = {
     "reminder_enabled": True,       # 定时提醒总开关
     "thinking_router_enabled": True,  # 思考路由层总开关
     "router_llm_enabled": True,     # 思考路由：规则未命中时用 LLM 快速预判兜底
+    # 思考档位阶梯（规格 docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md D5）：
+    # auto=照思考路由（日常快答/敏感问题自动加深）；none=不思考（**敏感词安全网保留**）；
+    # low/high/max=强制思考的轻/中/重度（映射 DeepSeek 顶层 reasoning_effort=low/high/max；
+    # 官方 minimal/medium/xhigh/ultra 会归并到 low/high/max，实测传 ultra 直接 400）。
+    # 旧值 on→high、off→none 由 chat._resolve_thinking_mode 兼容，无需数据迁移。
+    # 非特权键：kiosk 端也要能切（语音轮次不过前端，只有落库的设置才能让语音也吃到手动档位）。
+    "thinking_mode": "auto",
     "memory_consolidation_enabled": True,  # 记忆整理（话题结束后批量沉淀）
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
     "recycle_purge_days": 30,       # 回收站软删记忆保留多少天后物理清理

@@ -78,7 +78,10 @@ LLM/
 **权威清单 = `server.py` 里的 `@app.*` 装饰器行**，摘要：
 
 - 健康/状态：`GET /api/health` ｜ `GET /api/modules/status` ｜ `GET /api/logs/warnings` ｜ `GET /api/context`
-- 对话：`POST /api/chat`（SSE 流式，体 `{uid, message, thinking:"auto|on|off"}`）｜ `GET|DELETE /api/chat/history`
+- 对话：`POST /api/chat`（SSE 流式，体 `{uid, message, thinking:"auto|none|low|high|max", speak}`）｜ `GET|DELETE /api/chat/history`
+  - **思考档位（2026-09-17 规格 `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md`）**：五档 `auto`（照路由）/ `none` 不思考 / `low` 轻度 / `high` 中度 / `max` 重度——**`none` 也关不掉敏感词安全网**（`THINKING_KEYWORDS`/情绪词/LLM 预判命中的问题照旧加深，`method` 如实上报 `keyword|emotion|llm` 而不是 `manual`）；旧值 `on`/`off` 别名到 `high`/`none`。**空串 / 缺省**=读 `settings.thinking_mode`（非特权键，kiosk 也能改——语音轮次不过前端，只有落库的设置才能让语音吃到手动档位，`voice_api._stream_fn` 传的就是空串）。`meta` 事件带 `router.mode` + `router.effort` 上报实际生效强度。
+  - ⚠️ **`reasoning_effort` 必须是顶层参数**（`client.chat.completions.create(reasoning_effort=...)`，openai 3.3.1 签名里有）：塞进 `extra_body` 会被 DeepSeek 当未知字段**静默忽略**，表现就是「选了强制/中度也不思考」——2026-09-17 用户实测踩过。`extra_body` 只放 `{"thinking": {"type": "enabled"|"disabled"}}`；`low/high/max` 是实测可用档（官方 `minimal/medium/xhigh` 会被归并、`ultra` 直接 400）。思考档位下思维链也吃 `max_tokens`，故 `chat_stream` 有「只有思考没正文 → 关思考重答一次」的兜底（`action="thinking_empty_fallback"`）。
+  - **思维链**：SSE `reasoning` 事件（kiosk 语音轮次额外广播总线 `chat_reasoning`）**只上屏、绝不进 TTS、不落库**（历史回读不重播思考过程）——`server.py::chat_route` 只把 `content` 喂 `voice_api.feed_text_reply`，`voice/worker.py::_consume_events` 只对 `content` 分句合成；改这两处等于把思维链念出来，`LLM/tests/test_thinking_mode.py`、`test_worker_events.py::test_reasoning_is_shown_but_never_synthesized` 锁死该不变量。
 - 档案/会话：`GET|POST /api/profiles` ｜ `GET|POST /api/session/user`（active_uid + 锁定，kiosk 手动选人）
 - 提醒：`GET|POST /api/reminders` + `/{rid}/confirm` `/delete`
 - 记忆：`/api/memories` 一族 —— `GET|POST`、`/{mid}/confirm|reject|delete`、`/recycle`(+restore/purge)、`/correct`、`/import`、`/portrait`(护士手动画像)、`/suggest`、`/health`；`/api/memories/core`(+confirm/unconfirm/pin/unpin/{mid}delete)、`/rag`(+delete)、`/graph`、`/expressions`(+approve/reject)
@@ -129,7 +132,7 @@ LLM/
 - pnpm workspace（Vue3 + Vite + TS），三个包：
   - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
-  - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`），admin/kiosk 都从它引入。
+  - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 思考档位工具 `src/thinking.ts`（五档 `ThinkingMode` / `THINKING_MODE_ORDER` / `normalizeThinkingMode`（含 on/off 兼容）/ `thinkingModeLabel`），admin/kiosk 都从它引入。
   - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产由编辑器自己的进程挂 `/mapeditor`（主后端 8000 不再挂载，见「快速上手 → 前端」）；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
 - 工程细节：vite `base` 与后端挂载路径一致（admin→`/admin/`、kiosk→`/kiosk/`，见 vite.config 注释 C-1）；`shared` 包 alias 到 TS 源码（monorepo 已知坑）。
 - **功能齐平是渐进迁移**：个别旧功能尚未搬入 Vue admin——典型如**老人注册向导**（旧入口在 `UI(old)/index.html`「➕ 注册老人」4 步向导，规格 `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`，后端 `/api/profiles` + `/api/voice/enroll` 一直可用）。要动此类功能先看旧实现 + 规格，别从零重造。
@@ -144,6 +147,7 @@ LLM/
 - `docs/superpowers/specs/2026-08-27-frontend-multi-end-design.md` — **前端多端重构设计**（现行 frontend/ 架构依据：D1-D11 决策、admin/kiosk 分工、部署形态）。
 - `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md` — 老人注册向导设计（尚未迁入 Vue admin，见「前端（frontend/）」节）。
 - `docs/superpowers/specs/2026-09-14-map-editor-design.md` — **地图编辑器设计（A 篇：看图/标地点/划区域/管地图文件；B 篇：像素修图）**，**2026-09-14 已落地**（实现台账与偏差见文末「实现台账与偏差（2026-09-14 落地）」一节）。改地图相关代码前必读。
+- `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md` — **思考档位手动切换（五档：自动/不思考/轻/中/重度）+ 思维链上屏**（2026-09-17 落地，含 D5「`reasoning_effort` 必须是顶层参数、塞 extra_body 会被静默忽略」这条实测坑）：`none` 关不掉敏感词安全网、档位落 `settings.thinking_mode`、思维链只上屏绝不进 TTS。改 `chat_stream`/`voice/worker.py` 前必读。
 - 历史档案：`docs/superpowers/specs/2026-08-18-ai-chat-frontend-design.md` 等 8 月旧规格描述的是单文件 `UI/index.html` 时代的实现，仅作过程参考（其 `/api/chat` 请求体已过时，实际为 `{uid, message, thinking}`）。
 
 ## 固件（stm32/）

@@ -24,9 +24,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -117,6 +117,25 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _no_store_entry_html(request: Request, call_next):
+    """入口 HTML（/、/admin/、/kiosk/ 的 index.html）禁止缓存。
+
+    为什么必须这样：index.html 里的 `<script src="assets/index-<hash>.js">` 是**唯一**指向
+    当前构建的指针。浏览器若缓存了旧 index.html，用户按 Ctrl+F5 也只是"刷新页面"，
+    加载的仍是旧 JS —— 表现就是"代码明明改好/重启了，界面还是老样子、参数还是老参数"
+    （2026-09-18 排查思考档位时踩过：新代码在跑，页面却还在用 9 天前的 bundle）。
+    带 hash 的 assets 可以放心长期缓存，所以只对 html 入口加 no-store。"""
+    resp = await call_next(request)
+    path = request.url.path.rstrip("/") or "/"
+    if path in ("", "/", "/admin", "/kiosk") or path.endswith("/index.html"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
 app.include_router(mapctl.router)   # /api/mapeditor/service{,/start,/stop}（仅管理员）
 
 
@@ -348,6 +367,8 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
         try:
             for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking,
                                        settings, principal=principal):
+                # 只有 content 进 TTS：reasoning（思维链）**绝不允许**喂给 voice_api，
+                # 否则思考过程会被播报出来（规格 2026-09-17-thinking-mode-switch-design.md D3）。
                 if ev["type"] == "content":
                     voice_api.feed_text_reply(speech, ev.get("content") or "")
                 elif ev["type"] == "done":

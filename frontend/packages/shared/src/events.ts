@@ -40,6 +40,13 @@ export interface ChatPartialEvent {
   delta: string;   // 助手回复实时增量（LLM content delta），kiosk 打字机式追加
 }
 
+/** 思维链实时增量（LLM reasoning_content delta）——只上屏展示，**绝不进 TTS**。 */
+export interface ChatReasoningEvent {
+  type: "chat_reasoning";
+  uid: string;
+  delta: string;
+}
+
 export interface VoiceStateEvent {
   type: "voice_state";
   state: string;     // idle / listening / recognized / speaking / asr_partial（实时识别字幕，带 text）
@@ -90,6 +97,7 @@ export type BusEvent =
   | AlarmEvent
   | ChatNewEvent
   | ChatPartialEvent
+  | ChatReasoningEvent
   | VoiceStateEvent
   | UserChangedEvent
   | VoiceStatusEvent
@@ -103,6 +111,7 @@ const KNOWN_TYPES = new Set([
   "alarm",
   "chat_new",
   "chat_partial",
+  "chat_reasoning",
   "voice_state",
   "user_changed",
   "voice_status",

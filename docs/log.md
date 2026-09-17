@@ -896,3 +896,55 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - **风格统一**：`voice/worker.py` 两处函数内延迟导入原为绝对形式 `from LLM.agent import session`，改为 `from ..agent import session`，与关键约定 §6 一致。
 - **复查结论**：25 个新路径全部可导入、25 个旧路径全部不可导入；`conf.py` 三处 `__file__` 推导、`tools.py` 的 `pkgutil` 自动加载、`PROMPT_FILE`/`PROMPT_DIR` 均落位正确；`stm32/`、`ros2_car/`、`scripts/`、`vision/`、`UI(old)/`、根目录文档**无残留**。改完后重跑 `--collect-only` 仍是 **542 collected / 0 errors**。
 - **按原样保留**：`docs/log.md` ≤09-15 旧条目里的路径是"当日事实"（日记体），与 `docs/superpowers/plans|specs` 同理，不做回改。仅提示本文件里两条命令今天照抄会失败：`306` 的 `python -c "import LLM.tools"`、`492` 的 `py_compile … LLM\voice_api.py`。
+
+## 2026-09-17（续）· 思考档位手动切换 + 思维链上屏（不进 TTS）
+
+**依据：** 用户需求「现在的 llm 对话是默认快速不思考的。我希望你能在前端增加一个选择按钮，手动切换思考模式。但敏感词自动加深思考功能不改。当手选思考强度为不思考时触发敏感问题思考功能，以后者确定的思考深度为准。对话中要展示思维链，注意不要让思维链进入 tts」；规格 `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md`。
+
+### 改了什么
+
+| 文件 | 内容 |
+|------|------|
+| `LLM/agent/chat.py` | 新增 `_apply_thinking_mode()` / `_resolve_thinking_mode()`；`chat_stream` 的 `meta` 事件带 `router.mode` |
+| `LLM/conf.py` | `DEFAULT_SETTINGS["thinking_mode"] = "auto"`（非特权键，kiosk 也能改） |
+| `LLM/voice/voice_api.py` | 语音轮次调 `chat_stream` 时第 5 参数由 `"auto"` 改 `""`——**不改这一处，用户在界面上选的档位对语音完全无效** |
+| `LLM/voice/worker.py` | 新增 `reasoning` → 总线 `chat_reasoning` 广播（思维链上屏）；`content` 才分句合成 |
+| `LLM/server.py` | `chat_route` 把 content 喂 TTS 改显式分支 + 注释锁边界 |
+| `frontend/packages/shared/src/thinking.ts`（新） | `ThinkingMode` / `nextThinkingMode` / `normalizeThinkingMode` / `thinkingModeLabel` / `THINKING_MODE_HINT` |
+| `frontend/packages/shared/src/events.ts` | `ChatReasoningEvent` + `KNOWN_TYPES` 同步 |
+| `frontend/packages/admin/src/pages/ChatPage.vue` | 工具栏「🧠 思考：自动/强制/关闭」循环按钮（落 `settings.thinking_mode`，5s 轮询同步）+ 气泡内可折叠「💭 思考过程」 |
+| `frontend/packages/kiosk/src/App.vue` / `components/ChatArea.vue` / `components/SettingsSheet.vue` | 底部一键轮换按钮 + 设置弹层三档单选 + 对话区思考块（默认展开可收起） |
+
+### 关键决策
+
+- **`off` 关不掉安全网**：`on` 一律深思；`off` 只压制非敏感问题，命中 `THINKING_KEYWORDS`/情绪词/LLM 预判的问题**照旧加深**，且 `method` 如实上报 `keyword|emotion|llm`（reason 前缀「敏感话题已自动加深：」），绝不谎报成 `manual`。`auto` 行为不变。
+- **档位落地位置**：请求体显式值 > `settings.thinking_mode` > `auto`；只有**空串/缺省**才回读 settings。语音轮次不过前端，所以 `voice_api._stream_fn` 传空串（这一条有专门用例锁死）。
+- **思维链三不进**：不进 TTS（两条链路都只对 `content` 合成）、不进 DB（`append_history` 只写 assistant 正文，历史回读不重播思考）、不进语音播报文字广播。
+- 不加"思考强度档位"（`reasoning_effort` 仍固定 high）；不改 `route_thinking` 的判定逻辑一个字。
+
+### 验证
+
+- `pytest LLM/tests`：**4 failed, 166 passed, 135 errors** vs 基线（stash 后重跑）**4 failed, 150 passed, 135 errors** —— 失败集合完全一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件顺序污染/环境相关红态），新增 16 例全绿。135 errors 是本机沙箱下 `tmp_path` 不可建的既有环境限制。
+- 新增 `LLM/tests/test_thinking_mode.py`（档位优先级/安全网/meta/端到端）与 `test_worker_events.py::test_reasoning_is_shown_but_never_synthesized`（思维链广播了、但合成的字符串里一个字都没有）。
+- `pnpm -r test`：4 文件 24 例全绿（含新增 `shared/tests/thinking.test.ts` 5 例）；`pnpm --filter admin build`、`pnpm --filter kiosk build` 均成功，产物已由后端 8000 静态托管。
+- **未验**：真机/浏览器端到端（按按钮→敏感问题仍加深、语音不念思考过程）需人工；`vue-tsc` 在本机装不起来（`MODULE_NOT_FOUND`，本次改动前就坏的），故 Vue 模板类型未经 tsc 校验。
+
+### 2026-09-17（续二）· 修「选了强制也不思考」+ 思考档位改成五档阶梯
+
+**起因：** 用户实测反馈「强制模式下 llm 还是不思考啊。还有，我需要实现的样子是除了自动模式，还有强制"不思考、轻度、中度、重度"」。
+
+**根因（真 bug，已实测定位）：** 原实现把 `{"thinking": {...}, "reasoning_effort": "high"}` 整个塞进 `extra_body`。DeepSeek 只认 `extra_body.thinking`，**`reasoning_effort` 必须是顶层参数**（openai 3.3.1 的 `Completions.create` 签名里有这个形参），塞进 extra_body 会被当未知字段静默忽略——于是「开思考」生效、强度永远停在默认档，叠加当时前端根本不渲染 `reasoning` 事件，表现就是「强制也不思考」。修法：`extra_body` 只放 thinking 开关，`reasoning_effort` 走顶层形参（`_thinking_extra()` + 调用点）。
+
+**改成五档：** `auto` 自动 / `none` 不思考 / `low` 轻度 / `high` 中度 / `max` 重度。判定返回**强度**而不是布尔：
+- `low/high/max` → 该强度、`method=manual`；
+- `none` → 只压制非敏感问题，敏感词/情绪/LLM 预判命中照旧按 `high` 加深（`method` 仍如实报 `keyword|emotion|llm`）；
+- `auto` → 照思考路由；旧值 `on→high`、`off→none` 做别名，不迁移数据。
+
+**实测数据（2026-09-17，本机 key，模型 `deepseek-v4-flash`）：** 同一道工程题，思维链长度 `low≈150-450` / `high≈200` / `max≈353-1939` 字，三档确有区别；`ultra` 直接 **400**（`Failed to deserialize the JSON body`），官方文档里 `minimal/medium/xhigh/ultra` 均归并到 low/high/max。可用模型：`deepseek-flash`、`deepseek-v4-pro`。生产代码端到端复验（`mode=none/low/max` → reasoning `0/445/1939` 字）通过。
+
+**顺手补的兜底：** 思考档位下思维链也吃 `max_tokens`，实测敏感问题在 `max` 档出现「reasoning 有、`content` 全空」→ 老人一个字都听不到。故 `chat_stream` 加一次降级：本轮没正文就关思考重答一次（审计 `thinking_empty_fallback`，只降一次）。
+
+**前端：** admin 工具栏改成五档下拉；kiosk 底部大按钮点开五档菜单 + 设置弹层五档单选；`shared/thinking.ts` 的 `ThinkingMode` 扩到五档并兼容 `on/off`。
+
+**验证：** `pytest LLM/tests` **4 failed / 173 passed / 135 errors** vs 基线 **4 failed / 150 passed / 135 errors**（失败集合完全一致，全是既有红态）；`test_thinking_mode.py` 22 例全绿；`pnpm -r test` 25 例全绿；admin/kiosk 构建通过。
+**生效前提：** 后端改动需**重启 uvicorn**（当前 8000 上的进程跑的还是旧代码），前端需**硬刷新**（Ctrl+F5）——这正是用户上一轮「按了强制还是不思考」的另一个原因：前台 bundle 与后台进程都还是旧的。

@@ -102,6 +102,47 @@ def test_consume_reply_streams_partial_and_chat_new(monkeypatch):
     assert w.session.state == session_mod.State.SPEAKING
 
 
+def test_reasoning_is_shown_but_never_synthesized(monkeypatch):
+    """思维链只广播 chat_reasoning 上屏，**绝不进分句缓冲/TTS**（规格 D3 回归锁）。"""
+    _silence_audit(monkeypatch)
+    events = []
+    spoken = []
+
+    def pub(ev, **payload):
+        events.append((ev, payload))
+
+    def stream_fn(uid, text):
+        return iter([
+            {"type": "reasoning", "content": "老人问的是降压药，先想清楚能不能减。"},
+            {"type": "content", "content": "这个要问护士。"},
+            {"type": "done", "assistant": "这个要问护士。"},
+        ])
+
+    w = worker_mod.VoiceWorker(stream_fn=stream_fn,
+                               post_turn_fn=lambda uid, u, a: None,
+                               publish_fn=pub)
+    _install_stubs(w)
+    w.tts = w._local_tts = type("Tts", (), {
+        "provider": "local",
+        "synthesize_chunks": lambda self, t: (
+            spoken.append(t) or np.zeros(160, dtype=np.float32) for _ in (1,)
+        ),
+    })()
+    w.current_uid = "elder_002"
+    w._turn += 1
+    assistant = w._consume_reply("elder_002", "降压药能减半吗",
+                                 {"tts_enabled": True}, w._turn)
+
+    reasoning = "".join(p["delta"] for ev, p in events if ev == "chat_reasoning")
+    assert reasoning == "老人问的是降压药，先想清楚能不能减。"
+    assert [p for ev, p in events if ev == "chat_reasoning"][0]["uid"] == "elder_002"
+    # 合成内容只有正文：思考过程一个字都没进去
+    assert spoken == ["这个要问护士。"], f"思维链混进了 TTS：{spoken}"
+    assert "先想清楚" not in "".join(spoken)
+    # 落库/气泡正文也只含 content
+    assert assistant == "这个要问护士。"
+
+
 def test_speech_publishes_recognized(monkeypatch):
     """语音识别整句 → recognized + user_changed（不做 LLM 段同步断言）。"""
     _silence_audit(monkeypatch)

@@ -161,7 +161,10 @@ def _stream_fn(client, model):
     def _fn(uid, text):
         settings = db.get_settings()
         from ..agent import session as role_session
-        return chat.chat_stream(client, model, uid, text, "auto", settings,
+        # 第 5 个参数传空串 = "不在请求里指定档位"：语音轮次不过前端，档位只能来自
+        # settings.thinking_mode（前端按钮落库）。传 "auto" 会把用户的手动档位顶掉。
+        # 见规格 docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md D2。
+        return chat.chat_stream(client, model, uid, text, "", settings,
                                 principal=role_session.get_principal("kiosk"))
     return _fn
 

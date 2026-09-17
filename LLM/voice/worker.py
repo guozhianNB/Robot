@@ -10,7 +10,8 @@ r"""语音后台线程：编排 采集→VAD→(KWS|流式ASR)→声纹→LLM→
   - 引擎选择：启动时读 settings.asr_provider（local|cloud），重启生效。
   - 应答编排：recognized 后启动应答线程消费 chat_stream——content 增量逐字广播
     chat_partial（前端上屏），完整句切出后按句合成入队播报（句级 TTS，tts_provider=cloud
-    时云端句失败自动回退本地引擎，不中断播报）；老人插话打断 = sink.stop() + _abort 置位
+    时云端句失败自动回退本地引擎，不中断播报）；**reasoning（思维链）只广播 chat_reasoning
+    上屏，绝不进分句缓冲与合成**；老人插话打断 = sink.stop() + _abort 置位
     （仅播放期 barge-in 语义），应答线程停止后续合成/入队；chat_new 与 post_turn 在
     整段流收尾后发（旧 _speak 整段合成已删，改由 _consume_reply/_answer 编排）。
   - 轮次代数防双线程重叠：_start_answer 每轮 self._turn += 1（int 原子读写）抢占"最新轮"
@@ -486,6 +487,7 @@ class VoiceWorker(threading.Thread):
 
     def _consume_reply(self, uid, user_text, settings, turn):
         """同步消费 chat_stream 事件流（_answer 应答线程内调用；单测直接调用）：
+        reasoning → 广播 chat_reasoning（思维链上屏，**永不合成/播报**）；
         content → 广播 chat_partial(逐字上屏) → 分句缓冲 → 完整句合成入队（仅 speak 模式）；
         done → flush 尾句。返回完整 assistant 文本。
         turn = 本轮次代数：被新轮取代（self._turn != turn）或 _abort 置位时，检查点
@@ -563,7 +565,16 @@ class VoiceWorker(threading.Thread):
                 if self._abort.is_set() or self._turn != turn:
                     break                 # 打断 / 被新轮取代：停止后续消费与分句
                 t = ev.get("type")
-                if t == "content":
+                if t == "reasoning":
+                    # 思维链只上屏、**绝不入 TTS**（规格 2026-09-17-thinking-mode-switch-design.md D3）：
+                    # 走 chat_reasoning 总线事件给 kiosk 展示思考过程，不进分句缓冲、不调合成。
+                    delta = ev.get("content") or ""
+                    if delta:
+                        self._publish(
+                            "chat_reasoning",
+                            uid=settings.get("_voice_uid") or self.current_uid or "elder_001",
+                            delta=delta)
+                elif t == "content":
                     delta = ev.get("content") or ""
                     if delta:
                         if publish_text:

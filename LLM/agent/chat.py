@@ -15,7 +15,7 @@ from . import memory as rag
 from . import tools as tool_mod
 from ..conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
-                   LLM_TIMEOUT, PROMPT_FILE)
+                   LLM_TIMEOUT, PROMPT_FILE, DEFAULT_SETTINGS)
 # 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/agent/policy.py
 from .policy import role_policy
 
@@ -24,6 +24,15 @@ from mcp.client.session import ClientSession
 
 # stdio_client：用来把你的mcp服务端程序，启动为一个子进程，通过标准输入输出和客户端通信
 from mcp.client.stdio import stdio_client
+
+# ---- 思考档位阶梯（规格 2026-09-17-thinking-mode-switch-design.md D1/D5）----
+# 前端五档 → DeepSeek 的 `reasoning_effort`（官方映射：minimal→low、medium→high、xhigh→high、
+# ultra→max；实测 `ultra` 会 400，故只用 low/high/max 三档）。`auto` 不进这张表：它走思考路由。
+THINKING_MODES = ("auto", "none", "low", "high", "max")
+FORCED_EFFORTS = {"low": "low", "high": "high", "max": "max"}
+LEGACY_MODE_ALIASES = {"on": "high", "off": "none"}   # 旧三档值兼容（前端/设置里可能还留着）
+DEFAULT_ROUTED_EFFORT = "high"   # auto / 安全网命中时的思考强度
+THINKING_MODE_CN = {"auto": "自动", "none": "不思考", "low": "轻度", "high": "中度", "max": "重度"}
 
 # ---- P2a 记忆召回节流缓存（对标 MaiBot heuristic 记忆的缓存思想，省 embedding/上下文）----
 # 同 uid 的 RAG 召回 context 做短 TTL 缓存：短时间多轮对话复用同一份召回，避免每轮重复向量检索
@@ -177,6 +186,48 @@ def llm_json(client, model: str, prompt: str, timeout: int = LLM_TIMEOUT) -> dic
         return json.loads(text)
     except Exception:
         return {}
+
+
+def _apply_thinking_mode(mode: str, routed: dict) -> tuple[str, str, str, str]:
+    """把手动档位与路由结果合成最终**思考强度**（规格 2026-09-17-thinking-mode-switch-design.md D1/D5）。
+
+    档位是五档阶梯：`none`(不思考) / `low`(轻度) / `high`(中度) / `max`(重度) / `auto`(自动)。
+    手动档位**叠加**在思考路由之上，不是替换：
+      - low/high/max：用户要深思 → 一律按该强度思考（method=manual）；
+      - none：用户要快答 → 只压制**非敏感**问题的思考；命中关键词/情绪词/LLM 预判的
+              问题**照旧加深**（强度取 DEFAULT_ROUTED_EFFORT，安全网手动关不掉，用户口径
+              「敏感词自动加深思考功能不改」）。此时 reason/method 保持路由原值，绝不谎报 manual；
+      - auto：完全照路由（日常不思考，敏感问题加深）。
+    返回 (effort, reason, method, mode)，`effort` 为 None 表示不思考。
+    """
+    on, reason, method = routed["on"], routed["reason"], routed["method"]
+    if mode in FORCED_EFFORTS:
+        return FORCED_EFFORTS[mode], f"用户手动选择：{THINKING_MODE_CN.get(mode, mode)}", "manual", mode
+    if mode == "none":
+        if on:
+            return DEFAULT_ROUTED_EFFORT, f"敏感话题已自动加深：{reason}", method, mode
+        return None, "用户手动关闭", "manual", mode
+    return (DEFAULT_ROUTED_EFFORT if on else None), reason, method, "auto"
+
+
+def _resolve_thinking_mode(thinking: str, settings: dict) -> str:
+    """请求体显式档位 > 持久化设置 > auto（语音轮次不过前端，只能靠 settings 吃手动档位）。
+    旧三档值 `on`/`off` 一律别名到 `high`/`none`（缓存里的老前端 bundle / 老设置都能跑）。"""
+    if thinking in THINKING_MODES:
+        return thinking
+    if thinking in LEGACY_MODE_ALIASES:
+        return LEGACY_MODE_ALIASES[thinking]
+    fallback = str(settings.get("thinking_mode") or DEFAULT_SETTINGS.get("thinking_mode", "auto"))
+    fallback = LEGACY_MODE_ALIASES.get(fallback, fallback)
+    return fallback if fallback in THINKING_MODES else "auto"
+
+
+def _thinking_extra(effort: str | None) -> dict:
+    """extra_body 部分：只放 `thinking` 开关。**`reasoning_effort` 绝不能塞这里** ——
+    它必须是顶层参数（`client.chat.completions.create(reasoning_effort=...)`，openai 3.3.1
+    的签名里有），塞进 extra_body 会被服务端当未知字段静默忽略，
+    表现就是用户看到的「选了强制/中度，模型照样不思考」。"""
+    return {"thinking": {"type": "enabled"}} if effort else {"thinking": {"type": "disabled"}}
 
 
 def route_thinking(text: str, settings: dict, llm_client=None, model: str = MODEL) -> dict:
@@ -408,45 +459,46 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
       {"type":"reasoning"|"content"|"tool_start"|"tool_result"|"done"|"error", ...}
     工具循环最多 2 轮，防止模型无限调工具。
     """
-    # 思考路由（规则 + 情绪词 + LLM 预判兜底）
+    # 思考路由（规则 + 情绪词 + LLM 预判兜底）+ 手动档位叠加（见 _apply_thinking_mode）
     routed = route_thinking(user_text, settings, llm_client=client, model=model)
-    thinking_on, reason, method = routed["on"], routed["reason"], routed["method"]
-    if thinking == "on":
-        thinking_on, reason, method = True, "用户手动开启", "manual"
-    elif thinking == "off":
-        thinking_on, reason, method = False, "用户手动关闭", "manual"
+    mode = _resolve_thinking_mode(thinking, settings)
+    effort, reason, method, mode = _apply_thinking_mode(mode, routed)
+    thinking_on = effort is not None
 
     # 历史读写也必须与权限口径同源：客户端传来的 uid 不可信（R1），否则会把别人的私聊注入
     # 当前会话、并把回答写进别人的历史（R5 的旁路）。`meta` 里报的也是这个**实际生效**的
     # 数据主体（前端若与入参比对，能看出伪造/过期的 uid 已被忽略）。
     data_uid = (principal.get("uid") or uid) if principal is not None else uid
 
-    yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method,
-                                      "uid": data_uid}}
+    yield {"type": "meta", "router": {"on": thinking_on, "effort": effort, "reason": reason,
+                                      "method": method, "mode": mode, "uid": data_uid}}
 
     messages = build_messages(data_uid, user_text, thinking_on, settings, principal=principal)
     tools = tool_mod.effective_tools(settings, principal)
 
     full_assistant = ""
+    reasoning_text = ""          # 思维链累计（只用于审计字数，不落库、不播报）
+    retried_no_thinking = False   # 空回复兜底只允许降级一次（防死循环）
     try:
         #--------------------------
         # 1、调用模型生成器，stream=True 流式输出
         for round_i in range(2):
-            extra = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"} if thinking_on \
-                else {"thinking": {"type": "disabled"}}
+            extra = _thinking_extra(effort)
             try:
                 stream = client.chat.completions.create(
                     model=model, messages=messages, stream=True,
                     tools=tools or None, tool_choice="auto" if tools else None,
+                    reasoning_effort=effort,
                     extra_body=extra,
                 )
             except Exception as e:
                 # thinking+工具冲突等：降级重试一次（去掉 thinking 或去掉工具）
-                if thinking_on:
-                    thinking_on = False
-                    yield {"type": "meta", "router": {"on": False, "reason": f"重试降级：{e}",
-                                                      "uid": data_uid}}
-                    extra = {"thinking": {"type": "disabled"}}
+                if effort:
+                    effort, thinking_on = None, False
+                    yield {"type": "meta",
+                           "router": {"on": False, "effort": None, "reason": f"重试降级：{e}",
+                                      "mode": mode, "uid": data_uid}}
+                    extra = _thinking_extra(None)
                     stream = client.chat.completions.create(
                         model=model, messages=messages, stream=True,
                         tools=tools or None, tool_choice="auto" if tools else None,
@@ -463,6 +515,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 delta = choice.delta
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
+                    reasoning_text += reasoning
                     yield {"type": "reasoning", "content": reasoning}
                 if delta.content:
                     full_assistant += delta.content
@@ -511,6 +564,30 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 continue  # 下一轮：把工具结果交给模型
 
             break  # 正常结束
+
+        # 空回复兜底：思考档位下，思维链也吃 max_tokens，极端情况下（如敏感问题在 max 档
+        # 长时间自问）会"只想不说"——reasoning 有内容、content 为空，老人那边什么都听不到。
+        # 一轮没出正文就降级成不思考重来一次（只降一次，防死循环）。
+        if effort and not full_assistant.strip() and not retried_no_thinking:
+            retried_no_thinking = True
+            audit.log("chat", action="thinking_empty_fallback", uid=data_uid, mode=mode, effort=effort)
+            yield {"type": "meta",
+                   "router": {"on": False, "effort": None, "reason": "只思考没作答，已降级重答",
+                              "mode": mode, "uid": data_uid}}
+            effort, thinking_on = None, False
+            stream = client.chat.completions.create(
+                model=model, messages=messages, stream=True,
+                tools=tools or None, tool_choice="auto" if tools else None,
+                extra_body=_thinking_extra(None),
+            )
+            for chunk in stream:
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if delta.content:
+                    full_assistant += delta.content
+                    yield {"type": "content", "content": delta.content}
+                if choice.finish_reason:
+                    break
     except Exception as e:
         audit.log("chat", action="error", uid=data_uid, error=str(e))
         yield {"type": "error", "content": f"对话服务出错：{e}"}
@@ -520,6 +597,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     db.append_history(data_uid, "user", user_text)
     if full_assistant.strip():
         db.append_history(data_uid, "assistant", full_assistant)
+    # 审计带上思考档位/实际强度/思维链字数：现场排障时"参数到底传到 llm 没有"直接看审计
     audit.log("chat", action="turn", uid=data_uid, user=user_text[:200],
-              assistant=full_assistant[:200])
+              assistant=full_assistant[:200], mode=mode, effort=effort,
+              thinking_on=thinking_on, reasoning_chars=len(reasoning_text))
     yield {"type": "done", "assistant": full_assistant}
