@@ -261,24 +261,61 @@ def test_post_notifications_is_anonymous_but_type_is_required(c):
     r = c.post("/api/notifications", json={"source": "car", "type": "  "}, headers=K)
     assert r.status_code == 400
     # **有意放行**：投递口不带任何会话也必须成功 —— 告警源（小车/巡检/语音）没有口令，
-    # 需求文档模块 11 明确"任何模块发现异常都往该端口 POST"；读/确认/删除才是管理员专属。
+    # 需求文档模块 11 明确"任何模块发现异常都往该端口 POST"。
+    # （读/确认按 D11 同样免鉴权，仅删除仍是管理员专属，见下方 9 节用例。）
     r = c.post("/api/notifications", json={"type": "offline", "source": "car"}, headers=K)
     assert r.status_code == 200 and r.json()["ok"] is True
     assert db.list_notifications()[0]["source"] == "car"
 
 
-# ------------------------------------------------------------------ 9 管理口只给 admin
-def test_notification_admin_routes_reject_non_admin(c):
+# ------------------------------------------------------------------ 9 读/确认免鉴权、删单条仍 admin（D11）
+def test_notification_delete_rejects_non_admin_others_are_open(c):
+    """D11 演进的身份用例：原「四端点全拒非 admin」→「读/确认三端点放行 + 删单条仍 403」。
+
+    **契约已被规格变更**（规格 §4.3 路由表 + D11「护士台不再需要登录、也不会被弹」）：
+    `GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` 对非 admin（含未登录的 kiosk
+    槽）放行；**`DELETE /{nid}` 是唯一不放宽的端点**（删记录是数据损失）。
+
+    本用例继续锁住旧用例真正的关键断言：**删单条必须过口令，且 403 不留任何副作用（行还在）**。
+    """
     nid = notify.ingest("car", "offline")["id"]
 
-    assert c.get("/api/notifications", headers=K).status_code == 403
-    assert c.post(f"/api/notifications/{nid}/ack", headers=K).status_code == 403
-    assert c.post("/api/notifications/ack-all", headers=K).status_code == 403
-    assert c.delete(f"/api/notifications/{nid}", headers=K).status_code == 403
+    # D11：三条读/确认端点对非 admin 放行（身份闸门已按规格移除）
+    assert c.get("/api/notifications", headers=K).status_code == 200
+    assert c.post(f"/api/notifications/{nid}/ack", headers=K).status_code == 200
+    assert c.post("/api/notifications/ack-all", headers=K).status_code == 200
 
-    assert db.get_notification(nid) is not None
-    assert db.get_notification(nid)["ack_at"] == ""
-    assert c.get("/api/notifications", headers=K).json()["detail"] == "仅管理员可管理通知"
+    # D11：删单条仍 fail-closed
+    r = c.delete(f"/api/notifications/{nid}", headers=K)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "仅管理员可管理通知"
+
+    assert db.get_notification(nid) is not None      # 403 无副作用：行未被删除
+
+
+def test_notification_read_and_ack_are_anonymous(c):
+    """D11：三条读/确认端点**完全不带 `X-Surface`/会话**也必须成功，且语义完整。
+
+    不带任何头是最严口径 —— 后端已不读 principal，连默认槽位都不该依赖。
+    """
+    first = notify.ingest("car", "offline")["id"]      # warning
+    second = notify.ingest("car", "fall")["id"]        # critical
+
+    body = c.get("/api/notifications?state=all&limit=50").json()
+    assert body["ok"] is True
+    assert {i["id"] for i in body["items"]} == {first, second}
+    assert body["counts"] == {"unread": 2, "critical": 1}
+
+    # 单条 ack：落库 ack_at/ack_by（审计由 notify.ack 写，见同类 notify 层用例）
+    assert c.post(f"/api/notifications/{first}/ack",
+                  json={"by": "nurse"}).json() == {"ok": True, "id": first}
+    row = db.get_notification(first)
+    assert row["ack_at"] != "" and row["ack_by"] == "nurse"
+
+    # ack-all：把剩下的未处理全标掉，条数正确
+    assert c.post("/api/notifications/ack-all",
+                  json={"by": "nurse"}).json() == {"ok": True, "acked": 1}
+    assert notify.counts() == {"unread": 0, "critical": 0}
 
 
 # ------------------------------------------------------------------ 9b admin 全链路

@@ -1111,8 +1111,13 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
 
 
 # ---------------------------------------------------------------- 通知中心（模块 11）
-# 设计：**投递免鉴权**（需求文档模块 11："任何模块发现异常都往该端口 POST" —— 告警源可能
-# 是小车/语音/巡检等无口令的一方），但**读/确认/删除一律只给管理员**（护士台）。
+# 身份口径（2026-09-18 二次修订 D11）：
+#   投递口 `POST /api/notifications` **有意免鉴权**（需求文档模块 11："任何模块发现异常都往该
+#   端口 POST" —— 告警源可能是小车/语音/巡检等无口令的一方）；
+#   读/确认三条 `GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` **同样免鉴权**
+#   ——用户拍板 D11「护士台不再需要登录、也不会被弹」，护士台打开即用，后端不再判 principal
+#   （通知内容本就经免鉴权 SSE 广播公开，LAN 内部系统，阈值低）；
+#   唯一例外：`DELETE /{nid}` 仍要管理员（删记录是数据损失，不放宽）。
 def _notice_payload(n: dict) -> dict:
     """列表一条：补 `uid_name`（「姓名 · 床号」，无档案/无 uid 则空串）。
 
@@ -1124,7 +1129,10 @@ def _notice_payload(n: dict) -> dict:
 
 
 def _notice_admin(x_surface: str) -> None:
-    """通知的读/写管理口：非管理员一律 403（与同族 admin 路由同形）。"""
+    """通知的**删除**口：非管理员一律 403（与同族 admin 路由同形）。
+
+    只有 `DELETE /api/notifications/{nid}` 还走这里 —— 读/确认三条已按 D11 免鉴权。
+    """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理通知")
 
@@ -1146,19 +1154,18 @@ async def notice_ingest(n: NoticeIn):
 
 
 @app.get("/api/notifications")
-async def notices_list(x_surface: str = Header(default="kiosk"),
-                       state: str = Query("all"), limit: int = Query(0),
+async def notices_list(state: str = Query("all"), limit: int = Query(0),
                        before_id: int = Query(0)):
-    _notice_admin(x_surface)
+    # 免鉴权（D11）：护士台免登录 → 不读 principal、不认 `X-Surface`；通知内容本就经免鉴权
+    # SSE 广播对局域网公开，读列表不新增暴露面。
     items = await asyncio.to_thread(notify.list_notices, state, limit, before_id)
     return {"ok": True, "items": [_notice_payload(i) for i in items],
             "counts": await asyncio.to_thread(notify.counts)}
 
 
 @app.post("/api/notifications/{nid}/ack")
-async def notice_ack(nid: int, x_surface: str = Header(default="kiosk"),
-                     body: AckIn | None = None):
-    _notice_admin(x_surface)
+async def notice_ack(nid: int, body: AckIn | None = None):
+    # 免鉴权（D11）：护士台免登录；标记已处理不删数据，且 `notify.ack` 照旧写 `notify_ack` 审计。
     by = (body.by if body else "") or "admin"
     if not await asyncio.to_thread(notify.ack, nid, by):
         return {"ok": False, "error": "通知不存在"}
@@ -1166,15 +1173,15 @@ async def notice_ack(nid: int, x_surface: str = Header(default="kiosk"),
 
 
 @app.post("/api/notifications/ack-all")
-async def notice_ack_all(x_surface: str = Header(default="kiosk"),
-                         body: AckIn | None = None):
-    _notice_admin(x_surface)
+async def notice_ack_all(body: AckIn | None = None):
+    # 免鉴权（D11）：同上 —— 全标已处理只是清待办角标，审计仍由 `notify.ack_all` 落。
     by = (body.by if body else "") or "admin"
     return {"ok": True, "acked": await asyncio.to_thread(notify.ack_all, by)}
 
 
 @app.delete("/api/notifications/{nid}")
 async def notice_delete(nid: int, x_surface: str = Header(default="kiosk")):
+    # 唯一仍受保护的通知端点（D11 明确不放宽）：删记录是数据损失，必须管理员口令。
     _notice_admin(x_surface)
     if not await asyncio.to_thread(notify.remove, nid):
         return {"ok": False, "error": "通知不存在"}
