@@ -973,3 +973,19 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 
 **端到端实测（临时后端 8099 + 独立库，不碰用户 8000 与真 brain.db）：** `push(critical, uid=elder_001)` → `{ok:true,id:1,deduped:false}`，库里 `source="cart"/type="message"/title="通知"/uid_name="张建国 · 3-12"`；60 秒内重复投递同一条 → `deduped:true`、**同一行 count 自增**（护士台不刷屏）；全空白 message → 本地拒绝、**不发请求**；`level="bogus"` → 归一 `info`（`Critical/high/urgent` 之类按近义词**往上归**，不复现"跌倒被降成 info"）；`GET /api/notifications` = `{unread:2, critical:1}`；订阅 `/api/events` 收到 `{"type":"notification","source":"cart","kind":"message",…}` —— **实时广播链路通**。子进程冒烟：stdout **一个字节都没有**（不污染 MCP 协议），日志有「robot-notice MCP server 就绪」。**沙箱内做不了**：真 MCP stdio 握手（`mcp` SDK `stdio_client` 拉子进程）被 `WinError 5` 拒（沙箱不许子进程管道），该路径由进程内 `MCPServer.call_tool` 用例 + `vision_mcp` 同款样板兜住，真机验收时一并确认。
 **未验（需用户真机）：** 管理端设置页打开 `mcp_enabled` → **重启后端** → `GET /api/tools` 出现 `notify_nurse`；对小车说"我胸口疼" → 护士台出 critical 卡；停掉后端再调用应返回 `ok:false`（模型不许编造"已通知"）。
+---
+
+## 2026-09-18 · 对话编排升级为有界 ReAct Agent
+
+### 实现口径
+
+- 对话工具循环改用模型原生 `tool_calls` / `role=tool` 协议；`auto` 模式第一次请求保持原有低延时，只有工具实际执行后，后续推理才升到 `high`。
+- 单次对话最多允许四轮工具行动；工具预算耗尽后禁用工具，并强制模型根据已有 Observation 输出最终总结，避免无限循环。
+- 工具返回 `ok:false` 与非法 JSON 都作为 Observation 回传模型，让模型能够纠错或解释失败；工具参数不是合法 JSON 对象时不执行工具。
+- 不新增也不持久化 Thought。`reasoning` 仍只用于界面展示，不进入 TTS、聊天历史或记忆沉淀。
+
+### 验证
+
+- 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
+- `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
+- 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。
