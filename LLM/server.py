@@ -327,6 +327,7 @@ class AlarmIn(BaseModel):
     type: str = "sos"          # sos / fall / health / no_activity ...
     uid: str = ""
     message: str = ""
+    source: str = "kiosk"      # 告警来源（kiosk / vision ...）：带默认值，老调用不传也照旧
 
 
 class NoticeIn(BaseModel):
@@ -1187,6 +1188,13 @@ async def alarm_report(a: AlarmIn):
     # {"type": event_type, **payload}，payload 里再用 type 会覆盖事件类型，
     # 导致广播的事件 type 变成 "sos" 而非 "alarm"，前端会丢弃该事件
     bus.publish("alarm", level="critical", alarm_type=a.type, uid=a.uid, message=a.message)
+    # 落库到通知中心（模块 11）。**对 kiosk 这是救命通道，永远返回 {"ok": True}**：
+    # notify.ingest 在 type 为空时会抛 ValueError，落库失败绝不能把这条通道变成 500，
+    # 失败写审计（不许静默吞掉）。
+    try:
+        notify.ingest(source=a.source, type=a.type, uid=a.uid, body=a.message)
+    except Exception as e:  # noqa: BLE001
+        audit.log("notify_ingest_failed", path="/api/alarm", type=a.type, error=str(e))
     return {"ok": True}
 
 

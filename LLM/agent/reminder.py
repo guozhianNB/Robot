@@ -14,6 +14,7 @@ from ..store import db
 from ..core import bus
 from ..core import log as audit
 from ..conf import REMINDER_STATUS
+from . import notify
 
 _tick = 15          # 扫描间隔（秒）
 _miss_window = 300  # 错过判定窗口：超过触发点 5 分钟后才触发 → 视为错过补报
@@ -63,6 +64,14 @@ def _escalate(rem, settings):
                     message=f"提醒未确认：{rem['title']}")
     audit.log("alarm", level="warning", rid=rem["id"], uid=rem["uid"],
               title=rem["title"], reason="确认超时未回应")
+    # 落库到通知中心在 `if` **之外**：`alarm_enabled` 关掉的是"现场告警播报"，
+    # **不是**"护士该知道的记录"（规格要求通知是给护士看的留痕）。
+    try:
+        notify.ingest(source="reminder", type="reminder_unconfirmed", level="warning",
+                      uid=rem["uid"], title=f"提醒未确认：{rem['title']}",
+                      body=rem.get("content") or "", ref=f"rid:{rem['id']}")
+    except Exception as e:  # noqa: BLE001
+        audit.log("notify_ingest_failed", source="reminder", rid=rem["id"], error=str(e))
 
 
 def _tick_once(settings: dict):

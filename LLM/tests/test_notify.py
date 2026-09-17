@@ -12,6 +12,7 @@ import time
 import pytest
 
 from LLM.agent import notify
+from LLM.agent import reminder
 from LLM.conf import BASE_DIR
 from LLM.store import db
 
@@ -276,16 +277,21 @@ def test_notification_routes_admin_happy_path(c):
 
 # ------------------------------------------------------------------ 10 /api/alarm 防回归
 def test_alarm_route_unchanged(c, monkeypatch):
-    """本任务不接 `/api/alarm`（T2 才接）：它必须仍返回 {"ok":True} 且仍广播 alarm 事件。"""
+    """`/api/alarm` 的既有契约不变：仍返回 {"ok":True} 且仍广播 `alarm` 事件。
+
+    T1 时该口**没接**通知中心，故原断言只允许 `alarm` 一个事件；T2 起它在广播之后
+    追加落库（`notify.ingest` 自身会广播 `notification`），所以这里的负向断言换成
+    「`alarm` 仍是首个事件、字段一字不改」的防回归断言 —— 见下方 T2 用例。
+    """
     from LLM.core import bus
     evts = []
     monkeypatch.setattr(bus, "publish", lambda t, **p: evts.append({"type": t, **p}))
 
     r = c.post("/api/alarm", json={"type": "sos", "uid": "elder_1", "message": "救命"})
     assert r.status_code == 200 and r.json() == {"ok": True}
-    assert [e["type"] for e in evts] == ["alarm"]
+    assert evts[0]["type"] == "alarm"
     assert evts[0]["alarm_type"] == "sos"        # 仍用 alarm_type，未被 type 覆盖
-    assert "notification" not in [e["type"] for e in evts]   # 本任务不往告警口接线
+    assert [e["type"] for e in evts[1:]] == ["notification"]   # T2 起额外落库并广播通知
 
 
 # ------------------------------------------------------------------ 11 广播形态
@@ -327,6 +333,156 @@ def test_uid_name_falls_back_to_empty_or_single_part():
     finally:
         _cleanup_tmp_db()
         db.DB_PATH = old
+
+
+# ==================================================================== T2
+# T2：把 `/api/alarm` 与 reminder._escalate 接到通知中心，**既有契约一个字不改**。
+# 库隔离用上面的 `c` fixture / `_init_tmp_db`；bus 捕获照抄 test_alarm_route_unchanged。
+
+
+def _capture_bus(monkeypatch):
+    """捕获总线事件（照抄本文件既有手法：`bus.publish` 是模块属性查找，可直接打桩）。"""
+    from LLM.core import bus
+    evts = []
+    monkeypatch.setattr(bus, "publish", lambda t, **p: evts.append({"type": t, **p}))
+    return evts
+
+
+def _capture_audit(monkeypatch):
+    """捕获审计事件（`audit.log` 同样是模块属性查找）。"""
+    from LLM.core import log as audit
+    rows = []
+    monkeypatch.setattr(audit, "log", lambda ev, **f: rows.append({"event": ev, **f}))
+    return rows
+
+
+# ------------------------------------------------------------------ T2-1 告警口落库
+def test_alarm_route_ingests_kiosk_notification(c, monkeypatch):
+    """POST /api/alarm → 仍广播 alarm，且新增一条 source=kiosk 的 critical 通知。"""
+    evts = _capture_bus(monkeypatch)
+
+    r = c.post("/api/alarm", json={"type": "sos", "uid": "elder_x", "message": "老人说胸口疼"})
+
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    # 既有行为：alarm 事件仍是第一个、仍带 alarm_type（kiosk 的 toast 依赖它）
+    assert evts[0]["type"] == "alarm"
+    assert evts[0]["alarm_type"] == "sos"
+    assert evts[0]["level"] == "critical"
+
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    n = rows[0]
+    assert n["source"] == "kiosk"              # AlarmIn.source 默认值
+    assert n["type"] == "sos"
+    assert n["level"] == "critical"            # DEFAULT_LEVEL["sos"]
+    assert "胸口疼" in n["body"]
+    assert n["uid"] == "elder_x"
+    assert n["title"] == "紧急呼叫"             # TITLES 兜底
+    assert n["count"] == 1
+
+
+# ------------------------------------------------------------------ T2-2 source 覆盖
+def test_alarm_source_override_lands_in_notification(c, monkeypatch):
+    """AlarmIn.source 可覆盖（向后兼容：不传仍是 kiosk）。"""
+    _capture_bus(monkeypatch)
+
+    r = c.post("/api/alarm", json={"type": "fall", "source": "vision"})
+
+    assert r.json() == {"ok": True}
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    assert rows[0]["source"] == "vision" and rows[0]["type"] == "fall"
+    assert rows[0]["level"] == "critical"      # DEFAULT_LEVEL["fall"]
+
+
+# ------------------------------------------------------------------ T2-3 落库失败不许 500
+def test_alarm_ingest_failure_still_returns_ok(c, monkeypatch):
+    """notify.ingest 抛异常时，救命通道仍 {"ok": True}，且写 notify_ingest_failed 审计。"""
+    _capture_bus(monkeypatch)
+    logs = _capture_audit(monkeypatch)
+
+    def _boom(*a, **k):
+        raise ValueError("type 不能为空")
+
+    monkeypatch.setattr(notify, "ingest", _boom)
+
+    r = c.post("/api/alarm", json={"type": "sos", "uid": "elder_x", "message": "救命"})
+
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert db.list_notifications() == []       # 没落库
+    fails = [e for e in logs if e["event"] == "notify_ingest_failed"]
+    assert len(fails) == 1
+    assert fails[0]["path"] == "/api/alarm" and fails[0]["type"] == "sos"
+    assert "type 不能为空" in fails[0]["error"]
+
+
+# ------------------------------------------------------------------ T2-4 提醒升级落库
+def test_escalate_ingests_reminder_unconfirmed(c, monkeypatch):
+    """_escalate → 仍广播 alarm，且新增一条 reminder_unconfirmed 通知。"""
+    evts = _capture_bus(monkeypatch)
+    rem = {"id": 42, "uid": "elder_x", "title": "吃降压药", "content": "饭后一片"}
+
+    reminder._escalate(rem, {})
+
+    # 既有行为：alarm 广播字段一字不改
+    assert evts[0]["type"] == "alarm"
+    assert evts[0]["level"] == "warning" and evts[0]["rid"] == 42
+    assert evts[0]["message"] == "提醒未确认：吃降压药"
+
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    n = rows[0]
+    assert n["source"] == "reminder" and n["type"] == "reminder_unconfirmed"
+    assert n["level"] == "warning"
+    assert n["ref"] == "rid:42"
+    assert n["uid"] == "elder_x"
+    assert n["title"] == "提醒未确认：吃降压药"
+    assert n["body"] == "饭后一片"
+
+
+# ------------------------------------------------------------------ T2-5 关告警也要留痕
+def test_escalate_ingests_even_when_alarm_disabled(c, monkeypatch):
+    """alarm_enabled=False → 不广播 alarm，**但仍落一条通知**（通知是护士留痕，不是播报）。"""
+    evts = _capture_bus(monkeypatch)
+    rem = {"id": 7, "uid": "elder_y", "title": "测血糖", "content": ""}
+
+    reminder._escalate(rem, {"alarm_enabled": False})
+
+    assert [e["type"] for e in evts] == ["notification"]   # 没有 alarm
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    assert rows[0]["type"] == "reminder_unconfirmed"
+    assert rows[0]["uid"] == "elder_y"
+    assert rows[0]["body"] == ""                            # content 缺省 → 空正文
+
+
+# ------------------------------------------------------------------ T2-6 两处去重
+def test_escalate_dedups_same_reminder(c, monkeypatch):
+    """同一提醒连续两次 _escalate → 通知只有 1 行、count == 2（沿用 T1 去重窗口）。"""
+    _capture_bus(monkeypatch)
+    rem = {"id": 9, "uid": "elder_z", "title": "喝水", "content": "200ml"}
+
+    reminder._escalate(rem, {})
+    reminder._escalate(rem, {})
+
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 2
+    assert rows[0]["body"] == "200ml"          # 保留最早原文
+
+
+def test_alarm_route_dedups_repeated_sos(c, monkeypatch):
+    """告警口同样走去重窗口：同一老人连续两次 SOS → 1 行、count == 2。"""
+    _capture_bus(monkeypatch)
+    body = {"type": "sos", "uid": "elder_x", "message": "胸口疼"}
+
+    c.post("/api/alarm", json=body)
+    c.post("/api/alarm", json=body)
+
+    rows = db.list_notifications()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 2
+    assert rows[0]["source"] == "kiosk" and rows[0]["type"] == "sos"
 
 
 
