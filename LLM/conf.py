@@ -242,6 +242,25 @@ IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号",
 import sys as _sys
 _NPX = "npx.cmd" if _sys.platform == "win32" else "npx"
 
+# 护士后台投递口地址（LLM/notice_mcp 子进程用；规格 docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md）。
+# 默认**本机**：后端与它同机跑（PC 上的常规部署）；「LLM 不跟后端同机」时把 NOTICE_BACKEND_URL
+# 设成后端地址即可（跨机部署代码零改动）。投递口 `POST /api/notifications` 免鉴权，见通知中心规格 D4。
+NOTICE_BACKEND_URL = ((os.environ.get("NOTICE_BACKEND_URL") or "").strip()
+                      or "http://127.0.0.1:8000").rstrip("/")
+
+# notice MCP 子进程需要显式继承的可选项（照 `_vision_mcp_env()` 的惯例）：只在环境变量实际
+# 设置时传下去，避免用空串覆盖 notice_client / notice_server 内的默认值。
+_NOTICE_ENV_NAMES = ("NOTICE_TIMEOUT_S", "NOTICE_MCP_LOG")
+
+
+def _notice_mcp_env() -> dict[str, str]:
+    """Build the environment overrides for the notice MCP child process."""
+    env = {"NOTICE_BACKEND_URL": NOTICE_BACKEND_URL}
+    for name in _NOTICE_ENV_NAMES:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
 # MCP工具列表
 MCP_SERVERS: dict[str, dict] = {
     # 网页抓取（需要本机有 node/npx，首次会自动 npx 下载包）：
@@ -260,6 +279,16 @@ MCP_SERVERS: dict[str, dict] = {
         "env": _vision_mcp_env(),
         "enabled": True,
         "roles": ["elder", "admin"],
+    },
+    # 护士传达（把一条话推给护士台）：让"我这就去通知护士"这句话真的能做到。
+    # roles 三层都给 —— 声纹识别失败会 fail-closed 落到 ward 层，那里堵死等于"老人求助喊不出来"。
+    # 代价：未识别的说话人也能刷护士台（有 60s 去重兜底）；不想要就删掉 "ward"。
+    "notice": {
+        "command": _sys.executable,
+        "args": [str(BASE_DIR / "LLM" / "notice_mcp" / "notice_server.py")],
+        "env": _notice_mcp_env(),
+        "enabled": True,
+        "roles": ["elder", "ward", "admin"],
     },
 }
 

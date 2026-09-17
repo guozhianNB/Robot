@@ -148,7 +148,50 @@ def notify_nurse(message: str, level: str = "info", uid: str = "") -> str
 2. **未识别说话人也能上报**（ward 层，D5 有意为之），只有 60s 去重兜底，没有限流/签名（与通知中心规格 §9 同族）。
 3. 通知内容经**免鉴权 SSE** 广播给局域网（既有暴露面，非本设计新增）。
 4. 本工具只"传达"，**不代替急停**（`robot_stop`）与 kiosk SOS 按钮。
+5. `message` 原文在**允许**路径下会进审计 `tool` 事件与工具日志（与既有口径一致：那句话本来就在对话历史里）；**被闸门拒绝**时才脱敏（§4.3）。与 `see_what` 的"prompt 一律不入日志"口径相反，是否统一留待后续权衡。
 
-## 9. 实现台账与偏差
+## 9. 独立审查与修复轮（2026-09-18）
 
-（实现完成后回填：提交、测试基线、偏差。）
+独立审查子代理结论：**需修复后通过**。落地如下：
+
+| 编号 | 发现 | 处置 |
+|---|---|---|
+| **M1** | **合并语义会静默吞掉"同分钟内第二条不同的事"**（安全相关）：去重键只有 `(source,type,uid)`，而本工具的 `uid` 通常为空 ⇒ **所有小车消息**在 60s 内塌成一条，且合并只 `count+1`、保留最早那条的**正文与级别**；实时广播却用新正文 ⇒ 护士台 ≤30s 后被列表轮询覆盖回最早那条，critical 计数不涨、重开页面不再蜂鸣 | **已修根因**（3 处后端）：`db.find_unacked_notification` 的合并键加 `body`；`db.bump_notification` 支持**只升不降**地提级别（`notify._higher_level` 算 max，词表留在 agent 层）；`notify.ingest` 合并时**广播与库里那一行对齐**。补 3 条用例（不同正文不合并 / info→critical 升红卡 / 广播与库一致），并保留"同正文仍合并"的防刷屏口径 |
+| **M2** | 规格 §7 验收第 4 步与 README 承诺的"调用日志"没实现（`_notify_nurse` 全程无日志、异常也静默） | 已补：每次调用一行 `notify_nurse level=… has_uid=… ok=… deduped=… id=…`（**不记 `message` 原文**），异常分支也留痕（带异常文本） |
+| S1 | `level` 大小写/近义词静默降级（模型写 `Critical`/`high` 反而落到最低档、不置顶不蜂鸣） | 已补 `notice_client.normalize_level()`：大小写/空白不敏感 + 常见近义词**往上归**（high/severe/urgent→critical，medium→warning） |
+| S2 | 成功判定 `ok is True or "id" in result` 与"只认明确成功"的注释矛盾（`{"ok":false,"id":7}` 会被当成功 ⇒ 模型会对老人撒谎） | 已收紧为 `result.get("ok") is True`，补 3 种畸形响应用例 |
+| S3 | `NOTICE_TIMEOUT_S` / `NOTICE_MCP_LOG` 在正常拉起路径不可达（conf 只传了 URL） | 已补 `conf._notice_mcp_env()`（照 `_vision_mcp_env()` 惯例，只在环境变量真设过时传），补用例 |
+| S4 | 缺两条防退化用例 | 已补：`notify_nurse` 不在本地工具注册表（否则 MCP 版会被静默遮蔽）、`MESSAGE_MAX == conf.NOTIFY_BODY_MAX` |
+| S5 | 闸门拒绝用例只断言子串"不允许"，与总开关分支文案撞车（会因错误原因变绿） | 已收紧为精确文案 + 审计 `reason == "tool_roles_mismatch"` |
+| S6 | `_post` 兜底只留异常类名，叠加 M2 后线上无从排查 | 已带 `str(e)[:120]` |
+| 死代码 | `main()` 里 `if server is None: sys.exit(2)` 与其它降级分支不一致 | 已改为记日志 + 写 stderr 再退 |
+
+## 10. 实现台账与偏差
+
+**状态：已实现**（2026-09-18，分支 `feature/nurse-console`，BASE `1bad0c2`）。
+
+| 规格条目 | 产物 |
+|---|---|
+| §4.1 业务层 | `LLM/notice_mcp/notice_client.py`（`push()` / `_post()` / `_resolve_backend()` / `backend_url()` / `endpoint()`） |
+| §4.2 MCP 层 | `LLM/notice_mcp/notice_server.py`（`build_server()` 注册 `notify_nurse`） |
+| §4.3 接线 | `LLM/conf.py`（`NOTICE_BACKEND_URL` + `_notice_mcp_env()` + `MCP_SERVERS["notice"]`）、`LLM/agent/policy.py`（ward/elder 白名单；admin 是 `None` 无需改）、`LLM/agent/tools.py::_audit_args` |
+| §8 M1 根因修复（跨批次） | `LLM/store/db.py`（`find_unacked_notification` 合并键加 `body`、`bump_notification` 支持提级别）、`LLM/agent/notify.py`（`_higher_level` + 广播与库对齐）、`LLM/tests/test_notify.py`（+2 例净增）、护士台规格 D5/§4.2 修订 |
+| §6 测试 | `LLM/tests/test_notice_mcp.py`（30 例）+ `LLM/tests/test_policy_roles.py`（断言随策略演进，抽 `WARD_TOOLS` 常量） |
+| 文档 | `LLM/notice_mcp/README.md`、`AGENTS.md`（树/notify 条目/文档导航）、`docs/log.md` 2026-09-18 条目、`.gitignore`（`/LLM/notice_mcp/*.log`） |
+
+**验证（本机，2026-09-18，修复轮之后）：** `pytest LLM/tests` = **4 failed / 231 passed / 135 errors** vs 基线（`git worktree` 于 `1bad0c2` 独立重跑）**4 failed / 199 passed / 135 errors**：失败集合逐条一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件 `db.DB_PATH` 顺序污染/沙箱环境红态），净增 32 例全绿（新文件 30 例 + `test_notify.py` 净增 2 例）。
+
+**端到端实测（临时后端 8099 + 独立库 `.tmp/e2e_notice.db`，不碰用户的 8000 与真 `brain.db`）：**
+- `notice_client.push("张爷爷说胸口疼，想找护士", level="critical", uid="elder_001")` → `{"ok": true, "id": 1, "level": "critical", "deduped": false}`；库里落成 `source="cart" / type="message" / title="通知" / uid_name="张建国 · 3-12"`（姓名·床号按 `notify.uid_name()` 解析）。
+- 60 秒内重复投递同一条 → `deduped=true`、**仍是同一行、`count` 自增**（护士台不会刷屏）。
+- `push("   ")` → 本地就返回 `ok:false`，**没有发出请求**（库里没有多出空行）；`level="bogus"` → 归一成 `info`（`"Critical"/"high"` 之类按 §9 S1 往上归）。
+- `GET /api/notifications` 返回 `{unread: 2, critical: 1}`，与投递一致。
+- 订阅 `GET /api/events` 收到 `data: {"type": "notification", "source": "cart", "kind": "message", …}` —— **护士台实时弹卡依赖的广播确实发出**（`kind` 而非 `type`，符合规格 D6）。
+- 子进程冒烟（`Start-Process` 起 `notice_server.py`，stdout/stderr 落文件）：**stdout 一个字节都没有**（不污染 MCP stdio），stderr/日志有 `robot-notice MCP server 就绪（护士后台 http://127.0.0.1:8000，超时 5s）`。
+- **未能在此沙箱内做的**：真 MCP stdio 握手（用 `mcp` SDK 的 `stdio_client` 拉起子进程）在本机沙箱被拒（`WinError 5`，沙箱不允许子进程管道）；该路径由 `LLM/tests/test_notice_mcp.py::test_tool_call_through_mcp_layer_returns_json_text`（进程内 `MCPServer.call_tool`）与 `vision_mcp` 同款样板兜住，真机验收时一并确认。
+
+**偏差（2 条，均已在上文修正或说明）：**
+1. §4.1 提到的 `available()` **未实现**：本能力没有"本地依赖缺失"可判（只剩 stdlib），而启动又不许探网，故只留 `backend_url()` / `endpoint()` 两个调试入口。
+2. §4.3 原写 `env` 传空串走"运行时继承"，落地改为**传 `conf.NOTICE_BACKEND_URL` 的具体值**（该值非密钥，`conf` 导入时已 `load_dotenv`，值只需一处真相）。
+
+**未验（需用户真机）：** 管理端设置页打开 `mcp_enabled` → 重启后端 → `GET /api/tools` 出现 `notify_nurse`；对小车说"我胸口疼" → 护士台出 critical 卡；后端停掉时调用返回 `ok:false`。

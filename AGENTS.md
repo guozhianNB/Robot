@@ -43,7 +43,7 @@ LLM/
   maps/                mapstore mapsources maptags mapserver locator roslink  地图域
                        mapapi(编辑器路由，仅 :8010 进程 import) mapctl(编辑器进程管理)
   voice/               worker asr tts kws vad speaker + voice_api(挂载逻辑)
-  tool/ car_mcp/ vision_mcp/   工具实现与外部 MCP 子进程（不在后端导入链顶层）
+  tool/ car_mcp/ vision_mcp/ notice_mcp/   工具实现与外部 MCP 子进程（不在后端导入链顶层）
 ```
 
 分层铁律：**下层绝不 import 上层**（`core` 不 import `store`/`agent`；`store` 不 import `agent`）。
@@ -60,7 +60,7 @@ LLM/
 - `agent/prompt/` — **角色提示词片段**：`ward.md`/`elder.md`/`admin.md` 三层各一份，由 `chat._load_role_prompt()` 按 `role_policy(role)["prompt_file"]` 装载、叠加在 `base.md` 之上（`base.md` **是共用 base**，管"怎么说"；角色片段管"现在跟谁说话"）；缺文件 → 空串 + 审计 `prompt_role_missing`，不阻断对话。
 - `agent/memory.py` — RAG 记忆 + 半自动沉淀：`recall()`、`note_turn()`、`consolidate()`、`suggest_from_chat()`。**红线：`MEDICAL_KEYWORDS` 命中拒绝写入**。（MaiBot 对标增强：核心记忆定稿/保护、回收站、纠错、画像防退化等，见 `docs/log.md` 2026-09 条目）
 - `agent/reminder.py` — 独立线程定时调度（15s tick），状态机 `pending→triggered→confirmed/unconfirmed/missed`。
-- `agent/notify.py` — **通知中心（模块 11）的唯一写入口**：`ingest()`（归一化 → 去重合并 → 落库 → 审计 → 广播）/ `list_notices()` / `counts()` / `ack()` / `ack_all()` / `remove()` / `prune()`；护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
+- `agent/notify.py` — **通知中心（模块 11）的唯一写入口**：`ingest()`（归一化 → 去重合并 → 落库 → 审计 → 广播）/ `list_notices()` / `counts()` / `ack()` / `ack_all()` / `remove()` / `prune()`；护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。**合并键 = `(source,type,uid,正文)`，且合并时级别只升不降、广播与库里那一行对齐**（2026-09-18 修订：少了正文，同一分钟内的不同事会互相吞掉、critical 被静默降级）。LLM 侧上报出口 = MCP 子进程 `LLM/notice_mcp/`（工具 `notify_nurse`，投递到免鉴权投递口），规格 `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md`。
 - `core/bus.py` — SSE 事件总线，`publish()`（任意线程）→ asyncio 扇出订阅者。
 - `agent/tools.py` — 工具注册中心 + 分发：本地工具（`LLM/tool/` 下 `@tool` 装饰器注册，自动加载）+ MCP 工具（`conf.MCP_SERVERS` 配置），`run_tool()` 统一分发，per-tool 开关自动生效。
 - `agent/mcp_client.py` — MCP 客户端桥（**可选能力**）：后台线程 + 专属事件循环拉起 stdio MCP 服务器子进程，`tools/list` 转 OpenAI function-calling schema 并入工具循环，`mcp_enabled` 总开关控制；依赖缺失/连接失败只降级不崩后端。
@@ -151,7 +151,8 @@ LLM/
 - `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md` — 老人注册向导设计（尚未迁入 Vue admin，见「前端（frontend/）」节）。
 - `docs/superpowers/specs/2026-09-14-map-editor-design.md` — **地图编辑器设计（A 篇：看图/标地点/划区域/管地图文件；B 篇：像素修图）**，**2026-09-14 已落地**（实现台账与偏差见文末「实现台账与偏差（2026-09-14 落地）」一节）。改地图相关代码前必读。
 - `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md` — **思考档位手动切换（五档：自动/不思考/轻/中/重度）+ 思维链上屏**（2026-09-17 落地，含 D5「`reasoning_effort` 必须是顶层参数、塞 extra_body 会被静默忽略」这条实测坑）：`none` 关不掉敏感词安全网、档位落 `settings.thinking_mode`、思维链只上屏绝不进 TTS。改 `chat_stream`/`voice/worker.py` 前必读。
-- `docs/superpowers/specs/2026-09-18-nurse-console-design.md` — **护士台 + 后端通知中心设计**（模块 11 落地：`notifications` 表 + 5 条路由 + 总线 `notification`/`notification_ack` + 第四个前端包 `packages/nurse`）：含 D6「payload 里通知类型用 `kind`、绝不能用 `type`」与 D7 视觉尺度（不做大按钮/大字号）、D8（`server.host: true` + `--host 0.0.0.0` 保证局域网可达）。改通知链路前必读。
+- `docs/superpowers/specs/2026-09-18-nurse-console-design.md` — **护士台 + 后端通知中心设计**（模块 11 落地：`notifications` 表 + 5 条路由 + 总线 `notification`/`notification_ack` + 第四个前端包 `packages/nurse`）：含 D6「payload 里通知类型用 `kind`、绝不能用 `type`」与 D7 视觉尺度（不做大按钮/大字号）、D8（`server.host: true` + `--host 0.0.0.0` 保证局域网可达）；**D5/§4.2 于 2026-09-18 修订**（合并键加正文、级别只升不降、广播与库对齐）。改通知链路前必读。
+- `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md` — **小车 LLM 向护士后台传达信息的 MCP 工具**（`LLM/notice_mcp/` + 工具 `notify_nurse`）：投递到免鉴权投递口走 `notify.ingest()` 唯一写入口（去重/审计/SSE 实时广播全在）；含 D3「子进程回调后端」的自环裁定与 D5（ward 层也给，声纹识别失败时不能堵死求助）。改 MCP 工具接线/角色白名单前必读。
 - 历史档案：`docs/superpowers/specs/2026-08-18-ai-chat-frontend-design.md` 等 8 月旧规格描述的是单文件 `UI/index.html` 时代的实现，仅作过程参考（其 `/api/chat` 请求体已过时，实际为 `{uid, message, thinking}`）。
 
 ## 固件（stm32/）
