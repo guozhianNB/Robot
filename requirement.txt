@@ -24,7 +24,7 @@ chromadb
 kuzu
 
 # ------------------------- 语音链路 -------------------------
-# 缺省时语音模块整体降级，后端照常启动（见 LLM/voice_api.py）。
+# 缺省时语音模块整体降级，后端照常启动（见 LLM/voice/voice_api.py）。
 numpy
 sherpa-onnx
 sounddevice

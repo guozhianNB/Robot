@@ -104,7 +104,7 @@ onMounted(load);
   <section class="page">
     <h3>身份与权限</h3>
     <p class="hint">
-      三层能力由后端策略包（<code>LLM/policy.py</code>）决定，角色由后端按主体推导 —— 管理台只能看，不能改。
+      三层能力由后端策略包（<code>LLM/agent/policy.py</code>）决定，角色由后端按主体推导 —— 管理台只能看，不能改。
       改后端的提示词片段/工具白名单要动代码，不是本页。
     </p>
 

@@ -1,5 +1,5 @@
 // 米 ↔ 像素 换算 + 点包含判断。
-// 与后端 LLM/mapserver.py 的 meters_to_pixel / pixel_to_meters **严格同口径**：
+// 与后端 LLM/maps/mapserver.py 的 meters_to_pixel / pixel_to_meters **严格同口径**：
 //   x_m = origin_x + px * resolution
 //   y_m = origin_y + (H - 1 - py) * resolution
 //   px  = (x_m - origin_x) / resolution

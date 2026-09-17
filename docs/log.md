@@ -831,3 +831,68 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 ### 未纳入本条的并行项
 
 - `LLM/vision_mcp/`、`frontend/temp-esbuild-register.mjs`：本批次的未跟踪在途文件，**未提交**（提交一律带 pathspec）。
+
+---
+
+## 2026-09-17 · Qwen 视觉 MCP `see_what`
+
+### 做了什么
+
+- 新增独立 Python stdio MCP 服务 `LLM/vision_mcp/see_server.py`，注册工具 `see_what`；业务层支持摄像头当前帧和受限本地 JPEG/PNG/WebP 图片，并调用阿里云百炼 Qwen 视觉模型返回文字回答。
+- 摄像头通过 `vision.camera_server` 共享服务取帧，不直接占用摄像头硬件；本地图片仅允许位于 `VISION_SEE_IMAGE_DIRS` 白名单目录内，默认 `LLM/data/vision_inbox`。
+- `LLM/conf.py` 注册 vision MCP 子进程并继承 `DASHSCOPE_API_KEY`、`VISION_HOST`、`VISION_PORT`；后端启动时 `mcp_enabled` 关闭则不建连接，运行中关闭后拒绝工具调用，后端退出时清理 MCP 子进程。经本仓库后端策略，`elder`/`admin` 可见，`ward` 集体层禁用；独立 stdio 进程本身无角色鉴权。
+- README 补充了 `see_what` 输入示例、启动方式、Qwen 配置、阿里云上传隐私边界和缺依赖/摄像头/云端失败时的降级行为。
+
+### 验证状态
+
+- 相关回归（含视觉 MCP、权限、MCP 启动、摄像头和聊天工具日志）：193 passed、9 skipped、1 warning。
+- `import LLM.server` 成功；真实 MCP stdio `initialize`/`list_tools` 成功，`see_what` schema 中 `image`/`prompt` 为必填，`channel` 默认值为 `1`。
+- 配置有效 `DASHSCOPE_API_KEY` 后，使用 `linorobot2/docs/assets/linorobot2_launchfiles.png` 完成文件图片链路的真实 Qwen `qwen-vl-plus` 调用：返回 `ok: true`、`image/png`、`56120 bytes`，耗时约 `1375 ms`。审计和服务日志不记录图片、base64、回答正文或 prompt。
+- 启动 `vision.camera_server --mock` 后，通过真实 MCP stdio `call_tool` 调用 `see_what(image="camera", channel=2)`：共享服务产出合成 JPEG，阿里云接口返回 HTTP 200，结果为 `ok: true`、`source: camera`、`model: qwen-vl-plus`。本次只上传合成测试画面；真实硬件摄像头画面仍未做云端验收。
+- 首次沙箱网络调用遇到 `APIConnectionError`；获批联网后文件图片与 mock 摄像头图片调用均成功。验收日志未写入密钥、prompt 或模型回答正文。
+
+---
+
+## 2026-09-17 · LLM 后端按功能重新分层（29 个模块从包根归位到 core / store / agent / maps / voice）
+
+### 做了什么
+
+- **问题**：`LLM/` 根目录平铺了 29 个 `.py`（`server.py` 54KB、`db.py` 56KB、`mapapi.py` 46KB…），再加上 `prompt.md` 与 `prompt/` 目录同名混淆——"哪个模块属于哪一块"只能靠逐个读文件判断。
+- **分层结果**（依赖单向 `core → store → agent → server`，包根只留 2 个入口 + `conf.py`）：
+  - `core/` — `log`(审计) `bus`(SSE) `vectors`(轻量向量) `zonegeo`(几何)：零业务、零外部依赖
+  - `store/` — `db` `ragstore` `graph` `embed` `migrate`：一切"数据落在哪、怎么读写"
+  - `agent/` — `chat` `memory` `tools` `mcp_client` `reminder` `session` `policy` + `prompt/`
+  - `maps/` — `mapstore` `mapsources` `maptags` `mapserver` `locator` `roslink` + `mapapi` `mapctl`
+  - `voice/` — 原 `voice_api.py` 并入既有 voice 包
+- **`conf.py` 特意留在包根**：它的 `BASE_DIR = Path(__file__).resolve().parent.parent` 是 `.env`/`data/` 的定位锚点，移动它要同步改 3 处 `__file__` 推导，收益不抵风险。`server.py` / `mapeditor_server.py` 同理留根——**两个启动命令 `LLM.server:app`、`LLM.mapeditor_server:app` 一个字没变**。
+- **`prompt.md` → `agent/prompt/base.md`**：与角色片段 `ward/elder/admin.md` 同目录，消除"`prompt.md` vs `prompt/`"的歧义（`conf.PROMPT_FILE` + `policy.PROMPT_DIR` 各改 1 处）。
+- 迁移用 `git mv` 完成（保留重命名历史），import 重写脚本化（172 + 70 + 3 行，全部 dry-run 审查后落盘）。
+
+### 踩到的两个坑（都已在代码里留注释）
+
+- **`tools.py` 的 `__package__` 拼接**：自动加载本地工具原写 `f"{__package__}.tool.{name}"`；模块从包根搬进 `LLM/agent/` 后 `__package__` 变成 `"LLM.agent"`，拼出不存在的 `LLM.agent.tool.*` → 改用 `f"{_tool_pkg.__name__}.{name}"`（即 `LLM.tool.*`）。
+- **`from .. import db` 被漏改**：`voice/worker.py` 原本就用两点相对导入（两层包内合法），重写脚本最初只处理单点形态，结果 `voice_api` 整条链静默降级为"缺少依赖：cannot import name 'db' from 'LLM'"（`_VOICE_AVAILABLE=False`）。**这类"看起来像已迁移"的两点写法要单独扫**。
+
+### 验证状态
+
+- `pytest tests LLM/tests --collect-only -q` → **542 tests collected, 0 errors**（所有测试模块与新结构的 import 全部对上，这是本次重构最可能的破坏面）。
+- 不依赖 `tmp_path` 的纯逻辑子集实跑：**39 passed, 0 failed**。
+- 手动冒烟：`LLM.server`（80 routes）/ `LLM.mapeditor_server`（9 routes）/ `LLM.maps.mapapi`（34 routes）import 干净；`conf.PROMPT_FILE` 指向 `agent/prompt/base.md` 且文件存在；`chat._load_prompt_base()` 返回 836 字符、`_load_role_prompt('ward')` 返回 289 字符；`LLM.voice.voice_api` `_VOICE_AVAILABLE=True`（0 缺失依赖）；`vision.webbridge` 的审计桥接到真实 `LLM.core.log`（`vision_mcp` 那处**漏了**，见下节收尾修复）。
+- **`db.get_settings()` 实跑通过**：该路径会触发 `store/db.py` 里对 `agent.tools.TOOL_DEFAULTS` 的函数内延迟导入（全仓唯一的跨层循环出口），返回 34 个默认 key。
+- **环境限制（与本次改动无关）**：本机沙箱下 python 子进程对 pytest 自建 basetemp 的目录遍历被拒（`PermissionError WinError 5`），故依赖 `tmp_path` 的用例（约 500 例）本轮**未能实跑**；这些用例在本环境**重构前同样失败**（`sqlite3.OperationalError: unable to open database file`）。建议在无该限制的终端补跑一次全量。
+
+### 文档同步
+
+- `AGENTS.md`：新增「LLM/ 分层目录树 + 分层铁律（下层不 import 上层）」；架构与模块 24 条全部改到新路径；关键约定 §1（三件套 → `store/db.py`）、§2（`core/log.py`）、§4（`agent/chat.py` / `core/bus.py`）、§6（跨层相对导入写法）；已知坑补「`conf.py` 位置不可动」。
+- 活跃测试与 `vision/webbridge.py` 的引用同步更新；`docs/superpowers/plans|specs`、`.superpowers/**` 等历史归档**按原样保留**（它们记录的是当时的事实，不做回改）。
+
+### 收尾修复（子代理独立审查发现，同日补）
+
+派了一个独立子代理做只读的"残留引用"复查（全仓 grep + 实跑）。它发现一处**真会坏、且本轮现有验证手段抓不到**的遗漏：
+
+- **`LLM/vision_mcp/vision_client.py::_audit()`** 写的是 `from LLM import log as audit`（旧路径）。它包在 `try/except Exception: pass` 里 —— 失败被静默吞掉，后果是**视觉 MCP 的 `vision_see` 审计从此不再落盘、且不报任何错**。测试抓不到的原因：`tests/test_vision_mcp.py` 三处用例都直接 monkeypatch 掉了 `_audit` 本身，从未走过真实 log 桥；而 542 例 collection 与 import 冒烟都只覆盖模块顶层，碰不到函数体内的延迟导入。**已修**为 `from LLM.core import log as audit`，并用探针实证：monkeypatch `LLM.core.log.log` 后 `vc._audit(probe=1)` 收到 `(('vision_see',), {'probe': 1})`（修复前为空）。
+  → **遗留建议**：照 `tests/test_vision.py` 里 webbridge 那条审计桥用例的写法，给 `_audit` 补一条"真桥到 `LLM.core.log`"的用例，否则同类遗漏会再发生。**本轮未补**：`tests/test_vision_mcp.py` 是并行在途文件，避免动它。
+- **文档/注释/文案里的旧路径 18 处**一并清掉（不影响运行，但会误导后来读者）：后端 docstring 9 处（`mapeditor_server.py` / `maps/mapctl.py` / `maps/locator.py` / `vision_mcp/see_server.py`×2 / `car_mcp/car_server.py` / `agent/chat.py` / `agent/mcp_client.py` / `voice/worker.py`×2）、`tests/conftest.py` 注释、前端 3 处（`admin/src/pages/RolesPage.vue` 的**用户可见文案**、`mapeditor/src/lib/{coords,colorize}.ts`）、`requirement.txt` 注释、`limit.md` 权限矩阵的"事实来源"行、`docs/maibot参考/记忆系统差距分析.md`。
+- **风格统一**：`voice/worker.py` 两处函数内延迟导入原为绝对形式 `from LLM.agent import session`，改为 `from ..agent import session`，与关键约定 §6 一致。
+- **复查结论**：25 个新路径全部可导入、25 个旧路径全部不可导入；`conf.py` 三处 `__file__` 推导、`tools.py` 的 `pkgutil` 自动加载、`PROMPT_FILE`/`PROMPT_DIR` 均落位正确；`stm32/`、`ros2_car/`、`scripts/`、`vision/`、`UI(old)/`、根目录文档**无残留**。改完后重跑 `--collect-only` 仍是 **542 collected / 0 errors**。
+- **按原样保留**：`docs/log.md` ≤09-15 旧条目里的路径是"当日事实"（日记体），与 `docs/superpowers/plans|specs` 同理，不做回改。仅提示本文件里两条命令今天照抄会失败：`306` 的 `python -c "import LLM.tools"`、`492` 的 `py_compile … LLM\voice_api.py`。
