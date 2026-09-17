@@ -82,11 +82,13 @@ def ingest(source: str, type: str, *, level: str = "", uid: str = "",
     # 5. 去重合并：窗口内同 (source,type,uid) 的未处理通知
     since = (datetime.now() - timedelta(seconds=conf.NOTIFY_DEDUP_S)).strftime("%Y-%m-%d %H:%M:%S")
     old = db.find_unacked_notification(source, type, uid_, since)
-    deduped = bool(old)
-    if old:
+    # 竞态守卫：find 与 bump 各自持锁、不在同一临界区 —— 护士可能在这两步之间把该行 ack 了。
+    # bump 的 UPDATE 带 `ack_at=''`，rowcount=0 即"刚被处理"：此时**必须回落到新增一行**，
+    # 否则新上报会被并进"已处理"行（不出未读卡、不响蜂鸣、角标不变）→ 静默丢失。
+    deduped = bool(old) and db.bump_notification(old["id"], now) > 0
+    if deduped:
         nid = old["id"]
-        db.bump_notification(nid, now)              # 不改 body/title：保留最早原文
-        cnt = int(old.get("count") or 1) + 1
+        cnt = int(old.get("count") or 1) + 1        # 不改 body/title：保留最早原文
     else:
         nid = db.add_notification(lvl, source, type, uid=uid_, title=title_,
                                   body=body_, ref=ref_, ts=now)

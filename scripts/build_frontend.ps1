@@ -1,4 +1,4 @@
-# 构建前端双端产物（开发机执行；板卡部署时拷贝 dist 即可）
+# 构建前端四端产物（开发机执行；板卡部署时拷贝 dist 即可）
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..\frontend")
 pnpm install

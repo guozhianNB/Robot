@@ -1542,13 +1542,22 @@ def find_unacked_notification(source: str, ntype: str, uid: str, since_iso: str)
         conn.close()
 
 
-def bump_notification(nid: int, ts: str) -> None:
-    """合并：count+1、last_at=ts（**不动 body/title** —— 保留最早原文）。"""
+def bump_notification(nid: int, ts: str) -> int:
+    """合并：count+1、last_at=ts（**不动 body/title** —— 保留最早原文），返回受影响行数。
+
+    **`AND ack_at=''` 是竞态守卫**：`find_unacked_notification` 与本事不在同一临界区，
+    护士可能正好在这两步之间 ack 掉该行。此时 rowcount=0，调用方（`notify.ingest`）
+    **必须回落到新增一行** —— 否则新上报会被并进"已处理"行，既不出未读卡、不响蜂鸣、
+    角标也不变，等于静默丢失。
+    """
     with _lock:
         conn = _conn()
         try:
-            conn.execute("UPDATE notifications SET count=count+1, last_at=? WHERE id=?", (ts, nid))
+            cur = conn.execute(
+                "UPDATE notifications SET count=count+1, last_at=? WHERE id=? AND ack_at=''",
+                (ts, nid))
             conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 

@@ -126,7 +126,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _no_store_entry_html(request: Request, call_next):
-    """入口 HTML（/、/admin/、/kiosk/ 的 index.html）禁止缓存。
+    """入口 HTML（/、/admin/、/kiosk/、/nurse/ 的 index.html）禁止缓存。
 
     为什么必须这样：index.html 里的 `<script src="assets/index-<hash>.js">` 是**唯一**指向
     当前构建的指针。浏览器若缓存了旧 index.html，用户按 Ctrl+F5 也只是"刷新页面"，
@@ -1135,8 +1135,12 @@ async def notice_ingest(n: NoticeIn):
     if not (n.type or "").strip():
         raise HTTPException(status_code=400, detail="type 不能为空")
     try:
-        return notify.ingest(n.source, n.type, level=n.level, uid=n.uid,
-                             title=n.title, body=n.message, ref=n.ref)
+        # 同步 SQLite 写 + 审计追加 + 档案查询绝不能在事件循环上跑：投递口按 D4 有意
+        # 免鉴权，任何局域网客户端都能用极廉价请求把 chat/voice/SSE 串行堵住。
+        # to_thread 是安全的：bus.publish 线程安全、db 有线程锁。
+        return await asyncio.to_thread(
+            notify.ingest, n.source, n.type, level=n.level, uid=n.uid,
+            title=n.title, body=n.message, ref=n.ref)
     except ValueError as e:                     # type 为空 → 400（不是 5xx，也不是静默吞掉）
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1192,7 +1196,9 @@ async def alarm_report(a: AlarmIn):
     # notify.ingest 在 type 为空时会抛 ValueError，落库失败绝不能把这条通道变成 500，
     # 失败写审计（不许静默吞掉）。
     try:
-        notify.ingest(source=a.source, type=a.type, uid=a.uid, body=a.message)
+        # 同上：落库放线程池，别在事件循环上做同步 SQLite 写（救命通道也是免鉴权写口）。
+        await asyncio.to_thread(notify.ingest, source=a.source, type=a.type,
+                                uid=a.uid, body=a.message)
     except Exception as e:  # noqa: BLE001
         audit.log("notify_ingest_failed", path="/api/alarm", type=a.type, error=str(e))
     return {"ok": True}

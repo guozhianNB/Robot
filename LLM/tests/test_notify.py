@@ -75,9 +75,6 @@ def c():
     _cleanup_tmp_db()          # 退路目录在仓库里：每个用例跑完清掉自己的库文件
 
 
-def _client(c):
-    """未登录的 admin 槽：口令门默认开 → 角色是派生的 ward。"""
-    assert c.get("/api/session/user", headers=A).json()["role"] == "ward"
 # ------------------------------------------------------------------ 1 最小体
 def test_ingest_minimal_body_falls_back_to_defaults():
     old = _init_tmp_db()
@@ -150,6 +147,42 @@ def test_acked_notification_is_not_merged_again():
         assert len(db.list_notifications(state="all")) == 2
         assert len(db.list_notifications(state="unread")) == 1
         assert db.get_notification(a["id"])["count"] == 1     # 旧行不再被 bump
+    finally:
+        _cleanup_tmp_db()
+        db.DB_PATH = old
+
+
+# ------------------------------------------------------------------ 4b I1 竞态守卫
+def test_bump_notification_returns_zero_for_acked_row():
+    """`bump` 的 UPDATE 带 `ack_at=''` 守卫：已处理行进不去，返回 0。"""
+    old = _init_tmp_db()
+    try:
+        nid = notify.ingest("car", "offline", uid="elder_1")["id"]
+        assert db.bump_notification(nid, db.now_iso()) == 1     # 未处理 → 命中
+        assert notify.ack(nid) is True
+        assert db.bump_notification(nid, db.now_iso()) == 0     # 已处理 → 不命中
+        assert db.get_notification(nid)["count"] == 2           # 已处理行的 count 不再被改
+    finally:
+        _cleanup_tmp_db()
+        db.DB_PATH = old
+
+
+def test_ingest_adds_new_row_when_bump_loses_ack_race(monkeypatch):
+    """I1 竞态：find 命中后、bump 之前那一行被 ack（bump → 0）→ **必须新增一行**。
+
+    否则新上报会并进"已处理"行：不出未读卡、不响蜂鸣、角标不变 = 静默丢失。
+    """
+    old = _init_tmp_db()
+    try:
+        a = notify.ingest("car", "offline", uid="elder_1", body="第一次失联")
+        monkeypatch.setattr(db, "bump_notification", lambda nid, ts: 0)
+
+        b = notify.ingest("car", "offline", uid="elder_1", body="第二次失联")
+
+        assert b["deduped"] is False and b["id"] != a["id"]
+        assert len(db.list_notifications(state="all")) == 2
+        assert len(db.list_notifications(state="unread")) == 2   # 新上报必须进未读
+        assert db.get_notification(a["id"])["count"] == 1        # 老行没被 bump
     finally:
         _cleanup_tmp_db()
         db.DB_PATH = old
@@ -275,6 +308,66 @@ def test_notification_routes_admin_happy_path(c):
     assert c.get("/api/notifications", headers=A).json()["items"] == []
 
 
+# ==================================================================== 9c 口径锁（规格 §8）
+# 规格 §8 第 6/10 条点名的断言：D4 免鉴权投递必须**写审计**；ack/ack-all 必须**落库 + 广播**。
+
+
+def test_post_notifications_anonymous_writes_notify_ingest_audit(c, monkeypatch):
+    """D4 口径锁：非 admin 槽投递 → 200 放行，且写 `notify_ingest`（含 source/type/level/uid/id/deduped）。"""
+    logs = _capture_audit(monkeypatch)
+
+    r = c.post("/api/notifications",
+               json={"type": "offline", "source": "car", "uid": "elder_1", "message": "失联"},
+               headers=K)                     # K = kiosk 槽，未登录 → 绝非 admin
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert r.json()["deduped"] is False
+
+    rows = [e for e in logs if e["event"] == "notify_ingest"]
+    assert len(rows) == 1
+    e = rows[0]
+    assert e["source"] == "car" and e["type"] == "offline"
+    assert e["level"] == "warning"            # DEFAULT_LEVEL["offline"]
+    assert e["uid"] == "elder_1"
+    assert e["id"] == r.json()["id"]
+    assert e["deduped"] is False
+
+
+def test_ack_routes_land_in_db_and_broadcast_notification_ack(c, monkeypatch):
+    """规格 §8 第 6 条：单条 ack → 落库 + 广播含 id/by；ack-all → 落库 + 广播含 all=True/n。"""
+    evts = _capture_bus(monkeypatch)
+    nid = notify.ingest("car", "offline", uid="elder_1")["id"]
+    evts.clear()                              # 丢掉 ingest 的 notification，只看 ack 广播
+
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    assert c.post(f"/api/notifications/{nid}/ack", json={"by": "nurse"},
+                  headers=A).json() == {"ok": True, "id": nid}
+    assert db.get_notification(nid)["ack_at"] != ""          # 落库
+    assert db.get_notification(nid)["ack_by"] == "nurse"
+    assert evts[-1] == {"type": "notification_ack", "id": nid, "by": "nurse"}
+
+    notify.ingest("car", "fall")
+    notify.ingest("car", "help")
+    evts.clear()
+    assert c.post("/api/notifications/ack-all", json={"by": "nurse"},
+                  headers=A).json() == {"ok": True, "acked": 2}
+    assert evts[-1] == {"type": "notification_ack", "all": True, "by": "nurse", "n": 2}
+    assert notify.counts() == {"unread": 0, "critical": 0}   # 落库
+
+
+def test_delete_route_writes_notify_delete_audit(c, monkeypatch):
+    """规格 §8 第 10 条旁支：删单条 → 写 `notify_delete`（含 id）。"""
+    nid = notify.ingest("car", "offline")["id"]
+    c.post("/api/session/login", json={"password": "111111"}, headers=A)
+    logs = _capture_audit(monkeypatch)
+
+    assert c.delete(f"/api/notifications/{nid}", headers=A).json() == {"ok": True}
+
+    rows = [e for e in logs if e["event"] == "notify_delete"]
+    assert len(rows) == 1
+    assert rows[0]["id"] == nid and rows[0]["by"] == "admin"
+    assert db.get_notification(nid) is None                  # 真的删了
+
+
 # ------------------------------------------------------------------ 10 /api/alarm 防回归
 def test_alarm_route_unchanged(c, monkeypatch):
     """`/api/alarm` 的既有契约不变：仍返回 {"ok":True} 且仍广播 `alarm` 事件。
@@ -398,7 +491,7 @@ def test_alarm_source_override_lands_in_notification(c, monkeypatch):
 # ------------------------------------------------------------------ T2-3 落库失败不许 500
 def test_alarm_ingest_failure_still_returns_ok(c, monkeypatch):
     """notify.ingest 抛异常时，救命通道仍 {"ok": True}，且写 notify_ingest_failed 审计。"""
-    _capture_bus(monkeypatch)
+    evts = _capture_bus(monkeypatch)
     logs = _capture_audit(monkeypatch)
 
     def _boom(*a, **k):
@@ -409,6 +502,7 @@ def test_alarm_ingest_failure_still_returns_ok(c, monkeypatch):
     r = c.post("/api/alarm", json={"type": "sos", "uid": "elder_x", "message": "救命"})
 
     assert r.status_code == 200 and r.json() == {"ok": True}
+    assert [e["type"] for e in evts] == ["alarm"]   # 落库失败也**不许**吞掉 alarm 广播
     assert db.list_notifications() == []       # 没落库
     fails = [e for e in logs if e["event"] == "notify_ingest_failed"]
     assert len(fails) == 1

@@ -33,7 +33,7 @@ docs/      需求/教程/接口契约/开发日志
 
 ```
 LLM/
-  server.py            入口①  uvicorn LLM.server:app（:8000，挂 /admin /kiosk）
+  server.py            入口①  uvicorn LLM.server:app（:8000，挂 /admin /kiosk /nurse）
   mapeditor_server.py  入口②  uvicorn LLM.mapeditor_server:app（:8010，按需拉起）
   conf.py              集中配置（全包共享的顶层契约；**位置不可动**：BASE_DIR 靠它定位 .env）
   core/                log(审计) bus(SSE) vectors(轻量向量) zonegeo(几何)     零业务、零外部依赖
@@ -50,7 +50,7 @@ LLM/
 唯一例外出口是 `store/db.py` 对 `agent.tools.TOOL_DEFAULTS` 的**函数内延迟导入**（勿提到模块顶层）。
 跨层导入写法：子包内 `from ..store import db`，包根 `from .store import db`。
 
-- `server.py` — FastAPI 入口：CORS 全开，`lifespan` 启动 `db.init_db()` → `_seed_demo()` → `reminder.start()` → `bus.start_drain()` → `voice_api.start_voice()`；全局 OpenAI 客户端（DeepSeek），`_bg` 线程池跑后台任务；末尾挂载 `/admin`、`/kiosk` 前端静态产物。
+- `server.py` — FastAPI 入口：CORS 全开，`lifespan` 启动 `db.init_db()` → `_seed_demo()` → `notify.prune()` → `reminder.start()` → `bus.start_drain()` → `voice_api.start_voice()`；全局 OpenAI 客户端（DeepSeek），`_bg` 线程池跑后台任务；末尾挂载 `/admin`、`/kiosk`、`/nurse` 前端静态产物。
 - `agent/chat.py` — 对话编排：`chat_stream()`（SSE 生成器，工具循环最多 2 轮）、`route_thinking()`（思考路由）、`build_system()/build_messages()`（System Prompt + RAG + 滚动窗口）、`llm_json()`。
 - `conf.py` — **集中配置**。路径、`DEFAULT_SETTINGS`、`THINKING_KEYWORDS`、`HISTORY_WINDOW`、`MEMORY_RULES`、`MODEL`、超时等。**改参数先来这里**。
 - `store/db.py` — SQLite 数据层（`LLM/data/brain.db`，WAL + 线程锁）。函数命名 `get_*`/`add_*`/`set_*`/`update_*`/`delete_*`/`upsert_*`，协程侧用 `asyncio.to_thread`。
@@ -60,6 +60,7 @@ LLM/
 - `agent/prompt/` — **角色提示词片段**：`ward.md`/`elder.md`/`admin.md` 三层各一份，由 `chat._load_role_prompt()` 按 `role_policy(role)["prompt_file"]` 装载、叠加在 `base.md` 之上（`base.md` **是共用 base**，管"怎么说"；角色片段管"现在跟谁说话"）；缺文件 → 空串 + 审计 `prompt_role_missing`，不阻断对话。
 - `agent/memory.py` — RAG 记忆 + 半自动沉淀：`recall()`、`note_turn()`、`consolidate()`、`suggest_from_chat()`。**红线：`MEDICAL_KEYWORDS` 命中拒绝写入**。（MaiBot 对标增强：核心记忆定稿/保护、回收站、纠错、画像防退化等，见 `docs/log.md` 2026-09 条目）
 - `agent/reminder.py` — 独立线程定时调度（15s tick），状态机 `pending→triggered→confirmed/unconfirmed/missed`。
+- `agent/notify.py` — **通知中心（模块 11）的唯一写入口**：`ingest()`（归一化 → 去重合并 → 落库 → 审计 → 广播）/ `list_notices()` / `counts()` / `ack()` / `ack_all()` / `remove()` / `prune()`；护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
 - `core/bus.py` — SSE 事件总线，`publish()`（任意线程）→ asyncio 扇出订阅者。
 - `agent/tools.py` — 工具注册中心 + 分发：本地工具（`LLM/tool/` 下 `@tool` 装饰器注册，自动加载）+ MCP 工具（`conf.MCP_SERVERS` 配置），`run_tool()` 统一分发，per-tool 开关自动生效。
 - `agent/mcp_client.py` — MCP 客户端桥（**可选能力**）：后台线程 + 专属事件循环拉起 stdio MCP 服务器子进程，`tools/list` 转 OpenAI function-calling schema 并入工具循环，`mcp_enabled` 总开关控制；依赖缺失/连接失败只降级不崩后端。
@@ -130,7 +131,7 @@ LLM/
 
 ## 前端（frontend/）
 
-- pnpm workspace（Vue3 + Vite + TS），四个包：
+- pnpm workspace（Vue3 + Vite + TS），四个端包 + `shared` 共享层：
   - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
   - `packages/nurse` — **护士台**（PC 浏览器，模块 11 告警面板）：只做三件事 = 看通知 / 点「处理了」/ 一眼看清未处理条数（不做对话、设置、记忆、地图、身份权限）；dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。

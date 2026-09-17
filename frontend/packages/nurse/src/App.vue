@@ -271,6 +271,11 @@ function onAcked(id: number) {
 // 未处理数 → 浏览器标签标题（规格 §4.3）
 watch(unread, (n) => { document.title = n > 0 ? `(${n}) 护士台` : "护士台"; }, { immediate: true });
 
+/** 纪律兜底：`isAdmin` 变假（会话丢了）→ **无条件**收口实时连接。
+ *  现有各丢会话路径都已显式调 stopRealtime()，但那是"纪律"不是"结构"——
+ *  将来新增"把 session 置空却不走该收口"的路径会漏关 SSE。 */
+watch(isAdmin, (ok) => { if (!ok) stopRealtime(); });
+
 onMounted(async () => {
   const tick = () => { clock.value = new Date().toLocaleTimeString("zh-CN", { hour12: false }); };
   tick();
