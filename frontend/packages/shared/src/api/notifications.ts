@@ -2,13 +2,14 @@
 //
 // 后端契约（`LLM/server.py` 通知路由段 + `LLM/agent/notify.py`）：
 //   POST   /api/notifications            —— **免鉴权**投递口（小车/视觉/雷达/任意模块）
-//   GET    /api/notifications            —— 列表 + 计数（**仅管理员**）
-//   POST   /api/notifications/{id}/ack   —— 标记已处理（仅管理员）
-//   POST   /api/notifications/ack-all    —— 全量标记已处理（仅管理员）
-//   DELETE /api/notifications/{id}       —— 删单条（仅管理员）
+//   GET    /api/notifications            —— 列表 + 计数（**免鉴权**，D11）
+//   POST   /api/notifications/{id}/ack   —— 标记已处理（**免鉴权**，D11）
+//   POST   /api/notifications/ack-all    —— 全量标记已处理（**免鉴权**，D11）
+//   DELETE /api/notifications/{id}       —— 删单条（**仅管理员**，D11 未放宽）
 //
-// 读/确认/删除必须带 `X-Surface: admin`（后端 `_notice_admin()` 校验槽位角色，非 admin → 403），
-// 故这里统一走 `shared/src/api/client.ts` 的既有封装（不自己 new fetch）。
+// 规格 D11（2026-09-18 二次修订）：护士台免登录，故读/确认三条**不校验身份**；
+// 只有 `DELETE` 走 `X-Surface: admin` + `_notice_admin()`（非 admin → 403）。
+// 所有调用统一走 `shared/src/api/client.ts` 的既有封装（不自己 new fetch）。
 import { apiDelete, apiGet, apiPost } from "./client";
 
 /** 列表一条通知。字段名与后端 `SELECT * FROM notifications` 的列名一一对应

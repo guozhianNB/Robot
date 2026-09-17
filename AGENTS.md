@@ -88,7 +88,7 @@ LLM/
 - 记忆：`/api/memories` 一族 —— `GET|POST`、`/{mid}/confirm|reject|delete`、`/recycle`(+restore/purge)、`/correct`、`/import`、`/portrait`(护士手动画像)、`/suggest`、`/health`；`/api/memories/core`(+confirm/unconfirm/pin/unpin/{mid}delete)、`/rag`(+delete)、`/graph`、`/expressions`(+approve/reject)
 - 语音（可选，依赖缺失时降级，见「系统稳健性」）：`GET /api/voice/status` ｜ `POST /api/voice/enroll` ｜ `GET /api/voice/speakers` ｜ `DELETE /api/voice/speakers/{uid}` ｜ `POST /api/voice/record`(+`/{id}/audio`) ｜ `GET /api/face/status`
 - 告警/系统：`POST /api/alarm`（kiosk SOS）｜ `POST /api/system/shutdown`
-- 通知中心（模块 11，护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`）：`POST /api/notifications`（**免鉴权**投递口，任何模块/小车都能上报）｜ `GET /api/notifications`（`?state=all|unread&limit&before_id`，返回 `{items, counts}`）｜ `POST /api/notifications/{nid}/ack` ｜ `POST /api/notifications/ack-all` ｜ `DELETE /api/notifications/{nid}`（**后四条仅管理员**，走 `X-Surface: admin`）；广播总线事件 `notification`（新通知/去重合并，**通知类型在 `kind` 键里**）与 `notification_ack`
+- 通知中心（模块 11，护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`）：`POST /api/notifications`（**免鉴权**投递口，任何模块/小车都能上报）｜ `GET /api/notifications`（`?state=all|unread&limit&before_id`，返回 `{items, counts}`）｜ `POST /api/notifications/{nid}/ack` ｜ `POST /api/notifications/ack-all`（**读/确认这三条免鉴权**——规格 D11「护士台免登录」；D11 明确"只放护士台"）｜ `DELETE /api/notifications/{nid}`（**仅管理员**，删记录是数据损失，不放宽）；广播总线事件 `notification`（新通知/去重合并，**通知类型在 `kind` 键里**）与 `notification_ack`
 - 工具/设置：`GET /api/tools` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings`
 - 广播：`GET /api/events`（SSE）
 - **地图编辑器**（第三个前端 `/mapeditor`，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md`）—— ⚠️ **以下路由 2026-09-15 起已搬到 `LLM/maps/mapapi.py`，只在独立进程 `LLM.mapeditor_server`（`conf.MAP_EDITOR_PORT`=8010）上挂载，主后端（8000）不再暴露它们**（主后端只留 3 条仅管理员的 `GET|POST /api/mapeditor/service{,/start,/stop}` 做进程启停）：
@@ -134,7 +134,7 @@ LLM/
 - pnpm workspace（Vue3 + Vite + TS），四个端包 + `shared` 共享层：
   - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
-  - `packages/nurse` — **护士台**（PC 浏览器，模块 11 告警面板）：只做三件事 = 看通知 / 点「处理了」/ 一眼看清未处理条数（不做对话、设置、记忆、地图、身份权限）；dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
+  - `packages/nurse` — **护士台**（PC 浏览器，模块 11 告警面板）：只做三件事 = 看通知 / 点「处理了」/ 一眼看清未处理条数（不做对话、设置、记忆、地图、身份权限）；**免登录、打开即用**（规格 D11：用户原话"护士台不再需要登录、也不会被弹"；管理台 `/admin` 的口令门不受影响）；dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
   - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 思考档位工具 `src/thinking.ts`（五档 `ThinkingMode` / `THINKING_MODE_ORDER` / `normalizeThinkingMode`（含 on/off 兼容）/ `thinkingModeLabel`），admin/kiosk 都从它引入。
   - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产由编辑器自己的进程挂 `/mapeditor`（主后端 8000 不再挂载，见「快速上手 → 前端」）；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
 - 工程细节：vite `base` 与后端挂载路径一致（admin→`/admin/`、kiosk→`/kiosk/`，见 vite.config 注释 C-1）；`shared` 包 alias 到 TS 源码（monorepo 已知坑）。
