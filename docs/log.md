@@ -948,3 +948,20 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 
 **验证：** `pytest LLM/tests` **4 failed / 173 passed / 135 errors** vs 基线 **4 failed / 150 passed / 135 errors**（失败集合完全一致，全是既有红态）；`test_thinking_mode.py` 22 例全绿；`pnpm -r test` 25 例全绿；admin/kiosk 构建通过。
 **生效前提：** 后端改动需**重启 uvicorn**（当前 8000 上的进程跑的还是旧代码），前端需**硬刷新**（Ctrl+F5）——这正是用户上一轮「按了强制还是不思考」的另一个原因：前台 bundle 与后台进程都还是旧的。
+
+---
+
+## 2026-09-18 · 对话编排升级为有界 ReAct Agent
+
+### 实现口径
+
+- 对话工具循环改用模型原生 `tool_calls` / `role=tool` 协议；`auto` 模式第一次请求保持原有低延时，只有工具实际执行后，后续推理才升到 `high`。
+- 单次对话最多允许四轮工具行动；工具预算耗尽后禁用工具，并强制模型根据已有 Observation 输出最终总结，避免无限循环。
+- 工具返回 `ok:false` 与非法 JSON 都作为 Observation 回传模型，让模型能够纠错或解释失败；工具参数不是合法 JSON 对象时不执行工具。
+- 不新增也不持久化 Thought。`reasoning` 仍只用于界面展示，不进入 TTS、聊天历史或记忆沉淀。
+
+### 验证
+
+- 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
+- `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
+- 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。
