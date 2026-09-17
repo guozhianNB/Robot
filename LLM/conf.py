@@ -210,6 +210,12 @@ EPISODE_TTL_DAYS = 90              # 经历片段（Episode）记忆时效：一
 # 提醒状态机
 REMINDER_STATUS = ["pending", "triggered", "unconfirmed", "confirmed", "missed"]
 
+# ---- 通知中心（护士台数据底座，模块 11）----
+NOTIFY_DEDUP_S = 60          # 去重合并窗口（秒）
+NOTIFY_KEEP_DAYS = 30        # 已处理通知保留天数
+NOTIFY_LIST_LIMIT = 50       # 列表默认条数上限
+NOTIFY_BODY_MAX = 500        # 正文截断长度
+
 # ---- 记忆系统 v3：embedding ----
 EMBED_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EMBED_MODEL = "text-embedding-v3"

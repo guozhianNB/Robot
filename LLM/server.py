@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from .store import db
 from .core import bus
 from .agent import chat, memory as rag, reminder, tools as tool_mod
+from .agent import notify          # 通知中心（护士台数据底座，模块 11）
 from .voice import voice_api
 from .agent import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
 from .agent import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
@@ -73,6 +74,10 @@ async def lifespan(app: FastAPI):
               ragstore=ragstore.status(), graph=graph.status())
 
     _seed_demo()
+    try:
+        notify.prune()            # 通知中心：启动清一次过期已处理通知（失败不得阻断启动）
+    except Exception as e:
+        audit.log("notify_prune_error", error=str(e))
     audit.log("map_io_change", mode=conf.MAPS_IO, root=(
         conf.MAPS_SSH_ROOT if conf.MAPS_IO == "ssh" else str(conf.MAPS_DIR)))
     reminder.start()          # 独立线程的定时提醒调度器
@@ -322,6 +327,26 @@ class AlarmIn(BaseModel):
     type: str = "sos"          # sos / fall / health / no_activity ...
     uid: str = ""
     message: str = ""
+
+
+class NoticeIn(BaseModel):
+    """通知投递体（`POST /api/notifications`）：`type` 必填，其余可省。
+
+    `type` 故意给空串默认值而不是 `str` 必填：Pydantic 必填缺失会抛 422，而本接口的契约
+    是**类型问题一律 400**（与旁边 `/api/alarm` 的宽松形状同族，投递方是机器，400 更好排查）。
+    """
+    type: str = ""             # 空/缺失 → 路由 400
+    source: str = ""
+    level: str = ""            # 空/非法 → notify.ingest 按类型兜底
+    uid: str = ""
+    title: str = ""
+    message: str = ""          # → ingest(body=…)，与 /api/alarm 的字段名保持一族
+    ref: str = ""
+
+
+class AckIn(BaseModel):
+    """确认体：`by` 可省（默认 admin）。"""
+    by: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1107,73 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
     if role != "admin":
         return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
+
+
+# ---------------------------------------------------------------- 通知中心（模块 11）
+# 设计：**投递免鉴权**（需求文档模块 11："任何模块发现异常都往该端口 POST" —— 告警源可能
+# 是小车/语音/巡检等无口令的一方），但**读/确认/删除一律只给管理员**（护士台）。
+def _notice_payload(n: dict) -> dict:
+    """列表一条：补 `uid_name`（「姓名 · 床号」，无档案/无 uid 则空串）。
+
+    拼接口径与广播 payload 的 `uid_name` **共用 `notify.uid_name()`**（两处必须一致，
+    否则护士台的列表显示与实时 toast 会不一样）。
+    """
+    n["uid_name"] = notify.uid_name(n.get("uid") or "")
+    return n
+
+
+def _notice_admin(x_surface: str) -> None:
+    """通知的读/写管理口：非管理员一律 403（与同族 admin 路由同形）。"""
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理通知")
+
+
+@app.post("/api/notifications")
+async def notice_ingest(n: NoticeIn):
+    """投递通知（**有意免鉴权**，见上）。同 key 在窗口内自动合并。"""
+    if not (n.type or "").strip():
+        raise HTTPException(status_code=400, detail="type 不能为空")
+    try:
+        return notify.ingest(n.source, n.type, level=n.level, uid=n.uid,
+                             title=n.title, body=n.message, ref=n.ref)
+    except ValueError as e:                     # type 为空 → 400（不是 5xx，也不是静默吞掉）
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/notifications")
+async def notices_list(x_surface: str = Header(default="kiosk"),
+                       state: str = Query("all"), limit: int = Query(0),
+                       before_id: int = Query(0)):
+    _notice_admin(x_surface)
+    items = await asyncio.to_thread(notify.list_notices, state, limit, before_id)
+    return {"ok": True, "items": [_notice_payload(i) for i in items],
+            "counts": await asyncio.to_thread(notify.counts)}
+
+
+@app.post("/api/notifications/{nid}/ack")
+async def notice_ack(nid: int, x_surface: str = Header(default="kiosk"),
+                     body: AckIn | None = None):
+    _notice_admin(x_surface)
+    by = (body.by if body else "") or "admin"
+    if not await asyncio.to_thread(notify.ack, nid, by):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True, "id": nid}
+
+
+@app.post("/api/notifications/ack-all")
+async def notice_ack_all(x_surface: str = Header(default="kiosk"),
+                         body: AckIn | None = None):
+    _notice_admin(x_surface)
+    by = (body.by if body else "") or "admin"
+    return {"ok": True, "acked": await asyncio.to_thread(notify.ack_all, by)}
+
+
+@app.delete("/api/notifications/{nid}")
+async def notice_delete(nid: int, x_surface: str = Header(default="kiosk")):
+    _notice_admin(x_surface)
+    if not await asyncio.to_thread(notify.remove, nid):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- 紧急呼叫

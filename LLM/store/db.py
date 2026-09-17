@@ -127,6 +127,25 @@ CREATE TABLE IF NOT EXISTS zones (
   PRIMARY KEY (map_name, uid),
   UNIQUE(map_name, name)
 );
+-- ===== 通知中心（护士台数据底座，模块 11）=====
+-- 任何模块发现异常都往 POST /api/notifications 投递（免鉴权）。同 (source,type,uid) 在
+-- NOTIFY_DEDUP_S 窗口内命中的未处理通知做合并（count+1、last_at 刷新，保留最早原文）。
+CREATE TABLE IF NOT EXISTS notifications (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  level      TEXT NOT NULL DEFAULT 'info',
+  source     TEXT NOT NULL DEFAULT '',
+  type       TEXT NOT NULL,
+  uid        TEXT DEFAULT '',
+  title      TEXT DEFAULT '',
+  body       TEXT DEFAULT '',
+  ref        TEXT DEFAULT '',
+  count      INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  last_at    TEXT NOT NULL,
+  ack_at     TEXT DEFAULT '',
+  ack_by     TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
 """
 
 
@@ -1470,3 +1489,153 @@ def count_map_tags(map_name: str) -> dict:
         return {"destinations": d, "zones": z}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- notifications（通知中心）
+# 排序口径统一：**未处理优先，再按 created_at 倒序**（同秒内用 id 兜底，保证稳定分页）。
+_NOTIFY_ORDER = "ORDER BY (ack_at='') DESC, created_at DESC, id DESC"
+_NOTIFY_LIST_MAX = 200          # list_notifications 的 limit 硬上限
+
+
+def add_notification(level, source, ntype, uid="", title="", body="", ref="", ts="") -> int:
+    """新增一条通知，返回 id。`ts` 空则用服务器时间（created_at 与 last_at 同值）。"""
+    ts = ts or now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                """INSERT INTO notifications
+                   (level,source,type,uid,title,body,ref,count,created_at,last_at,ack_at,ack_by)
+                   VALUES (?,?,?,?,?,?,?,1,?,?,'','')""",
+                (level or "info", source or "", ntype, uid or "", title or "",
+                 body or "", ref or "", ts, ts),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def get_notification(nid: int) -> dict | None:
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM notifications WHERE id=?", (nid,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def find_unacked_notification(source: str, ntype: str, uid: str, since_iso: str) -> dict | None:
+    """查去重合并目标：同 (source,type,uid) 且**未处理**、`last_at >= since_iso` 的最新一条。
+
+    只认未处理的（已 ack 的通知不许被新事件并入 —— 那会把护士刚处理完的条目又翻成未读）。
+    """
+    conn = _conn()
+    try:
+        r = conn.execute(
+            f"""SELECT * FROM notifications
+                WHERE source=? AND type=? AND uid=? AND ack_at='' AND last_at>=?
+                {_NOTIFY_ORDER} LIMIT 1""",
+            (source or "", ntype, uid or "", since_iso)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def bump_notification(nid: int, ts: str) -> None:
+    """合并：count+1、last_at=ts（**不动 body/title** —— 保留最早原文）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE notifications SET count=count+1, last_at=? WHERE id=?", (ts, nid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_notifications(state: str = "all", limit: int = 50, before_id: int = 0) -> list[dict]:
+    """通知列表。`state="unread"` 只回未处理；`before_id` 分页（id < before_id）。"""
+    sql = "SELECT * FROM notifications"
+    where, args = [], []
+    if state == "unread":
+        where.append("ack_at=''")
+    if before_id:
+        where.append("id<?")
+        args.append(before_id)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    limit = max(0, min(int(limit or 0), _NOTIFY_LIST_MAX))
+    sql += f" {_NOTIFY_ORDER} LIMIT ?"
+    args.append(limit)
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def notification_counts() -> dict:
+    """角标用计数：`unread`=未处理总数，`critical`=未处理里的 critical 条数。"""
+    conn = _conn()
+    try:
+        unread = conn.execute("SELECT COUNT(*) AS c FROM notifications WHERE ack_at=''").fetchone()["c"]
+        crit = conn.execute(
+            "SELECT COUNT(*) AS c FROM notifications WHERE ack_at='' AND level='critical'"
+        ).fetchone()["c"]
+        return {"unread": unread, "critical": crit}
+    finally:
+        conn.close()
+
+
+def ack_notification(nid: int, by: str = "admin") -> int:
+    """确认一条通知，返回受影响行数（0 = 不存在或已确认过）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE notifications SET ack_at=?, ack_by=? WHERE id=? AND ack_at=''",
+                (now_iso(), by or "admin", nid))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def ack_all_notifications(by: str = "admin") -> int:
+    """确认全部未处理通知，返回条数。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("UPDATE notifications SET ack_at=?, ack_by=? WHERE ack_at=''",
+                               (now_iso(), by or "admin"))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def delete_notification(nid: int) -> int:
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("DELETE FROM notifications WHERE id=?", (nid,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def prune_notifications(before_iso: str) -> int:
+    """清老通知：**只删已处理（ack_at != ''）且 last_at < before_iso 的行**，返回删除行数。
+
+    未处理的老通知必须留着 —— 没被护士看过的告警不许因为"放太久"自己消失。
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "DELETE FROM notifications WHERE ack_at!='' AND last_at<?", (before_iso,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
