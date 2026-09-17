@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -95,9 +96,9 @@ def _chunk(*, content=None, tool_calls=None, finish_reason="stop", reasoning=Non
     )
 
 
-def _tool_call(name="search", arguments='{"query":"床位"}', call_id="call-1"):
+def _tool_call(name="search", arguments='{"query":"床位"}', call_id="call-1", index=0):
     return SimpleNamespace(
-        index=0,
+        index=index,
         id=call_id,
         function=SimpleNamespace(name=name, arguments=arguments),
     )
@@ -224,6 +225,138 @@ def test_tool_progress_and_final_answer_are_both_in_done_assistant(monkeypatch):
 
     assert [e["content"] for e in events if e["type"] == "content"] == ["我帮您看看", "查到了"]
     assert events[-1] == {"type": "done", "assistant": "我帮您看看查到了"}
+
+
+def test_failed_tool_is_observed_then_replanned_with_new_arguments(monkeypatch):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
+    calls = []
+
+    def run_tool(name, args, principal):
+        calls.append((name, args))
+        if args == {"value": 1}:
+            return {"ok": False, "type": "upstream_error", "error": "value 1 failed",
+                    "details": {"retryable": True}}
+        return {"ok": True, "result": "value 2 worked"}
+
+    monkeypatch.setattr(chat.tool_mod, "run_tool", run_tool)
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    audits = []
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: audits.append((args, kwargs)))
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[_tool_call(arguments='{"value":1}', call_id="call-first")],
+                finish_reason="tool_calls")],
+        [_chunk(tool_calls=[_tool_call(arguments='{"value":2}', call_id="call-second")],
+                finish_reason="tool_calls")],
+        [_chunk(content="第二次成功了")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "重试一下", "none", {}))
+
+    assert calls == [("search", {"value": 1}), ("search", {"value": 2})]
+    assert events[-1] == {"type": "done", "assistant": "第二次成功了"}
+    third_messages = completions.requests[2]["messages"]
+    observations = [message for message in third_messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in observations] == ["call-first", "call-second"]
+    assert json.loads(observations[0]["content"]) == {
+        "ok": False,
+        "type": "upstream_error",
+        "error": "value 1 failed",
+        "details": {"retryable": True},
+    }
+    assert json.loads(observations[1]["content"]) == {
+        "ok": True,
+        "result": "value 2 worked",
+    }
+    turn_audit = next(kwargs for args, kwargs in audits
+                      if args == ("chat",) and kwargs.get("action") == "turn")
+    assert turn_audit["tool_rounds"] == 2
+
+
+@pytest.mark.parametrize("raw", ['{"value":', "[]", '"not an object"'])
+def test_invalid_arguments_are_observed_without_executing_tool(monkeypatch, raw):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
+    calls = []
+    monkeypatch.setattr(chat.tool_mod, "run_tool",
+                        lambda *args: calls.append(args) or {"ok": True})
+    tool_logs = []
+    monkeypatch.setattr(chat.db, "log_tool",
+                        lambda *args, **kwargs: tool_logs.append((args, kwargs)))
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: None)
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[_tool_call(arguments=raw, call_id="call-invalid")],
+                finish_reason="tool_calls")],
+        [_chunk(content="参数不合法，我没有执行")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "执行一下", "none", {}))
+
+    assert calls == []
+    tool_starts = [event for event in events if event["type"] == "tool_start"]
+    assert tool_starts == [{"type": "tool_start", "tool": "search", "args": {}}]
+    tool_results = [event for event in events if event["type"] == "tool_result"]
+    assert len(tool_results) == 1
+    assert tool_results[0]["ok"] is False
+    assert tool_results[0]["snippet"]
+    observation = next(message for message in completions.requests[1]["messages"]
+                       if message["role"] == "tool")
+    assert observation["tool_call_id"] == "call-invalid"
+    result = json.loads(observation["content"])
+    assert result["ok"] is False
+    assert result["type"] == "invalid_arguments"
+    assert result["error"]
+    assert tool_logs[0][1]["status"] == "error"
+
+
+def test_invalid_arguments_parser_contract():
+    assert chat._parse_tool_arguments('{"value":1}') == ({"value": 1}, None)
+    for raw in ('{"value":', "[]", '"not an object"'):
+        args, error = chat._parse_tool_arguments(raw)
+        assert args is None
+        assert error["ok"] is False
+        assert error["type"] == "invalid_arguments"
+        assert error["error"]
+
+
+def test_multiple_tools_keep_index_order_ids_and_count_as_one_round(monkeypatch):
+    monkeypatch.setattr(chat, "build_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat.tool_mod, "effective_tools", lambda *args: [{"type": "function"}])
+    calls = []
+    monkeypatch.setattr(chat.tool_mod, "run_tool",
+                        lambda name, args, principal: calls.append((name, args)) or
+                        {"ok": True, "result": name})
+    monkeypatch.setattr(chat.db, "log_tool", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat.db, "append_history", lambda *args, **kwargs: None)
+    audits = []
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: audits.append((args, kwargs)))
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[
+            _tool_call(name="second", arguments='{"position":2}', call_id="call-2", index=1),
+            _tool_call(name="first", arguments='{"position":1}', call_id="call-1", index=0),
+        ], finish_reason="tool_calls")],
+        [_chunk(content="都完成了")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "依次执行", "auto", {}))
+
+    assert calls == [("first", {"position": 1}), ("second", {"position": 2})]
+    messages = completions.requests[1]["messages"]
+    assistant = next(message for message in messages if message["role"] == "assistant")
+    assert [call["id"] for call in assistant["tool_calls"]] == ["call-1", "call-2"]
+    observations = [message for message in messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in observations] == ["call-1", "call-2"]
+    escalations = [event for event in events if event.get("type") == "meta" and
+                   event["router"].get("method") == "tool_observation"]
+    assert len(escalations) == 1
+    turn_audit = next(kwargs for args, kwargs in audits
+                      if args == ("chat",) and kwargs.get("action") == "turn")
+    assert turn_audit["tool_rounds"] == 1
 
 
 def test_empty_content_fallback_disables_tools(monkeypatch):

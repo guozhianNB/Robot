@@ -4,7 +4,7 @@ r"""
   - 角色设定：温柔护工 System Prompt + 安全红线 + 老人风格注入 + RAG 记忆注入 + 历史摘要
   - 思考路由层：关键词预分类，棘手/敏感/健康类问题自动 thinking on，日常秒回
   - 上下文管理：滚动窗口 + 历史摘要
-  - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成，最多 2 轮
+  - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成
 """
 import json
 import time
@@ -487,12 +487,30 @@ def _tool_log_fields(name: str, args, snippet: str):
     return {}, _VISION_LOG_SNIPPET
 
 
+def _parse_tool_arguments(raw: str) -> tuple[dict | None, dict | None]:
+    """Parse model-provided arguments without allowing non-object JSON into tools."""
+    try:
+        args = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return None, {
+            "ok": False,
+            "type": "invalid_arguments",
+            "error": f"工具参数 JSON 解析失败：{exc}",
+        }
+    if not isinstance(args, dict):
+        return None, {
+            "ok": False,
+            "type": "invalid_arguments",
+            "error": "工具参数必须是 JSON 对象",
+        }
+    return args, None
+
+
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
                 principal: dict | None = None):
     """
     核心生成器：逐条 yield SSE 事件 dict。
       {"type":"reasoning"|"content"|"tool_start"|"tool_result"|"done"|"error", ...}
-    工具循环最多 2 轮，防止模型无限调工具。
     """
     # 思考路由（规则 + 情绪词 + LLM 预判兜底）+ 手动档位叠加（见 _apply_thinking_mode）
     routed = route_thinking(user_text, settings, llm_client=client, model=model)
@@ -514,10 +532,11 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     full_assistant = ""
     reasoning_text = ""          # 思维链累计（只用于审计字数，不落库、不播报）
     retried_no_thinking = False   # 空回复兜底只允许降级一次（防死循环）
+    tool_rounds = 0
     try:
         #--------------------------
         # 1、调用模型生成器，stream=True 流式输出
-        for round_i in range(2):
+        while True:
             extra = _thinking_extra(effort)
             try:
                 stream = client.chat.completions.create(
@@ -568,33 +587,35 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     break
 
             if finish == "tool_calls" and tool_calls:
+                tool_rounds += 1
+                resolved_calls = [
+                    (i, slot, slot["id"] or f"call_{tool_rounds}_{i}")
+                    for i, slot in sorted(tool_calls.items())
+                ]
                 # 把工具调用补进上下文，再执行
                 assistant_msg = {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": slot["id"] or f"call_{round_i}_{i}", "type": "function",
+                    {"id": call_id, "type": "function",
                      "function": {"name": slot["name"], "arguments": slot["args"] or "{}"}}
-                    for i, slot in sorted(tool_calls.items())
+                    for i, slot, call_id in resolved_calls
                 ]}
                 messages.append(assistant_msg)
-                for i, slot in sorted(tool_calls.items()):
-                    try:
-                        args = json.loads(slot["args"] or "{}")
-                    except Exception:
-                        args = {}
+                for i, slot, call_id in resolved_calls:
+                    args, invalid_result = _parse_tool_arguments(slot["args"])
                     name = slot["name"]
-                    yield {"type": "tool_start", "tool": name, "args": args}
+                    yield {"type": "tool_start", "tool": name, "args": args or {}}
                     t0 = time.time()
-                    result = tool_mod.run_tool(name, args, principal)
+                    result = invalid_result or tool_mod.run_tool(name, args, principal)
                     latency = int((time.time() - t0) * 1000)
                     snippet = (result.get("result") or result.get("message")
                                or result.get("error") or "")[:500]
-                    log_args, log_snippet = _tool_log_fields(name, args, snippet)
+                    log_args, log_snippet = _tool_log_fields(name, args or {}, snippet)
                     db.log_tool(data_uid, name, log_args, log_snippet,
                                 status="ok" if result.get("ok") else "error", latency_ms=latency)
                     audit.log("tool", uid=data_uid, tool=name, args=log_args,
                               ok=result.get("ok"), latency_ms=latency)
                     yield {"type": "tool_result", "tool": name, "ok": result.get("ok"),
                            "snippet": snippet}
-                    messages.append({"role": "tool", "tool_call_id": slot["id"] or f"call_{round_i}_{i}",
+                    messages.append({"role": "tool", "tool_call_id": call_id,
                                      "content": json.dumps(result, ensure_ascii=False)})
                 if mode == "auto" and effort != "high":
                     effort, thinking_on = "high", True
@@ -642,5 +663,6 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     # 审计带上思考档位/实际强度/思维链字数：现场排障时"参数到底传到 llm 没有"直接看审计
     audit.log("chat", action="turn", uid=data_uid, user=user_text[:200],
               assistant=full_assistant[:200], mode=mode, effort=effort,
-              thinking_on=thinking_on, reasoning_chars=len(reasoning_text))
+              thinking_on=thinking_on, reasoning_chars=len(reasoning_text),
+              tool_rounds=tool_rounds)
     yield {"type": "done", "assistant": full_assistant}
