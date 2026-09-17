@@ -7,6 +7,7 @@ r"""
   - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成
 """
 import json
+import threading
 import time
 
 from ..store import db
@@ -129,6 +130,7 @@ _DEFAULT_REACT_PROMPT = (
 )
 
 _react_prompt_warned = False  # react.md 缺失只告警一次，恢复后允许再次告警
+_react_prompt_warn_lock = threading.Lock()
 
 
 def _load_react_prompt() -> str:
@@ -137,11 +139,16 @@ def _load_react_prompt() -> str:
     try:
         raw = REACT_PROMPT_FILE.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        if not _react_prompt_warned:
-            _react_prompt_warned = True
+        should_warn = False
+        with _react_prompt_warn_lock:
+            if not _react_prompt_warned:
+                _react_prompt_warned = True
+                should_warn = True
+        if should_warn:
             audit.log("chat", action="prompt_react_missing", file=str(REACT_PROMPT_FILE))
         return _DEFAULT_REACT_PROMPT
-    _react_prompt_warned = False
+    with _react_prompt_warn_lock:
+        _react_prompt_warned = False
     marker_idx = None
     for i, line in enumerate(raw.splitlines()):
         if line.strip() == "<!-- PROMPT -->":
@@ -480,6 +487,7 @@ _REACT_FINALIZE_PROMPT = (
     "工具调用次数已达上限。不要再调用工具；请仅根据已有工具结果直接回答用户，"
     "并如实说明尚未完成或无法确认的部分。"
 )
+_REACT_LOCAL_TERMINAL_REPLY = "这次没能完成，我先停在这里，请稍后再试。"
 
 
 def _tool_log_fields(name: str, args, snippet: str):
@@ -514,6 +522,43 @@ def _parse_tool_arguments(raw: str) -> tuple[dict | None, dict | None]:
     return args, None
 
 
+def _collect_buffered_response(stream):
+    """Collect a tool-disabled response before deciding whether its content is safe to publish."""
+    content_chunks = []
+    reasoning_chunks = []
+    tool_calls = {}
+    finish = None
+    for chunk in stream:
+        choice = chunk.choices[0]
+        delta = choice.delta
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            reasoning_chunks.append(reasoning)
+        content = getattr(delta, "content", None)
+        if content:
+            content_chunks.append(content)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            call_id = getattr(tc, "id", None)
+            function = getattr(tc, "function", None)
+            if call_id:
+                slot["id"] += call_id
+            if function and getattr(function, "name", None):
+                slot["name"] += function.name
+            if function and getattr(function, "arguments", None):
+                slot["args"] += function.arguments
+        if choice.finish_reason:
+            finish = choice.finish_reason
+            break
+    return {
+        "content": "".join(content_chunks),
+        "content_chunks": content_chunks,
+        "reasoning_chunks": reasoning_chunks,
+        "tool_calls": tool_calls,
+        "finish": finish,
+    }
+
+
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
                 principal: dict | None = None):
     """
@@ -542,7 +587,7 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     retried_no_thinking = False   # 空回复兜底只允许降级一次（防死循环）
     tool_rounds = 0
     finalizing = False
-    final_response_content = ""
+    terminal_response_content = ""
     finalize_protocol_violation = False
     try:
         #--------------------------
@@ -573,45 +618,50 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 else:
                     raise
         #-------------------------
+            if finalizing:
+                response = _collect_buffered_response(stream)
+                for reasoning in response["reasoning_chunks"]:
+                    reasoning_text += reasoning
+                    yield {"type": "reasoning", "content": reasoning}
+                terminal_response_content = response["content"]
+                finalize_protocol_violation = bool(response["tool_calls"])
+                if not finalize_protocol_violation:
+                    for content in response["content_chunks"]:
+                        full_assistant += content
+                        yield {"type": "content", "content": content}
+                break
+
             # 解析流式输出，逐条 yield SSE 事件
             tool_calls = {}
             finish = None
             response_content = ""
-            response_content_chunks = []
+            response_reasoning = ""
             for chunk in stream:
                 choice = chunk.choices[0]
                 delta = choice.delta
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     reasoning_text += reasoning
+                    response_reasoning += reasoning
                     yield {"type": "reasoning", "content": reasoning}
-                if delta.content:
-                    response_content += delta.content
-                    if finalizing:
-                        response_content_chunks.append(delta.content)
-                    else:
-                        full_assistant += delta.content
-                        yield {"type": "content", "content": delta.content}
-                for tc in (delta.tool_calls or []):
+                content = getattr(delta, "content", None)
+                if content:
+                    response_content += content
+                    full_assistant += content
+                    yield {"type": "content", "content": content}
+                for tc in (getattr(delta, "tool_calls", None) or []):
                     slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-                    if tc.id:
-                        slot["id"] += tc.id
-                    if tc.function and tc.function.name:
-                        slot["name"] += tc.function.name
-                    if tc.function and tc.function.arguments:
-                        slot["args"] += tc.function.arguments
+                    call_id = getattr(tc, "id", None)
+                    function = getattr(tc, "function", None)
+                    if call_id:
+                        slot["id"] += call_id
+                    if function and getattr(function, "name", None):
+                        slot["name"] += function.name
+                    if function and getattr(function, "arguments", None):
+                        slot["args"] += function.arguments
                 if choice.finish_reason:
                     finish = choice.finish_reason
                     break
-
-            if finalizing:
-                final_response_content = response_content
-                finalize_protocol_violation = bool(tool_calls)
-                if not finalize_protocol_violation:
-                    for content in response_content_chunks:
-                        full_assistant += content
-                        yield {"type": "content", "content": content}
-                break
 
             if finish == "tool_calls" and tool_calls:
                 tool_rounds += 1
@@ -625,6 +675,8 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                      "function": {"name": slot["name"], "arguments": slot["args"] or "{}"}}
                     for i, slot, call_id in resolved_calls
                 ]}
+                if response_reasoning:
+                    assistant_msg["reasoning_content"] = response_reasoning
                 messages.append(assistant_msg)
                 executed_tool = False
                 for i, slot, call_id in resolved_calls:
@@ -663,15 +715,17 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                     finalizing = True
                 continue  # 下一轮：把工具结果交给模型
 
+            terminal_response_content = response_content
             break  # 正常结束
 
         # 空回复兜底：思考档位下，思维链也吃 max_tokens，极端情况下（如敏感问题在 max 档
         # 长时间自问）会"只想不说"——reasoning 有内容、content 为空，老人那边什么都听不到。
         # 一轮没出正文就降级成不思考重来一次（只降一次，防死循环）。
         empty_final_response = finalizing and (
-            finalize_protocol_violation or not final_response_content.strip()
+            finalize_protocol_violation or not terminal_response_content.strip()
         )
-        if ((effort and not full_assistant.strip()) or empty_final_response) and not retried_no_thinking:
+        empty_thinking_response = effort and not terminal_response_content.strip()
+        if (empty_thinking_response or empty_final_response) and not retried_no_thinking:
             retried_no_thinking = True
             audit.log("chat", action="thinking_empty_fallback", uid=data_uid, mode=mode, effort=effort)
             yield {"type": "meta",
@@ -683,14 +737,17 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
                 tools=None, tool_choice=None, reasoning_effort=None,
                 extra_body=_thinking_extra(None),
             )
-            for chunk in stream:
-                choice = chunk.choices[0]
-                delta = choice.delta
-                if delta.content:
-                    full_assistant += delta.content
-                    yield {"type": "content", "content": delta.content}
-                if choice.finish_reason:
-                    break
+            response = _collect_buffered_response(stream)
+            for reasoning in response["reasoning_chunks"]:
+                reasoning_text += reasoning
+                yield {"type": "reasoning", "content": reasoning}
+            if response["tool_calls"] or not response["content"].strip():
+                full_assistant += _REACT_LOCAL_TERMINAL_REPLY
+                yield {"type": "content", "content": _REACT_LOCAL_TERMINAL_REPLY}
+            else:
+                for content in response["content_chunks"]:
+                    full_assistant += content
+                    yield {"type": "content", "content": content}
     except Exception as e:
         audit.log("chat", action="error", uid=data_uid, error=str(e))
         yield {"type": "error", "content": f"对话服务出错：{e}"}

@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,6 +70,30 @@ def test_missing_react_prompt_uses_fallback_and_warns_once_until_recovery(monkey
         prompt_file.unlink(missing_ok=True)
 
 
+def test_missing_react_prompt_warns_once_under_concurrency(monkeypatch):
+    class _SlowFalse:
+        def __bool__(self):
+            time.sleep(0.05)
+            return False
+
+    prompt_file = Path(__file__).with_name("react_prompt_concurrent_missing.tmp.md")
+    prompt_file.unlink(missing_ok=True)
+    audits = []
+    monkeypatch.setattr(chat, "REACT_PROMPT_FILE", prompt_file)
+    monkeypatch.setattr(chat, "_react_prompt_warned", _SlowFalse())
+    monkeypatch.setattr(chat.audit, "log", lambda *args, **kwargs: audits.append((args, kwargs)))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: chat._load_react_prompt(), range(2)))
+
+    assert results == [chat._DEFAULT_REACT_PROMPT, chat._DEFAULT_REACT_PROMPT]
+    assert [kwargs for args, kwargs in audits
+            if args == ("chat",) and kwargs.get("action") == "prompt_react_missing"] == [{
+                "action": "prompt_react_missing",
+                "file": str(prompt_file),
+            }]
+
+
 def test_react_prompt_contains_required_tool_decision_rules():
     text = chat._load_react_prompt()
     for expected in (
@@ -110,7 +137,7 @@ class _SequenceCompletions:
         self.requests = []
 
     def create(self, **kwargs):
-        self.requests.append(kwargs)
+        self.requests.append(deepcopy(kwargs))
         return self.streams[len(self.requests) - 1]
 
 
@@ -263,6 +290,73 @@ def test_tool_progress_and_final_answer_are_both_in_done_assistant(monkeypatch):
 
     assert [e["content"] for e in events if e["type"] == "content"] == ["我帮您看看", "查到了"]
     assert events[-1] == {"type": "done", "assistant": "我帮您看看查到了"}
+
+
+def test_request_snapshots_are_not_mutated_by_later_tool_messages(monkeypatch):
+    _prepare_tool_stream(monkeypatch)
+    client = _client_with_tool_then_answer()
+
+    list(chat.chat_stream(client, "m", "elder-1", "查一下", "none", {}))
+
+    assert client.chat.completions.requests[0]["messages"] == []
+    assert [message["role"] for message in
+            client.chat.completions.requests[1]["messages"]] == ["assistant", "tool"]
+
+
+def test_reasoning_is_returned_with_later_assistant_tool_call(monkeypatch):
+    _prepare_tool_stream(monkeypatch)
+    history = []
+    tool_logs = []
+    audits = []
+    monkeypatch.setattr(chat.db, "append_history",
+                        lambda uid, role, content: history.append((uid, role, content)))
+    monkeypatch.setattr(chat.db, "log_tool",
+                        lambda *args, **kwargs: tool_logs.append((args, kwargs)))
+    monkeypatch.setattr(chat.audit, "log",
+                        lambda *args, **kwargs: audits.append((args, kwargs)))
+    completions = _SequenceCompletions([
+        [_chunk(tool_calls=[_tool_call(call_id="call-first")],
+                finish_reason="tool_calls")],
+        [_chunk(reasoning="我需要核验第二步", finish_reason=None),
+         _chunk(tool_calls=[_tool_call(call_id="call-second")],
+                finish_reason="tool_calls")],
+        [_chunk(content="核验完成")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "查两步", "high", {}))
+
+    second_assistant = [message for message in completions.requests[2]["messages"]
+                        if message["role"] == "assistant"][1]
+    assert second_assistant["reasoning_content"] == "我需要核验第二步"
+    assert [event["content"] for event in events if event["type"] == "reasoning"] == [
+        "我需要核验第二步",
+    ]
+    assert events[-1] == {"type": "done", "assistant": "核验完成"}
+    persisted = json.dumps({"history": history, "tool_logs": tool_logs, "audits": audits},
+                           ensure_ascii=False)
+    assert "我需要核验第二步" not in persisted
+
+
+def test_tool_progress_does_not_hide_reasoning_only_final_response(monkeypatch):
+    _prepare_tool_stream(monkeypatch)
+    completions = _SequenceCompletions([
+        [_chunk(content="我先查一下", finish_reason=None),
+         _chunk(tool_calls=[_tool_call()], finish_reason="tool_calls")],
+        [_chunk(reasoning="只有思考，没有答复", finish_reason="stop")],
+        [_chunk(content="查好了")],
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "查一下", "high", {}))
+
+    assert len(completions.requests) == 3
+    assert completions.requests[2]["tools"] is None
+    assert completions.requests[2]["reasoning_effort"] is None
+    assert [event["content"] for event in events if event["type"] == "content"] == [
+        "我先查一下", "查好了",
+    ]
+    assert events[-1] == {"type": "done", "assistant": "我先查一下查好了"}
 
 
 def test_failed_tool_is_observed_then_replanned_with_new_arguments(monkeypatch):
@@ -529,7 +623,10 @@ def test_budget_fourth_round_executes_all_calls_before_finalize(monkeypatch):
 
 def test_budget_reasoning_only_finalize_falls_back_once_without_tools(monkeypatch):
     streams = _budget_streams([_chunk(reasoning="还在整理", finish_reason="stop")])
-    streams.append([_chunk(content="兜底回答")])
+    streams.append([
+        _chunk(content="兜底", finish_reason=None),
+        _chunk(content="回答", finish_reason="stop"),
+    ])
     client, completions, calls, audits = _prepare_budget_stream(monkeypatch, streams)
 
     events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
@@ -545,6 +642,9 @@ def test_budget_reasoning_only_finalize_falls_back_once_without_tools(monkeypatc
                for message in fallback_request["messages"])
     assert [event["content"] for event in events if event["type"] == "reasoning"] == [
         "还在整理",
+    ]
+    assert [event["content"] for event in events if event["type"] == "content"] == [
+        "兜底", "回答",
     ]
     assert events[-1] == {"type": "done", "assistant": "兜底回答"}
     fallbacks = [kwargs for args, kwargs in audits
@@ -599,6 +699,73 @@ def test_budget_finalize_detects_tool_calls_even_when_finish_reason_is_stop(monk
     assert forbidden_content not in [event["content"] for event in events
                                      if event["type"] == "content"]
     assert events[-1] == {"type": "done", "assistant": "协议违规后兜底回答"}
+
+
+def test_fallback_tool_calls_are_not_published_and_use_local_terminal_reply(monkeypatch):
+    forbidden_content = "第二次违规正文也不能泄漏"
+    streams = _budget_streams([_chunk(reasoning="收尾思考", finish_reason="stop")])
+    streams.append([
+        _chunk(content=forbidden_content,
+               tool_calls=[_tool_call(name="still-forbidden", call_id="call-6")],
+               finish_reason="stop"),
+    ])
+    client, completions, calls, _ = _prepare_budget_stream(monkeypatch, streams)
+    history = []
+    monkeypatch.setattr(chat.db, "append_history",
+                        lambda uid, role, content: history.append((uid, role, content)))
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(completions.requests) == 6
+    assert len(calls) == 4
+    assert all(name != "still-forbidden" for name, _ in calls)
+    assert forbidden_content not in [event["content"] for event in events
+                                     if event["type"] == "content"]
+    assert events[-2:] == [
+        {"type": "content", "content": "这次没能完成，我先停在这里，请稍后再试。"},
+        {"type": "done", "assistant": "这次没能完成，我先停在这里，请稍后再试。"},
+    ]
+    assert history == [
+        ("elder-1", "user", "连续执行"),
+        ("elder-1", "assistant", "这次没能完成，我先停在这里，请稍后再试。"),
+    ]
+    assert forbidden_content not in str(history)
+
+
+def test_empty_fallback_uses_local_terminal_reply(monkeypatch):
+    streams = _budget_streams([_chunk(reasoning="收尾思考", finish_reason="stop")])
+    streams.append([_chunk(finish_reason="stop")])
+    client, completions, calls, _ = _prepare_budget_stream(monkeypatch, streams)
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(completions.requests) == 6
+    assert len(calls) == 4
+    assert events[-2:] == [
+        {"type": "content", "content": "这次没能完成，我先停在这里，请稍后再试。"},
+        {"type": "done", "assistant": "这次没能完成，我先停在这里，请稍后再试。"},
+    ]
+
+
+def test_tool_free_finalize_tolerates_missing_optional_delta_fields(monkeypatch):
+    class _Delta:
+        content = None
+
+    finalize_chunk = SimpleNamespace(
+        choices=[SimpleNamespace(delta=_Delta(), finish_reason="stop")]
+    )
+    streams = _budget_streams([finalize_chunk])
+    streams.append([finalize_chunk])
+    client, completions, calls, _ = _prepare_budget_stream(monkeypatch, streams)
+
+    events = list(chat.chat_stream(client, "m", "elder-1", "连续执行", "auto", {}))
+
+    assert len(completions.requests) == 6
+    assert len(calls) == 4
+    assert events[-2:] == [
+        {"type": "content", "content": "这次没能完成，我先停在这里，请稍后再试。"},
+        {"type": "done", "assistant": "这次没能完成，我先停在这里，请稍后再试。"},
+    ]
 
 
 def test_budget_manual_low_finalize_preserves_low_effort(monkeypatch):
