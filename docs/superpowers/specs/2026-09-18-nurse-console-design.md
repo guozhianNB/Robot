@@ -178,6 +178,8 @@ curl -X POST http://<PC-IP>:8000/api/notifications \
 
 ⚠️ **`kind` 是通知类型（sos/task_done…），不是 `type`**（D6 陷阱）。`uid_name` 一并广播，免得前端再拉一次档案。
 
+**合并（去重命中）时广播的是"本次" `title`/`body`，而库里保留"最早"那条原文**——这是有意的：实时卡片要显示最新描述（例如同一故障的最新细节），留痕要保留原始上报文本。因此实时 toast 与列表正文可能不同；30s 兜底轮询会以后端为准覆盖本地。
+
 ### 4.6 审计与配置
 
 - 审计事件：`notify_ingest`（含 source/type/level/uid/id/deduped）、`notify_ack`（id/by/all）、`notify_delete`（id/by）。模块 11 要求告警"强制可追溯"，所以上报与处理**两头都留痕**。
@@ -279,6 +281,8 @@ packages/nurse/
 3. kiosk 按 SOS → 面板出红卡（且 kiosk 原有 toast 不退化）
 4. 在 A 屏幕点「处理了」→ B 屏幕同一张卡同步变灰
 5. 停后端 → 页面显示断线红条；重启后端 → 自动恢复且**之前的通知还在**（持久化验收）
+6. **把护士台开着 ≥6 分钟不动**（口令门开启时）→ 观察是否被弹回登录门。这是已知限制（§9「每 5 分钟弹回登录门」），验收目的是确认你接受这一行为、或决定改部署方式
+7. **第二台 PC 同时打开 `/nurse/`** → 验证登录门的真实语义（D2 复用进程级 admin 槽：第一台登录后，第二台**不会**看到登录门）
 
 ## 9. 风险与已知限制
 
@@ -290,6 +294,13 @@ packages/nurse/
 | 与将来「计划表 / 派车」功能冲突 | 上报体已预留 `source`/`ref`，将来小车任务系统只需往 `/api/notifications` POST，**本设计不需要改契约** |
 | 通知表长期膨胀 | `prune()` + 30 天保留已处理 |
 | 用户 9-18 踩过的"页面还在跑旧 JS" | `_no_store_entry_html` 的入口路径白名单**必须加 `/nurse`**（§10 落点清单第 4 条） |
+| **读边界被 SSE 旁路**（2026-09-18 最终审查 I4） | `GET /api/notifications` 要 admin，但同一份 `uid_name`（老人姓名·床号）/`title`/`body` 由 `notification` 事件广播在**完全免鉴权**的 `/api/events` 上，且 CORS `allow_origins=["*"]`（跨源 EventSource 也能读）。**裁定：记入已知限制**——既有 `alarm`/`reminder` 早已同样暴露（本分支只是新增了老人身份字段），给 SSE 加闸门会波及 kiosk/admin 两个既有消费方，属另一份规格的范围。收紧路径：给 `/api/events` 加 `X-Surface` 校验，或把身份字段从广播里摘掉（后者与 §4.5 冲突，需改规格） |
+| **护士台每 5 分钟被弹回登录门**（2026-09-18 最终审查 I5） | `login_admin` 的 TTL 是**绝对**值（`conf` 默认 300s）且**无续期路径**；护士台被动挂着时基本每 5 分钟回一次口令页。**裁定：本版不改会话层**——给 admin 槽加"活动即续期"会削弱"无人看管自动降权"这条既有安全属性，且它在 `session.py` 红线区附近。部署建议：护士站常驻屏**关闭口令门**（`admin_auth_required=false`）或接受每 5 分钟重登；已列入 §8 人工验收清单第 6 条，由用户拍板 |
+| **多台 PC 共享一个进程级 admin 槽**（D2 的直接后果） | 第一台 PC 登录后，第二台 PC 打开 `/nurse/`（或 `/admin/`）**不会**看到登录门——会话是后端进程级的，不是每浏览器一份。局域网内多屏共用一个管理员身份；要按人隔离需独立护士角色（另立规格，见上一行） |
+| **角标数可能大于可见卡片数** | 角标是**未处理总数**（全表 COUNT），列表默认上限 50 且面板**不做加载更多**（`before_id` 后端已留、面板不用）→ 未处理 >50 时"未处理 60"但只看到 50 张卡。符合 YAGNI，记此说明 |
+| **持续复报长期合并为一行** | 去重窗口锚在 `last_at`：同一 `(source,type,uid)` 每 <60s 复报会一直被合并、`count` 无限增长（一个持续故障 = 一行 + 次数），**ack 之后自然新开一行**。经裁定符合 D5 防刷屏本意 |
+| **审计里的"谁处理的"不防伪造** | `AckIn.by` 由客户端自报，`POST /api/notifications` 又免鉴权 → 审计能记"哪台机器在什么时候上报/处理了什么"，但不能作为身份证据。这是 D4 的已知代价 |
+| **两个并发上报可能各插一行**（2026-09-18 定向复审确认） | I1 的修复只闭合了"find 命中而 bump 时已被 ack"这一路；**两个并发 ingest 都未命中 find 时仍会各插一行**（`add_notification` 无唯一约束）。影响＝可见重复卡（同一事件两张、角标虚高 1，可 ack/可 prune 收敛），**不是**静默丢失；触发窗口微秒级、修复前即存在。真正闭合需 db 层单临界区 `dedup_or_add` 或部分唯一索引（`(source,type,uid) WHERE ack_at=''`），本版不做 |
 
 ## 10. 实施落点清单（7 处接线，一处都不能漏）
 
@@ -319,9 +330,35 @@ packages/nurse/
 - 通知限流 / 签名鉴权 / 护士独立角色
 - 通知搜索、导出、地图位置、图片附件
 - 面板内的任何设置项（要改设置请去管理台）
+- 面板的通知分页/"加载更多"（后端 `before_id` 已留，面板不用；未处理 >50 时看角标即可）
+- 给 `/api/events`（SSE）加鉴权闸门（见 §9「读边界被 SSE 旁路」，属另一份规格）
+- admin 会话活动续期（见 §9「每 5 分钟弹回登录门」，会动既有安全属性）
 
 ---
 
 ## 实现台账与偏差
 
-> 待实施后填写（日期 / 实际落点 / 与规格的偏差及理由 / 测试证据）。
+> 落地日期：2026-09-18 ｜ 分支 `feature/nurse-console` ｜ 范围 `408e35e`（规格提交）→ `986cde8`（HEAD）
+> 执行方式：任务简报 T1/T2/T3（`.superpowers/sdd/task-*-brief.md`）→ 每个任务全新实现子代理 → 逐任务审查（规格合规 + 代码质量）→ T3 修复轮 → **整分支最终审查**（裁定"修完再合"）→ 一次修复浪潮 → 定向复审（通过）
+
+**实际落点（§10 的 7 处全部落地）**：`LLM/conf.py` 4 常量、`LLM/store/db.py` 建表 + 10 个数据操作、`LLM/agent/notify.py`（新建）、`LLM/server.py` 5 条路由 + `NoticeIn`/`AckIn` + lifespan `prune()` + 静态托管/no-store 白名单、`LLM/agent/reminder.py` 接线、`LLM/tests/test_notify.py`（新建，25 例）、`frontend/packages/nurse/*`（App.vue + NoticeCard.vue + lib + vite/tsconfig/index.html）、`shared/src/{events.ts,api/notifications.ts,index.ts}`、`frontend/package.json`、`scripts/build_frontend.ps1`、`AGENTS.md`。
+
+**测试证据（协调者在 `danger-full-access` 下独立复核）**：
+- `pytest LLM/tests -q` → **330 passed / 7 errors / 0 failed**；7 个 error 全在 `LLM/tests/test_speaker_enroll.py`（PermissionError，**基线红态**，非本分支引入）；本批次前基线 305 → +25（`test_notify.py`）
+- `pnpm -r build` 四包全过（admin/kiosk/nurse/mapeditor）；`pnpm --filter shared test` 6 文件 31 例全绿
+- 产物核对：四端 `dist/index.html` 的 base 依次为 `/admin/`、`/kiosk/`、`/nurse/`、`/mapeditor/`，与后端挂载点一一对应；`/nurse/` 带 `Cache-Control: no-store`
+
+**与规格的偏差（均为有理由的改进或澄清）**：
+1. `notify.ingest` **去掉了规格 §4.2 的 `ts` 形参**——依据 §4.4"落库以服务器时间为准、不采信外部时间"，统一 `db.now_iso()`。
+2. 前端**不再把原始错误串上屏**（规格 §5.2 曾写「读取通知失败：<原因>」）→ 改人话 + `console.error` 留证。依据 D7「界面文案零术语」。
+3. `未处理` 筛选为**纯前端过滤**（规格 §5.2 同段既写"纯前端过滤"又暗示 `state=unread`，属规格自相矛盾；实现取纯前端，取值合理）。
+4. `AlarmIn` **新增 `source: str = "kiosk"`** 字段（§4.3 提到可覆盖，实现为可选字段，向后兼容）。
+5. `bump_notification` 返回值由 `None` 改为 `int`（rowcount）——最终审查 I1 修复所需；仓内仅 `notify.ingest` 一个调用点。
+6. `shared` 新增 `ingestNotice()`（规格 §5.3 有、T3 简报漏列，按规格补齐，UI 未使用）。
+7. `AckIn.by` 由客户端自报、`notify.remove` 硬编码 `by="admin"`——规格未约束，记入 §9。
+8. 面板另加 `watch(isAdmin)` 兜底（最终审查 M4）与"未登录不连 SSE"的单一清理收口 `stopRealtime()`（T3 修复轮）。
+
+**审查抓出的真问题（值得留档）**：最终整分支审查找出 `find → bump` 竞态会让**新告警被并进已 ack 的行、静默不出卡不响铃**（救命通路，逐任务审查未发现）；以及免鉴权投递口在事件循环上做同步 SQLite 写（可被廉价请求堵死后端）。两者均已修并有测试锁定。
+
+**留作后续（§12 与 §9 已记）**：面板通知分页、`/api/events` 鉴权、admin 会话活动续期、通知限流/签名、护士独立角色、微信推送、`(source,type,uid)` 部分唯一索引闭合并发重复窗口、`AlarmIn.source`/`AckIn.by` 长度与取值约束、`notify.py` 去重窗口边界改用 `db.now_iso()`。
+
