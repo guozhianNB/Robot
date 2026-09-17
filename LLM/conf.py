@@ -16,7 +16,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
-PROMPT_FILE = Path(__file__).resolve().parent / "agent" / "prompt" / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+PROMPT_DIR = Path(__file__).resolve().parent / "agent" / "prompt"
+PROMPT_FILE = PROMPT_DIR / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+REACT_PROMPT_FILE = PROMPT_DIR / "react.md"  # ReAct 工具决策规则（每次请求实时读取）
 FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
@@ -263,3 +265,4 @@ MCP_CONNECT_TIMEOUT = 60          # 单台服务器握手超时（秒）
 # LLM 参数
 MODEL = "deepseek-v4-flash"
 LLM_TIMEOUT = 60
+REACT_MAX_TOOL_ROUNDS = 4

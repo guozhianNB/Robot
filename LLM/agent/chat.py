@@ -15,7 +15,7 @@ from . import memory as rag
 from . import tools as tool_mod
 from ..conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
-                   LLM_TIMEOUT, PROMPT_FILE, DEFAULT_SETTINGS)
+                   LLM_TIMEOUT, PROMPT_FILE, REACT_PROMPT_FILE, DEFAULT_SETTINGS)
 # 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/agent/policy.py
 from .policy import role_policy
 
@@ -109,6 +109,38 @@ def _load_prompt_base() -> str:
             audit.log("chat", action="prompt_file_missing", file=str(PROMPT_FILE))
         return _DEFAULT_PROMPT_BASE
     _prompt_warned = False
+    marker_idx = None
+    for i, line in enumerate(raw.splitlines()):
+        if line.strip() == "<!-- PROMPT -->":
+            marker_idx = i
+    if marker_idx is not None:
+        raw = "\n".join(raw.splitlines()[marker_idx + 1:])
+    return raw.strip()
+
+
+_DEFAULT_REACT_PROMPT = (
+    "【工具调用与核验规则】\n"
+    "1. 仅必要时调用工具；已有充分可靠的信息时直接回答。\n"
+    "2. 每次收到 Observation 后，核验工具的成功和充分性，确认结果足够回答当前问题。\n"
+    "3. 工具失败时，可以改参或换工具；仍无法完成时如实停止，不要假装成功。\n"
+    "4. 信息充分即答，不为凑步骤继续调用工具。\n"
+    "5. 不输出内部 Thought、工具协议或虚构结果；工具调用前最多一句不带结论的进度说明。"
+)
+
+_react_prompt_warned = False  # react.md 缺失只告警一次，恢复后允许再次告警
+
+
+def _load_react_prompt() -> str:
+    """读取 ReAct 提示词正文；文件异常时使用内置保底且不阻断对话。"""
+    global _react_prompt_warned
+    try:
+        raw = REACT_PROMPT_FILE.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        if not _react_prompt_warned:
+            _react_prompt_warned = True
+            audit.log("chat", action="prompt_react_missing", file=str(REACT_PROMPT_FILE))
+        return _DEFAULT_REACT_PROMPT
+    _react_prompt_warned = False
     marker_idx = None
     for i, line in enumerate(raw.splitlines()):
         if line.strip() == "<!-- PROMPT -->":
@@ -312,6 +344,9 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
     role_txt = _load_role_prompt(p.get("role"))
     if role_txt:
         parts.append("\n" + role_txt)
+    react_txt = _load_react_prompt()
+    if react_txt:
+        parts.append("\n" + react_txt)
 
     if scope == "self":                      # 老人层：本人档案/记忆/画像
         recall_ctx = _recall_cached(data_uid, query) if query else rag.recall_v3(data_uid, "")["context"]
