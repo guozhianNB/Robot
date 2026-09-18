@@ -12,12 +12,13 @@ r"""地图编辑器后端（独立服务）—— 从 ``server.py`` 原样搬来
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .. import conf
 from ..store import db
@@ -64,6 +65,25 @@ class LearnIn(BaseModel):
     note: str = ""
 
 
+class ZoneGoalIn(BaseModel):
+    x: float
+    y: float
+    yaw_deg: float = 0.0
+
+    @field_validator("x", "y", "yaw_deg", mode="before")
+    @classmethod
+    def finite_number(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("goal 坐标不能是 bool")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError("goal 坐标必须是数值") from e
+        if not math.isfinite(number):
+            raise ValueError("goal 坐标必须是有限数值")
+        return number
+
+
 class ZoneIn(BaseModel):
     map_name: str
     name: str = ""
@@ -72,6 +92,7 @@ class ZoneIn(BaseModel):
     polygon: list[list[float]] = []
     parent: str = ""
     note: str = ""
+    goal: ZoneGoalIn | None = None
 
 
 class ValidateIn(BaseModel):
@@ -155,6 +176,14 @@ def _err(msg: str, code: int = 400, **extra):
 def _name_of(path_name: str) -> str:
     """路径参数 → 合法地图名；不合法直接抛（由各路由统一转 400）。"""
     return mapstore.check_name(path_name)
+
+
+def _zone_payload(body: ZoneIn) -> dict:
+    """Keep explicit ``goal=null`` distinct from an omitted goal on updates."""
+    payload = body.model_dump()
+    if "goal" not in body.model_fields_set:
+        payload.pop("goal", None)
+    return payload
 
 
 def _tag_counts(names: list[str]) -> dict[str, dict]:
@@ -720,21 +749,23 @@ def zones_add(z: ZoneIn, source: str = Query("", alias="source"), store=Depends(
     from ..core import log as audit
     try:
         n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), store=store)
+        out = maptags.upsert_zone(n, _zone_payload(z), store=store)
     except mapstore.MapStoreError as e:
         audit.log("map_edit_reject", action="zone_add", map=z.map_name, error=str(e))
         return _err(str(e))
-    return {"ok": True, "uid": out["uid"]}
+    return {"ok": True, "uid": out["uid"], "warnings": out.get("warnings") or [],
+            "goal_validation": out.get("goal_validation")}
 
 
 @router.post("/api/zones/{uid}")
 def zones_update(uid: str, z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
     try:
         n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), uid=uid, store=store)
+        out = maptags.upsert_zone(n, _zone_payload(z), uid=uid, store=store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    return {"ok": True, "uid": out["uid"]}
+    return {"ok": True, "uid": out["uid"], "warnings": out.get("warnings") or [],
+            "goal_validation": out.get("goal_validation")}
 
 
 @router.delete("/api/zones/{uid}")

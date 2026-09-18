@@ -19,11 +19,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import time
 
 from ..store import db
 from ..core import log as audit
+from ..core import zonegeo
 from . import mapserver
 from .mapstore import MapStoreError, check_name, get_store
 
@@ -139,7 +141,7 @@ def _norm_tags(obj: dict, map_name: str) -> tuple[dict, list[str]]:
         if shape == "polygon" and len(poly) < 3:
             warn.append(f"区域 {name} 的多边形少于 3 个点，已跳过")
             continue
-        out["zones"].append({
+        normalized = {
             "uid": uid, "name": name,
             "kind": zz.get("kind") if zz.get("kind") in ZONE_KINDS else "room",
             "shape": shape, "polygon": poly,
@@ -147,7 +149,14 @@ def _norm_tags(obj: dict, map_name: str) -> tuple[dict, list[str]]:
             "note": str(zz.get("note") or ""),
             "created_at": str(zz.get("created_at") or db.now_iso()),
             "updated_at": str(zz.get("updated_at") or db.now_iso()),
-        })
+        }
+        if "goal" in zz and zz.get("goal") is not None:
+            goal, reason = _norm_goal(zz.get("goal"))
+            if goal is None:
+                warn.append(f"区域 {name} goal 非法，已丢弃：{reason}")
+            else:
+                normalized["goal"] = goal
+        out["zones"].append(normalized)
     return out, warn
 
 
@@ -172,6 +181,35 @@ def _num_or_zero(v):
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _norm_goal(value) -> tuple[dict | None, str | None]:
+    """规范区域停靠点；拒绝 bool、NaN、Infinity 和缺失坐标。"""
+    if not isinstance(value, dict):
+        return None, "必须是对象"
+    values = {}
+    for key in ("x", "y"):
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            return None, f"{key} 不能是 bool"
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None, f"{key} 不是数值"
+        if not math.isfinite(number):
+            return None, f"{key} 必须是有限数值"
+        values[key] = number
+    raw_yaw = value.get("yaw_deg", 0.0)
+    if isinstance(raw_yaw, bool):
+        return None, "yaw_deg 不能是 bool"
+    try:
+        yaw = float(raw_yaw)
+    except (TypeError, ValueError, OverflowError):
+        return None, "yaw_deg 不是数值"
+    if not math.isfinite(yaw):
+        return None, "yaw_deg 必须是有限数值"
+    values["yaw_deg"] = yaw
+    return values, None
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +536,7 @@ def upsert_zone(map_name: str, data: dict, uid: str = "", store=None) -> dict:
     name = check_name(map_name)
     tags = _load_or_empty(name, st)
     now = db.now_iso()
+    warnings: list[str] = []
     other = [z for z in tags["zones"] if z["uid"] != uid]
     if any(z["name"] == (data.get("name") or "").strip() for z in other):
         raise MapStoreError(f"区域名已存在：{data.get('name')!r}")
@@ -526,6 +565,18 @@ def upsert_zone(map_name: str, data: dict, uid: str = "", store=None) -> dict:
         target["parent"] = str(data["parent"]).strip()
     if data.get("note") is not None:
         target["note"] = str(data["note"])
+    # ``goal`` is special: absent means "leave it unchanged" on update, while
+    # explicit None means clear it.  API callers preserve this distinction.
+    if "goal" in data:
+        if data["goal"] is None:
+            target.pop("goal", None)
+        else:
+            goal, reason = _norm_goal(data["goal"])
+            target.pop("goal", None)
+            if goal is None:
+                warnings.append(f"区域 {target.get('name') or uid} goal 非法，已丢弃：{reason}")
+            else:
+                target["goal"] = goal
     target.setdefault("kind", "room")
     target.setdefault("shape", "polygon")
     target.setdefault("polygon", [])
@@ -542,9 +593,27 @@ def upsert_zone(map_name: str, data: dict, uid: str = "", store=None) -> dict:
             raise MapStoreError(f"父区域不存在：{target['parent']}")
         if p["uid"] == target["uid"]:
             raise MapStoreError("父区域不能是自己")
+    goal_validation = None
+    if target.get("goal") is not None:
+        goal = target["goal"]
+        reasons: list[str] = []
+        try:
+            checked = mapserver.validate_point(name, goal["x"], goal["y"], st)
+            reasons.extend(checked.get("reasons") or [])
+            if checked.get("ok") is False and not reasons:
+                reasons.append("停靠点无法校验")
+        except Exception as e:  # noqa: BLE001  校验不可用不应阻断编辑保存
+            reasons.append(f"停靠点无法校验：{e}")
+        try:
+            if not zonegeo.zone_hit(target, goal["x"], goal["y"]):
+                reasons.append("停靠点在区域外")
+        except Exception as e:  # noqa: BLE001  坏几何只产生告警
+            reasons.append(f"停靠点区域归属无法校验：{e}")
+        goal_validation = {"ok": not reasons, "reasons": reasons}
     save(name, tags, st, action="zone_upsert" if uid else "zone_add",
          uid=target["uid"], zone_name=target["name"])
-    return {"ok": True, "uid": target["uid"]}
+    return {"ok": True, "uid": target["uid"], "warnings": warnings,
+            "goal_validation": goal_validation}
 
 
 def delete_zone(map_name: str, uid: str, store=None) -> dict:
