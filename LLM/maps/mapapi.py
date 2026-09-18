@@ -12,13 +12,12 @@ r"""地图编辑器后端（独立服务）—— 从 ``server.py`` 原样搬来
 from __future__ import annotations
 
 import asyncio
-import math
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, FiniteFloat, field_validator
 
 from .. import conf
 from ..store import db
@@ -66,22 +65,16 @@ class LearnIn(BaseModel):
 
 
 class ZoneGoalIn(BaseModel):
-    x: float
-    y: float
-    yaw_deg: float = 0.0
+    x: FiniteFloat
+    y: FiniteFloat
+    yaw_deg: FiniteFloat = 0.0
 
     @field_validator("x", "y", "yaw_deg", mode="before")
     @classmethod
     def finite_number(cls, value):
-        if isinstance(value, bool):
-            raise ValueError("goal 坐标不能是 bool")
-        try:
-            number = float(value)
-        except (TypeError, ValueError, OverflowError) as e:
-            raise ValueError("goal 坐标必须是数值") from e
-        if not math.isfinite(number):
-            raise ValueError("goal 坐标必须是有限数值")
-        return number
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("goal 坐标必须是 JSON number")
+        return value
 
 
 class ZoneIn(BaseModel):
@@ -738,10 +731,15 @@ async def zones_list(map: str = Query("", alias="map"), source: str = Query("", 
         return _err("缺少 map 参数")
     try:
         n = _name_of(map)
-        rows = await asyncio.to_thread(maptags.get_zones, n, store)
+        # zones are an editor read path over the tags truth; SQLite intentionally
+        # omits the optional goal field and is only an index cache.
+        got = await asyncio.to_thread(maptags.resolve, n, store)
     except mapstore.MapStoreError as e:
         return _err(str(e))
-    return {"ok": True, "map": n, "zones": rows}
+    if not got.get("ok"):
+        return _err(got.get("error") or "读取 tags.json 失败")
+    return {"ok": True, "map": n, "zones": got["tags"].get("zones") or [],
+            "warnings": got.get("warnings") or []}
 
 
 @router.post("/api/zones")

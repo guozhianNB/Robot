@@ -150,7 +150,7 @@ def _norm_tags(obj: dict, map_name: str) -> tuple[dict, list[str]]:
             "created_at": str(zz.get("created_at") or db.now_iso()),
             "updated_at": str(zz.get("updated_at") or db.now_iso()),
         }
-        if "goal" in zz and zz.get("goal") is not None:
+        if "goal" in zz:
             goal, reason = _norm_goal(zz.get("goal"))
             if goal is None:
                 warn.append(f"区域 {name} goal 非法，已丢弃：{reason}")
@@ -190,8 +190,8 @@ def _norm_goal(value) -> tuple[dict | None, str | None]:
     values = {}
     for key in ("x", "y"):
         raw = value.get(key)
-        if isinstance(raw, bool):
-            return None, f"{key} 不能是 bool"
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None, f"{key} 必须是 JSON number"
         try:
             number = float(raw)
         except (TypeError, ValueError, OverflowError):
@@ -200,8 +200,8 @@ def _norm_goal(value) -> tuple[dict | None, str | None]:
             return None, f"{key} 必须是有限数值"
         values[key] = number
     raw_yaw = value.get("yaw_deg", 0.0)
-    if isinstance(raw_yaw, bool):
-        return None, "yaw_deg 不能是 bool"
+    if isinstance(raw_yaw, bool) or not isinstance(raw_yaw, (int, float)):
+        return None, "yaw_deg 必须是 JSON number"
     try:
         yaw = float(raw_yaw)
     except (TypeError, ValueError, OverflowError):

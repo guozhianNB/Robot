@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 r"""区域停靠点（zone goal）数据契约测试。"""
+import asyncio
 import json
 
 import time
 
 import pytest
+from pydantic import ValidationError
 
 from LLM.maps import mapapi, maptags, mapserver
 from LLM.maps.mapstore import MapStoreError
@@ -62,6 +64,7 @@ def test_norm_tags_keeps_legacy_zone_without_goal_and_normalizes_valid_goal():
     "goal",
     [
         {"x": True, "y": 2},
+        {"x": "1", "y": 2},
         {"x": 1, "y": float("nan")},
         {"x": 1, "y": float("inf")},
         {"x": 1},
@@ -72,6 +75,41 @@ def test_norm_tags_drops_invalid_goal_with_warning(goal):
 
     assert "goal" not in tags["zones"][0]
     assert any("goal" in warning for warning in warnings)
+
+
+def test_norm_tags_drops_explicit_null_goal_with_warning_but_missing_goal_is_silent():
+    tags, warnings = maptags._norm_tags(
+        {"zones": [_zone(goal=None), _zone(uid="z2", name="102")]}, "ward"
+    )
+
+    assert "goal" not in tags["zones"][0]
+    assert "goal" not in tags["zones"][1]
+    assert sum("goal" in warning for warning in warnings) == 1
+
+
+def test_zone_list_reads_goal_from_tags_truth_not_sqlite(monkeypatch):
+    expected = {"x": 1.0, "y": 2.0, "yaw_deg": 0.0}
+    monkeypatch.setattr(
+        mapapi.maptags,
+        "resolve",
+        lambda name, store: {"ok": True, "tags": {"zones": [_zone(goal=expected)]}},
+    )
+    monkeypatch.setattr(
+        mapapi.maptags,
+        "get_zones",
+        lambda *args, **kwargs: [{**_zone(), "goal": None}],
+    )
+
+    result = asyncio.run(mapapi.zones_list(map="ward", store=_MemoryStore()))
+
+    assert result["ok"] is True
+    assert result["zones"][0]["goal"] == expected
+
+
+@pytest.mark.parametrize("value", ["1", True, float("nan"), float("inf")])
+def test_zone_goal_api_rejects_non_json_finite_numbers(value):
+    with pytest.raises(ValidationError):
+        mapapi.ZoneGoalIn(x=value, y=2)
 
 
 def test_zone_update_distinguishes_omitted_goal_from_explicit_null(monkeypatch):
