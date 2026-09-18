@@ -2,13 +2,353 @@
 r"""车控连接层测试：仅替换 websocket 边界，不访问板卡。"""
 import importlib
 import importlib.util
+import asyncio
 import json
 import math
 import queue
 import threading
 import time
+import runpy
+from pathlib import Path
+from unittest.mock import mock_open
+from concurrent.futures import Future
 
 import pytest
+
+
+class DeferredExecutor:
+    """Tests can inspect an accepted task before running its worker."""
+    def __init__(self):
+        self.jobs = []
+        self.closed = False
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        self.jobs.append((fn, args, kwargs, future))
+        return future
+
+    def run_next(self):
+        fn, args, kwargs, future = self.jobs.pop(0)
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+            future.set_exception(exc)
+
+    def shutdown(self, wait=True):
+        self.closed = True
+
+
+class ServerLink:
+    def __init__(self, *, ready=True, nav_available=True):
+        self.ready = ready
+        self.nav_available = nav_available
+        self.tasks = []
+        self.calls = []
+        self.finished = []
+        self.stopped = 0
+        self.closed = False
+        self.fail_action = None
+
+    def readiness(self):
+        return {"ok": True, "ready": self.ready, "exec_state": "idle",
+                "nav_available": self.nav_available, "message": "ready"}
+
+    def begin_task(self, action, target, expected_state):
+        if self.tasks:
+            return {"ok": False, "status": "rejected", "error": "已有执行中的任务"}
+        task = {"ok": True, "task_id": len(self.finished) + 1, "action": action,
+                "target": target, "expected_state": expected_state}
+        self.tasks.append(task)
+        return task
+
+    def call_action(self, action, request, *, task_id):
+        self.calls.append((action, request, task_id))
+        if self.fail_action:
+            raise self.fail_action
+        return {"ok": True, "message": "accepted"}
+
+    def finish_task(self, task_id, ok, detail):
+        self.tasks.clear()
+        self.finished.append((task_id, ok, detail))
+        return {"ok": True}
+
+    def stop(self):
+        self.stopped += 1
+        return {"ok": True, "message": "stopped"}
+
+    def snapshot(self):
+        return {"ok": True, "exec_state": "idle", "last": self.finished[-1] if self.finished else None}
+
+    def close(self):
+        self.closed = True
+
+
+class ServerNav:
+    def __init__(self):
+        self.calls = []
+
+    def _out(self, kind, *args):
+        self.calls.append((kind, args))
+        return {"ok": True, "target": {"x": 1.0, "y": 2.0, "yaw_deg": 30.0, "goal_source": kind},
+                "warnings": ["地图标记较旧"], "summary_target": kind}
+
+    def resolve_point(self, x, y, yaw_deg=0): return self._out("point", x, y, yaw_deg)
+    def resolve_zone(self, zone): return self._out("zone", zone)
+    def resolve_place(self, place): return self._out("place", place)
+
+
+@pytest.fixture
+def car_server():
+    return importlib.import_module("LLM.car_mcp.car_server")
+
+
+@pytest.fixture
+def server_rig(car_server):
+    link, nav, executor = ServerLink(), ServerNav(), DeferredExecutor()
+    return car_server, link, nav, executor
+
+
+def load_json(text):
+    assert isinstance(text, str)
+    return json.loads(text)
+
+
+def test_server_registers_seven_json_text_tools(server_rig):
+    module, link, nav, executor = server_rig
+    server = module.build_server(link=link, nav=nav, executor=executor)
+    assert {tool.name for tool in asyncio.run(server.list_tools())} == {
+        "robot_move", "robot_turn", "robot_goto_point", "robot_goto_zone",
+        "robot_goto_place", "robot_stop", "robot_status"}
+    assert load_json(module._status(link))["ok"] is True
+    assert load_json(module._stop(link))["ok"] is True
+
+
+@pytest.mark.parametrize("direction,distance", [
+    (True, 1), ("up", 1), ("forward", True), ("forward", "1"),
+    ("forward", float("nan")), ("forward", float("inf")), ("forward", 0), ("forward", 5.1),
+])
+def test_move_rejects_unsafe_parameters_without_registering_task(server_rig, direction, distance):
+    module, link, nav, executor = server_rig
+    out = load_json(module._move(link, executor, direction, distance))
+    assert out["ok"] is False
+    assert not link.tasks and not executor.jobs
+
+
+@pytest.mark.parametrize("angle", [True, "90", float("nan"), float("inf"), 0, 361, -361])
+def test_turn_rejects_unsafe_parameters_without_registering_task(server_rig, angle):
+    module, link, nav, executor = server_rig
+    out = load_json(module._turn(link, executor, angle))
+    assert out["ok"] is False
+    assert not link.tasks and not executor.jobs
+
+
+def test_readiness_failure_does_not_register_task(server_rig):
+    module, link, nav, executor = server_rig
+    link.ready = False
+    out = load_json(module._move(link, executor, "forward", 1))
+    assert out["ok"] is False and "就绪" in out["error"]
+    assert not link.tasks and not executor.jobs
+
+
+def test_goto_requires_navigation_before_task_registration(server_rig):
+    module, link, nav, executor = server_rig
+    link.nav_available = False
+    out = load_json(module._goto_point(link, nav, executor, 1, 2))
+    assert out["ok"] is False and "导航" in out["error"]
+    assert not link.tasks and not executor.jobs
+
+
+def test_started_returns_immediately_and_worker_sends_exact_ros_request(server_rig):
+    module, link, nav, executor = server_rig
+    out = load_json(module._goto_point(link, nav, executor, 4, 5, 90))
+    assert out == {"ok": True, "status": "started", "action": "goto_point",
+                   "summary": "前往 point", "exec_state": "navigating",
+                   "target": {"x": 1.0, "y": 2.0, "yaw_deg": 30.0, "goal_source": "point"},
+                   "warnings": ["地图标记较旧"]}
+    assert not link.calls
+    executor.run_next()
+    assert link.calls == [("navigate_to", {"place": "", "x": 1.0, "y": 2.0, "theta": 30.0}, 1)]
+    assert link.finished[-1][1] is True
+
+
+def test_worker_failure_is_recorded_after_started_response(server_rig):
+    module, link, nav, executor = server_rig
+    link.fail_action = RuntimeError("service offline")
+    assert load_json(module._move(link, executor, "forward", 1))["status"] == "started"
+    executor.run_next()
+    assert link.finished[-1][1] is False
+    assert "service offline" in str(link.finished[-1][2])
+
+
+def test_busy_rejection_stop_bypass_status_degradation_and_lifecycle(server_rig):
+    module, link, nav, executor = server_rig
+    link.tasks.append({"task_id": 99})
+    assert load_json(module._move(link, executor, "forward", 1))["ok"] is False
+    assert load_json(module._stop(link))["ok"] is True and link.stopped == 1
+    link.snapshot = lambda: (_ for _ in ()).throw(RuntimeError("connection unavailable"))
+    status = load_json(module._status(link))
+    assert status == {"ok": True, "status": "unavailable", "reason": "connection unavailable"}
+    module._close_resources(link, executor)
+    assert link.closed and executor.closed
+
+
+def test_server_import_has_no_controller_or_rclpy_and_optional_mcp_degrades(monkeypatch, server_rig):
+    module, link, nav, executor = server_rig
+    assert "car_controller" not in module.__dict__.get("__doc__", "")
+    monkeypatch.setattr(module, "MCPServer", None)
+    assert module.build_server(link=link, nav=nav, executor=executor) is None
+
+
+@pytest.mark.parametrize("name,args", [
+    ("robot_move", {"direction": "forward", "distance_m": True}),
+    ("robot_move", {"direction": "forward", "distance_m": "1"}),
+    ("robot_turn", {"angle_deg": True}),
+    ("robot_turn", {"angle_deg": "90"}),
+])
+def test_mcp_numeric_inputs_rejected_before_sdk_coercion(server_rig, name, args):
+    module, link, nav, executor = server_rig
+    server = module.build_server(link=link, nav=nav, executor=executor)
+    response = asyncio.run(server.call_tool(name, args))
+    assert load_json(response.content[0].text)["ok"] is False
+    assert not link.tasks and not executor.jobs
+
+
+@pytest.mark.parametrize("snapshot", [
+    {"ok": True, "available": False, "last_error": "offline"},
+    {"ok": True, "available": True, "state_fresh": False, "exec_state": "unknown"},
+])
+def test_status_unavailable_keeps_snapshot_details(server_rig, snapshot):
+    module, link, nav, executor = server_rig
+    link.snapshot = lambda: snapshot
+    result = load_json(module._status(link))
+    assert result["ok"] is True and result["status"] == "unavailable"
+    assert result["reason"]
+    assert result["available"] == snapshot["available"]
+
+
+def test_main_keeps_tools_when_link_unavailable_and_closes(monkeypatch, server_rig):
+    module, link, nav, executor = server_rig
+    def no_startup_probe():
+        pytest.fail("main must not probe network at startup")
+    link.start = no_startup_probe
+    monkeypatch.setattr(module, "CarLink", lambda: link)
+    monkeypatch.setattr(module, "CarNav", lambda: nav)
+    monkeypatch.setattr(module, "ThreadPoolExecutor", lambda **kw: executor)
+    monkeypatch.setattr(module, "_log", lambda msg: None)
+    calls = []
+    class Server:
+        def run(self, **kw): calls.append(kw)
+    monkeypatch.setattr(module, "build_server", lambda **kw: Server())
+    module.main()
+    assert calls == [{"transport": "stdio"}]
+    assert link.closed and executor.closed
+
+
+def test_script_entry_imports_from_any_working_directory(monkeypatch, car_server):
+    monkeypatch.chdir(Path(car_server.__file__).resolve().parents[2] / "docs")
+    namespace = runpy.run_path(car_server.__file__, run_name="car_entry_test")
+    assert namespace["CarLink"].__module__ == "LLM.car_mcp.car_link"
+
+
+@pytest.mark.parametrize("name,args,action,ros_request", [
+    ("robot_move", {"direction": "back", "distance_m": 5}, "move_back", {"direction": "back", "distance_m": 5.0}),
+    ("robot_turn", {"angle_deg": -360}, "turn", {"angle_deg": -360.0}),
+    ("robot_goto_zone", {"zone": "ward"}, "goto_zone", {"place": "", "x": 1.0, "y": 2.0, "theta": 30.0}),
+    ("robot_goto_place", {"place": "desk"}, "goto_place", {"place": "", "x": 1.0, "y": 2.0, "theta": 30.0}),
+])
+def test_mcp_actions_return_json_and_preserve_ros_fields(server_rig, name, args, action, ros_request):
+    module, link, nav, executor = server_rig
+    server = module.build_server(link=link, nav=nav, executor=executor)
+    response = asyncio.run(server.call_tool(name, args))
+    accepted = load_json(response.content[0].text)
+    assert accepted["status"] == "started" and accepted["action"] == action
+    executor.run_next()
+    transport_action = "navigate_to" if action.startswith("goto_") else name.removeprefix("robot_")
+    assert link.calls == [(transport_action, ros_request, 1)]
+
+
+def test_executor_rejection_releases_task_and_returns_error(server_rig):
+    module, link, nav, executor = server_rig
+    executor.submit = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("shutdown"))
+    result = load_json(module._move(link, executor, "forward", 1))
+    assert result["ok"] is False and result["status"] == "error"
+    assert not link.tasks and link.finished[-1][1] is False
+
+
+def test_python_mcp_missing_main_exits_two_without_stdout(monkeypatch, capsys, car_server):
+    monkeypatch.setattr(car_server, "MCPServer", None)
+    opened = mock_open()
+    monkeypatch.setattr("builtins.open", opened)
+    with pytest.raises(SystemExit) as exc:
+        car_server.main()
+    assert exc.value.code == 2
+    streams = capsys.readouterr()
+    assert not streams.out and "python-mcp" in streams.err
+    opened().write.assert_called_once()
+
+
+def test_mcp_stop_remains_responsive_while_readiness_waits(server_rig):
+    module, link, nav, executor = server_rig
+    original = link.readiness
+    waiting, release = threading.Event(), threading.Event()
+    def blocked():
+        waiting.set()
+        release.wait(1)
+        return original()
+    link.readiness = blocked
+    server = module.build_server(link=link, nav=nav, executor=executor)
+    async def calls():
+        action = asyncio.create_task(server.call_tool("robot_move", {"direction": "forward", "distance_m": 1}))
+        try:
+            assert await asyncio.to_thread(waiting.wait, 1)
+            stop = await server.call_tool("robot_stop", {})
+            assert load_json(stop.content[0].text)["ok"]
+            assert not action.done(), "MCP readiness blocked the event loop and delayed stop"
+        finally:
+            release.set()
+            await action
+    asyncio.run(calls())
+
+
+def test_state_connections_start_once_on_first_use(server_rig):
+    module, link, nav, executor = server_rig
+    starts = []
+    link.start = lambda: starts.append(True) or {"ok": True}
+    assert load_json(module._stop(link))["ok"]
+    assert not starts
+    assert load_json(module._status(link))["ok"]
+    assert load_json(module._move(link, executor, "forward", 1))["status"] == "started"
+    assert load_json(module._status(link))["ok"]
+    assert starts == [True]
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_real_link_worker_results_reach_status(rig, car_server, success):
+    link, ctrl, *_ = rig
+    executor = DeferredExecutor()
+    ctrl.on_send = lambda req: ctrl.reply(req, {"success": success, "message": "done" if success else "blocked"})
+    assert load_json(car_server._turn(link, executor, 30))["status"] == "started"
+    executor.run_next()
+    result = load_json(car_server._status(link))
+    assert result["last"]["ok"] is success and result["current"] is None
+    if not success:
+        assert result["last_error"] == "blocked"
+
+
+def test_missing_websocket_still_registers_and_returns_json(monkeypatch, car_server):
+    link_module = importlib.import_module("LLM.car_mcp.car_link")
+    monkeypatch.setattr(link_module, "websocket", None)
+    link = link_module.CarLink("ws://unavailable:9090")
+    executor = DeferredExecutor()
+    server = car_server.build_server(link=link, nav=ServerNav(), executor=executor)
+    try:
+        assert len(asyncio.run(server.list_tools())) == 7
+        result = asyncio.run(server.call_tool("robot_move", {"direction": "forward", "distance_m": 1}))
+        assert "websocket-client" in load_json(result.content[0].text)["error"]
+        assert load_json(car_server._status(link))["status"] == "unavailable"
+        assert not executor.jobs
+    finally:
+        car_server._close_resources(link, executor)
 
 
 class FakeSocket:
