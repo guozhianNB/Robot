@@ -489,6 +489,34 @@ def test_nav_old_tags_fingerprint_warning_and_changed_rejection(nav_deps):
     assert importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_point(1, 2)["ok"] is False
 
 
+def test_nav_zone_fallback_selects_nearest_destination_and_reports_it(nav_deps):
+    deps = dict(nav_deps)
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {
+        "destinations": [{"name": "远", "x": 0.5, "y": 0.5, "yaw_deg": 0},
+                         {"name": "近", "x": 2.7, "y": 2.7, "yaw_deg": 90}],
+        "zones": [{"name": "无goal", "shape": "rect", "polygon": [[0, 0], [5, 0], [5, 5], [0, 5]]}],
+        "resolution": .05, "origin": [0, 0, 0]}}
+    out = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_zone("无goal")
+    assert out["ok"] and out["target"] == {"x": 2.7, "y": 2.7, "yaw_deg": 90.0, "goal_source": "destination"}
+    assert any("近" in warning for warning in out["warnings"])
+
+
+def test_nav_zone_rejects_explicit_or_fallback_target_outside_zone(nav_deps):
+    deps = dict(nav_deps)
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {
+        "destinations": [], "zones": [{"name": "显式外", "polygon": [[0,0],[1,0],[1,1],[0,1]],
+            "goal": {"x": 2, "y": 2, "yaw_deg": 0}}], "resolution": .05, "origin": [0,0,0]}}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    obj.zone_hit = lambda *_: False
+    assert obj.resolve_zone("显式外")["ok"] is False
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {
+        "destinations": [{"name": "区外", "x": 2, "y": 2, "yaw_deg": 0}],
+        "zones": [{"name": "回退外", "polygon": [[0,0],[1,0],[1,1],[0,1]]}], "resolution": .05, "origin": [0,0,0]}}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    obj.zone_hit = lambda *_: False
+    assert obj.resolve_zone("回退外")["ok"] is False
+
+
 def test_race_dispatch_first_stop_publishes_immediately_then_again(rig):
     link, ctrl, _, stop, *_ = rig
     link.readiness()
