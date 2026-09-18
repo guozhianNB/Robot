@@ -141,22 +141,26 @@ def test_readiness_failures_are_dict_errors(rig, failure):
 ])
 def test_link_action_passthrough_and_service_success(rig, action, typ, arguments):
     link, ctrl, *_ = rig
+    link.readiness()
+    task = link.begin_task(action, arguments, "navigating" if action == "navigate_to" else "moving")
     ctrl.on_send = lambda req: ctrl.reply(req, {"success": True, "message": "done"})
-    result = link.call_action(action, arguments)
+    result = link.call_action(action, arguments, task_id=task["task_id"])
     assert result["ok"] and result["message"] == "done"
     assert ctrl.sent[-1]["service"] == "/robot/" + action
     assert ctrl.sent[-1]["type"] == "robot_interfaces/srv/" + typ
     assert ctrl.sent[-1]["args"] == arguments
     assert ctrl.timeout > 189
     ctrl.on_send = lambda req: ctrl.reply(req, {"success": False, "message": "blocked"})
-    assert link.call_action(action, arguments)["ok"] is False
+    assert link.call_action(action, arguments, task_id=task["task_id"])["ok"] is False
 
 
 def test_link_ctrl_block_does_not_block_stop_probe_state(rig):
     link, ctrl, _, stop, state, _ = rig
+    link.readiness()
+    task = link.begin_task("turn", {}, "moving")
     sent = threading.Event()
     ctrl.on_send = lambda req: sent.set()
-    worker = threading.Thread(target=lambda: link.call_action("turn", {"angle_deg": 20}))
+    worker = threading.Thread(target=lambda: link.call_action("turn", {"angle_deg": 20}, task_id=task["task_id"]))
     worker.start()
     try:
         assert sent.wait(1)
@@ -295,7 +299,7 @@ def test_link_missing_dependency_and_connection_failure(link_class, monkeypatch)
     module = importlib.import_module("LLM.car_mcp.car_link")
     monkeypatch.setattr(module, "websocket", None)
     link = link_class("ws://fake:9090")
-    for result in (link.start(), link.readiness(), link.stop(), link.call_action("move", {})):
+    for result in (link.start(), link.readiness(), link.stop(), link.call_action("move", {}, task_id=1)):
         assert result["ok"] is False
         assert "websocket-client" in result["error"]
     link.close()
@@ -353,11 +357,13 @@ def test_stop_old_probe_inflight_cannot_authorize_new_task(rig):
 
 def test_link_ctrl_calls_remain_serial_and_ids_are_matched(rig):
     link, ctrl, *_ = rig
+    link.readiness()
+    task = link.begin_task("move", {}, "moving")
     entered = threading.Event()
     ctrl.on_send = lambda req: entered.set()
     results = []
-    first = threading.Thread(target=lambda: results.append(link.call_action("move", {"direction": "forward"})))
-    second = threading.Thread(target=lambda: results.append(link.call_action("turn", {"angle_deg": 15})))
+    first = threading.Thread(target=lambda: results.append(link.call_action("move", {"direction": "forward"}, task_id=task["task_id"])))
+    second = threading.Thread(target=lambda: results.append(link.call_action("turn", {"angle_deg": 15}, task_id=task["task_id"])))
     first.start()
     assert entered.wait(1)
     second.start()
@@ -434,3 +440,85 @@ def test_race_stop_first_prevents_waiting_action_dispatch(rig):
             action.join(1)
     assert results[0]["status"] == "stale"
     assert not ctrl.sent
+
+
+def test_link_action_requires_task_id(rig):
+    link, ctrl, *_ = rig
+    ctrl.on_send = lambda req: ctrl.reply(req, {"success": True})
+    with pytest.raises(TypeError, match="task_id"):
+        link.call_action("move", {})
+    assert not ctrl.sent
+
+
+@pytest.mark.parametrize("task_id", [None, True, 1.0, "1", 0, -1])
+def test_link_action_rejects_invalid_task_id(rig, task_id):
+    link, ctrl, *_ = rig
+    link.readiness()
+    link.begin_task("move", {}, "moving")
+    ctrl.on_send = lambda req: ctrl.reply(req, {"success": True})
+    result = link.call_action("move", {}, task_id=task_id)
+    assert result["ok"] is False
+    assert not ctrl.sent
+
+
+def test_stop_invalidates_second_action_queued_on_ctrl(rig):
+    link, ctrl, *_ = rig
+    link.readiness()
+    task = link.begin_task("move", {}, "moving")
+    sent, queued = threading.Event(), threading.Event()
+    ctrl.on_send = lambda req: sent.set()
+    results = []
+    first = threading.Thread(target=lambda: link.call_action("move", {}, task_id=task["task_id"]))
+    def second_call():
+        queued.set()
+        results.append(link.call_action("turn", {}, task_id=task["task_id"]))
+    second = threading.Thread(target=second_call)
+    first.start()
+    assert sent.wait(1)
+    second.start()
+    assert queued.wait(1)
+    assert link.stop()["ok"]
+    ctrl.reply(ctrl.sent[0], {"success": True})
+    first.join(1)
+    second.join(1)
+    assert results[0]["status"] == "stale"
+    assert len(ctrl.sent) == 1
+
+
+@pytest.mark.parametrize("newer_result", ["busy", "failure"])
+def test_readiness_network_and_application_are_linearized(rig, monkeypatch, newer_result):
+    link, _, probe, *_ = rig
+    link.stop()
+    old_received, release_old, second_started, second_network = (threading.Event() for _ in range(4))
+    service = link._service
+    calls = 0
+    def paused_service(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = service(*args, **kwargs)
+            old_received.set()
+            assert release_old.wait(1)
+            return result
+        second_network.set()
+        return service(*args, **kwargs)
+    monkeypatch.setattr(link, "_service", paused_service)
+    first = threading.Thread(target=link.readiness)
+    def newer_probe():
+        second_started.set()
+        link.readiness()
+    second = threading.Thread(target=newer_probe)
+    first.start()
+    assert old_received.wait(1)  # 第一调用已释放 socket 锁，但尚未应用 idle。
+    probe.on_send = lambda req: probe.reply(req, {
+        "ready": False, "exec_state": "navigating", "nav_available": True, "message": "busy"
+    }, result=newer_result != "failure")
+    second.start()
+    assert second_started.wait(1)
+    overtook_application = second_network.wait(0.1)
+    release_old.set()
+    first.join(1)
+    second.join(1)
+    assert not overtook_application, "new probe overtook prior probe cache application"
+    assert second_network.is_set()
+    assert link.begin_task("move", {}, "moving")["status"] != "accepted"

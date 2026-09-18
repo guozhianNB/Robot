@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""车控 rosbridge 四连接；网络等待不持有任务状态锁，急停独立发送。
 
-call_action 仅传输；上层负责 begin_task / finish_task。带 task_id 的调用
+call_action 仅传输；上层负责 begin_task / finish_task。所有调用必须带 task_id，
 在发送前检查任务是否仍有效，发送后登记 dispatched。状态话题没有 task_id，
 因此只能用 dispatched + seen_active 门控，不能证明跨连接旧帧的来源。
 """
@@ -39,6 +39,7 @@ class CarLink:
         self.action_timeout = action_timeout
         self._lock = threading.RLock()
         self._dispatch_lock = threading.Lock()
+        self._readiness_lock = threading.Lock()
         self._io_locks = {name: threading.Lock() for name in ("ctrl", "probe", "stop", "state")}
         self._sockets = dict.fromkeys(self._io_locks)
         self._closed = threading.Event()
@@ -167,11 +168,10 @@ class CarLink:
                     # 与 stop 的第二次发布建立本地顺序；绝不包含 recv。
                     with self._dispatch_lock:
                         with self._lock:
-                            if task_id is not None and not self._matches(task_id):
+                            if type(task_id) is not int or task_id <= 0 or not self._matches(task_id):
                                 return {"ok": False, "status": "stale", "error": "任务已失效"}
                         sock.send(payload)
-                        if task_id is not None:
-                            self.mark_dispatched(task_id)
+                        self.mark_dispatched(task_id)
                 else:
                     sock.send(payload)
                 deadline = time.monotonic() + timeout
@@ -204,6 +204,12 @@ class CarLink:
             return self._error(exc)
 
     def readiness(self, timeout=None):
+        # 包住收包及缓存应用，防同 generation 的旧 idle 覆盖较新 busy/error。
+        # 锁序：readiness → probe → state；没有反向获取 readiness 的路径。
+        with self._readiness_lock:
+            return self._readiness(timeout)
+
+    def _readiness(self, timeout):
         with self._lock:
             generation = self._generation
         result = self._service("probe", "/robot/readiness", "robot_interfaces/srv/RobotReadiness", {},
@@ -238,7 +244,9 @@ class CarLink:
                         self._state_mono = None
         return {"ok": True, **values}
 
-    def call_action(self, action, request, timeout=None, *, task_id=None):
+    def call_action(self, action, request, timeout=None, *, task_id: int):
+        if type(task_id) is not int or task_id <= 0:
+            return self._error("task_id must be a positive int")
         if action not in self._ACTIONS:
             return self._error(f"unknown action: {action}")
         return self._service("ctrl", f"/robot/{action}", f"robot_interfaces/srv/{self._ACTIONS[action]}",
