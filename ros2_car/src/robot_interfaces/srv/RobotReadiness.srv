@@ -1,0 +1,5 @@
+---
+bool ready
+string exec_state
+bool nav_available
+string message

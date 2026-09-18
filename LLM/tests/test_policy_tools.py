@@ -136,6 +136,7 @@ def test_run_tool_denies_mcp_outside_server_roles(monkeypatch):
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool",
                         lambda name, args: called.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     res = tools.run_tool("mcp_probe", {}, _p("elder"))
     assert res["ok"] is False and called == []
     assert tools.run_tool("mcp_probe", {}, _p("admin"))["ok"] is True and called == ["mcp_probe"]
@@ -176,6 +177,7 @@ def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool",
                         lambda name, args: called.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
     assert "robot_stop" in policy.role_policy("elder")["allowed_tools"]   # 前提：白名单内
     assert "robot_stop" not in _names({"mcp_enabled": True}, _p("elder"))  # 看不见
@@ -265,6 +267,53 @@ def test_vision_mcp_configuration():
     assert vision["env"]["VISION_PORT"] != ""
     assert vision["enabled"] is True
     assert vision["roles"] == ["elder", "admin"]
+
+
+def test_car_mcp_configuration_and_environment(monkeypatch):
+    import sys
+
+    from LLM import conf
+
+    monkeypatch.setenv("ROSBRIDGE_URL", "ws://robot:9090")
+    monkeypatch.setenv("CAR_PROBE_TIMEOUT_S", "4")
+    monkeypatch.setenv("CAR_HEARTBEAT_TTL_S", "6")
+    monkeypatch.setenv("CAR_MCP_LOG", "car-test.log")
+    monkeypatch.delenv("CAR_ACTION_TIMEOUT_S", raising=False)
+    env = conf._car_mcp_env()
+    assert env == {
+        "ROSBRIDGE_URL": "ws://robot:9090",
+        "CAR_PROBE_TIMEOUT_S": "4",
+        "CAR_HEARTBEAT_TTL_S": "6",
+        "CAR_MCP_LOG": "car-test.log",
+    }
+    car = conf.MCP_SERVERS["car"]
+    assert car["command"] == sys.executable
+    assert car["args"] == [str(conf.BASE_DIR / "LLM" / "car_mcp" / "car_server.py")]
+    assert car["enabled"] is True
+    assert car["roles"] == ["ward", "elder", "admin"]
+
+
+def test_car_mcp_visibility_and_direct_call_are_role_symmetric(monkeypatch):
+    car_tools = {
+        name: {"server": "car", "schema": {"type": "function", "function": {
+            "name": name, "description": "", "parameters": {}}}}
+        for name in ("robot_status", "robot_stop", "robot_move", "robot_turn",
+                     "robot_goto_point", "robot_goto_zone", "robot_goto_place")
+    }
+    calls = []
+    seen = []
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: car_tools)
+    monkeypatch.setattr(tools.mcp_client, "call_tool",
+                        lambda name, args: calls.append(name) or {"ok": True})
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
+
+    assert set(_names({"mcp_enabled": True}, _p("ward"))) == {"robot_status", "robot_stop"}
+    assert set(car_tools) <= set(_names({"mcp_enabled": True}, _p("elder")))
+    assert set(car_tools) <= set(_names({"mcp_enabled": True}, _p("admin")))
+    denied = tools.run_tool("robot_move", {"direction": "forward", "distance_m": 1}, _p("ward"))
+    assert denied["ok"] is False and calls == []
+    assert seen[-1][0] == "policy_deny" and seen[-1][1]["decision"] == "deny"
 
 
 def test_vision_policy_deny_audit_redacts_args_when_mcp_disabled(monkeypatch):

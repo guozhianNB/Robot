@@ -263,6 +263,23 @@ def _notice_mcp_env() -> dict[str, str]:
             env[name] = os.environ[name]
     return env
 
+
+_CAR_MCP_ENV_NAMES = (
+    "CAR_PROBE_TIMEOUT_S",
+    "CAR_ACTION_TIMEOUT_S",
+    "CAR_HEARTBEAT_TTL_S",
+    "CAR_MCP_LOG",
+)
+
+
+def _car_mcp_env() -> dict[str, str]:
+    """Build explicit environment overrides for the car MCP child process."""
+    env = {"ROSBRIDGE_URL": os.environ.get("ROSBRIDGE_URL", ROSBRIDGE_URL)}
+    for name in _CAR_MCP_ENV_NAMES:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
 # MCP工具列表
 MCP_SERVERS: dict[str, dict] = {
     # 网页抓取（需要本机有 node/npx，首次会自动 npx 下载包）：
@@ -291,6 +308,14 @@ MCP_SERVERS: dict[str, dict] = {
         "env": _notice_mcp_env(),
         "enabled": True,
         "roles": ["elder", "ward", "admin"],
+    },
+    # 默认登记，但仍受 settings.mcp_enabled 总开关控制；总开关关闭时不会拉起子进程。
+    "car": {
+        "command": _sys.executable,
+        "args": [str(BASE_DIR / "LLM" / "car_mcp" / "car_server.py")],
+        "env": _car_mcp_env(),
+        "enabled": True,
+        "roles": ["ward", "elder", "admin"],
     },
 }
 

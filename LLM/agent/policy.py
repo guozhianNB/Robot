@@ -32,8 +32,12 @@ POLICY_DEFAULTS: dict[str, dict] = {
     # ---- 老人层：本人档案 + 本病房集体上下文（只读、单向）----
     "elder": {
         "prompt_file": PROMPT_DIR / "elder.md",
-        # R3：急停/呼救类工具永远在列（当前仅有 robot_stop 是安全动作）
-        "allowed_tools": ["robot_status", "robot_stop", "see_what", "notify_nurse"],
+        # 老人可直接发起移动与导航；急停/呼救仍永远在列（R3）。
+        "allowed_tools": [
+            "robot_status", "robot_stop", "robot_move", "robot_turn",
+            "robot_goto_point", "robot_goto_zone", "robot_goto_place",
+            "see_what", "notify_nurse",
+        ],
         "data_scope": "self",
         "ward_context": True,
     },

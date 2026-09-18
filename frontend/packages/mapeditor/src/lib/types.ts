@@ -1,7 +1,7 @@
 // 地图编辑器前端类型（与后端 pydantic 模型一一对应，字段名禁止改动）
 
 /** 画布绘制模式（App / MapCanvas / ZonePanel 共用） */
-export type DrawMode = "idle" | "point" | "polygon" | "rect";
+export type DrawMode = "idle" | "point" | "goal" | "polygon" | "rect";
 
 export interface MapMetaFields {
   name: string;
@@ -169,10 +169,17 @@ export interface Zone {
   kind?: string;
   shape?: string;
   polygon?: number[][];
+  goal?: ZoneGoal | null;
   parent?: string;
   note?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface ZoneGoal {
+  x: number;
+  y: number;
+  yaw_deg?: number;
 }
 
 export interface ZoneIn {
@@ -181,6 +188,7 @@ export interface ZoneIn {
   kind: string;
   shape: string;
   polygon: number[][];
+  goal?: ZoneGoal | null;
   parent: string;
   note: string;
 }

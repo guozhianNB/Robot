@@ -1,96 +1,95 @@
-# LLM/car_mcp —— 高层「小车移动」MCP 车控
+# 车控 MCP
 
-让 **LLM 能控制小车移动** 的可选能力模块。目标是 **RDK X5 真机**，VM 用模拟底盘数据自测，
-**高层语义动作（move/turn，到位自动停）实现在本层**。全部为**新增文件**，不改动任何既有源。
+本目录提供七个车控工具：`robot_move`、`robot_turn`、`robot_goto_point`、
+`robot_goto_zone`、`robot_goto_place`、`robot_stop`、`robot_status`。
 
+## 生产路径
+
+生产环境的后端运行在 PC，链路固定为：
+
+```text
+LLM 工具循环
+  -> PC: car_server.py（stdio MCP，无 rclpy）
+  -> PC: car_link.py（websocket-client，四条独立连接）
+  -> 板卡 rosbridge :9090
+  -> 板卡 robot_actions
+  -> Nav2 或 chassis_driver -> STM32
 ```
-LLM/car_mcp/
-  car_controller.py     ★ 高层控制核心（纯 rclpy，不含 MCP；move/turn/stop/status）
-  car_server.py          MCP 2.0 服务端（stdio 子进程）—— 把控制器包成 MCP 工具
-  odom_sim_driver.py     VM 用模拟底盘（镜像真机 chassis_driver 语义，出 /odom）
-  car_cli_test.py        VM 端到端自测（无需 python-mcp，只需 rclpy + 模拟底盘）
-  README.md             本文件
-LLM/tool/_car_mcp_demo.py   冒烟：走真·MCP 管道调用车控工具（需 python-mcp）
+
+`LLM/conf.py` 已登记 `MCP_SERVERS["car"]`，默认 `enabled=True`，但只有设置
+`mcp_enabled=True` 时 MCP 管理器才会拉起子进程。子进程使用后端当前 Python 解释器，避免
+另一个解释器缺少 `mcp` 或 `websocket-client`。
+
+板卡需要提供 `/robot/readiness`、三个动作服务、`/robot/exec_state` 1 Hz 心跳、
+`/robot/arrived`、`/amcl_pose` 和 `/robot/cmd_stop`。`car_link.py` 使用四条独立 websocket：
+
+| 连接 | 用途 |
+|---|---|
+| `ctrl` | 串行调用动作服务，允许长时间阻塞 |
+| `stop` | 独立发布急停，绕过 busy/readiness |
+| `state` | 后台接收执行状态、到达状态和 AMCL 位姿 |
+| `probe` | 快速调用 readiness，不与 `ctrl` 共用读循环 |
+
+五个动作工具在参数、安全校验和 readiness 通过后立即返回 `status="started"`，后台线程继续
+等待板卡结果。`started` 只代表已受理，不代表到达；完成情况用 `robot_status` 查询。
+
+## 配置
+
+主后端通过 `_car_mcp_env()` 显式传递下列环境变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `ROSBRIDGE_URL` | `ws://<MAPS_SSH_HOST>:9090` | 板卡 rosbridge 地址，始终传递 |
+| `CAR_PROBE_TIMEOUT_S` | `3` | readiness 调用超时 |
+| `CAR_ACTION_TIMEOUT_S` | `190` | 动作服务最长等待时间 |
+| `CAR_HEARTBEAT_TTL_S` | `3` | 执行状态心跳新鲜度 |
+| `CAR_MCP_LOG` | `LLM/car_mcp/car_mcp.log` | MCP 子进程日志文件 |
+
+后三个超时项与日志路径只在环境中实际设置时覆盖默认值。所有时间值必须为正有限秒数，非法值
+退回默认值。
+
+## 降级行为
+
+- 可选依赖缺失、rosbridge 断开、readiness 不存在或 Nav2 未启动时，后端继续运行；
+- 动作工具返回 `ok:false` 和真实原因，不登记任务，也不假装已发车；
+- `robot_status` 在通道不可用时返回 `ok:true, status:"unavailable"`；
+- 地图或 tags 无法安全校验时，三个 goto 工具 fail-closed；move/turn/stop/status 不受影响；
+- `python-mcp` 缺失时子进程向 stderr 写原因并以退出码 2 退出。
+
+MCP 使用 stdio 协议，禁止向 stdout 打印业务日志。`car_server.py` 只写日志文件或 stderr，所有工具
+都返回 JSON 字符串。
+
+## PC 无板卡测试
+
+在仓库根目录运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest LLM/tests/test_car_mcp.py -q
+.venv\Scripts\python.exe -m pytest LLM/tests/test_maptags_goal.py -q
 ```
 
----
+测试使用假 websocket 和假地图存储，不访问真实板卡。
 
-## 一、它解决什么 & 为什么"控制器在这个目录"
+## 板卡或 VM 自测路径
 
-真机 `ros2_car/.../chassis_driver.py` 把 `/cmd_vel` 当**持续速度保持**（自身没有
-"走 x 米后停"）。所以"走 1m / 转 90°"这种**有终点**的语义动作，判定与停止逻辑必须
-额外做——本目录的 `car_controller.py` 就是这个控制器：循环 publish `/cmd_vel`、读
-`/odom` 判到位、到位自动发全零/急停。**这是"在高层 MCP 侧做工具"的落点。**
-
-## 二、通信/话题（真机与模拟同一套，代码零改动）
-
-| 话题 | 类型 | 方向 | 用途 |
-|---|---|---|---|
-| `/cmd_vel` | `geometry_msgs/Twist` | 发布↓ | 下发运动速度（持续） |
-| `/robot/cmd_stop` | `std_msgs/Bool` | 发布↓ | 急停（一收即停） |
-| `/odom` | `nav_msgs/Odometry` | 订阅↑ | 读实际位姿/位移，判到位 |
-
-- **真机 RDK X5**：单独起真 `chassis_driver`（串口→STM32）→ 喂 `/cmd_vel`、产 `/odom`。
-- **VM 模拟**：起本目录 `odom_sim_driver.py` 当"假底盘"产 `/odom` → 同一份控制器自测。
-
-## 三、工具（LLM 可见）
-
-| 工具 | 参数 | 说明 | 护栏 |
-|---|---|---|---|
-| `robot_move` | `direction`(forward/back/left/right) + `distance_m` | 直线/横移，到位自动停 | 单次 ≤5m |
-| `robot_turn` | `angle_deg`(正=左, 负=右) | 原地转向，到位自动停 | 单次 ≤360° |
-| `robot_stop` | — | 立即急停（老人喊停/异常必调） | — |
-| `robot_status` | — | 读位姿/是否在动（先查再动） | — |
-
-默认运动参数在 `car_controller.py` 顶部常量（直行 0.2 m/s、横移 0.15 m/s、转弯 20°/s）。
-
-## 四、VM 自测（用底盘数据，无需 python-mcp）
-
-要先在本机 source ROS2：`source /opt/ros/jazzy/setup.bash`
+`car_controller.py`、`odom_sim_driver.py`、`car_cli_test.py` 是板卡本地或 ROS2 VM 自测工具，
+依赖 `rclpy`，不进入生产 MCP 导入链，也不要与板卡 `robot_actions` 同时争用 `/cmd_vel`。
 
 ```bash
-# 终端 A：起模拟底盘（产生 /odom 底盘数据）
+source /opt/ros/jazzy/setup.bash
 python3 LLM/car_mcp/odom_sim_driver.py
-# 另一终端 B：验证底盘数据
-ros2 topic echo /odom
 
-# 终端 C：驱动控制器（高层动作，到位自动停）
+# 另一个已 source ROS2 的终端
 python3 LLM/car_mcp/car_cli_test.py status
-python3 LLM/car_mcp/car_cli_test.py move forward 0.5     # 前移 0.5m 自动停，moved_m≈0.5
-python3 LLM/car_mcp/car_cli_test.py turn 90               # 原地左转 90°，turned_deg≈90
-# 运动中想急停：再开一个终端
+python3 LLM/car_mcp/car_cli_test.py move forward 0.5
+python3 LLM/car_mcp/car_cli_test.py turn 90
 python3 LLM/car_mcp/car_cli_test.py stop
 ```
 
-## 五、走真·MCP 管道的冒烟（若后端环境装了 python-mcp）
+这条路径只验证本地控制器与模拟 `/odom`，不等价于生产的 rosbridge/readiness/Nav2 链路。
 
-```bash
-python3 -m LLM.tool._car_mcp_demo      # Linux（需模拟/真底盘已在跑）
-```
-Windows / RDK X5 用 `.venv\Scripts\python.exe -m LLM.tool._car_mcp_demo`。
+## 真机验收
 
-## 六、接入 LLM 后端（正式启用）
-
-在 `LLM/conf.py::MCP_SERVERS` 加一条（**唯一要改的既有文件，仅加一个 dict、默认关**）：
-```python
-MCP_SERVERS = {
-    # ...现有 fetch / tavily ...
-    "car": {
-        "command": "<目标机装有 mcp+rclpy 的解释器，如 python3>",
-        "args": ["/home/aa/Robot/LLM/car_mcp/car_server.py"],   # 绝对路径
-        "enabled": False,          # 默认关；需真车/模拟底盘就绪且想启用时再开
-    },
-}
-```
-然后后端设置页打开 `mcp_enabled`（改后重启后端生效）→ 前端 `/api/tools` 自动出现
-robot_move / robot_turn / robot_stop / robot_status。
-
-> 别的都不用改：`mcp_client` 会自动拉起、转 schema、`tools.run_tool` 自动分发、前端自动显示。
-
-## 七、注意
-
-- MCP 服务走 **stdio**，`car_server.py` 业务日志写到 `LLM/car_mcp/car_mcp.log`，**绝不 print 到 stdout**。
-- 每个工具返回 **JSON 字符串**（`mcp_client.call_tool` 只读文本块，dict 会读不到）。
-- `car_controller` 内 rclpy 节点跑在**独立后台线程**（MultiThreadedExecutor），move/turn 在调用线程
-  循环 publish + 读后台刷新的 `/odom`，`robot_stop` 可随时从别的线程打断。
-- 真机接入前请核对真 `chassis_driver` 的串口/限速/看门狗参数；本模块已按真机保守限速。
+真机测试前必须清空车周围空间，按顺序验证 readiness、0.3 m 前进、30 度转向、开阔点导航、
+区域停靠点导航、导航中急停，以及断开 rosbridge 后的诚实失败。任一步失败应立即停止，不继续后续
+运动测试。仓库内自动化测试不代表这些现场项目已通过。

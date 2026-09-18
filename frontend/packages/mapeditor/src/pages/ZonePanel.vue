@@ -2,7 +2,7 @@
 // 区域面板：列表 + 增改删；polygon 支持「画多边形/画矩形」从画布取点
 import { computed, ref, watch } from "vue";
 import { deleteJson, enc, postJson } from "../lib/api";
-import type { Zone, ZoneIn } from "../lib/types";
+import type { Zone, ZoneGoal, ZoneIn } from "../lib/types";
 
 type Kind = "room" | "ward" | "bed" | "other";
 type Shape = "polygon" | "rect";
@@ -24,6 +24,8 @@ const props = defineProps<{
   donePolygon: number[][] | null;
   /** 画布拖拽完成后的矩形 4 角点（米坐标） */
   doneRect: number[][] | null;
+  /** 画布单击得到的区域停靠点（米坐标） */
+  doneGoal: { x: number; y: number } | null;
   /** 父组件请求进入「画多边形」模式（每次递增的令牌） */
   wantDrawPolygon: number;
 }>();
@@ -31,7 +33,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "select", uid: string): void;
   (e: "request-focus", p: { x: number; y: number }): void;
-  (e: "shape-mode", m: "idle" | "polygon" | "rect"): void;
+  (e: "shape-mode", m: "idle" | "goal" | "polygon" | "rect"): void;
   (e: "changed"): void;
 }>();
 
@@ -41,18 +43,20 @@ interface Form {
   kind: Kind;
   shape: Shape;
   polygon: number[][];
+  goal: ZoneGoal | null;
   parent: string;
   note: string;
 }
 
 function emptyForm(): Form {
-  return { uid: "", name: "", kind: "room", shape: "polygon", polygon: [], parent: "", note: "" };
+  return { uid: "", name: "", kind: "room", shape: "polygon", polygon: [], goal: null, parent: "", note: "" };
 }
 
 const list = computed(() => props.items);
 const form = ref<Form>(emptyForm());
 const msg = ref("");
 const errMsg = ref("");
+const warningMsg = ref("");
 const drawing = ref<"idle" | "polygon" | "rect">("idle");
 const pointsText = ref("");
 
@@ -64,6 +68,7 @@ function startNew() {
   pointsText.value = "";
   msg.value = "";
   errMsg.value = "";
+  warningMsg.value = "";
 }
 
 function startEdit(z: Zone) {
@@ -73,12 +78,14 @@ function startEdit(z: Zone) {
     kind: (z.kind as Kind) || "room",
     shape: (z.shape as Shape) || "polygon",
     polygon: (z.polygon || []).map((p) => [Number(p[0]), Number(p[1])]),
+    goal: z.goal ? { x: Number(z.goal.x), y: Number(z.goal.y), yaw_deg: Number(z.goal.yaw_deg || 0) } : null,
     parent: z.parent || "",
     note: z.note || "",
   };
   pointsText.value = form.value.polygon.map((p) => `${p[0]},${p[1]}`).join("; ");
   msg.value = "";
   errMsg.value = "";
+  warningMsg.value = "";
   emit("select", z.uid);
   const c = centroid(form.value.polygon);
   if (c) emit("request-focus", { x: c[0], y: c[1] });
@@ -113,6 +120,7 @@ function parsePoints(text: string): number[][] {
 async function save() {
   msg.value = "";
   errMsg.value = "";
+  warningMsg.value = "";
   const poly = parsePoints(pointsText.value);
   if (!form.value.name.trim()) {
     errMsg.value = "区域必须有名字";
@@ -132,6 +140,7 @@ async function save() {
     kind: form.value.kind,
     shape: form.value.shape,
     polygon: poly,
+    goal: form.value.goal,
     parent: form.value.parent,
     note: form.value.note,
   };
@@ -142,9 +151,23 @@ async function save() {
     return;
   }
   msg.value = `${isEdit.value ? "已更新" : "已新增"}区域 ${form.value.name}（uid=${r.data.uid}）`;
+  const reasons: string[] = r.data.goal_validation?.reasons || [];
+  warningMsg.value = reasons.length ? `区域已保存；停靠点警告：${reasons.join("；")}` : "";
   if (!form.value.uid) form.value.uid = String(r.data.uid || "");
   emit("changed");
   emit("select", String(r.data.uid || ""));
+}
+
+function startGoalPick() {
+  drawing.value = "idle";
+  msg.value = "在画布上单击区域停靠点";
+  emit("shape-mode", "goal");
+}
+
+function clearGoal() {
+  form.value.goal = null;
+  emit("shape-mode", "idle");
+  msg.value = "已清除停靠点，记得点保存";
 }
 
 async function remove(z: Zone) {
@@ -242,6 +265,15 @@ watch(
   },
 );
 
+watch(
+  () => props.doneGoal,
+  (goal) => {
+    if (!goal) return;
+    form.value.goal = { x: Number(goal.x), y: Number(goal.y), yaw_deg: 0 };
+    msg.value = "已取到停靠点，记得点保存";
+  },
+);
+
 // 父组件请求进入「画多边形」模式（令牌递增；已在画则忽略）
 watch(
   () => props.wantDrawPolygon,
@@ -264,6 +296,7 @@ watch(
     </div>
 
     <div class="hint err" v-if="errMsg">{{ errMsg }}</div>
+    <div class="hint warn" v-if="warningMsg">{{ warningMsg }}</div>
     <div class="hint ok" v-if="msg">{{ msg }}</div>
 
     <div class="list">
@@ -282,6 +315,7 @@ watch(
         <div class="row-sub">
           {{ z.shape || "polygon" }} · {{ (z.polygon || []).length }} 点
           <span v-if="z.parent"> · parent={{ z.parent }}</span>
+          <span> · {{ z.goal ? `停靠点 (${z.goal.x}, ${z.goal.y})` : "未标停靠点" }}</span>
           <span v-if="z.note"> · {{ z.note }}</span>
         </div>
         <div class="row-act">
@@ -338,6 +372,15 @@ watch(
           {{ drawing === "rect" ? "画矩形中…拖拽" : "画矩形" }}
         </button>
       </div>
+      <label>区域停靠点
+        <div class="goal-row">
+          <span v-if="form.goal">({{ form.goal.x }}, {{ form.goal.y }}) m</span>
+          <span v-else class="muted">未标停靠点</span>
+          <button type="button" class="mini" @click="startGoalPick">在图上点选</button>
+          <button type="button" class="icon" title="清除停靠点" aria-label="清除停靠点"
+                  :disabled="!form.goal" @click="clearGoal">×</button>
+        </div>
+      </label>
 
       <div class="actions">
         <button class="primary" @click="save">{{ isEdit ? "保存修改" : "新增区域" }}</button>
@@ -355,6 +398,7 @@ watch(
 .hint.gray { color: #94a3b8; background: #111827; border: 1px solid #1f2937; }
 .hint.err { color: #fecaca; background: #450a0a; border: 1px solid #b91c1c; white-space: pre-wrap; }
 .hint.ok { color: #bbf7d0; background: #052e16; border: 1px solid #15803d; }
+.hint.warn { color: #fde68a; background: #422006; border: 1px solid #a16207; }
 .list { flex: 1 1 auto; overflow-y: auto; min-height: 72px; border: 1px solid #1f2937;
   border-radius: 8px; background: #0b1220; }
 .row { padding: 8px 10px; border-bottom: 1px solid #111827; cursor: pointer; }
@@ -386,6 +430,9 @@ button.danger { border-color: #7f1d1d; color: #fca5a5; }
 button.mini { padding: 3px 7px; font-size: 11px; }
 button.on { background: #7c2d12; border-color: #c2410c; color: #fed7aa; }
 .draw { display: flex; gap: 6px; }
+.goal-row { display: flex; align-items: center; gap: 6px; min-height: 30px; }
+.goal-row .muted { color: #64748b; }
+button.icon { width: 28px; height: 28px; padding: 0; font-size: 18px; line-height: 1; }
 /* 主按钮常驻表单底部：即使表单很长，也始终能看到"新增区域 / 保存修改"。
    用不透明背景 + 向上分隔线，避免滚动时按钮和字段正文叠在一起。 */
 .actions { display: flex; gap: 6px; position: sticky; bottom: 0;

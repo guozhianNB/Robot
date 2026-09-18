@@ -62,6 +62,7 @@ const draftPoint = ref<{ x: number; y: number } | null>(null);
 const draftPoints = ref<number[][] | null>(null);
 const donePolygon = ref<number[][] | null>(null);
 const doneRect = ref<number[][] | null>(null);
+const doneGoal = ref<{ x: number; y: number } | null>(null);
 const wantDrawPolygon = ref(0);
 
 const canvasRef = ref<InstanceType<typeof MapCanvas> | null>(null);
@@ -180,6 +181,7 @@ async function pickMap(name: string) {
   draftPoints.value = null;
   donePolygon.value = null;
   doneRect.value = null;
+  doneGoal.value = null;
   meta.value = { name, width: null, height: null, resolution: null, origin: null,
     negate: null, occupied_thresh: null, free_thresh: null } as MapMetaFields;
   fingerprint.value = null;
@@ -274,6 +276,12 @@ function onPolygonDone(poly: number[][]) {
 
 function onRectDone(poly: number[][]) {
   doneRect.value = poly.slice();
+  drawMode.value = "idle";
+  tab.value = "zones";
+}
+
+function onGoalPoint(p: { x: number; y: number }) {
+  doneGoal.value = { ...p };
   drawMode.value = "idle";
   tab.value = "zones";
 }
@@ -430,6 +438,7 @@ function onSelectMap(e: Event) {
         :show-places="showPlaces"
         :show-zones="showZones"
         @point="onPoint"
+        @goal-point="onGoalPoint"
         @draft="onDraft"
         @polygon="onPolygonDone"
         @rect="onRectDone"
@@ -465,6 +474,7 @@ function onSelectMap(e: Event) {
             :draft-points="draftPoints"
             :done-polygon="donePolygon"
             :done-rect="doneRect"
+            :done-goal="doneGoal"
             :want-draw-polygon="wantDrawPolygon"
             @select="onSelect"
             @request-focus="requestFocus"

@@ -9,6 +9,8 @@ const read = (name) => fs.readFileSync(path.join(root, "src", name), "utf8");
 const app = read("App.vue");
 const places = read("pages/PlacePanel.vue");
 const zones = read("pages/ZonePanel.vue");
+const canvas = read("pages/MapCanvas.vue");
+const types = read("lib/types.ts");
 
 assert.match(app, /:items="places"/, "PlacePanel 必须使用父组件的地点列表");
 assert.match(app, /:items="zones"/, "ZonePanel 必须使用父组件的区域列表");
@@ -24,6 +26,15 @@ assert.match(app, /getJson<[^>]+>\("\/api\/mapeditor\/status"\)/,
   "状态轮询必须使用单一汇总接口，避免并发读取 rosbridge");
 assert.doesNotMatch(app, /getJson<[^>]+>\("\/api\/robot\/pose"\)/,
   "前端不应与当前地图接口并发读取 rosbridge");
+assert.match(types, /DrawMode\s*=\s*[^;]*"goal"/, "DrawMode 必须支持区域停靠点模式");
+assert.match(types, /interface ZoneGoal/, "共享类型必须声明 ZoneGoal");
+assert.match(canvas, /\(e:\s*"goal-point"/, "画布必须发出独立 goal-point 事件");
+assert.match(canvas, /z\.goal/, "画布必须绘制已有区域停靠点");
+assert.match(app, /const doneGoal = ref/, "App 必须持有区域停靠点草稿");
+assert.match(app, /@goal-point="onGoalPoint"/, "App 必须接收画布停靠点事件");
+assert.match(app, /:done-goal="doneGoal"/, "App 必须把停靠点传给 ZonePanel");
+assert.match(zones, /goal_validation/, "区域保存后必须显示停靠点校验警告");
+assert.match(zones, /未标停靠点/, "区域列表必须提示缺少停靠点");
 
 const service = fs.readFileSync(path.join(root, "src", "lib", "service.ts"), "utf8");
 assert.match(app, /保存并退出/, "编辑器顶部必须有「保存并退出」");
