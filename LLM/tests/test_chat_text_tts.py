@@ -4,7 +4,9 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import chat, server, voice_api
+from LLM.agent import chat
+from LLM import server
+from LLM.voice import voice_api
 
 
 def _patch_request_side_effects(monkeypatch):
@@ -164,6 +166,10 @@ def test_chat_submits_completed_turn_when_body_closes_after_done(monkeypatch):
     asyncio.run(consume_until_done_then_close())
 
     assert end_calls == [(handle, True)]
-    assert submit_calls == [
-        ((server._post_chat_jobs, "elder_done", "请回复", "完整回复"), {})
-    ]
+    assert len(submit_calls) == 1
+    args, kwargs = submit_calls[0]
+    # 第 4 个参数 = 本轮 principal 的角色（集体层不沉淀，规格 §5.3；任务 11 起 /api/chat
+    # 必须把它带给后台沉淀任务）。角色值直接与会话层对齐断言，不写死字面量。
+    assert args[:4] == (server._post_chat_jobs, "elder_done", "请回复", "完整回复")
+    assert args[4] == server.session.get_principal("kiosk")["role"]
+    assert kwargs == {}

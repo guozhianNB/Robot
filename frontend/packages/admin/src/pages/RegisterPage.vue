@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // 老人注册向导（4 步：基本信息 → 声纹 → 人脸占位 → 完成）
 // 迁移自 UI(old)/index.html「➕ 注册老人」，规格 docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
+import { assignElderWard, listWards, type Ward } from "shared";
 
 const step = ref(1);
 const steps = ["基本信息", "声纹", "人脸", "完成"];
@@ -19,6 +20,12 @@ const topicsRaw = ref("");
 const style = ref("");
 const notes = ref("");
 const saving = ref(false);
+
+// ---- 步骤 1：病房归属（集体层）----
+// 档案保存成功后单独调 assignElderWard 写 profiles.ward_id —— 后端 `upsert_profile`
+// **故意不碰病房字段**（否则档案编辑会静默清掉归属），所以必须走 /api/profiles/{uid}/ward。
+const wards = ref<Ward[]>([]);
+const wardId = ref("");
 
 // ---- 步骤 2：声纹 ----
 const recState = ref<"idle" | "recording" | "result" | "error">("idle");
@@ -59,8 +66,18 @@ async function nextElderUid(): Promise<string> {
   }
 }
 
+// 【按床位号自动建议病房】bed="101-2" → 建议 ward_101（只为建议，用户可改）
+watch(bed, (v) => {
+  const m = /^(\d+)/.exec((v || "").trim());
+  if (m) wardId.value = `ward_${m[1]}`;
+});
+
 onMounted(async () => {
   uid.value = await nextElderUid();
+  try {
+    const w = await listWards("admin");
+    wards.value = w.wards ?? [];
+  } catch { wards.value = []; }
   try {
     const st = await json("/api/face/status");
     faceUnavailable.value = (st.status ?? "unavailable") === "unavailable";
@@ -97,7 +114,17 @@ async function saveProfile() {
       },
     });
     if (!res.ok) throw new Error(res.error || "保存失败");
-    msg.value = "✅ 档案已保存（病史 / 用药可在记忆页补录）";
+    let saved = "✅ 档案已保存（病史 / 用药可在记忆页补录）";
+    // 档案保存成功后再写病房归属（失败不影响档案本身，提示去病房管理页补）
+    if (wardId.value) {
+      try {
+        const wr = await assignElderWard(uid.value.trim() || uid.value, wardId.value, "admin");
+        saved += wr.ok ? ` · 已归入 ${wardId.value}` : " · ⚠️ 病房归属未写入（可到「病房管理」页补）";
+      } catch (e) {
+        saved += ` · ⚠️ 病房归属未写入：${e}（可到「病房管理」页补）`;
+      }
+    }
+    msg.value = saved;
     step.value = 2;
   } catch (e) {
     msg.value = `保存失败：${e}`;
@@ -180,6 +207,7 @@ function done() {
 async function reset() {
   name.value = nickname.value = bed.value = gender.value = birthday.value = "";
   call.value = topicsRaw.value = style.value = notes.value = "";
+  wardId.value = "";
   age.value = null;
   recordingId.value = null;
   recMsg.value = "";
@@ -215,7 +243,13 @@ async function reset() {
         <label class="field"><span>UID（自动生成，可改）</span><input v-model="uid" /></label>
         <label class="field"><span>姓名 *</span><input v-model="name" placeholder="张桂芳" /></label>
         <label class="field"><span>称呼</span><input v-model="nickname" placeholder="张奶奶" /></label>
-        <label class="field"><span>床位</span><input v-model="bed" placeholder="3-15" /></label>
+        <label class="field"><span>床位</span><input v-model="bed" placeholder="101-2" /></label>
+        <label class="field"><span>病房（按床位号自动建议，可改）</span>
+          <select v-model="wardId">
+            <option value="">（暂不指定）</option>
+            <option v-for="w in wards" :key="w.uid" :value="w.uid">{{ w.name || w.uid }}</option>
+          </select>
+        </label>
         <label class="field"><span>年龄</span><input v-model.number="age" type="number" /></label>
         <label class="field"><span>性别</span><input v-model="gender" placeholder="女" /></label>
         <label class="field"><span>生日</span><input v-model="birthday" type="date" /></label>
@@ -318,6 +352,9 @@ async function reset() {
 .field span { color: #94a3b8; font-size: 13px; }
 .field input { padding: 8px 12px; border-radius: 8px; border: 1px solid #334155;
   background: #1e293b; color: #e2e8f0; font-size: 14px; }
+.field select { padding: 8px 12px; border-radius: 8px; border: 1px solid #334155;
+  background: #1e293b; color: #e2e8f0; font-size: 14px; }
+.field select option { background: #1e293b; }
 .rec-panel { background: #17233f; border: 1px solid #1e3a5f; border-radius: 12px;
   padding: 22px; text-align: center; margin-bottom: 16px; }
 .rec-panel.done { border-color: #1f9d55; }

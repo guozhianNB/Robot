@@ -51,7 +51,11 @@ export interface UserChangedEvent {
   type: "user_changed";
   uid: string;
   locked: boolean;
-  source: "manual" | "voiceprint";
+  /** manual | voiceprint | password | auth_disabled | logout | expired | location | auth_reenabled … */
+  source: string;
+  role?: "admin" | "ward" | "elder";
+  slot?: "kiosk" | "admin";
+  ward_uid?: string;
 }
 
 export interface VoiceStatusEvent {
@@ -59,6 +63,25 @@ export interface VoiceStatusEvent {
   status: string;   // running / degraded / disabled / stopped（worker._report 广播）
   error?: string;
   retries?: number;
+}
+
+/** 管理员会话过期（TTL 到点）——该槽位回落到集体层，前端应退回登录门。 */
+export interface SessionExpiredEvent {
+  type: "session_expired";
+  slot: "kiosk" | "admin";
+}
+
+/** 管理员口令门开关变化（开/关都会作废已有 admin 会话）。 */
+export interface AdminAuthChangedEvent {
+  type: "admin_auth_changed";
+  required: boolean;
+}
+
+/** 病房数据变化：action = upsert | zone | assign | manual … */
+export interface WardChangedEvent {
+  type: "ward_changed";
+  uid: string;
+  action: string;
 }
 
 export type BusEvent =
@@ -69,7 +92,10 @@ export type BusEvent =
   | ChatPartialEvent
   | VoiceStateEvent
   | UserChangedEvent
-  | VoiceStatusEvent;
+  | VoiceStatusEvent
+  | SessionExpiredEvent
+  | AdminAuthChangedEvent
+  | WardChangedEvent;
 
 const KNOWN_TYPES = new Set([
   "reminder",
@@ -80,6 +106,9 @@ const KNOWN_TYPES = new Set([
   "voice_state",
   "user_changed",
   "voice_status",
+  "session_expired",
+  "admin_auth_changed",
+  "ward_changed",
 ]);
 
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */

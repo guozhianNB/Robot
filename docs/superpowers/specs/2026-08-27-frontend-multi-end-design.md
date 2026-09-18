@@ -90,6 +90,8 @@ frontend/                          # 新目录（pnpm workspace 单仓库）
       src/App.vue     # 单页沉浸式：状态条/对话区/提醒轮播/切用户/设置/SOS
 ```
 
+`packages/mapeditor/` 另含不经 Vite 打包的 `public/` 静态资源（`pixel-editor.html`、`pixel-netio.js`、`vendor/`），`pnpm build` 会把 `public/` **原样拷贝**进 `dist/`，后端再把 `dist/` 挂到 `/mapeditor`。
+
 ### 4.1 shared/events.ts（SSE 协议唯一事实来源，草案）
 
 ```ts

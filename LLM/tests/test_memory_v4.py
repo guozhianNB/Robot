@@ -7,12 +7,12 @@ import tempfile
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from LLM import db  # noqa: E402
+from LLM.store import db  # noqa: E402
 
 
 @pytest.fixture()
 def d():
-    from LLM import db as _db
+    from LLM.store import db as _db
     tmp = tempfile.mkdtemp()
     old = _db.DB_PATH
     _db.DB_PATH = os.path.join(tmp, "t.db")
@@ -62,9 +62,9 @@ def test_authority_inference(d):
 
 
 def test_correct_from_feedback(d):
-    from LLM import ragstore as rs
+    from LLM.store import ragstore as rs
     rs._AVAILABLE = False  # 降级镜像路径，不触网
-    from LLM import memory as rag
+    from LLM.agent import memory as rag
     d.add_core_memory("e1", "fact", "老人说他是上海人", "", "", source="llm:consolidate")
     d.add_rag_memory("e1", "episodic", "昨天聊天老人提到自己是上海人", "cid_r1")
     res = rag.correct_from_feedback("e1", "上海人", "老人其实是南京人", by="nurse")
@@ -77,7 +77,7 @@ def test_correct_from_feedback(d):
 
 
 def test_expression_merge_and_redline(d):
-    from LLM import memory as rag
+    from LLM.agent import memory as rag
     r1 = rag._apply_expression("e1", {"situation": "夸她穿得好看", "style": "闺女眼光就是好"})
     assert r1["action"] == "add"
     r2 = rag._apply_expression("e1", {"situation": "夸她穿得好看", "style": "闺女眼光就是好"})
@@ -100,7 +100,7 @@ def test_import_memories(d):
 
 
 def test_core_pinned_guard(d):
-    from LLM import memory as rag
+    from LLM.agent import memory as rag
     mid = d.add_core_memory("e1", "fact", "护士重要备注", "", "", source="manual:nurse")
     d.set_core_pinned(mid, True)
     d.add_core_memory("e1", "persona", "旧画像", "", "", source="llm:consolidate")
@@ -113,7 +113,7 @@ def test_core_pinned_guard(d):
 
 def test_correct_instant_signal_gate(d):
     """R1 信号词预筛：无纠正信号 → 不调 LLM 直接 no_signal 早退（省每轮调用）。"""
-    from LLM import memory as rag
+    from LLM.agent import memory as rag
 
     # 无信号词（日常闲聊）→ no_signal，不触发 LLM
     r = rag.correct_instant("e1", "今天天气不错", None, "fake")
@@ -128,7 +128,7 @@ def test_correct_instant_signal_gate(d):
 
 def test_portrait_guard_and_nurse_override(d):
     """R2 画像防退化 + 护士手动维护优先（pinned 不被 AI 覆盖）。"""
-    from LLM import memory as rag
+    from LLM.agent import memory as rag
     # 首次 AI 画像
     rag._upsert_portrait("e1", "老人性格温和，喜欢京剧，说话亲切", source="llm:consolidate")
     personas = [m for m in d.list_core_memories("e1") if m["type"] == "persona"]

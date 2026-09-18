@@ -9,12 +9,12 @@
 /stm32/control_test/
 /stm32/led_test/
 .real_frame.jpg
-temp.*
 
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+.pytest-tmp/
+.tmp/
 temp.*
 
 # LLM 运行时数据（SQLite 库 / 审计日志 / 向量库 / 图库，不入库）
@@ -25,6 +25,9 @@ LLM/data/audit.jsonl
 LLM/data/graph
 LLM/data/chroma
 LLM/data/*.log
+/LLM/vision_mcp/*.log
+# 地图源注册表（运行时数据：首启由 ROBOT_IP/MAPS_IO 等环境变量种入，含主机与路径）
+LLM/data/maps_sources.json
 
 # 子代理驱动开发的临时工作产物（进度账本/简报/审查包，不入库）
 .superpowers/
@@ -41,6 +44,8 @@ ros2_car/log/
 # 外部教程项目（自带独立 .git 的嵌套仓库，不入库）
 /localization-with-ROS/
 /linorobot2/
+# 外部开源工程：第三期地图编辑器像素修图的改造上游（GyroPalm/ROS-SLAM-Map-Editor，MIT）
+/ROS-SLAM-Map-Editor/
 
 # Python
 ros2_car/**/__pycache__/
@@ -49,6 +54,12 @@ ros2_car/**/*.py[cod]
 # SLAM 地图产物（运行时生成，用 map_saver_cli 保存，不入库）
 ros2_car/src/robot_bringup/maps/*.pgm
 ros2_car/src/robot_bringup/maps/*.yaml
+
+# 地图编辑器保存前自动备份（/mapeditor/pixel-editor.html 每次写盘前落一份，不入库）
+ros2_car/maps/.backup/
+
+# pnpm 本地 store（离线安装时会落在仓库内，勿入库）
+.pnpm-store/
 
 # 语音：运行时模型与调研残留不入库
 LLM/models/

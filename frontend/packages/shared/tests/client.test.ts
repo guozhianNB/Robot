@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { apiGet, apiPost } from "../src/api/client";
+import { apiDelete, apiGet, apiPost } from "../src/api/client";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -23,6 +23,18 @@ describe("REST client", () => {
     expect(url).toBe("/api/session/user");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ uid: "elder_002", locked: true });
+  });
+
+  it("apiDelete 发送 DELETE 与端槽位", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ ok: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await apiDelete("/api/wards/ward_101", "admin");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/wards/ward_101");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers["X-Surface"]).toBe("admin");
   });
 
   it("非 ok 响应抛错", async () => {

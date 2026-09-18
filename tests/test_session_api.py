@@ -7,14 +7,20 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import server, log as audit, voice_api
+from LLM import server
+from LLM.core import log as audit
+from LLM.agent import session
 
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
-    """重置会话全局状态 + 隔离审计日志（防测试间污染真实 audit.jsonl）。"""
-    voice_api._session_uid = None
-    voice_api._session_locked = False
+    """重置会话全局状态 + 隔离审计日志（防测试间污染真实 audit.jsonl）。
+
+    `session.reset_for_test()` 才是会话层的权威重置入口 —— 旧代码重的
+    `voice_api._session_uid/_session_locked` 早已随会话持有权移交 `session.py` 而删除，
+    那两行是**静默 no-op**（前一个用例留下的主体会把下一个用例的状态带脏）。
+    """
+    session.reset_for_test()
     monkeypatch.setattr(audit, "AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     yield
 

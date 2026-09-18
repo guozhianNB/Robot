@@ -492,3 +492,407 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - GREEN/静态验证：kiosk 同一 `rg` 退出码 0、命中 1 处；admin 同一检查退出码 1、无匹配；`D:\_project\Robot\.venv\Scripts\python.exe -m py_compile LLM\server.py LLM\voice_api.py LLM\voice\worker.py` 退出码 0；`git diff --check` 退出码 0。
 - 全量验证原始摘要：`$env:DEEPSEEK_API_KEY='test-key'; D:\_project\Robot\.venv\Scripts\python.exe -m pytest LLM\tests -q --basetemp .superpowers/pytest-tmp-task4` → `97 passed in 16.48s`；`frontend/packages/kiosk` 与 `frontend/packages/admin` 均执行 `node_modules\\.bin\\vite.CMD build` → Vite 构建成功（分别 37、42 modules）。`vue-tsc` 沿用任务前已知损坏安装（`vue-tsc/index.js` 缺失），未修复、未计为本任务回归。
 - 合并前审查修复：文本播报入口不再同步等待 `AudioSink.stop()`；后台交接锁串行停止旧播放，首句通过 `AudioSink.play()` 复位停止标志后再入队，避免新轮被旧声卡停止状态吞掉。新增声卡重启与首包不阻塞回归测试；修复后全量 `pytest LLM/tests -q` → `99 passed`。使用临时 `vue-tsc@2.0.29` 仅检查 kiosk `src` → 通过；仓库原始配置包含的 `vite.config.ts` 仍因缺 `@types/node` 报 `node:url`，未纳入本次改动。
+
+---
+
+## 2026-09-14 · 地图编辑器落地（第三个前端 `/mapeditor` + 地图标记唯一真相 + 地图文件 SSH 读写）
+
+- 规格：`docs/superpowers/specs/2026-09-14-map-editor-design.md`（A 篇看图/标地点/划区域/管地图文件，B 篇像素修图）。本轮把规格落到代码，文档回填见文末「已知限制 / 未做」。
+
+### 后端（`LLM/`，新增 5 个模块 + 改动 4 个文件）
+
+- `LLM/mapstore.py`（新）：`MapStore` 协议 / `LocalMapStore`（纯 stdlib）/ `SshMapStore`（主形态，paramiko 优先、退回 `ssh.exe` 子进程）/ `MapCache` 离线缓存（`DATA_DIR/mapcache/`，键 = `sha1(io_mode+root+name+ext)`）/ `get_store()/reset_store()/io_status()/io_test()` / 名字白名单 `check_name()` / `backup()` + `_prune_backups()`（备份到 `maps/.backup/<名>.<YYYYmmdd-HHMMSS>.{pgm,yaml}`，只按自己的命名规则删，保留最近 `MAPS_BACKUP_KEEP`=10 组）。
+- `LLM/maptags.py`（新）：`<图名>.tags.json` 唯一真相的读写（`resolve`/原子 `save`/`replace_all`）、单向刷索引缓存 `sync_map()`、`fingerprint_check()`、地点/区域增删改、`learn_here()`、`record_room_polygon()`、`reindex()/reindex_all()`。
+- `LLM/mapserver.py`（新）：PGM(P2/P5) 解析、灰度 PNG 编码（纯 stdlib 手写 zlib + struct）、未知率三分、`meters_to_pixel()/pixel_to_meters()`、`validate_point()`、`map_info()`。
+- `LLM/roslink.py`（新）：rosbridge(websocket) 连接层、降级、假数据注入。
+- `LLM/locator.py`（新）：位姿 `pose_payload()`、`set_pose_for_test()`、当前地图指纹识别 `current_map()`。
+- `LLM/db.py`：新增三张**只读索引缓存**表 `map_tags_manifest` / `destinations` / `zones`，主键 `(map_name, uid)`，加一组访问函数（业务代码不得直接写这三张表，唯一写入口是 `maptags.sync_map()`）。
+- `LLM/conf.py`：新增 `MAPS_IO`(默认 `ssh`) / `MAPS_DIR` / `MAPS_SSH_*` / `MAPS_MAX_PGM_BYTES` / `MAPS_MAX_YAML_BYTES` / `MAPS_BACKUP_KEEP` / `MAP_RE_NAME_RE` / `ROSBRIDGE_*`，以及 `DEFAULT_SETTINGS` 的 `current_map` / `map_boundary_margin_m` / `map_topic_fingerprint_enabled` / `mapeditor_auto_switch_map`。
+- `LLM/server.py`：新增地图编辑器全部路由（源码里有注释锚点 `# 地图编辑器（第三个前端 /mapeditor）`）；`lifespan` 新增一行 `audit.log("map_io_change", ...)`（不新增任何启动步骤）；静态挂载新增 `/mapeditor`（优先 dist，未构建则回退 `public/`）。
+
+### 前端（`frontend/packages/mapeditor/`，新包）
+
+- `public/pixel-editor.html`：上游 `ROS-SLAM-Map-Editor/editor.html` 的副本，**LF**；实测 `git diff --no-index` 对上游 git blob（43165 字节）只有 **7 增 5 删**（＝5 条 CDN URL 换本地 vendor + 1 行 `<script src="./pixel-netio.js">`），文件 43178 字节。
+- `public/pixel-netio.js`：接线层（读注入 + 写截获 + 状态条）。
+- `public/vendor/`：5 个自托管资源（jQuery 3.4.1 / js-yaml 4.1.0 / Bootstrap 4.4.1 CSS+JS / Font Awesome 4.7.0 含 webfonts）+ `ROS-SLAM-Map-Editor.LICENSE`（上游 MIT 原文）。
+- `src/`：Vue3 应用（`App.vue` / `pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue` / `lib/{coords,colorize,api,types}.ts`）。
+- `frontend/package.json` 加 `dev:mapeditor`；`vite.config.ts` 为 base `/mapeditor/`、端口 5175、proxy `/api`→8000（可用 `VITE_API_TARGET` 指向板卡后端）。
+- 仓库根 `scripts/vendor_mapeditor_assets.py`（幂等下载/落盘 5 个 vendor 资源）、`scripts/e2e_smoke.mjs`（无头浏览器冒烟脚本）。
+
+### 验证
+
+- 后端测试：`D:\_project\Robot\.venv\Scripts\python.exe -m pytest tests/test_mapeditor.py -q` → **46 passed**（单跑该文件）。
+- 全量 `pytest tests -q` → **91 passed / 4 failed**，4 个红态**均在 `test_mapeditor.py` 之外**且属既有基线漂移：`tests/test_modules_status.py::test_modules_status_shape`（断言模块集合）、`tests/test_unlock_switch.py` 3 例（`VoiceWorker.__init__() got an unexpected keyword argument 'chat_fn'`，测试与 `voice/worker.py` 签名漂移）。本轮未修（非本任务范围）。
+- 前端构建：`frontend/packages/mapeditor/dist/` 产物存在，但**本开发沙箱（DSH workspace-write）里 `vite build` 跑不起来**：① 浏览器进程无法启动（headless Edge 直接被沙箱杀掉），② Node 子进程不能用管道 stdio（`spawn EPERM`，esbuild 服务进程起不来）。为此 `packages/mapeditor/scripts/build.mjs` 用文件句柄 stdio 起子进程跑真正的 `vite build`（正常机器上与 admin 等价）；撞上 EPERM 时**不静默兜底**，明确失败并提示改用 `pnpm --filter mapeditor build:sandbox`（= `scripts/verify-build.mjs`，同一份 `vite.config.ts` 的等价构建，实测产物与 `vite build` 逐字节相同）。**因此产物尚未在真实开发机上用 `vite build` 复验过，也没做过真实浏览器联调**。Linux/正常 Windows 开发机上应直接 `cd frontend && pnpm install && pnpm --filter mapeditor build`。
+- 板卡：`ssh sunrise@100.65.82.93` **实测连接超时**，故板卡真机验收（规格 §九 7~10、§B11.3 16~19）与 `MAPS_IO=ssh` 真机读写**均未做**。
+
+### 已知限制 / 未做
+
+- 真实 `vite build` 复验、真实浏览器联调（`scripts/e2e_smoke.mjs` 在沙箱里跑不起来，正常机器上可用）、板卡真机验收。
+- 规格 §十二 / §B十四 的前置仍成立：需重扫一张地图、对齐 AMCL 初始位姿、板卡可达（实测不通）。
+- 文档回填：`AGENTS.md`、规格 `2026-09-14-map-editor-design.md`（文首状态 + 文末「实现台账与偏差」）、`ros2_car/建图与导航操作手册.md`（补「改完必须重启导航」+ 浏览器入口 + 备份位置）、`2026-08-27-frontend-multi-end-design.md`（补 vendor 静态资源一句）本轮已做；**板卡上那份操作手册副本（`/home/sunrise/Robot/ros2_car/建图与导航操作手册.md`）因 ssh 不通未同步，需另行同步**。
+
+---
+
+## 2026-09-14（续）—— 摄像头共享服务（vision/）审查与加固
+
+### 背景
+
+用户问"摄像头调用代码是否完善"。审查 `vision/`（2026-08-27 提交，此后未改动）后确认：协议设计与进程隔离思路是对的，但存在 **4 处确定性缺陷**，且该模块**零测试、零消费方**（`LLM/`、`frontend/` 全局 grep `vision|CameraClient|9540` 无命中）。
+
+### 修复（不动架构）
+
+1. **`get_next_frame` 永久挂死**（最严重）：原实现 `settimeout(None)`，服务端在新帧到达前不发任何字节，"对端已死"与"仍在等待"无法区分。实测传大 `last_id` 后**永久阻塞**，且卡死后同一连接上 `info()` 也超时（client 实例报废），`_io_timeout=10.0` 形同虚设。
+   - 新增构造参数 `wait_timeout` 与单次 `timeout=` 覆盖；超时抛新异常 `CameraTimeout`。
+   - **关键**：`CameraTimeout` **不继承** `ConnectionError`（别被当成断线吞掉）；超时后丢弃连接（服务端那笔迟到应答无法撤回，复用会串话——实测 `info()` 会读到帧头），下次调用自动重连；**游标仅在真正取到帧后推进，故不丢帧**。
+2. **JPEG 帧头宽高与实际编码尺寸不符**：payload 是 16 对齐后编码的，帧头却写通道原始尺寸。默认 1920x1080 → 实际编码 **1920x1072**，帧头报 1080，消费方按帧头建 buffer 必错位。改为记录 `_jpeg_size`（编码器真实输出）并写进帧头，同时 `info()` 暴露 `jpeg_size`。
+3. **`frames()` 连接泄漏**：`try` 从 `sendall` 才开始，连接建立后若 `setsockopt`/`sendall` 抛错则永不释放。改为 `try/finally` 覆盖建连后的全部步骤。
+4. **`--status` 与 `--bind` 语义冲突**：`--status` 拿**监听**地址当**连接**地址，服务以 `--bind 0.0.0.0` 启动时查不到。新增独立 `--host`（`0.0.0.0`/`::` 自动换回环）。
+
+### 新增：HTTP 桥（`vision/webbridge.py`）—— 上位机可达
+
+裸 TCP 浏览器说不了，故桥成 HTTP，**后端跑在 PC 上即可用浏览器看板卡画面**：
+
+- `GET /api/vision/status`：不可用时 `ok:True` + `status:"unavailable"`（遵「系统稳健性」：服务健康 ≠ 功能可用）
+- `GET /api/vision/snapshot?channel=&quality=`：单帧 JPEG（不可用 → 503 `ok:False`）
+- `GET /api/vision/stream?channel=&fps=`：MJPEG（不可用 → **直接结束流**，不无限空转）
+
+**零新增第三方依赖**：服务端开了 `--enable-jpeg` 走硬件编码；否则退回自写的**纯 stdlib 基线 JPEG 编码器**，响应头 `X-Vision-Source: hardware|software` 标明路径。
+
+> 软件编码器实现时踩了 3 个坑，均为"结构合法但 Pillow 报 broken data stream"，值得记录：
+> ① **DQT 必须按 zigzag 顺序存**（内部量化表是自然顺序，须重排）；
+> ② **SOF0 分量字节错位**（`struct` 打包把分量描述串了位）；
+> ③ **位写入器 `acc` 无界膨胀**（拼接长码字后未屏蔽已写出字节，导致比特流与熵编码器预期不符）。
+> 定位手法：先与 Pillow 产出的同尺寸参考图**逐段 diff**（这一步直接暴露 ①②），再对小块（8x8 灰）核对熵编码字节（`2803`）确认 ③ 以外部分正确。最终以 Pillow 真解码 + 像素梯度单调性断言验收。
+> 另注：`vision/webbridge.py` 对 `LLM.log` 的导入做成可选（`vision/` 需能独立使用）。
+
+### 测试
+
+新增 `tests/test_vision.py`，**51 项全过**，全程 `--mock`，不依赖板卡/摄像头/opencv（`numpy`/`Pillow` 用 `importorskip`）。覆盖协议往返、错误恢复（ERR 后同连接不串话）、**超时不再挂死且自动重连**、`frames()` 释放连接、**JPEG 帧头尺寸回归**、软件编码器可解码 + 像素正确性、`/api/vision/*` 降级行为、并发多客户端。
+
+全量 `pytest tests -q` → **151 passed / 4 failed**；4 个红态与上一条日志（2026-09-14）记录的**同一批既有基线漂移**完全一致（`test_modules_status` 1 例 + `test_unlock_switch` 3 例 `VoiceWorker` 签名漂移），frozenset 未变，本轮未修（非本任务范围）。
+
+### 未做 / 已知限制
+
+- **板卡真机未验收**：`--enable-jpeg`（JPU 硬件编码）路径与真实 MIPI 摄像头取帧**均未在板卡上实测**，仅在 Windows + `--mock` 下验证。硬件编码分支的帧头尺寸改动是按代码逻辑 + 替身编码器测的，需真机确认。
+- 前端未接：`/api/vision/*` 目前只有后端接口，admin/kiosk 里**没有摄像头页面**（用户当前目标是"多程序共享摄像头"，故未强加 UI）。
+- 未接真实消费方（目标检测/拍照/LLM 视觉）——仍是"能力就绪、无人使用"状态。
+- 沙箱里 `TestClient(app)` 会卡在 lifespan（MCP/voice 启动），故路由层测试改为**直接 await 路由函数**；真机/正常环境下不受此限。
+
+---
+
+## 2026-09-14（续二）—— 摄像头来源可选：板卡 MIPI / Windows USB（`--source auto`）
+
+### 背景与用户原话
+
+> 「我希望摄像头不仅可以用板卡的，还能用Windows电脑的，方便调试。」
+> 「我的意思就是说优先用板卡的摄像头，如果不行，说明在windows系统中，用windows的摄像头」
+
+即：不是两路同时接入，而是**自动判断当前在哪、能用哪个就用哪个，优先板卡**。
+规格：`docs/superpowers/specs/2026-09-14-vision-webcam-source-design.md`（commit `bbfcb8b`）。
+
+### 实现
+
+**新增 `vision/webcam.py`**（OpenCV 后端，**进程内**）：
+
+- `bgr_to_nv12(frame, w, h)`：纯 numpy 函数，BT.601 **limited range**（与 `Frame.bgr()` 用的
+  `COLOR_YUV2BGR_NV12` 口径配套，改一个必须改另一个，否则整体偏色）；色度按 **2x2 平均**
+  下采样（不是取左上角，否则块状色噪）；UV 交织顺序为 U 在前 V 在后（与 I420 不同）。
+- `WebcamBackend`：实现既有后端契约 `open()/next_frame()/close()`。**cv2 惰性导入**（守住
+  「可选依赖不进导入链」红线）。Windows 优先 `CAP_DSHOW`（MSMF 慢且对不存在设备会卡）。
+- `list_cameras()`：逐个**试读一帧**确认设备号。设计理由：注册表/设备管理器会把"曾经装过
+  的"设备也列出来（用户既有教训），据此判"有没有摄像头"会误判。
+
+**改 `vision/camera_server.py`**：
+
+- `--source auto|mipi|webcam|mock`（默认 `auto`）、`--device N`、`--list-cameras`；
+  `--mock` 保留为 `--source mock` 别名。
+- `source_candidates()`：板卡（Linux 且有 `hobot_vio`）→ `[mipi, webcam]`，其余 → `[webcam]`。
+  **`hobot_vio` 不可用时不在 auto 里列 mipi** —— 它不可能成功，试它只会白起一个子进程
+  再等超时（实测很拖沓）；显式 `--source mipi` 时仍会尝试，以便报出真实原因。
+- `make_backend()`：逐个候选尝试，**全部失败时把所有原因逐条汇总**（对齐项目"缺多个依赖
+  时别只报第一个"口径）。构造与 `open()` 都包在 `try/except Exception` 里（子进程/队列
+  权限、缺依赖、设备占用都可能失败）。
+- `info()`：`mode` 由 `real|mock` 细化为 **`mipi|webcam|mock`**，并加 `source`/`device`。
+
+**改 `LLM/conf.py` + `vision/webbridge.py`**：
+
+- 新增 `VISION_HOST`/`VISION_PORT`（env 可覆盖，默认 `127.0.0.1:9540`）。`webbridge` 原先
+  **硬编码** `P.DEFAULT_HOST/DEFAULT_PORT`，导致「后端在 PC、摄像头在板卡」这一形态根本
+  跑不通 —— 这是用户"优先板卡"能落地的前提。
+- 默认取**本机**而非板卡（与 `ROSBRIDGE_URL` 默认指向板卡不同）：摄像头服务在 PC（USB）
+  和板卡（MIPI）上都可能跑，默认本机才不会让"PC 调试"先要改配置。
+- `/api/vision/status` 增加 `target` 字段回显实际连的地址，排查时不用猜配置。
+
+### 关键决策
+
+- **D1 一律归一化成 NV12**：cv2 给 BGR，但下游（client/webbridge/软件 JPEG 编码器）全按
+  NV12 处理。归一化让下游**一行都不用改**。
+- **D3 WebcamBackend 先做进程内**：板卡那边隔离子进程是因为 `libsrcampy.get_img()` 长时间
+  占 GIL 饿死分发线程；`cv2.read()` 在 C 层通常释放 GIL，无此问题。**留了验证步骤**：若
+  实测 PING 延迟劣化（>100ms）再挪进子进程（接口一致，改动局部）。
+- **设备不支持请求分辨率时按实际尺寸产帧**：设备只给 640x480 而请求 1920x1080 时，产
+  640x480 并把真实尺寸写进帧头/`info()`。这是刻意选择 —— 强行按请求尺寸声明会让 NV12
+  长度与帧头不符，**正是 2026-09-14 早些时候修掉的同类 bug**。
+- **多通道从同一次读帧缩放**：一个物理摄像头不可能同时以两种分辨率出图。
+
+### 测试
+
+`tests/test_vision.py` 扩到 **86 passed / 1 skipped**（skip 的是 cv2 往返用例，本机没装 cv2）。
+新增覆盖：NV12 已知色值/UV 交织顺序/2x2 平均（并断言**不等于**只取左上角）/尺寸校验；
+**假 cv2** 驱动 `WebcamBackend`（协议形状、frame_id 递增、open·close 幂等、失败即释放句柄、
+持久读失败抛错、设备能力收窄、多通道单次读）；`--source` 与 auto 候选顺序（monkeypatch
+平台与 hobot_vio）；**汇总错误含全部候选原因**；失败回退到第二候选；`list_cameras` 只报
+可读设备；**cv2 缺失时 `vision.*` 仍可导入**（红线）；端到端 webcam→client→webbridge JPEG
+可解码。
+
+全量 `pytest tests -q` → **186 passed / 4 failed / 1 skipped**；4 个红态仍是既有基线漂移
+（`test_modules_status` 1 例 + `test_unlock_switch` 3 例），**与本次改动无关**（改动前即存在）。
+
+### 已知限制（重要）
+
+- **本机装不了 opencv**：到 `pypi.org`/清华/阿里云 PyPI 的 SSL 全部失败、`pip download`
+  超时，全盘也没有已装 cv2 的 Python 环境。故**真实"读 Windows 摄像头"这一跳未经验证**，
+  需要用户执行 `pip install opencv-python` 后共同验收。
+- **本机是否有可用摄像头未确认**：注册表有 `Camera`/`USB\Class_0e` 多条记录，正属"历史设备
+  也会列出来"的情形；`Get-PnpDevice` 在本机报 CIM 不可用。这正是加 `--list-cameras` 的原因。
+- **板卡 MIPI 路径未回归**：改动不应影响 mipi，但本机无 MIPI 硬件、ssh 也不通，未实测。
+- **GIL 风险未实测**：见 D3，需在装好 cv2 的真机上量 PING 延迟。
+
+---
+
+## 2026-09-14（续三）—— 分层用户体系 P0：管理层 / 集体层 / 老人层（15 任务落地）
+
+### 背景与用户原话
+
+> 「我想创立一个管理员用户，与老人用户分开。前端可以切换。我的想法是分层级，比如管理员层，
+> 众人层（这个先放着不做），老人层，方便给每个层级的用户分配不同的权限和提示词。比如老人层
+> 可以使用声纹识别，发出简单的指令（比如让小车从病房出去），管理层可以发布所以指令」
+> 「挂人身份上。但不要声纹，管理员是特殊账号，以免误识别。但语音链路要保留，以实现管理员也可以语音控制」
+> 「先不管mcp，先完成用户系统。还有，管理员的口令可以直接修改，甚至可以关闭。」
+> 「**集体层**的设计是想让小车与"大家"对话。比如小车进入某个病房，与大家打招呼，公布消息之类的。
+> 然后就可以根据声纹切换到特定老人与他对话。我想把同一个病房的老人打包成一个病房用户放在集体层，
+> 集体层的消息上下文也可以被老人用户读取到。」
+
+规格 `docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（§14 = 二次复审结论）；
+实现计划 `docs/superpowers/plans/2026-09-14-layered-user-roles.md`（v2，15 任务 TDD，已执行完）。
+**代码区间：`b83c594`（任务 1 `zonegeo.py`）→ `5c3e1db`（任务 14 admin 登录门与两个页签）**，
+基线 `6295df3`。该区间内混有**并行会话**的 vision / mapeditor 提交（`bbfcb8b`/`ff82042`/`29fa314`/
+`a69aba7`/`3516839`），不属于本批。
+
+### 实现（15 个任务）
+
+**新增模块**
+
+- `LLM/zonegeo.py`（任务 1，约 30 行，纯 stdlib）：`point_in_polygon()`（射线法）+ `zone_hit()`
+  （吃缓存行；`shape='rect'` 用外接矩形；点数 <3 一律 `False`；**任何坏入参都不抛异常**）。
+  口径与前端 `packages/mapeditor/src/lib/coords.ts` 对齐。
+- `LLM/policy.py`（任务 4）：三角色策略包 `POLICY_DEFAULTS` + `role_policy()`（未知角色 fail-closed
+  落集体层，返回浅拷贝防全局白名单被污染）。纯数据 + 纯函数，不做 IO；P1 的 `check_action()` 不留空壳。
+- `LLM/session.py`（任务 5/6/7）：`derive_role()`（uid→role 唯一权威，按 `profiles.kind`，**不靠前缀**）、
+  双槽 `get_principal()/set_subject()`、`login_admin()/logout()`、口令改/关/开/首启生成、
+  `current_ward()/manual_set_ward()/running_map_name()/autoswitch_state()`、`tick()`。
+- `LLM/prompt/{ward,elder,admin}.md`（任务 8）：角色片段，叠加在共用 base `prompt.md` 之上；
+  装载口径取自 `role_policy(role)["prompt_file"]`，缺文件 → 空串 + 审计 `prompt_role_missing`。
+
+**改造**
+
+- `db.py`（任务 2）：`profiles` 纯加列 `kind`/`ward_id`/`ward_map`/`ward_zone`；`upsert_ward`/
+  `set_ward_zone`/`set_profile_ward`/`list_wards`/`get_profile_kind`/`list_profiles(kind=)`；
+  管理员口令 PBKDF2-SHA256（20 万轮、随机盐）存 `settings` **raw key**；`list_zones(kind=)`、
+  `get_zone(uid, map_name="")` 向后兼容扩参。**口令 key 不进 `GET /api/settings`**（堵泄露）。
+- `conf.py`（任务 3）：`admin_auth_required`/`admin_session_ttl_s`/`ward_context_window`/
+  `ward_autoswitch_enabled`/`ward_switch_debounce`/`ward_zone_default_r`/`manual_override_sec`/
+  `ward_map_source`（`current_map` 一期已有，未重复添加）。
+- `chat.py`（任务 8）：`build_system(..., principal=)`、`_load_role_prompt()`、`_ward_context()`
+  （**R5 单向**：只从病房 uid 往外读，且必须先确认"真的是病房档案"）。
+- `tools.py`（任务 9）：`@tool(roles=)`、`effective_tools(settings, principal)`、`run_tool()` 二次校验；
+  **MCP 工具纳入角色白名单交集**（服务器未声明 `roles` = 仅 admin）。
+- `memory.py`（任务 10）：`note_turn()` 对 `role=ward` 不沉淀。
+- `voice_api.py` + `voice/worker.py`（任务 10）：会话持有权移交 `session.py`（同名函数转发）；
+  worker 按角色分支——**管理员不降权**（审计 `voice_spk action=ignored_in_admin`），未识别不改主体。
+- `server.py`（任务 11）：新增 `/api/session/{user,login,logout,password,admin-auth}`、`/api/wards`
+  （+`/{uid}/zone`）、`/api/profiles/{uid}/ward`、`/api/policy/roles`；业务接口按请求头
+  `X-Surface: kiosk|admin` 取 principal（**非法值 400**）；`lifespan` 补首启口令、两条 WARN、
+  每秒 `session.tick()`；广播 `session_expired`/`admin_auth_changed`/`ward_changed`。
+
+**前端（任务 12-14）**
+
+- `shared`：`src/api/client.ts` 加 `X-Surface`、`src/api/session.ts` 加登录/口令/病房 API、
+  `src/events.ts` +3 事件（`ward_changed`/`session_expired`/`admin_auth_changed`）并扩展 `user_changed` 载荷。
+- `kiosk`：左侧层级栏（管理层/集体层/老人层）+ 状态条角色徽标与 TTL 倒计时（换人入口在
+  `components/VoiceStatusBar.vue`）。
+- `admin`：登录门 + Header 身份/退出 + 「身份与权限」「病房管理」两个页签（注册在 `App.vue` 的 `tabs`）
+  + 注册向导加病房归属下拉。
+
+### 测试（本机实跑）
+
+- `.venv\Scripts\python.exe -m pytest LLM/tests -q` → **222 passed in 52.05s**。
+- `.venv\Scripts\python.exe -m pytest tests -q` → **4 failed, 186 passed, 1 skipped in 64.05s**。
+  那 4 个红态是**既有基线漂移、非本批引入**（`tests/test_modules_status.py::test_modules_status_shape`
+  1 例 + `tests/test_unlock_switch.py` 3 例 `VoiceWorker.__init__() got an unexpected keyword
+  argument 'chat_fn'`），与规格 §12 记的基线一致，**按约定未修**。
+- 本批**新增 11 个测试文件、123 条用例**（`--collect-only` 逐文件实测）：`test_zonegeo.py` 6、
+  `test_ward_db.py` 16、`test_settings_roles.py` 3、`test_policy_roles.py` 7、`test_session_roles.py` 26、
+  `test_ward_autoswitch.py` 15、`test_prompt_layers.py` 11、`test_policy_tools.py` 12、
+  `test_ward_memory.py` 4、`test_worker_roles.py` 9、`test_server_roles_routes.py` 14。
+  （规格 §13 写"10 个新测试文件"，**实际 11 个**——口令族独立进了 `test_ward_db.py`，
+  任务 5/6 共用 `test_session_roles.py`；口径以本条为准。）另有 1 个既有文件
+  `LLM/tests/test_chat_text_tts.py` 随 `/api/chat` 新签名改断言（条数不变）。
+
+### 端到端验收（13 条，本机 TestClient，不进 lifespan）
+
+一次性脚本 `.superpowers/sdd/task-15-acceptance.py`（**跑完即弃、未提交**；临时库 + 逐条重建隔离；
+位姿用 `locator.set_pose_for_test` 注入，**不动车、不用板卡**）。结果：**13/13 PASS**。
+
+| # | 验收项 | 结果 |
+|---|---|---|
+| 1 | 三层可切（admin 建病房 → kiosk 槽 role=ward → 切老人 uid → role=elder） | PASS |
+| 2 | 口令门：连错 3 次后第 4 次正确口令也被冷却拦住（error 含"10 秒"） | PASS |
+| 3 | 口令可改可关（旧口令失效、`login(null)` 直进且 `source=auth_disabled`） | PASS |
+| 4 | R1：`POST /api/session/user` 带 `role` → 400、带 `uid="admin"` → 400 | PASS |
+| 5 | 集体层 System Prompt 无老人档案（无"糖尿病"/姓名）、含本病房上下文 | PASS |
+| 6 | R5 单向：老人读得到集体层上下文；老人私聊不出现于集体层 | PASS |
+| 7 | 跨病房隔离（`elder_102_1` 看不到 `ward_101` 消息） | PASS |
+| 8 | 双槽隔离（admin 槽登录不影响 kiosk 槽角色） | PASS |
+| 9 | R3：`POST /api/alarm` 在集体层/老人层/管理层都 `ok:true` | PASS |
+| 10 | 位置自动切病房（`ward_map_source="setting"` + 注入位姿 + 3 次 `tick()` → `ward_102`；走廊位姿不切） | PASS |
+| 11 | 位置源不可用即降级（`ward_autoswitch_enabled=False` → `enabled:false, reason:"disabled"`，对话照常） | PASS |
+| 12 | 手动覆盖（`manual_set_ward` 后位置判定不抢，`reason:"manual_override"`） | PASS |
+| 13 | 降级自检：`import LLM.server` 成功 | PASS |
+
+**本脚本未单列、改由单测覆盖的 4 条**（提示词把"逐条重跑规格 §11 的 16 条"收窄为"本机可自动化部分"）：
+§11.8 管理员 TTL 到期降权（`test_session_roles.py::test_ttl_expiry_*`）、§11.10 管理员语音不降权
+（`test_worker_roles.py::test_worker_admin_is_not_downgraded`）、§11.11 未识别默认态
+（`test_session_roles.py::test_derive_role_by_kind` + 验收 #5）、§11.14 不打断私聊
+（`test_ward_autoswitch.py::test_does_not_steal_elder_private_chat`）。**真机（rosbridge 真位姿 +
+真地图指纹）未验**，留待 MCP/导航线重启后一并做。
+
+### 实现偏差（详情见规格 §15 与计划文末「实现台账与偏差」）
+
+- `GET /api/session/user` 走 `asyncio.to_thread`（`autoswitch_state()` 会碰位姿/地图，占事件循环）。
+- 解锁（`POST /api/session/user {locked:false}`）= 回**当前病房**的集体层（规格 §4.5 语义），前端传的 uid 被忽略。
+- 改口令：**只要已设过口令就必须验旧口令**，与口令门开关无关（堵"关门→改口令→开门"永久占住口令的链）。
+- `POST /api/session/user` 额外拒绝 `uid="admin"`；`X-Surface` 非法值 400。
+- `remote`-MCP 工具纳入角色白名单**交集**（白名单是天花板）；MCP 服务器未声明 `roles` = 仅 admin。
+- 集体层白名单 = `["robot_status","robot_stop"]`（**R3 急停必须可用**），不是空列表。
+
+### 已知限制与暂缓项
+
+- **前端构建/单测在本机跑不了（环境限制，非代码问题）**：`frontend` 下 `pnpm --filter shared test`
+  → `Error: spawn EPERM`（栈底是 `esbuild@0.21.3/lib/main.js ensureServiceIsRunning`，
+  即沙箱不允许子进程管道通信）。故**三个前端包的 `vitest` 与 `vite build` 均未在本机复验**，
+  需**用户侧**跑 `cd frontend && pnpm test && pnpm -r build` 后复验；`vite build` 产物未重建。
+- **P1 暂缓（D16，用户 2026-09-14：「先不管 mcp，先完成用户系统」）**：car MCP 的 `robot_goto`、
+  地点白名单解析、风险分级与二次确认状态机、admin「地点白名单」页签（规格 §6.3/§7）——**本轮未做**，
+  待 MCP 线重启后另立计划。
+- **真实语音链路未联调**：声纹→角色→提示词分层这条链在本机只有单测覆盖，未接麦克风实测。
+
+---
+
+## 2026-09-15 · 地图编辑器改为独立进程按需启动（`LLM.mapeditor_server:app` :8010 + admin 启停页签）
+
+- 规格：`docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md`（9 任务计划 `docs/superpowers/plans/2026-09-15-map-editor-on-demand-service.md`，台账见规格 §十一 / 计划附录 C）。**目标**：把地图编辑器（像素修图 + 划线/标点）从主后端拆成**独立进程**，默认不跑，按需由 admin 拉起、用完在编辑器里「保存并退出」停掉——主后端因此**可杀、可隔离、接口面缩小**（被强杀的编辑器不再拖住陪护功能）。
+
+### 后端（`LLM/`，新增 3 个模块）
+
+- `LLM/mapapi.py`（新，1031 行）：编辑器专属后端 = 9 个 pydantic 模型 + **34 条路由**（`@router.`）+ 5 个助手 + `mount_editor(app)`；**不 import `server`**，可被任意 app 复用。搬迁是**逐字**的（对 `HEAD:LLM/server.py` 原两段做逐字比对：`37876 == 37876`、`IDENTICAL: True`，唯一差异是 34 处 `@app.` → `@router.`）。
+- `LLM/mapeditor_server.py`（新）：独立进程薄壳 app —— 建 app、挂 CORS、`include_router(mapapi.router)`、`mount_editor`、`GET /` → `/mapeditor/` 跳转，外加两条服务自身接口 `GET /api/mapeditor/service`（状态）与 `POST /api/mapeditor/service/stop`（**自停**，先回响应、0.5s 后退出）。`_delayed_exit` 带 `pytest` 护栏（测试进程绝不真退）。
+- `LLM/mapctl.py`（新，主后端侧，**纯 stdlib**）：`status()/start()/stop()/reset_for_test()` + **3 条仅管理员接口** `GET /api/mapeditor/service` ｜ `POST /api/mapeditor/service/start` ｜ `POST /api/mapeditor/service/stop`（`X-Surface: admin`，非管理员 **403**）。probe-first：8010 已有东西在应答 → 报 `source="external"`、**不重复拉起**（这是"主后端被 kill -9 后留下的孤儿"能被识别与一键收掉的关键）。`stop()` 同时挂在 `lifespan` 收尾与 `/api/system/shutdown`，**主后端退出会把编辑器一起带走**。
+- `LLM/server.py`：**瘦身 995 行**（2210 → 1215）；顶层 import 改为 `from . import locator, maptags`（**保留**：`locator` 管病房位置自动切换、`maptags` 管 `POST /api/wards/{uid}/zone` 的「记录当前房间为病房区域」）；删掉编辑器模型/路由/`/mapeditor` 静态挂载；接上 `mapctl.router`。
+- `LLM/conf.py`：`MAP_EDITOR_PORT = 8010`、`MAP_EDITOR_START_TIMEOUT = 20.0`（**不加 `.env` 覆盖**，端口冲突时 `start` 明确报错并提示改 `conf.py`）。
+
+### 前端（admin 启停 + 编辑器两个「退出」）
+
+- `packages/shared`：`src/api/mapService.ts`（3 个客户端函数，全部透传 `X-Surface`）+ 单测 3 例。
+- `packages/admin`：新 `pages/MapEditorPage.vue`（状态卡 + 启动/停止 + 5 秒轮询 + `onUnmounted` 清定时器）；`App.vue` 加「地图编辑器」页签（共 **11** 个）；`WardsPage.vue` 两处硬链 `/mapeditor/` 改为 `goto-mapeditor` 事件（主后端已不挂该路径，硬链会 404）。
+- `packages/mapeditor`：`src/lib/service.ts`（同源自停 + 关窗 + 掉线探测）；主界面加「保存并退出」/「仅关窗（保留服务）」+ 服务掉线红条；`public/pixel-netio.js`（像素修图页）加「保存并退出」——**只有后端返回 `ok:true` 才停服务 + 关窗**，保存失败/409/空提交/网络异常一律只清退出意图，共 **17 处**清位出口（比计划多 5 处：`flushDownloads` 的 catch、`saveToServer` 的结果异常/`fetch` 异常、上游"未加载 yaml/pgm 只 alert"路径）。
+
+### 验证
+
+- 后端：`pytest LLM/tests tests -q` → **4 failed / 455 passed / 1 skipped**，判据是**失败集合不变**——4 个失败＝`test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3（**既有红态，本批次一例未修**）；基线里那条环境相关的 `tests/test_vision.py`（未装 opencv / 取帧时序）本轮为绿（**红的具体是哪一条会飘**，不计入判据）。新增测试全绿：`test_map_service_split.py` 6 + `test_mapeditor_server.py` 6 + `test_mapctl.py` 11 + `tests/test_mapeditor.py` 50 + conftest 护栏回归用例。
+- 前端：shared vitest **19 passed**（基线 16 + 新 3）；mapeditor `pnpm test:startup` → `mapeditor startup contract: ok`（含 3 条新契约断言，变异验证证明断言非空转）；三个 admin SFC 编译 OK；像素修图页用一次性 DOM-stub 脚手架跑 **12/12 PASS**（删掉那 5 处补丁的反向对照 **10/12**，证明补丁承重）。
+- 本机真实进程冒烟：`uvicorn LLM.mapeditor_server:app --port 8011` → `GET /api/mapeditor/service` 200、`GET /mapeditor/` 200、`POST .../service/stop` 200 后端口连接被拒（进程真退）。
+
+### 本批次修掉的 3 个真缺陷（都不是"新功能没写好"，而是踩到了既有代码/测试的雷）
+
+1. **搬走模块级 `from fastapi.responses import Response` 打断 `/api/vision/snapshot`**（相机可用时 `NameError`→500）→ 改函数内 import + 补确定性回归测试（monkeypatch `get_jpeg`，不依赖摄像头）。
+2. **跑既有测试会真停掉本机正在跑的编辑器服务**（`tests/test_modules_status.py` 跑完整 `lifespan` → 收尾 `mapctl.stop()` 走 external 分支 → 探到真 8010 就 POST 自停）→ `tests/conftest.py` 加 **autouse 护栏** + 回归用例（RED 实证真打到 `.../service/stop`，GREEN 零调用）。
+3. **像素修图页退出意图泄漏**：计划只列 12 处「没保存成功」出口，实测 17 处——残留意图会让**下一次普通保存成功**误停服务 + 误关窗（反向对照实验 10/12 vs 12/12 证实）。
+
+### 已知限制与未做（**用户侧/真机项**）
+
+- **真实浏览器链路未验**：admin 点「启动地图编辑器」→ 弹窗打开 → 划线/标点 →「保存并退出」→ 自动关窗，这条 `window.open` → `window.close()` 链路只有真实浏览器能验（本机无浏览器；任务 5 的 `window.open` 已被改成"同步栈里先开 `about:blank` 再导航"以规避弹窗拦截）。
+- **`cd frontend && pnpm -r build` 三包构建 + 前端全量单测未在本机跑**（沙箱 esbuild `spawn EPERM`）；mapeditor 只跑了 `pnpm build:sandbox` 的等价产物（与 `vite build` 逐字节相同）。
+- **真机联动未验**：`MAPS_IO=ssh` 下编辑器经 SSH 读写板卡 `ros2_car/maps/` 的地图（本轮**不改地图 IO 口径**）；仍需板卡可达（`ssh sunrise@100.65.82.93`）。
+- **本轮明确不做**：新的全量一键 `start.py`（前后端 + ROS）、编辑器服务登录鉴权（与拆分前 `/mapeditor` 在 8000 上同样无鉴权，绑内网/本机）、"编辑器空闲 N 分钟自动退出"（YAGNI）。
+- **文档同步**：`AGENTS.md`（快速上手·前端 / 后端运行位置 / API 端点节的编辑器归属 / 地图修图入口）、规格 `2026-09-14-map-editor-design.md` 顶部口径表（追加**第 8 条**）、`start_UI.py`（定位改为**纯 UI 启动器**：`后端 + kiosk + admin`，**不含**地图编辑器；启动完成后打印一行"按需启动"提示）本轮已做；计划文档另追加「附录 C：计划回填与偏差」（让后来读者不被旧文本误导）。
+
+### 未纳入本条的并行项
+
+- `LLM/vision_mcp/`、`frontend/temp-esbuild-register.mjs`：本批次的未跟踪在途文件，**未提交**（提交一律带 pathspec）。
+
+---
+
+## 2026-09-17 · Qwen 视觉 MCP `see_what`
+
+### 做了什么
+
+- 新增独立 Python stdio MCP 服务 `LLM/vision_mcp/see_server.py`，注册工具 `see_what`；业务层支持摄像头当前帧和受限本地 JPEG/PNG/WebP 图片，并调用阿里云百炼 Qwen 视觉模型返回文字回答。
+- 摄像头通过 `vision.camera_server` 共享服务取帧，不直接占用摄像头硬件；本地图片仅允许位于 `VISION_SEE_IMAGE_DIRS` 白名单目录内，默认 `LLM/data/vision_inbox`。
+- `LLM/conf.py` 注册 vision MCP 子进程并继承 `DASHSCOPE_API_KEY`、`VISION_HOST`、`VISION_PORT`；后端启动时 `mcp_enabled` 关闭则不建连接，运行中关闭后拒绝工具调用，后端退出时清理 MCP 子进程。经本仓库后端策略，`elder`/`admin` 可见，`ward` 集体层禁用；独立 stdio 进程本身无角色鉴权。
+- README 补充了 `see_what` 输入示例、启动方式、Qwen 配置、阿里云上传隐私边界和缺依赖/摄像头/云端失败时的降级行为。
+
+### 验证状态
+
+- 相关回归（含视觉 MCP、权限、MCP 启动、摄像头和聊天工具日志）：193 passed、9 skipped、1 warning。
+- `import LLM.server` 成功；真实 MCP stdio `initialize`/`list_tools` 成功，`see_what` schema 中 `image`/`prompt` 为必填，`channel` 默认值为 `1`。
+- 配置有效 `DASHSCOPE_API_KEY` 后，使用 `linorobot2/docs/assets/linorobot2_launchfiles.png` 完成文件图片链路的真实 Qwen `qwen-vl-plus` 调用：返回 `ok: true`、`image/png`、`56120 bytes`，耗时约 `1375 ms`。审计和服务日志不记录图片、base64、回答正文或 prompt。
+- 启动 `vision.camera_server --mock` 后，通过真实 MCP stdio `call_tool` 调用 `see_what(image="camera", channel=2)`：共享服务产出合成 JPEG，阿里云接口返回 HTTP 200，结果为 `ok: true`、`source: camera`、`model: qwen-vl-plus`。本次只上传合成测试画面；真实硬件摄像头画面仍未做云端验收。
+- 首次沙箱网络调用遇到 `APIConnectionError`；获批联网后文件图片与 mock 摄像头图片调用均成功。验收日志未写入密钥、prompt 或模型回答正文。
+
+---
+
+## 2026-09-17 · LLM 后端按功能重新分层（29 个模块从包根归位到 core / store / agent / maps / voice）
+
+### 做了什么
+
+- **问题**：`LLM/` 根目录平铺了 29 个 `.py`（`server.py` 54KB、`db.py` 56KB、`mapapi.py` 46KB…），再加上 `prompt.md` 与 `prompt/` 目录同名混淆——"哪个模块属于哪一块"只能靠逐个读文件判断。
+- **分层结果**（依赖单向 `core → store → agent → server`，包根只留 2 个入口 + `conf.py`）：
+  - `core/` — `log`(审计) `bus`(SSE) `vectors`(轻量向量) `zonegeo`(几何)：零业务、零外部依赖
+  - `store/` — `db` `ragstore` `graph` `embed` `migrate`：一切"数据落在哪、怎么读写"
+  - `agent/` — `chat` `memory` `tools` `mcp_client` `reminder` `session` `policy` + `prompt/`
+  - `maps/` — `mapstore` `mapsources` `maptags` `mapserver` `locator` `roslink` + `mapapi` `mapctl`
+  - `voice/` — 原 `voice_api.py` 并入既有 voice 包
+- **`conf.py` 特意留在包根**：它的 `BASE_DIR = Path(__file__).resolve().parent.parent` 是 `.env`/`data/` 的定位锚点，移动它要同步改 3 处 `__file__` 推导，收益不抵风险。`server.py` / `mapeditor_server.py` 同理留根——**两个启动命令 `LLM.server:app`、`LLM.mapeditor_server:app` 一个字没变**。
+- **`prompt.md` → `agent/prompt/base.md`**：与角色片段 `ward/elder/admin.md` 同目录，消除"`prompt.md` vs `prompt/`"的歧义（`conf.PROMPT_FILE` + `policy.PROMPT_DIR` 各改 1 处）。
+- 迁移用 `git mv` 完成（保留重命名历史），import 重写脚本化（172 + 70 + 3 行，全部 dry-run 审查后落盘）。
+
+### 踩到的两个坑（都已在代码里留注释）
+
+- **`tools.py` 的 `__package__` 拼接**：自动加载本地工具原写 `f"{__package__}.tool.{name}"`；模块从包根搬进 `LLM/agent/` 后 `__package__` 变成 `"LLM.agent"`，拼出不存在的 `LLM.agent.tool.*` → 改用 `f"{_tool_pkg.__name__}.{name}"`（即 `LLM.tool.*`）。
+- **`from .. import db` 被漏改**：`voice/worker.py` 原本就用两点相对导入（两层包内合法），重写脚本最初只处理单点形态，结果 `voice_api` 整条链静默降级为"缺少依赖：cannot import name 'db' from 'LLM'"（`_VOICE_AVAILABLE=False`）。**这类"看起来像已迁移"的两点写法要单独扫**。
+
+### 验证状态
+
+- `pytest tests LLM/tests --collect-only -q` → **542 tests collected, 0 errors**（所有测试模块与新结构的 import 全部对上，这是本次重构最可能的破坏面）。
+- 不依赖 `tmp_path` 的纯逻辑子集实跑：**39 passed, 0 failed**。
+- 手动冒烟：`LLM.server`（80 routes）/ `LLM.mapeditor_server`（9 routes）/ `LLM.maps.mapapi`（34 routes）import 干净；`conf.PROMPT_FILE` 指向 `agent/prompt/base.md` 且文件存在；`chat._load_prompt_base()` 返回 836 字符、`_load_role_prompt('ward')` 返回 289 字符；`LLM.voice.voice_api` `_VOICE_AVAILABLE=True`（0 缺失依赖）；`vision.webbridge` 的审计桥接到真实 `LLM.core.log`（`vision_mcp` 那处**漏了**，见下节收尾修复）。
+- **`db.get_settings()` 实跑通过**：该路径会触发 `store/db.py` 里对 `agent.tools.TOOL_DEFAULTS` 的函数内延迟导入（全仓唯一的跨层循环出口），返回 34 个默认 key。
+- **环境限制（与本次改动无关）**：本机沙箱下 python 子进程对 pytest 自建 basetemp 的目录遍历被拒（`PermissionError WinError 5`），故依赖 `tmp_path` 的用例（约 500 例）本轮**未能实跑**；这些用例在本环境**重构前同样失败**（`sqlite3.OperationalError: unable to open database file`）。建议在无该限制的终端补跑一次全量。
+
+### 文档同步
+
+- `AGENTS.md`：新增「LLM/ 分层目录树 + 分层铁律（下层不 import 上层）」；架构与模块 24 条全部改到新路径；关键约定 §1（三件套 → `store/db.py`）、§2（`core/log.py`）、§4（`agent/chat.py` / `core/bus.py`）、§6（跨层相对导入写法）；已知坑补「`conf.py` 位置不可动」。
+- 活跃测试与 `vision/webbridge.py` 的引用同步更新；`docs/superpowers/plans|specs`、`.superpowers/**` 等历史归档**按原样保留**（它们记录的是当时的事实，不做回改）。
+
+### 收尾修复（子代理独立审查发现，同日补）
+
+派了一个独立子代理做只读的"残留引用"复查（全仓 grep + 实跑）。它发现一处**真会坏、且本轮现有验证手段抓不到**的遗漏：
+
+- **`LLM/vision_mcp/vision_client.py::_audit()`** 写的是 `from LLM import log as audit`（旧路径）。它包在 `try/except Exception: pass` 里 —— 失败被静默吞掉，后果是**视觉 MCP 的 `vision_see` 审计从此不再落盘、且不报任何错**。测试抓不到的原因：`tests/test_vision_mcp.py` 三处用例都直接 monkeypatch 掉了 `_audit` 本身，从未走过真实 log 桥；而 542 例 collection 与 import 冒烟都只覆盖模块顶层，碰不到函数体内的延迟导入。**已修**为 `from LLM.core import log as audit`，并用探针实证：monkeypatch `LLM.core.log.log` 后 `vc._audit(probe=1)` 收到 `(('vision_see',), {'probe': 1})`（修复前为空）。
+  → **遗留建议**：照 `tests/test_vision.py` 里 webbridge 那条审计桥用例的写法，给 `_audit` 补一条"真桥到 `LLM.core.log`"的用例，否则同类遗漏会再发生。**本轮未补**：`tests/test_vision_mcp.py` 是并行在途文件，避免动它。
+- **文档/注释/文案里的旧路径 18 处**一并清掉（不影响运行，但会误导后来读者）：后端 docstring 9 处（`mapeditor_server.py` / `maps/mapctl.py` / `maps/locator.py` / `vision_mcp/see_server.py`×2 / `car_mcp/car_server.py` / `agent/chat.py` / `agent/mcp_client.py` / `voice/worker.py`×2）、`tests/conftest.py` 注释、前端 3 处（`admin/src/pages/RolesPage.vue` 的**用户可见文案**、`mapeditor/src/lib/{coords,colorize}.ts`）、`requirement.txt` 注释、`limit.md` 权限矩阵的"事实来源"行、`docs/maibot参考/记忆系统差距分析.md`。
+- **风格统一**：`voice/worker.py` 两处函数内延迟导入原为绝对形式 `from LLM.agent import session`，改为 `from ..agent import session`，与关键约定 §6 一致。
+- **复查结论**：25 个新路径全部可导入、25 个旧路径全部不可导入；`conf.py` 三处 `__file__` 推导、`tools.py` 的 `pkgutil` 自动加载、`PROMPT_FILE`/`PROMPT_DIR` 均落位正确；`stm32/`、`ros2_car/`、`scripts/`、`vision/`、`UI(old)/`、根目录文档**无残留**。改完后重跑 `--collect-only` 仍是 **542 collected / 0 errors**。
+- **按原样保留**：`docs/log.md` ≤09-15 旧条目里的路径是"当日事实"（日记体），与 `docs/superpowers/plans|specs` 同理，不做回改。仅提示本文件里两条命令今天照抄会失败：`306` 的 `python -c "import LLM.tools"`、`492` 的 `py_compile … LLM\voice_api.py`。

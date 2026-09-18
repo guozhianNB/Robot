@@ -6,13 +6,18 @@ r"""
 from pathlib import Path
 import os
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent   # 项目根
+load_dotenv(BASE_DIR / ".env")
+
 DATA_DIR = Path(__file__).resolve().parent / "data"  # LLM 侧数据目录
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
-PROMPT_FILE = Path(__file__).resolve().parent / "prompt.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+PROMPT_FILE = Path(__file__).resolve().parent / "agent" / "prompt" / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
 DEFAULT_SETTINGS = {
@@ -38,7 +43,119 @@ DEFAULT_SETTINGS = {
     "confirm_timeout_min": 30,      # 提醒送达后多少分钟未确认 → 升级"未确认"
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
     "mcp_enabled": False,          # MCP 外部工具总开关（开启后在启动时拉起 MCP_SERVERS）
+    # ---- 地图编辑器（第三个前端 /mapeditor，见 docs/superpowers/specs/2026-09-14-map-editor-design.md）----
+    "current_map": "my_map",            # 目标地图名（下次启动导航用；≠"车此刻在跑哪张图"，后者靠指纹自动识别）
+    "map_boundary_margin_m": 0.3,       # 标点校验：距地图各边缩进（沿用 where_am_i.py 口径）
+    "map_topic_fingerprint_enabled": True,  # 是否用 /map 元数据指纹反查"车此刻在跑哪张图"
+    "mapeditor_auto_switch_map": False, # 打开编辑器时是否自动跳到指纹识别出的那张图
+    # ---- 分层用户体系（2026-09-14，规格 docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）----
+    "admin_auth_required": True,     # 管理员口令门开关（D13：可在 UI 直接关掉，界面须警示）
+    "admin_session_ttl_s": 300,      # 管理员提权后无操作自动降权秒数（D8）
+    "ward_context_window": 10,       # 集体层上下文注入条数（老人可读本病房最近 N 条，R5）
+    "ward_autoswitch_enabled": True, # 病房位置自动切换总开关（关掉=退回手动；rosbridge 地址在 conf.ROSBRIDGE_URL）
+    "ward_switch_debounce": 3,       # 自动切病房防抖：连续 N 次 tick 同病房才认（D18）
+    "ward_zone_default_r": 3.0,      # 便捷录入病房区域的半径（米），以当前位姿为圆心采样 16 边形
+    "manual_override_sec": 600,      # 手动切病房后，位置判定不覆盖的秒数（D18）
+    "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=/map 指纹反查（默认）；setting=用 current_map
 }
+
+# ---- 地图编辑器独立服务（按需启动，见 docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md）----
+MAP_EDITOR_PORT = 8010            # 编辑器服务端口（主后端 mapctl 用它拉起/探活/停止）
+MAP_EDITOR_START_TIMEOUT = 20.0   # 拉起编辑器服务的最长等待秒数
+
+# ---------------------------------------------------------------------------
+# 地图文件（规格 §B十）：MarkStore / maptags / locator 共用的路径与远程 IO 配置
+# ---------------------------------------------------------------------------
+# 运行位置口径（2026-09-14 用户拍板「还是把地图工作放到PC上吧，因为板卡性能不是很好」）：
+#   后端默认跑在 PC 上 → MAPS_IO="ssh"，地图真相仍在板卡 ros2_car/maps/，经 SSH 读写；
+#   后端跑在板卡上时用 "local"。开发期板卡不可达可 `MAPS_IO=local` + 仓库副本目录。
+#   ⚠️ 2026-09-14 起这只是**内置 ssh 源的种子**；编辑器实际读哪个源由 maps_sources.json
+#   的命名源决定（见 MAPS_SOURCES_FILE）。ROS 端与编辑器解耦：改这里不影响 ROS 在跑的图。
+MAPS_IO = os.environ.get("MAPS_IO", "ssh")            # ssh（默认）| local
+MAPS_DIR = Path(os.environ.get("MAPS_DIR", str(BASE_DIR / "ros2_car" / "maps")))  # local 模式根目录
+MAPS_CACHE_DIR = DATA_DIR / "mapcache"                # ssh 模式本地缓存（离线看图 + 断连降级）
+MAPS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MAPS_BACKUP_DIRNAME = ".backup"                       # 与地图同级；list() 必须排除它
+# 地图源注册表（命名源：一组"地图文件在哪"的具名配置）——运行时数据，不进 git。
+# 首次运行由下面的环境变量种入两个内置源（board / pc），此后以文件为准、改了即时生效。
+MAPS_SOURCES_FILE = DATA_DIR / "maps_sources.json"
+MAPS_SOURCE_LABEL = os.environ.get("MAPS_SOURCE_LABEL", "")   # 内置 ssh 源的显示名（空=自动生成）
+
+MAPS_SSH_HOST = os.environ.get("MAPS_SSH_HOST") or os.environ.get("ROBOT_IP", "100.65.82.93")  # 板卡（Tailscale）
+MAPS_SSH_USER = os.environ.get("MAPS_SSH_USER", "sunrise")
+MAPS_SSH_PORT = int(os.environ.get("MAPS_SSH_PORT", "22"))
+MAPS_SSH_ROOT = os.environ.get("MAPS_SSH_ROOT", "/home/sunrise/Robot/ros2_car/maps")
+MAPS_SSH_KEY = os.environ.get("MAPS_SSH_KEY", "")      # 私钥路径（空=用 ~/.ssh/id_* 默认）
+MAPS_SSH_PASSWORD = os.environ.get("MAPS_SSH_PASSWORD", "")  # 仅 paramiko 通道；从 .env 读，不入 git
+MAPS_SSH_TRANSPORT = os.environ.get("MAPS_SSH_TRANSPORT", "auto")  # auto | paramiko | cli
+MAPS_SSH_TIMEOUT = float(os.environ.get("MAPS_SSH_TIMEOUT", "10"))  # 单次连接/命令超时（秒）
+
+MAPS_MAX_PGM_BYTES = 10 * 1024 * 1024   # 上传 pgm（解码后）上限
+MAPS_MAX_YAML_BYTES = 64 * 1024         # 上传 yaml 上限
+MAPS_MAX_BODY_BYTES = 16 * 1024 * 1024  # 请求体上限
+MAPS_BACKUP_KEEP = 10                   # maps/.backup/ 保留组数
+
+# 地图名白名单（规格 §B7.1 红线）：防路径穿越，且是 ssh 子进程模式**唯一的**命令注入防线。
+# 另：不得含 keepout（上游编辑器会把它当掩膜文件，编辑到另一张画布上）。
+MAP_RE_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
+MAP_RE_NAME_BANNED = ("keepout",)
+
+# 位姿/当前地图识别（rosbridge，websocket 只读；不引入 rclpy —— Windows 开发机无 ROS）
+ROSBRIDGE_URL = os.environ.get("ROSBRIDGE_URL", f"ws://{MAPS_SSH_HOST}:9090")
+ROSBRIDGE_TIMEOUT = float(os.environ.get("ROSBRIDGE_TIMEOUT", "5"))
+ROSBRIDGE_RETRY_S = float(os.environ.get("ROSBRIDGE_RETRY_S", "5"))
+ROSBRIDGE_POSE_TTL_S = 10.0             # 位姿超过这么久没更新 → 视为不可用
+ROSBRIDGE_MOCK_POSE = os.environ.get("ROSBRIDGE_MOCK_POSE", "")  # "x,y,yaw" 注入假位姿（无 ROS 开发/测试）
+MAP_CURRENT_CACHE_TTL_S = 5.0           # 大于前端轮询周期；从扫描完成时计，避免慢 SSH 吞掉 TTL
+
+# 摄像头共享服务（vision/camera_server.py，裸 TCP）—— webbridge 连它的地址
+# 默认**本机**：摄像头服务与后端通常一起跑（PC 上用 webcam 调试、板卡上用 MIPI）。
+#   - 与 ROSBRIDGE_URL 默认指向板卡不同：那里板卡是唯一来源；而摄像头服务在
+#     PC（usb 摄像头）和板卡（MIPI）上都可能跑，默认本机才不会让"PC 调试"要先改配置。
+# 「后端跑在 PC、摄像头在板卡」时：把 VISION_HOST 设成板卡地址（同 MAPS_SSH_HOST），
+# 并在板卡上以 `--bind 0.0.0.0` 启动服务。
+def _parse_vision_port(raw, default: int = 9540) -> int:
+    """Parse a TCP port without allowing malformed environment input to abort import."""
+    try:
+        port = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+VISION_HOST = (os.environ.get("VISION_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+VISION_PORT = _parse_vision_port(os.environ.get("VISION_PORT"))
+
+# vision MCP 子进程需要显式继承的视觉参数。可选项仅在环境变量实际设置时
+# 传入，避免用空串覆盖 vision_client 内的默认值。
+_VISION_SEE_ENV_NAMES = (
+    "VISION_SEE_MODEL",
+    "VISION_SEE_BASE_URL",
+    "VISION_SEE_TIMEOUT",
+    "VISION_SEE_MAX_TOKENS",
+    "VISION_SEE_MAX_WIDTH",
+    "VISION_SEE_QUALITY",
+    "VISION_SEE_MAX_BYTES",
+    "VISION_SEE_IMAGE_DIRS",
+    "VISION_SEE_GRAB_TIMEOUT",
+    "VISION_SEE_CONNECT_TIMEOUT",
+    "VISION_SEE_CHANNEL",
+)
+
+
+def _vision_mcp_env() -> dict[str, str]:
+    """Build the environment overrides for the vision MCP child process."""
+    env = {
+        # An empty key is intentional: see_server reports cloud unavailability.
+        "DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", ""),
+        "VISION_HOST": str(VISION_HOST),
+        "VISION_PORT": str(VISION_PORT),
+    }
+    for name in _VISION_SEE_ENV_NAMES:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
 
 # 声纹录制
 VOICE_ENROLL_SECONDS = 15        # 注册/追加默认录制秒数
@@ -123,6 +240,13 @@ MCP_SERVERS: dict[str, dict] = {
         # env 值留空串 = 运行时从 os.environ 继承（.env 由 server.py 加载后才有值）
         "env": {"TAVILY_API_KEY": ""},
         "enabled": True,
+    },
+    "vision": {
+        "command": _sys.executable,
+        "args": [str(BASE_DIR / "LLM" / "vision_mcp" / "see_server.py")],
+        "env": _vision_mcp_env(),
+        "enabled": True,
+        "roles": ["elder", "admin"],
     },
 }
 

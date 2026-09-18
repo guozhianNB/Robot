@@ -18,7 +18,8 @@ r"""vision —— MIPI 摄像头共享子系统。
 
 __version__ = "1.0.0"
 
-from .camera_client import CameraClient, CameraServerError, CameraNotRunning, Frame  # noqa: F401
+from .camera_client import (CameraClient, CameraServerError, CameraNotRunning,
+                            CameraTimeout, Frame)  # noqa: F401
 
 __all__ = ["CameraClient", "CameraServerError", "CameraNotRunning",
-           "Frame", "__version__"]
+           "CameraTimeout", "Frame", "__version__"]

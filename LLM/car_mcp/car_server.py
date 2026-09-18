@@ -3,7 +3,7 @@
 r"""高层「小车移动」MCP 服务端（子进程, stdio 传输）。
 
 它把高层车载控制器（car_controller.CarController）包成 MCP 2.0 工具，供 LLM 后端
-（LLM/mcp_client.py）在启动时以 stdio 子进程拉起，工具名自动并入 OpenAI function-
+（LLM/agent/mcp_client.py）在启动时以 stdio 子进程拉起，工具名自动并入 OpenAI function-
 calling 工具循环 —— 大模型据此可让小车"前进/后退/横移 x 米、转向 x 度、急停、查状态"。
 
 对本机并无 python-mcp 依赖时**也能起**（降级成一行提示并退出非零）——遵循

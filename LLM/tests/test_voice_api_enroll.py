@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import numpy as np
-from LLM import voice_api
+from LLM.voice import voice_api
 from LLM.voice import config
 
 

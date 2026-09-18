@@ -31,7 +31,8 @@ import time
 
 import numpy as np
 
-from .. import db, log as audit
+from ..store import db
+from ..core import log as audit
 from . import config
 from . import audio, vad as vad_mod, kws as kws_mod, asr as asr_mod, tts as tts_mod
 from . import speaker as spk_mod, identity as id_mod, session as session_mod
@@ -79,7 +80,11 @@ class VoiceWorker(threading.Thread):
         self.status = "stopped"           # running / degraded / disabled / stopped
         self.sub_status = {}
         self.current_uid = None
-        self.locked_uid = None       # 手动锁定用户（None=未锁定，规格 D11）
+        # 手动锁定用户（规格 D11）——**兼容属性，不参与任何判定**：锁定语义的唯一真相是
+        # 会话层 `LLM/agent/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
+        # 语音可用时被 `voice_api.set_session_uid` 同步，语音降级/管理台登出后会永久粘住，
+        # 拿它判定就等于"陈旧的锁定一直带下去、只能重启恢复"。判定处一律读会话层。
+        self.locked_uid = None
         self.src = self.sink = None
         self.vad = self.kws = self.asr = self.tts = self.spk = self.fusion = None
         self.session = session_mod.Session()
@@ -338,27 +343,92 @@ class VoiceWorker(threading.Thread):
         self._asr_tail = []
         self._last_partial = ""
 
+    def _apply_role_subject(self, recognized_uid: str | None) -> None:
+        """按当前角色决定这次说话算谁说的（规格 §4.3）。
+
+        * kiosk 槽是 admin → 按 admin 走，声纹认到谁都不降权（D8）；
+        * 认出老人 → 切到该老人（elder，source=voiceprint）；
+        * **没认出来 → 主体不动**（集体层已由位置/手动维持，这里不许回写、更不许把旧主体
+          当成"刚认出来的"——那会把位置自动切换的结果回退掉）。
+
+        注意：这里引的是**顶层角色会话层** `LLM/agent/session.py`（≠ `LLM.voice.session`
+        语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
+
+        **锁定语义读会话层**（不读 `self.locked_uid` 镜像）：镜像只在语音可用时被
+        `voice_api.set_session_uid` 同步，语音降级/管理台登出后就会陈旧，会让"锁定"永久粘住。
+
+        **降级**：`set_subject()` 内部会 `derive_role()` → `db.get_profile_kind()` 读库，
+        库路径错/文件被换/锁都会抛异常；这里绝不能让它抛穿到 `run()` 的 except
+        （那会 `_reconnect()` 掉这一整句——没有应答、没有 TTS）。出问题只记审计并
+        退回上一主体（本方法不改任何内存态）。
+        """
+        try:
+            from ..agent import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
+            principal = role_session.get_principal("kiosk")
+            if principal["role"] == "admin":
+                return
+            if not recognized_uid:
+                return
+            role_session.set_subject(recognized_uid, bool(principal["locked"]), slot="kiosk",
+                                     source="voiceprint")
+        except Exception as e:              # noqa: BLE001  DB/会话层异常不许掐掉整句应答
+            audit.log("voice_error", action="role_subject", uid=recognized_uid, error=str(e))
+
     def _handle_speech(self, seg, text, settings):
         self.session.note_speech()
         audit.log("voice_asr", text=text[:200])
 
+        from ..agent import session as role_session
+        # 读会话层（= 读库）异常（`database is locked` 等）不许从 try 之外抛穿到 `run()` 的
+        # except —— 那会 `_reconnect()` 掉这一整句：没有应答、没有 TTS。出问题只记审计，
+        # 并用"上一次已知主体"（取 prev 失败时用空主体）继续把这一句答完。
+        empty_principal = {"uid": "", "locked": False, "source": "", "ward_uid": "",
+                           "role": "ward"}
+        try:
+            prev = role_session.get_principal("kiosk")
+        except Exception as e:              # noqa: BLE001
+            audit.log("voice_error", action="role_principal", step="prev", error=str(e))
+            prev = empty_principal
+
         vote = self.fusion.resolve(seg)
-        uid = id_mod.effective_uid(vote, self.current_uid, self.locked_uid)
+        # 只认**真正的识别结果**：`effective_uid()` 在没认出来时会回落到 `current_uid`
+        # （内存里的旧主体），那是"本轮用谁应答"的兜底，不是"认出谁了"。把它当识别结果
+        # 喂给 `_apply_role_subject` 会把位置自动切换（D17/D18）刚切好的主体回退掉。
+        #
+        # 锁定语义读**会话层**（不读 `self.locked_uid` 镜像：镜像只在语音可用时同步，
+        # 语音降级/管理台登出后会永久粘住）。锁定时按锁定的人走（声纹只提示不切换，
+        # 规格 D11/§8.2 行为矩阵）；解锁时宁问勿猜 —— 认不出来就不带 candidate。
+        locked_uid = (prev["uid"] or None) if prev["locked"] else None
+        candidate = locked_uid if locked_uid else vote.candidate_uid
         # 锁定时识别到锁定外用户：只记审计提示，不切换（规格 §8.2 行为矩阵）
-        if self.locked_uid and vote.candidate_uid and vote.candidate_uid != self.locked_uid:
-            audit.log("voice_spk", action="locked_ignored", locked=self.locked_uid,
+        if locked_uid and vote.candidate_uid and vote.candidate_uid != locked_uid:
+            audit.log("voice_spk", action="locked_ignored", locked=locked_uid,
                       detected=vote.candidate_uid, score=round(vote.confidence, 3))
-        prev_uid = self.current_uid
-        self.current_uid = uid or self.current_uid
         audit.log("voice_spk", identified=(vote.candidate_uid is not None),
                   uid=vote.candidate_uid, score=round(vote.confidence, 3))
 
-        chat_uid = self.current_uid or "elder_001"
-        # I-1：声纹识别切换了用户（或首次识别出用户）→ 广播 user_changed，
-        # 与 server.py 手动切换的广播格式一致，前端状态条/admin toast 同步
-        if self.current_uid and self.current_uid != prev_uid:
-            self._publish("user_changed", uid=chat_uid,
-                          locked=bool(self.locked_uid), source="voiceprint")
+        self._apply_role_subject(candidate)                  # 谁说的：按角色决定（含 D8）
+        try:
+            principal = role_session.get_principal("kiosk")
+        except Exception as e:              # noqa: BLE001
+            audit.log("voice_error", action="role_principal", step="principal", error=str(e))
+            principal = prev
+        # 只把**权威主体**写回内存态；兜底常量只用于本轮应答 uid。
+        # 反例（本行曾写错）：无条件 `self.current_uid = chat_uid` 会把 "elder_001"
+        # 回灌成内存态——那既是"内存里有个假主体"，也是当年"未识别被当成认出了
+        # elder_001"的源头（`_apply_role_subject` 曾吃 `effective_uid()` 在本轮无候选时
+        # 回落 `current_uid` 的结果）：冒充演示档案、把集体层对话沉淀进该老人的记忆、
+        # `session._holds_session()` 变 False 让位置自动切换停摆。
+        subject = principal["uid"] or principal["ward_uid"]
+        if subject:
+            self.current_uid = subject
+        chat_uid = subject or self.current_uid or "elder_001"
+        # I-1：主体变了 → 广播 user_changed。payload 与 server.py 手动切换
+        # （uid/locked/source）**严格同形**：多塞字段会撞上按整字典比对的既有用例，
+        # 前端 events.ts 的 parseBusPayload 也只认这三个字段。
+        if principal["uid"] != prev["uid"]:
+            self._publish("user_changed", uid=chat_uid, locked=principal["locked"],
+                          source=principal["source"])
         self._publish("voice_state", state="recognized", uid=chat_uid, text=text)
         # 流式问答：应答线程消费 chat_stream → 逐字上屏(chat_partial) + 句级 TTS 播放
         self._start_answer(chat_uid, text, dict(settings))

@@ -2,8 +2,8 @@
 // kiosk 主界面：状态条 + 对话区 + 提醒 + SOS（规格 §5）
 import { onMounted, ref } from "vue";
 import {
-  type BusEvent, type ReminderEvent, setSessionUser,
-  reportAlarm, getSessionUser,
+  type BusEvent, type ReminderEvent,
+  reportAlarm, getSessionUser, type SessionUser,
 } from "shared";
 import { useBus } from "./useBus";
 import VoiceStatusBar from "./components/VoiceStatusBar.vue";
@@ -16,6 +16,7 @@ import SettingsSheet from "./components/SettingsSheet.vue";
 const state = ref("idle");
 const uid = ref<string | null>(null);
 const locked = ref(false);
+const session = ref<SessionUser | null>(null);   // 分层用户体系：角色/病房/TTL 的唯一来源（层级栏与状态条都吃它）
 const liveText = ref("");        // 流式 ASR 实时字幕（asr_partial 事件）
 const messages = ref<Msg[]>([]);
 const reminder = ref<ReminderEvent | null>(null);
@@ -27,10 +28,11 @@ const { connected } = useBus(onEvent);
 
 async function loadSession() {
   try {
-    const s = await getSessionUser();
+    const s = await getSessionUser("kiosk");
+    session.value = s;
     uid.value = s.uid;
     locked.value = s.locked;
-  } catch { /* 后端未就绪时忽略 */ }
+  } catch { /* 后端未就绪时忽略，保留旧值 */ }
 }
 
 async function loadAsrProvider() {
@@ -115,8 +117,18 @@ function onEvent(ev: BusEvent) {
   }
   if (ev.type === "reminder") reminder.value = ev;
   if (ev.type === "user_changed") {
-    uid.value = ev.uid;
+    // 载荷是 {uid, locked, source}（role/slot/ward_uid 可选）：先按载荷即时更新，
+    // 再拉一次全量会话（角色/病房/TTL 只有 /api/session/user 有）。
+    uid.value = ev.uid || null;
     locked.value = ev.locked;
+    loadSession();
+  }
+  if (ev.type === "ward_changed") {
+    loadSession();               // 当前病房变了（位置自动切换 / 手动切 / 后台管理改动）
+  }
+  if (ev.type === "session_expired") {
+    loadSession();               // 管理员 TTL 到点 → 该槽位已回落集体层
+    if (ev.slot === "kiosk") liveText.value = "管理员会话已超时，已回到集体层";
   }
 }
 
@@ -165,20 +177,6 @@ async function onSos() {
   alert("已发送紧急呼叫");
 }
 
-async function onSwitchUser(nextUid: string) {
-  await setSessionUser(nextUid, true);   // 手动切换即锁定（规格 D11）
-  uid.value = nextUid;
-  locked.value = true;
-  showSwitcher.value = false;
-}
-
-// Minor：解锁 = 恢复声纹自动判定（不换人；后端清 _session_uid 残留 + worker.locked_uid）
-async function onUnlock() {
-  await setSessionUser(uid.value ?? "elder_001", false);
-  locked.value = false;
-  showSwitcher.value = false;
-}
-
 async function onConfirmReminder(rid: number) {
   try {
     await fetch(`/api/reminders/${rid}/confirm`, { method: "POST" });
@@ -190,12 +188,15 @@ onMounted(() => {
   loadSession();
   loadAsrProvider();
   loadTtsProvider();
+  // 管理员 TTL 倒计时得真的在走：事件只覆盖"状态变化"，剩多少秒只有轮询能刷新。
+  // 10s 轮询同时是 session_expired 的兜底（SSE 断线时也能自己发现会话已回落集体层）。
+  setInterval(loadSession, 10000);
 });
 </script>
 
 <template>
   <div class="kiosk">
-    <VoiceStatusBar :state="state" :uid="uid" :locked="locked" @open-switcher="showSwitcher = true" />
+    <VoiceStatusBar :state="state" :session="session" @open-switcher="showSwitcher = true" />
     <div v-if="liveText" class="live-asr">🗣 {{ liveText }}</div>
     <ReminderBanner v-if="reminder" :reminder="reminder" @confirm="onConfirmReminder" />
     <ChatArea :messages="messages" @send="sendText" />
@@ -210,8 +211,10 @@ onMounted(() => {
       <button class="settings-btn" @click="showSettings = true">⚙ 设置</button>
       <span class="conn" :class="{ off: !connected }">{{ connected ? "●" : "○ 重连中" }}</span>
     </div>
-    <UserSwitcher v-if="showSwitcher" :current="uid"
-                  @pick="onSwitchUser" @unlock="onUnlock" @close="showSwitcher = false" />
+    <!-- 左侧层级栏（管理层/集体层/老人层）：组件自己取 /api/profiles 与 /api/wards。
+         session 未拉到（后端不可达）时不渲染，避免拿假会话去渲染角色区。 -->
+    <UserSwitcher v-if="showSwitcher && session" :session="session"
+                  @changed="loadSession" @close="showSwitcher = false" />
     <SettingsSheet v-if="showSettings" @close="showSettings = false" />
   </div>
 </template>
