@@ -90,6 +90,12 @@ class CarNav:
         return self._safe_point(name, x, y, yaw_deg, "point", warnings)
 
     def resolve_place(self, place: str) -> dict:
+        try:
+            return self._resolve_place(place)
+        except Exception:
+            return self._bad("地点解析失败", "请检查地图标记")
+
+    def _resolve_place(self, place: str) -> dict:
         if not isinstance(place, str) or not place.strip():
             return self._bad("地点名称不能为空", "请提供地点名称")
         ctx, err = self._context()
@@ -109,6 +115,12 @@ class CarNav:
         return self._safe_point(name, d["x"], d["y"], d["yaw_deg"], "destination", warnings)
 
     def resolve_zone(self, zone: str) -> dict:
+        try:
+            return self._resolve_zone(zone)
+        except Exception:
+            return self._bad("区域解析失败", "请检查地图区域与停靠点")
+
+    def _resolve_zone(self, zone: str) -> dict:
         if not isinstance(zone, str) or not zone.strip():
             return self._bad("区域名称不能为空", "请提供区域名称")
         ctx, err = self._context()
@@ -124,7 +136,9 @@ class CarNav:
             if not self._finite(yaw) or not self.zone_hit(z, float(goal["x"]), float(goal["y"])):
                 return self._bad("区域显式目标不在区域内", "请在地图编辑器修正区域停靠点")
             return self._safe_point(name, goal["x"], goal["y"], yaw, "explicit", warnings)
-        candidates = [d for d in tags.get("destinations", []) if self._finite(d.get("x")) and self._finite(d.get("y")) and self.zone_hit(z, d["x"], d["y"])]
+        candidates = [d for d in tags.get("destinations", [])
+                      if self._finite(d.get("x")) and self._finite(d.get("y")) and
+                      self._finite(d.get("yaw_deg")) and self.zone_hit(z, d["x"], d["y"])]
         if not candidates: return self._bad("区域没有可用停靠点", "请去地图编辑器标停靠点")
         poly = z.get("polygon") or []
         cx = sum(float(p[0]) for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2) / max(1, len(poly))

@@ -458,6 +458,36 @@ def test_nav_zone_without_goal_does_not_create_centroid(nav, nav_deps):
     out = obj.resolve_zone("空区")
     assert out["ok"] is False and "停靠点" in out["hint"]
 
+def test_nav_zone_fallback_validates_yaw_and_zone_exceptions(nav_deps):
+    deps = dict(nav_deps)
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {
+        "destinations": [{"name": "坏yaw", "x": 1, "y": 1, "yaw_deg": float("nan")}],
+        "zones": [{"name": "无goal", "polygon": [[0,0],[2,0],[2,2],[0,2]]}]},
+        "fingerprint": {"ok": True, "changed": False}}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    assert obj.resolve_zone("无goal")["ok"] is False
+    deps["zone_hit"] = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+    assert importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_zone("无goal")["ok"] is False
+
+@pytest.mark.parametrize("field,value", [
+    ("in_bounds", False), ("on_obstacle", True), ("on_unknown", True),
+    ("edge_margin_m", 0.2), ("clearance_m", 0.2)])
+def test_nav_point_each_validate_failure(nav, nav_deps, field, value):
+    deps = dict(nav_deps)
+    deps["validate_point"] = lambda *a, **k: {"ok": True, "in_bounds": True, "on_obstacle": False,
+        "on_unknown": False, "edge_margin_m": 1, "clearance_m": 1, "reasons": [field], field: value}
+    assert importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_point(1, 2)["ok"] is False
+
+def test_nav_old_tags_fingerprint_warning_and_changed_rejection(nav_deps):
+    deps = dict(nav_deps)
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {"destinations": [], "zones": []}, "fingerprint": {"ok": True, "changed": False}}
+    deps["fingerprint_check"] = lambda tags, info: {"ok": True, "changed": False, "reasons": ["该 tags.json 无指纹"]}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    out = obj.resolve_point(1, 2)
+    assert out["ok"] and any("无指纹" in w for w in out["warnings"])
+    deps["fingerprint_check"] = lambda tags, info: {"ok": False, "changed": False, "reasons": ["yaml 元数据不可用"]}
+    assert importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_point(1, 2)["ok"] is False
+
 
 def test_race_dispatch_first_stop_publishes_immediately_then_again(rig):
     link, ctrl, _, stop, *_ = rig
