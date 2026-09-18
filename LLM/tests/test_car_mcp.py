@@ -389,6 +389,76 @@ def test_stop_failed_publish_preserves_current_task(rig):
     assert link.snapshot()["last"] is None
 
 
+# --- 导航目标解析与 fail-closed 安全层 ---
+@pytest.fixture
+def nav_deps():
+    tags = {
+        "destinations": [
+            {"uid": "d1", "name": "护士站", "aliases": ["护士台"], "x": 1.0, "y": 1.0, "yaw_deg": 10},
+            {"uid": "d2", "name": "病房", "aliases": ["护士台"], "x": 8.0, "y": 1.0, "yaw_deg": 20},
+            {"uid": "d3", "name": "远端", "aliases": [], "x": 8.0, "y": 8.0, "yaw_deg": 30},
+        ],
+        "zones": [{"uid": "z1", "name": "一区", "shape": "rect", "polygon": [[0, 0], [10, 0], [10, 5], [0, 5]],
+                   "goal": {"x": 2.0, "y": 2.0, "yaw_deg": 0}}],
+        "resolution": 0.05, "origin": [0, 0, 0],
+    }
+    def running(): return ("demo", "")
+    def resolve(name): return {"ok": True, "exists": True, "stale": False, "tags": tags, "warnings": [], "fingerprint": {"ok": True, "changed": False, "reasons": []}}
+    def info(name, *args): return {"meta_ok": True, "resolution": 0.05, "origin": [0, 0, 0]}
+    def validate(name, x, y, *args, **kwargs): return {"ok": True, "in_bounds": True, "on_obstacle": False, "on_unknown": False,
+                                                        "edge_margin_m": 1.0, "clearance_m": 1.0, "reasons": []}
+    def hit(zone, x, y): return 0 <= x <= 10 and 0 <= y <= 5
+    return dict(running_map_name=running, resolve=resolve, map_info=info, validate_point=validate,
+                fingerprint_check=lambda tags, info: {"ok": True, "changed": False, "reasons": []}, zone_hit=hit)
+
+
+@pytest.fixture
+def nav(nav_deps):
+    module = importlib.import_module("LLM.car_mcp.car_nav")
+    return module.CarNav(**nav_deps)
+
+
+def test_nav_place_exact_alias_and_rejects_ambiguous(nav):
+    assert nav.resolve_place(" 护士站 ")["target"]["goal_source"] == "destination"
+    assert nav.resolve_place("护士台")["ok"] is False
+    assert "不唯一" in nav.resolve_place("护士台")["error"]
+    assert nav.resolve_place("不存在")["ok"] is False
+
+
+def test_nav_zone_explicit_and_nearest_destination_fallback(nav):
+    explicit = nav.resolve_zone("一区")
+    assert explicit["ok"] and explicit["target"]["goal_source"] == "explicit"
+    fallback = nav.resolve_zone("一区")
+    assert fallback["ok"]
+
+
+def test_nav_point_and_input_validation(nav):
+    assert nav.resolve_point(1, 2, 90)["ok"]
+    for value in [True, "1", float("nan"), float("inf")]:
+        assert nav.resolve_point(value, 2)["ok"] is False
+
+
+def test_nav_fail_closed_map_and_validate_failures(nav, nav_deps):
+    for field, value in [("running_map_name", lambda: ("", "unknown")),
+                         ("resolve", lambda name: {"ok": False, "error": "missing"}),
+                         ("map_info", lambda *a: {"meta_ok": False}),
+                         ("validate_point", lambda *a, **k: {"ok": False, "reasons": ["障碍"]})]:
+        deps = dict(nav_deps); deps[field] = value
+        module = importlib.import_module("LLM.car_mcp.car_nav")
+        obj = module.CarNav(**deps)
+        assert obj.resolve_point(1, 2)["ok"] is False
+
+
+def test_nav_zone_without_goal_does_not_create_centroid(nav, nav_deps):
+    deps = dict(nav_deps)
+    deps["resolve"] = lambda name: {"ok": True, "exists": True, "tags": {"destinations": [],
+        "zones": [{"name": "空区", "shape": "rect", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]]}],
+        "resolution": 0.05, "origin": [0, 0, 0]}, "fingerprint": {"ok": True, "changed": False}}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    out = obj.resolve_zone("空区")
+    assert out["ok"] is False and "停靠点" in out["hint"]
+
+
 def test_race_dispatch_first_stop_publishes_immediately_then_again(rig):
     link, ctrl, _, stop, *_ = rig
     link.readiness()
