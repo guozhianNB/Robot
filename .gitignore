@@ -26,6 +26,7 @@ LLM/data/graph
 LLM/data/chroma
 LLM/data/*.log
 /LLM/vision_mcp/*.log
+/LLM/notice_mcp/*.log
 # 地图源注册表（运行时数据：首启由 ROBOT_IP/MAPS_IO 等环境变量种入，含主机与路径）
 LLM/data/maps_sources.json
 

@@ -4,9 +4,10 @@ r"""
   - 角色设定：温柔护工 System Prompt + 安全红线 + 老人风格注入 + RAG 记忆注入 + 历史摘要
   - 思考路由层：关键词预分类，棘手/敏感/健康类问题自动 thinking on，日常秒回
   - 上下文管理：滚动窗口 + 历史摘要
-  - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成，最多 2 轮
+  - 工具调用循环：模型输出 tool_calls → 执行（联网）→ 结果回填 → 继续生成
 """
 import json
+import threading
 import time
 
 from ..store import db
@@ -15,7 +16,8 @@ from . import memory as rag
 from . import tools as tool_mod
 from ..conf import (MODEL, THINKING_KEYWORDS, THINKING_EMOTION_WORDS,
                    ROUTER_LLM_MIN_LEN, HISTORY_WINDOW, SUMMARY_THRESHOLD,
-                   LLM_TIMEOUT, PROMPT_FILE)
+                   LLM_TIMEOUT, PROMPT_FILE, REACT_PROMPT_FILE, DEFAULT_SETTINGS,
+                   REACT_MAX_TOOL_ROUNDS)
 # 角色策略（提示词片段/工具白名单/数据可见范围）：分层用户体系，见 LLM/agent/policy.py
 from .policy import role_policy
 
@@ -24,6 +26,15 @@ from mcp.client.session import ClientSession
 
 # stdio_client：用来把你的mcp服务端程序，启动为一个子进程，通过标准输入输出和客户端通信
 from mcp.client.stdio import stdio_client
+
+# ---- 思考档位阶梯（规格 2026-09-17-thinking-mode-switch-design.md D1/D5）----
+# 前端五档 → DeepSeek 的 `reasoning_effort`（官方映射：minimal→low、medium→high、xhigh→high、
+# ultra→max；实测 `ultra` 会 400，故只用 low/high/max 三档）。`auto` 不进这张表：它走思考路由。
+THINKING_MODES = ("auto", "none", "low", "high", "max")
+FORCED_EFFORTS = {"low": "low", "high": "high", "max": "max"}
+LEGACY_MODE_ALIASES = {"on": "high", "off": "none"}   # 旧三档值兼容（前端/设置里可能还留着）
+DEFAULT_ROUTED_EFFORT = "high"   # auto / 安全网命中时的思考强度
+THINKING_MODE_CN = {"auto": "自动", "none": "不思考", "low": "轻度", "high": "中度", "max": "重度"}
 
 # ---- P2a 记忆召回节流缓存（对标 MaiBot heuristic 记忆的缓存思想，省 embedding/上下文）----
 # 同 uid 的 RAG 召回 context 做短 TTL 缓存：短时间多轮对话复用同一份召回，避免每轮重复向量检索
@@ -109,6 +120,44 @@ def _load_prompt_base() -> str:
     return raw.strip()
 
 
+_DEFAULT_REACT_PROMPT = (
+    "【工具调用与核验规则】\n"
+    "1. 仅必要时调用工具；已有充分可靠的信息时直接回答。\n"
+    "2. 每次收到 Observation 后，核验工具的成功和充分性，确认结果足够回答当前问题。\n"
+    "3. 工具失败时，可以改参或换工具；仍无法完成时如实停止，不要假装成功。\n"
+    "4. 信息充分即答，不为凑步骤继续调用工具。\n"
+    "5. 不输出内部 Thought、工具协议或虚构结果；工具调用前最多一句不带结论的进度说明。"
+)
+
+_react_prompt_warned = False  # react.md 缺失只告警一次，恢复后允许再次告警
+_react_prompt_warn_lock = threading.Lock()
+
+
+def _load_react_prompt() -> str:
+    """读取 ReAct 提示词正文；文件异常时使用内置保底且不阻断对话。"""
+    global _react_prompt_warned
+    try:
+        raw = REACT_PROMPT_FILE.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        should_warn = False
+        with _react_prompt_warn_lock:
+            if not _react_prompt_warned:
+                _react_prompt_warned = True
+                should_warn = True
+        if should_warn:
+            audit.log("chat", action="prompt_react_missing", file=str(REACT_PROMPT_FILE))
+        return _DEFAULT_REACT_PROMPT
+    with _react_prompt_warn_lock:
+        _react_prompt_warned = False
+    marker_idx = None
+    for i, line in enumerate(raw.splitlines()):
+        if line.strip() == "<!-- PROMPT -->":
+            marker_idx = i
+    if marker_idx is not None:
+        raw = "\n".join(raw.splitlines()[marker_idx + 1:])
+    return raw.strip()
+
+
 # ---- 角色片段（分层用户体系）：LLM/agent/prompt/{ward,elder,admin}.md ----
 # 与 base.md（共用 base：人设 + 安全红线）叠加：base 管"怎么说"，角色片段管"现在跟谁说话"。
 _prompt_role_warned: set[str] = set()   # 某个角色片段缺失只告警一次，避免刷审计日志
@@ -177,6 +226,48 @@ def llm_json(client, model: str, prompt: str, timeout: int = LLM_TIMEOUT) -> dic
         return json.loads(text)
     except Exception:
         return {}
+
+
+def _apply_thinking_mode(mode: str, routed: dict) -> tuple[str, str, str, str]:
+    """把手动档位与路由结果合成最终**思考强度**（规格 2026-09-17-thinking-mode-switch-design.md D1/D5）。
+
+    档位是五档阶梯：`none`(不思考) / `low`(轻度) / `high`(中度) / `max`(重度) / `auto`(自动)。
+    手动档位**叠加**在思考路由之上，不是替换：
+      - low/high/max：用户要深思 → 一律按该强度思考（method=manual）；
+      - none：用户要快答 → 只压制**非敏感**问题的思考；命中关键词/情绪词/LLM 预判的
+              问题**照旧加深**（强度取 DEFAULT_ROUTED_EFFORT，安全网手动关不掉，用户口径
+              「敏感词自动加深思考功能不改」）。此时 reason/method 保持路由原值，绝不谎报 manual；
+      - auto：完全照路由（日常不思考，敏感问题加深）。
+    返回 (effort, reason, method, mode)，`effort` 为 None 表示不思考。
+    """
+    on, reason, method = routed["on"], routed["reason"], routed["method"]
+    if mode in FORCED_EFFORTS:
+        return FORCED_EFFORTS[mode], f"用户手动选择：{THINKING_MODE_CN.get(mode, mode)}", "manual", mode
+    if mode == "none":
+        if on:
+            return DEFAULT_ROUTED_EFFORT, f"敏感话题已自动加深：{reason}", method, mode
+        return None, "用户手动关闭", "manual", mode
+    return (DEFAULT_ROUTED_EFFORT if on else None), reason, method, "auto"
+
+
+def _resolve_thinking_mode(thinking: str, settings: dict) -> str:
+    """请求体显式档位 > 持久化设置 > auto（语音轮次不过前端，只能靠 settings 吃手动档位）。
+    旧三档值 `on`/`off` 一律别名到 `high`/`none`（缓存里的老前端 bundle / 老设置都能跑）。"""
+    if thinking in THINKING_MODES:
+        return thinking
+    if thinking in LEGACY_MODE_ALIASES:
+        return LEGACY_MODE_ALIASES[thinking]
+    fallback = str(settings.get("thinking_mode") or DEFAULT_SETTINGS.get("thinking_mode", "auto"))
+    fallback = LEGACY_MODE_ALIASES.get(fallback, fallback)
+    return fallback if fallback in THINKING_MODES else "auto"
+
+
+def _thinking_extra(effort: str | None) -> dict:
+    """extra_body 部分：只放 `thinking` 开关。**`reasoning_effort` 绝不能塞这里** ——
+    它必须是顶层参数（`client.chat.completions.create(reasoning_effort=...)`，openai 3.3.1
+    的签名里有），塞进 extra_body 会被服务端当未知字段静默忽略，
+    表现就是用户看到的「选了强制/中度，模型照样不思考」。"""
+    return {"thinking": {"type": "enabled"}} if effort else {"thinking": {"type": "disabled"}}
 
 
 def route_thinking(text: str, settings: dict, llm_client=None, model: str = MODEL) -> dict:
@@ -261,6 +352,9 @@ def build_system(uid: str, settings: dict, query: str = "", principal: dict | No
     role_txt = _load_role_prompt(p.get("role"))
     if role_txt:
         parts.append("\n" + role_txt)
+    react_txt = _load_react_prompt()
+    if react_txt:
+        parts.append("\n" + react_txt)
 
     if scope == "self":                      # 老人层：本人档案/记忆/画像
         recall_ctx = _recall_cached(data_uid, query) if query else rag.recall_v3(data_uid, "")["context"]
@@ -389,6 +483,11 @@ async def mcp_init(client, model: str):
             _mcp_session = session
 
 _VISION_LOG_SNIPPET = "[视觉结果未写入日志]"
+_REACT_FINALIZE_PROMPT = (
+    "工具调用次数已达上限。不要再调用工具；请仅根据已有工具结果直接回答用户，"
+    "并如实说明尚未完成或无法确认的部分。"
+)
+_REACT_LOCAL_TERMINAL_REPLY = "这次没能完成，我先停在这里，请稍后再试。"
 
 
 def _tool_log_fields(name: str, args, snippet: str):
@@ -401,116 +500,254 @@ def _tool_log_fields(name: str, args, snippet: str):
     return {}, _VISION_LOG_SNIPPET
 
 
+def _parse_tool_arguments(raw: str) -> tuple[dict | None, dict | None]:
+    """Parse model-provided arguments without allowing non-object JSON into tools."""
+    def reject_non_finite(value: str):
+        raise ValueError(f"不允许非有限数值 {value}")
+
+    try:
+        args = json.loads(raw or "{}", parse_constant=reject_non_finite)
+    except (ValueError, TypeError) as exc:
+        return None, {
+            "ok": False,
+            "type": "invalid_arguments",
+            "error": f"工具参数 JSON 解析失败：{exc}",
+        }
+    if not isinstance(args, dict):
+        return None, {
+            "ok": False,
+            "type": "invalid_arguments",
+            "error": "工具参数必须是 JSON 对象",
+        }
+    return args, None
+
+
+def _collect_buffered_response(stream):
+    """Collect a tool-disabled response before deciding whether its content is safe to publish."""
+    content_chunks = []
+    reasoning_chunks = []
+    tool_calls = {}
+    finish = None
+    for chunk in stream:
+        choice = chunk.choices[0]
+        delta = choice.delta
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            reasoning_chunks.append(reasoning)
+        content = getattr(delta, "content", None)
+        if content:
+            content_chunks.append(content)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            call_id = getattr(tc, "id", None)
+            function = getattr(tc, "function", None)
+            if call_id:
+                slot["id"] += call_id
+            if function and getattr(function, "name", None):
+                slot["name"] += function.name
+            if function and getattr(function, "arguments", None):
+                slot["args"] += function.arguments
+        if choice.finish_reason:
+            finish = choice.finish_reason
+            break
+    return {
+        "content": "".join(content_chunks),
+        "content_chunks": content_chunks,
+        "reasoning_chunks": reasoning_chunks,
+        "tool_calls": tool_calls,
+        "finish": finish,
+    }
+
+
 def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, settings: dict,
                 principal: dict | None = None):
     """
     核心生成器：逐条 yield SSE 事件 dict。
       {"type":"reasoning"|"content"|"tool_start"|"tool_result"|"done"|"error", ...}
-    工具循环最多 2 轮，防止模型无限调工具。
     """
-    # 思考路由（规则 + 情绪词 + LLM 预判兜底）
+    # 思考路由（规则 + 情绪词 + LLM 预判兜底）+ 手动档位叠加（见 _apply_thinking_mode）
     routed = route_thinking(user_text, settings, llm_client=client, model=model)
-    thinking_on, reason, method = routed["on"], routed["reason"], routed["method"]
-    if thinking == "on":
-        thinking_on, reason, method = True, "用户手动开启", "manual"
-    elif thinking == "off":
-        thinking_on, reason, method = False, "用户手动关闭", "manual"
+    mode = _resolve_thinking_mode(thinking, settings)
+    effort, reason, method, mode = _apply_thinking_mode(mode, routed)
+    thinking_on = effort is not None
 
     # 历史读写也必须与权限口径同源：客户端传来的 uid 不可信（R1），否则会把别人的私聊注入
     # 当前会话、并把回答写进别人的历史（R5 的旁路）。`meta` 里报的也是这个**实际生效**的
     # 数据主体（前端若与入参比对，能看出伪造/过期的 uid 已被忽略）。
     data_uid = (principal.get("uid") or uid) if principal is not None else uid
 
-    yield {"type": "meta", "router": {"on": thinking_on, "reason": reason, "method": method,
-                                      "uid": data_uid}}
+    yield {"type": "meta", "router": {"on": thinking_on, "effort": effort, "reason": reason,
+                                      "method": method, "mode": mode, "uid": data_uid}}
 
     messages = build_messages(data_uid, user_text, thinking_on, settings, principal=principal)
     tools = tool_mod.effective_tools(settings, principal)
 
     full_assistant = ""
+    reasoning_text = ""          # 思维链累计（只用于审计字数，不落库、不播报）
+    retried_no_thinking = False   # 空回复兜底只允许降级一次（防死循环）
+    tool_rounds = 0
+    finalizing = False
+    terminal_response_content = ""
+    finalize_protocol_violation = False
     try:
         #--------------------------
         # 1、调用模型生成器，stream=True 流式输出
-        for round_i in range(2):
-            extra = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"} if thinking_on \
-                else {"thinking": {"type": "disabled"}}
+        while True:
+            extra = _thinking_extra(effort)
+            request_tools = None if finalizing else (tools or None)
             try:
                 stream = client.chat.completions.create(
                     model=model, messages=messages, stream=True,
-                    tools=tools or None, tool_choice="auto" if tools else None,
+                    tools=request_tools, tool_choice="auto" if request_tools else None,
+                    reasoning_effort=effort,
                     extra_body=extra,
                 )
             except Exception as e:
                 # thinking+工具冲突等：降级重试一次（去掉 thinking 或去掉工具）
-                if thinking_on:
-                    thinking_on = False
-                    yield {"type": "meta", "router": {"on": False, "reason": f"重试降级：{e}",
-                                                      "uid": data_uid}}
-                    extra = {"thinking": {"type": "disabled"}}
+                if effort:
+                    effort, thinking_on = None, False
+                    yield {"type": "meta",
+                           "router": {"on": False, "effort": None, "reason": f"重试降级：{e}",
+                                      "mode": mode, "uid": data_uid}}
+                    extra = _thinking_extra(None)
                     stream = client.chat.completions.create(
                         model=model, messages=messages, stream=True,
-                        tools=tools or None, tool_choice="auto" if tools else None,
+                        tools=request_tools, tool_choice="auto" if request_tools else None,
                         extra_body=extra,
                     )
                 else:
                     raise
         #-------------------------
+            if finalizing:
+                response = _collect_buffered_response(stream)
+                for reasoning in response["reasoning_chunks"]:
+                    reasoning_text += reasoning
+                    yield {"type": "reasoning", "content": reasoning}
+                terminal_response_content = response["content"]
+                finalize_protocol_violation = bool(response["tool_calls"])
+                if not finalize_protocol_violation:
+                    for content in response["content_chunks"]:
+                        full_assistant += content
+                        yield {"type": "content", "content": content}
+                break
+
             # 解析流式输出，逐条 yield SSE 事件
             tool_calls = {}
             finish = None
+            response_content = ""
+            response_reasoning = ""
             for chunk in stream:
                 choice = chunk.choices[0]
                 delta = choice.delta
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
+                    reasoning_text += reasoning
+                    response_reasoning += reasoning
                     yield {"type": "reasoning", "content": reasoning}
-                if delta.content:
-                    full_assistant += delta.content
-                    yield {"type": "content", "content": delta.content}
-                for tc in (delta.tool_calls or []):
+                content = getattr(delta, "content", None)
+                if content:
+                    response_content += content
+                    full_assistant += content
+                    yield {"type": "content", "content": content}
+                for tc in (getattr(delta, "tool_calls", None) or []):
                     slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-                    if tc.id:
-                        slot["id"] += tc.id
-                    if tc.function and tc.function.name:
-                        slot["name"] += tc.function.name
-                    if tc.function and tc.function.arguments:
-                        slot["args"] += tc.function.arguments
+                    call_id = getattr(tc, "id", None)
+                    function = getattr(tc, "function", None)
+                    if call_id:
+                        slot["id"] += call_id
+                    if function and getattr(function, "name", None):
+                        slot["name"] += function.name
+                    if function and getattr(function, "arguments", None):
+                        slot["args"] += function.arguments
                 if choice.finish_reason:
                     finish = choice.finish_reason
                     break
 
             if finish == "tool_calls" and tool_calls:
+                tool_rounds += 1
+                resolved_calls = [
+                    (i, slot, slot["id"] or f"call_{tool_rounds}_{i}")
+                    for i, slot in sorted(tool_calls.items())
+                ]
                 # 把工具调用补进上下文，再执行
                 assistant_msg = {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": slot["id"] or f"call_{round_i}_{i}", "type": "function",
+                    {"id": call_id, "type": "function",
                      "function": {"name": slot["name"], "arguments": slot["args"] or "{}"}}
-                    for i, slot in sorted(tool_calls.items())
+                    for i, slot, call_id in resolved_calls
                 ]}
+                if response_reasoning:
+                    assistant_msg["reasoning_content"] = response_reasoning
                 messages.append(assistant_msg)
-                for i, slot in sorted(tool_calls.items()):
-                    try:
-                        args = json.loads(slot["args"] or "{}")
-                    except Exception:
-                        args = {}
+                executed_tool = False
+                for i, slot, call_id in resolved_calls:
+                    args, invalid_result = _parse_tool_arguments(slot["args"])
                     name = slot["name"]
-                    yield {"type": "tool_start", "tool": name, "args": args}
+                    yield {"type": "tool_start", "tool": name, "args": args or {}}
                     t0 = time.time()
-                    result = tool_mod.run_tool(name, args, principal)
+                    if invalid_result is not None:
+                        result = invalid_result
+                    else:
+                        executed_tool = True
+                        result = tool_mod.run_tool(name, args, principal)
                     latency = int((time.time() - t0) * 1000)
                     snippet = (result.get("result") or result.get("message")
                                or result.get("error") or "")[:500]
-                    log_args, log_snippet = _tool_log_fields(name, args, snippet)
+                    log_args, log_snippet = _tool_log_fields(name, args or {}, snippet)
                     db.log_tool(data_uid, name, log_args, log_snippet,
                                 status="ok" if result.get("ok") else "error", latency_ms=latency)
                     audit.log("tool", uid=data_uid, tool=name, args=log_args,
                               ok=result.get("ok"), latency_ms=latency)
                     yield {"type": "tool_result", "tool": name, "ok": result.get("ok"),
                            "snippet": snippet}
-                    messages.append({"role": "tool", "tool_call_id": slot["id"] or f"call_{round_i}_{i}",
+                    messages.append({"role": "tool", "tool_call_id": call_id,
                                      "content": json.dumps(result, ensure_ascii=False)})
+                if mode == "auto" and executed_tool and effort != "high":
+                    effort, thinking_on = "high", True
+                    yield {"type": "meta",
+                           "router": {"on": True, "effort": "high",
+                                      "reason": "已取得工具结果，自动加深思考",
+                                      "method": "tool_observation", "mode": "auto",
+                                      "uid": data_uid}}
+                if tool_rounds >= REACT_MAX_TOOL_ROUNDS:
+                    messages.append({"role": "system", "content": _REACT_FINALIZE_PROMPT})
+                    audit.log("chat", action="react_budget_exhausted", uid=data_uid,
+                              tool_rounds=tool_rounds, effort=effort)
+                    finalizing = True
                 continue  # 下一轮：把工具结果交给模型
 
+            terminal_response_content = response_content
             break  # 正常结束
+
+        # 空回复兜底：思考档位下，思维链也吃 max_tokens，极端情况下（如敏感问题在 max 档
+        # 长时间自问）会"只想不说"——reasoning 有内容、content 为空，老人那边什么都听不到。
+        # 一轮没出正文就降级成不思考重来一次（只降一次，防死循环）。
+        empty_final_response = finalizing and (
+            finalize_protocol_violation or not terminal_response_content.strip()
+        )
+        empty_thinking_response = effort and not terminal_response_content.strip()
+        if (empty_thinking_response or empty_final_response) and not retried_no_thinking:
+            retried_no_thinking = True
+            audit.log("chat", action="thinking_empty_fallback", uid=data_uid, mode=mode, effort=effort)
+            yield {"type": "meta",
+                   "router": {"on": False, "effort": None, "reason": "只思考没作答，已降级重答",
+                              "mode": mode, "uid": data_uid}}
+            effort, thinking_on = None, False
+            stream = client.chat.completions.create(
+                model=model, messages=messages, stream=True,
+                tools=None, tool_choice=None, reasoning_effort=None,
+                extra_body=_thinking_extra(None),
+            )
+            response = _collect_buffered_response(stream)
+            for reasoning in response["reasoning_chunks"]:
+                reasoning_text += reasoning
+                yield {"type": "reasoning", "content": reasoning}
+            if response["tool_calls"] or not response["content"].strip():
+                full_assistant += _REACT_LOCAL_TERMINAL_REPLY
+                yield {"type": "content", "content": _REACT_LOCAL_TERMINAL_REPLY}
+            else:
+                for content in response["content_chunks"]:
+                    full_assistant += content
+                    yield {"type": "content", "content": content}
     except Exception as e:
         audit.log("chat", action="error", uid=data_uid, error=str(e))
         yield {"type": "error", "content": f"对话服务出错：{e}"}
@@ -520,6 +757,9 @@ def chat_stream(client, model: str, uid: str, user_text: str, thinking: str, set
     db.append_history(data_uid, "user", user_text)
     if full_assistant.strip():
         db.append_history(data_uid, "assistant", full_assistant)
+    # 审计带上思考档位/实际强度/思维链字数：现场排障时"参数到底传到 llm 没有"直接看审计
     audit.log("chat", action="turn", uid=data_uid, user=user_text[:200],
-              assistant=full_assistant[:200])
+              assistant=full_assistant[:200], mode=mode, effort=effort,
+              thinking_on=thinking_on, reasoning_chars=len(reasoning_text),
+              tool_rounds=tool_rounds)
     yield {"type": "done", "assistant": full_assistant}

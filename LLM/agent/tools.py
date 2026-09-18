@@ -67,6 +67,13 @@ def _audit_args(name: str, args: dict | None):
         if isinstance(channel, int) and not isinstance(channel, bool) and 1 <= channel <= 255:
             return {"channel": channel}
         return {}
+    if name == "notify_nurse":
+        # 要传达的话里可能带老人私聊原文（`message`）：拒绝记录只留级别与"有没有 uid"。
+        # 注意只脱敏**拒绝**这条路径；正常调用的工具日志照旧（那句话本来就在对话历史里）。
+        level = args.get("level") if isinstance(args, dict) else None
+        uid = args.get("uid") if isinstance(args, dict) else None
+        return {"level": level if isinstance(level, str) else "",
+                "has_uid": bool(isinstance(uid, str) and uid.strip())}
     return args or {}
 
 

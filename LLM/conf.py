@@ -16,7 +16,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "brain.db"          # SQLite：档案/记忆/提醒/工具日志/对话历史/设置
 AUDIT_LOG = DATA_DIR / "audit.jsonl"     # 审计日志（对话/记忆改动/提醒/工具调用，JSON Lines）
-PROMPT_FILE = Path(__file__).resolve().parent / "agent" / "prompt" / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+PROMPT_DIR = Path(__file__).resolve().parent / "agent" / "prompt"
+PROMPT_FILE = PROMPT_DIR / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
+REACT_PROMPT_FILE = PROMPT_DIR / "react.md"  # ReAct 工具决策规则（每次请求实时读取）
 FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
@@ -26,6 +28,13 @@ DEFAULT_SETTINGS = {
     "reminder_enabled": True,       # 定时提醒总开关
     "thinking_router_enabled": True,  # 思考路由层总开关
     "router_llm_enabled": True,     # 思考路由：规则未命中时用 LLM 快速预判兜底
+    # 思考档位阶梯（规格 docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md D5）：
+    # auto=照思考路由（日常快答/敏感问题自动加深）；none=不思考（**敏感词安全网保留**）；
+    # low/high/max=强制思考的轻/中/重度（映射 DeepSeek 顶层 reasoning_effort=low/high/max；
+    # 官方 minimal/medium/xhigh/ultra 会归并到 low/high/max，实测传 ultra 直接 400）。
+    # 旧值 on→high、off→none 由 chat._resolve_thinking_mode 兼容，无需数据迁移。
+    # 非特权键：kiosk 端也要能切（语音轮次不过前端，只有落库的设置才能让语音也吃到手动档位）。
+    "thinking_mode": "auto",
     "memory_consolidation_enabled": True,  # 记忆整理（话题结束后批量沉淀）
     "consolidate_idle_sec": 30,     # 对话空闲多久秒后视为"话题结束"触发记忆整理
     "recycle_purge_days": 30,       # 回收站软删记忆保留多少天后物理清理
@@ -203,6 +212,12 @@ EPISODE_TTL_DAYS = 90              # 经历片段（Episode）记忆时效：一
 # 提醒状态机
 REMINDER_STATUS = ["pending", "triggered", "unconfirmed", "confirmed", "missed"]
 
+# ---- 通知中心（护士台数据底座，模块 11）----
+NOTIFY_DEDUP_S = 60          # 去重合并窗口（秒）
+NOTIFY_KEEP_DAYS = 30        # 已处理通知保留天数
+NOTIFY_LIST_LIMIT = 50       # 列表默认条数上限
+NOTIFY_BODY_MAX = 500        # 正文截断长度
+
 # ---- 记忆系统 v3：embedding ----
 EMBED_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EMBED_MODEL = "text-embedding-v3"
@@ -229,6 +244,25 @@ IDENTITY_KEYWORDS = ["姓名", "年龄", "生日", "性别", "床位", "床号",
 import sys as _sys
 _NPX = "npx.cmd" if _sys.platform == "win32" else "npx"
 
+# 护士后台投递口地址（LLM/notice_mcp 子进程用；规格 docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md）。
+# 默认**本机**：后端与它同机跑（PC 上的常规部署）；「LLM 不跟后端同机」时把 NOTICE_BACKEND_URL
+# 设成后端地址即可（跨机部署代码零改动）。投递口 `POST /api/notifications` 免鉴权，见通知中心规格 D4。
+NOTICE_BACKEND_URL = ((os.environ.get("NOTICE_BACKEND_URL") or "").strip()
+                      or "http://127.0.0.1:8000").rstrip("/")
+
+# notice MCP 子进程需要显式继承的可选项（照 `_vision_mcp_env()` 的惯例）：只在环境变量实际
+# 设置时传下去，避免用空串覆盖 notice_client / notice_server 内的默认值。
+_NOTICE_ENV_NAMES = ("NOTICE_TIMEOUT_S", "NOTICE_MCP_LOG")
+
+
+def _notice_mcp_env() -> dict[str, str]:
+    """Build the environment overrides for the notice MCP child process."""
+    env = {"NOTICE_BACKEND_URL": NOTICE_BACKEND_URL}
+    for name in _NOTICE_ENV_NAMES:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
 # MCP工具列表
 MCP_SERVERS: dict[str, dict] = {
     # 网页抓取（需要本机有 node/npx，首次会自动 npx 下载包）：
@@ -248,6 +282,16 @@ MCP_SERVERS: dict[str, dict] = {
         "enabled": True,
         "roles": ["elder", "admin"],
     },
+    # 护士传达（把一条话推给护士台）：让"我这就去通知护士"这句话真的能做到。
+    # roles 三层都给 —— 声纹识别失败会 fail-closed 落到 ward 层，那里堵死等于"老人求助喊不出来"。
+    # 代价：未识别的说话人也能刷护士台（有 60s 去重兜底）；不想要就删掉 "ward"。
+    "notice": {
+        "command": _sys.executable,
+        "args": [str(BASE_DIR / "LLM" / "notice_mcp" / "notice_server.py")],
+        "env": _notice_mcp_env(),
+        "enabled": True,
+        "roles": ["elder", "ward", "admin"],
+    },
 }
 
 MCP_TOOL_TIMEOUT = 30             # 单次 MCP 工具调用超时（秒）
@@ -256,3 +300,4 @@ MCP_CONNECT_TIMEOUT = 60          # 单台服务器握手超时（秒）
 # LLM 参数
 MODEL = "deepseek-v4-flash"
 LLM_TIMEOUT = 60
+REACT_MAX_TOOL_ROUNDS = 4

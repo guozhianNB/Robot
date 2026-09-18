@@ -896,3 +896,96 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - **风格统一**：`voice/worker.py` 两处函数内延迟导入原为绝对形式 `from LLM.agent import session`，改为 `from ..agent import session`，与关键约定 §6 一致。
 - **复查结论**：25 个新路径全部可导入、25 个旧路径全部不可导入；`conf.py` 三处 `__file__` 推导、`tools.py` 的 `pkgutil` 自动加载、`PROMPT_FILE`/`PROMPT_DIR` 均落位正确；`stm32/`、`ros2_car/`、`scripts/`、`vision/`、`UI(old)/`、根目录文档**无残留**。改完后重跑 `--collect-only` 仍是 **542 collected / 0 errors**。
 - **按原样保留**：`docs/log.md` ≤09-15 旧条目里的路径是"当日事实"（日记体），与 `docs/superpowers/plans|specs` 同理，不做回改。仅提示本文件里两条命令今天照抄会失败：`306` 的 `python -c "import LLM.tools"`、`492` 的 `py_compile … LLM\voice_api.py`。
+
+## 2026-09-17（续）· 思考档位手动切换 + 思维链上屏（不进 TTS）
+
+**依据：** 用户需求「现在的 llm 对话是默认快速不思考的。我希望你能在前端增加一个选择按钮，手动切换思考模式。但敏感词自动加深思考功能不改。当手选思考强度为不思考时触发敏感问题思考功能，以后者确定的思考深度为准。对话中要展示思维链，注意不要让思维链进入 tts」；规格 `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md`。
+
+### 改了什么
+
+| 文件 | 内容 |
+|------|------|
+| `LLM/agent/chat.py` | 新增 `_apply_thinking_mode()` / `_resolve_thinking_mode()`；`chat_stream` 的 `meta` 事件带 `router.mode` |
+| `LLM/conf.py` | `DEFAULT_SETTINGS["thinking_mode"] = "auto"`（非特权键，kiosk 也能改） |
+| `LLM/voice/voice_api.py` | 语音轮次调 `chat_stream` 时第 5 参数由 `"auto"` 改 `""`——**不改这一处，用户在界面上选的档位对语音完全无效** |
+| `LLM/voice/worker.py` | 新增 `reasoning` → 总线 `chat_reasoning` 广播（思维链上屏）；`content` 才分句合成 |
+| `LLM/server.py` | `chat_route` 把 content 喂 TTS 改显式分支 + 注释锁边界 |
+| `frontend/packages/shared/src/thinking.ts`（新） | `ThinkingMode` / `nextThinkingMode` / `normalizeThinkingMode` / `thinkingModeLabel` / `THINKING_MODE_HINT` |
+| `frontend/packages/shared/src/events.ts` | `ChatReasoningEvent` + `KNOWN_TYPES` 同步 |
+| `frontend/packages/admin/src/pages/ChatPage.vue` | 工具栏「🧠 思考：自动/强制/关闭」循环按钮（落 `settings.thinking_mode`，5s 轮询同步）+ 气泡内可折叠「💭 思考过程」 |
+| `frontend/packages/kiosk/src/App.vue` / `components/ChatArea.vue` / `components/SettingsSheet.vue` | 底部一键轮换按钮 + 设置弹层三档单选 + 对话区思考块（默认展开可收起） |
+
+### 关键决策
+
+- **`off` 关不掉安全网**：`on` 一律深思；`off` 只压制非敏感问题，命中 `THINKING_KEYWORDS`/情绪词/LLM 预判的问题**照旧加深**，且 `method` 如实上报 `keyword|emotion|llm`（reason 前缀「敏感话题已自动加深：」），绝不谎报成 `manual`。`auto` 行为不变。
+- **档位落地位置**：请求体显式值 > `settings.thinking_mode` > `auto`；只有**空串/缺省**才回读 settings。语音轮次不过前端，所以 `voice_api._stream_fn` 传空串（这一条有专门用例锁死）。
+- **思维链三不进**：不进 TTS（两条链路都只对 `content` 合成）、不进 DB（`append_history` 只写 assistant 正文，历史回读不重播思考）、不进语音播报文字广播。
+- 不加"思考强度档位"（`reasoning_effort` 仍固定 high）；不改 `route_thinking` 的判定逻辑一个字。
+
+### 验证
+
+- `pytest LLM/tests`：**4 failed, 166 passed, 135 errors** vs 基线（stash 后重跑）**4 failed, 150 passed, 135 errors** —— 失败集合完全一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件顺序污染/环境相关红态），新增 16 例全绿。135 errors 是本机沙箱下 `tmp_path` 不可建的既有环境限制。
+- 新增 `LLM/tests/test_thinking_mode.py`（档位优先级/安全网/meta/端到端）与 `test_worker_events.py::test_reasoning_is_shown_but_never_synthesized`（思维链广播了、但合成的字符串里一个字都没有）。
+- `pnpm -r test`：4 文件 24 例全绿（含新增 `shared/tests/thinking.test.ts` 5 例）；`pnpm --filter admin build`、`pnpm --filter kiosk build` 均成功，产物已由后端 8000 静态托管。
+- **未验**：真机/浏览器端到端（按按钮→敏感问题仍加深、语音不念思考过程）需人工；`vue-tsc` 在本机装不起来（`MODULE_NOT_FOUND`，本次改动前就坏的），故 Vue 模板类型未经 tsc 校验。
+
+### 2026-09-17（续二）· 修「选了强制也不思考」+ 思考档位改成五档阶梯
+
+**起因：** 用户实测反馈「强制模式下 llm 还是不思考啊。还有，我需要实现的样子是除了自动模式，还有强制"不思考、轻度、中度、重度"」。
+
+**根因（真 bug，已实测定位）：** 原实现把 `{"thinking": {...}, "reasoning_effort": "high"}` 整个塞进 `extra_body`。DeepSeek 只认 `extra_body.thinking`，**`reasoning_effort` 必须是顶层参数**（openai 3.3.1 的 `Completions.create` 签名里有这个形参），塞进 extra_body 会被当未知字段静默忽略——于是「开思考」生效、强度永远停在默认档，叠加当时前端根本不渲染 `reasoning` 事件，表现就是「强制也不思考」。修法：`extra_body` 只放 thinking 开关，`reasoning_effort` 走顶层形参（`_thinking_extra()` + 调用点）。
+
+**改成五档：** `auto` 自动 / `none` 不思考 / `low` 轻度 / `high` 中度 / `max` 重度。判定返回**强度**而不是布尔：
+- `low/high/max` → 该强度、`method=manual`；
+- `none` → 只压制非敏感问题，敏感词/情绪/LLM 预判命中照旧按 `high` 加深（`method` 仍如实报 `keyword|emotion|llm`）；
+- `auto` → 照思考路由；旧值 `on→high`、`off→none` 做别名，不迁移数据。
+
+**实测数据（2026-09-17，本机 key，模型 `deepseek-v4-flash`）：** 同一道工程题，思维链长度 `low≈150-450` / `high≈200` / `max≈353-1939` 字，三档确有区别；`ultra` 直接 **400**（`Failed to deserialize the JSON body`），官方文档里 `minimal/medium/xhigh/ultra` 均归并到 low/high/max。可用模型：`deepseek-flash`、`deepseek-v4-pro`。生产代码端到端复验（`mode=none/low/max` → reasoning `0/445/1939` 字）通过。
+
+**顺手补的兜底：** 思考档位下思维链也吃 `max_tokens`，实测敏感问题在 `max` 档出现「reasoning 有、`content` 全空」→ 老人一个字都听不到。故 `chat_stream` 加一次降级：本轮没正文就关思考重答一次（审计 `thinking_empty_fallback`，只降一次）。
+
+**前端：** admin 工具栏改成五档下拉；kiosk 底部大按钮点开五档菜单 + 设置弹层五档单选；`shared/thinking.ts` 的 `ThinkingMode` 扩到五档并兼容 `on/off`。
+
+**验证：** `pytest LLM/tests` **4 failed / 173 passed / 135 errors** vs 基线 **4 failed / 150 passed / 135 errors**（失败集合完全一致，全是既有红态）；`test_thinking_mode.py` 22 例全绿；`pnpm -r test` 25 例全绿；admin/kiosk 构建通过。
+**生效前提：** 后端改动需**重启 uvicorn**（当前 8000 上的进程跑的还是旧代码），前端需**硬刷新**（Ctrl+F5）——这正是用户上一轮「按了强制还是不思考」的另一个原因：前台 bundle 与后台进程都还是旧的。
+
+### 2026-09-18（续）· 小车 LLM 向护士后台传达信息：MCP 工具 `notify_nurse`
+
+**起因：** 用户「制作一个 mcp 工具，让小车 llm 能够向护士后台推送传达信息」。现状核查发现这**不是新需求缺口，而是人设红线早就承诺、却没有工具兑现**：`LLM/agent/prompt/base.md:36` 写着危险信号要「明确说出『我这就去通知护士』」，`elder.md:4` 写着「危险信号先安抚再叫护士」，需求文档模块 11 也要求「我帮您问护士，并把问题转达」——但模型手上没有任何工具能真的通知护士（通知只能来自 kiosk SOS 按钮、`reminder._escalate` 超时、外部 POST，**对话链路一条都进不去**），它只能说、不能做。
+
+**方案（用户拍板 A）：** 新建 MCP 子进程 `LLM/notice_mcp/`（`notice_client.py` = 纯 stdlib 业务层，可脱离 MCP 单测；`notice_server.py` = MCP 2.0 注册层），工具 `notify_nurse(message, level=info|warning|critical, uid="")`，HTTP 投递到免鉴权投递口 `POST /api/notifications`（通知中心规格 D4）→ `notify.ingest()` **唯一写入口** → 归一化/60s 去重合并/审计/`bus.publish` 广播全在，护士台 5 秒内弹卡。服务端固定 `source="cart"`（对上护士台「小车」筛选页签）、`type="message"`。
+
+**两个被否的方案与原因：** ① 本地工具 `LLM/tool/*.py` 直调 `notify.ingest`——不是 MCP、只在后端进程内可用；② 子进程直写 SQLite——绕过去向重复合并/审计/广播，护士台要等 30s 轮询才有卡，且违反"notify 是唯一写入口"。
+
+**"子进程回调后端"的自环裁定（D3）：** `vision_client.py` 里有一条"刻意不走后端 HTTP，那会形成自环"的既有评注，本设计**不违反**它——识图有本地可用路径（vision 包），绕后端纯属自找麻烦；而通知的真相**只能**由后端进程内的 `notify.ingest` 产出（SSE 总线是进程内的，子进程 publish 没有订阅者），走 HTTP 反而是唯一不丢实时性的路。安全边界：请求只发生在**工具调用瞬间**（那时后端必然在监听）；对话流是 sync 生成器交 Starlette 线程池（`server.py::chat_route`）跑的，**不占事件循环**，不会自锁；**启动不做任何网络探测**（后端重启期间工具不失踪，只在调用时返回 `ok:false`）。
+
+**接线（3 处既有文件最小插行）：** `conf.NOTICE_BACKEND_URL`（env 可覆盖，默认 `http://127.0.0.1:8000`，跨机部署零改动）+ `MCP_SERVERS["notice"]`（`command=sys.executable`、`roles=["elder","ward","admin"]`）；`policy.py` 把 `notify_nurse` 加进 ward/elder 白名单（admin 是 `None` 不裁剪）——**ward 也给**：声纹识别失败会 fail-closed 落到集体层，那里堵死等于"老人求助喊不出来"（R3 精神），代价是未识别的说话人也能刷护士台（60s 去重兜底），不要就把两处的 ward 那条删掉。**隐私**：闸门拒绝时的审计参数脱敏（`tools.py::_audit_args` 新增分支，只留 `{level, has_uid}`，不留 `message` 原文）。
+
+**验证：** 新增 `LLM/tests/test_notice_mcp.py` 31 例（HTTP 桩走 127.0.0.1 随机端口，**不碰 8000、不起 uvicorn**）；`pytest LLM/tests` **4 failed / 233 passed / 135 errors** vs 基线（`git worktree` 于 `1bad0c2` 独立重跑）**4 failed / 199 passed / 135 errors** —— 失败集合逐条一致（`test_policy_tools`×2、`test_settings_roles`、`test_worker_events`，均为既有的跨文件 DB_PATH 顺序污染/环境红态），净增 34 例全绿。规格里写的 `notice_client.available()` 未实现（没有"本地依赖缺失"可判，启动又不许探网），改为 `backend_url()/endpoint()` 两个调试入口。
+
+**独立审查子代理 + 修复轮（2026-09-18，同批）：** 裁定"需修复后通过"，两条必修 + 六条建议全部落地。
+- **M1（安全相关，必修）：合并语义会静默吞掉"同分钟内第二条不同的事"。** 去重键只有 `(source,type,uid)`，而新工具的 `uid` 通常为空 ⇒ **所有小车消息**在 60s 内塌成一条，且合并只 `count+1`、保留最早那条的正文与级别；实时广播却用新正文 ⇒ 护士台 ≤30s 后被列表轮询覆盖回最早那条，**critical 计数不涨、重开页面不再蜂鸣**（「张爷爷想喝水」吞掉「李奶奶摔倒了」）。**已修根因**（跨批次，共 3 处后端 + 3 条用例）：`db.find_unacked_notification` 合并键加 `body`；`db.bump_notification` 支持**只升不降**地提级别（`notify._higher_level` 算 max，级别词表留在 agent 层）；`notify.ingest` 合并时**广播与库里那一行对齐**。护士台规格 D5/§4.2 同步修订（前端一行未动）。**对 `/api/alarm`、`reminder._escalate` 这类"同一次事件重复上报"（正文相同）无行为变化**。
+- **M2（必修）：规格 §7 的"调用记录"没实现。** 已补：每次 `notify_nurse` 调用写一行 `notice_mcp.log`（`level/has_uid/ok/deduped/id`，**不记 message 原文**），异常分支也留痕（带异常文本）。
+- **建议项**：`level` 归一改为大小写不敏感 + 近义词**往上归**（`Critical/high/severe/urgent→critical`，`medium→warning`）——原实现把 `Critical` 静默降成 info，跌倒反而不响蜂鸣；成功判定收紧为 `{"ok": true}`（原来 `{"ok":false,"id":7}` 会被当成功、模型会对老人撒谎）；补 `conf._notice_mcp_env()` 让 `NOTICE_TIMEOUT_S`/`NOTICE_MCP_LOG` 真能传到子进程（原先只在单跑 server 时有效）；补两条防退化用例（`notify_nurse` 不在本地工具注册表、`MESSAGE_MAX == conf.NOTIFY_BODY_MAX`）；闸门拒绝用例断言收紧为精确文案 + 审计 `reason`（原来与总开关分支文案撞车、会因错误原因变绿）；`_post` 兜底错误带上异常文本；`main()` 的死代码分支补日志。
+- **审查侧副作用披露（已清理）**：审查子代理探测 `push(123)` 边界时，8000 上恰有实盘后端在跑，**真的投了一条 "123" 通知进真 `brain.db`**；已按行核对特征后删除（`notifications` 表恢复为空），护士台那张车卡 30s 内自行消失。教训：在跑着后端的机器上做"只读探测"也可能真写进生产数据 —— 探测一律先打桩。
+- **二轮定向复审（修复轮）裁定：通过**，另列 8 条非阻断残余，已基本清掉：`notify.py`/`db.py`/护士台规格两处旧口径注释、本文件里 `urgent→info` 的笔误；**工具回话的 `level` 改为回显后端生效级别**（合并升级时不再"工具说 info、护士台是红卡"）——这一条是端到端实测才暴露的：M1 修复后重跑真 HTTP 链路，发现 `push` 一直回显**请求**的级别而非库里那行的级别；`_higher_level` 先把词表外的级别归一到 `info` 再比；`NOTICE_MCP_LOG=""` 不再让文件日志静默失效；补"竞态回落的新行不许继承旧行级别"用例（钉住 `else: eff = lvl`）。未采纳项：`normalize_level` 收录 `alert/error` 等（规格口径是"未知兜底 info"，加词属猜测）。
+- **M1 修复的端到端复核（临时后端 8099 + 独立库）**：uid 空、type 相同、正文不同 → **各自成条**（`张爷爷想喝水`/info 与 `李奶奶摔倒了`/critical 两行）；同正文复报 → 合并 `count+1`；**拿 info 复报一条已在 critical 的行 → 仍为 critical**；`counts={unread:2, critical:1}`；SSE 级别序列 `info/critical/critical/critical` —— 紧急事件不再被静默降级或吞掉。
+
+**端到端实测（临时后端 8099 + 独立库，不碰用户 8000 与真 brain.db）：** `push(critical, uid=elder_001)` → `{ok:true,id:1,deduped:false}`，库里 `source="cart"/type="message"/title="通知"/uid_name="张建国 · 3-12"`；60 秒内重复投递同一条 → `deduped:true`、**同一行 count 自增**（护士台不刷屏）；全空白 message → 本地拒绝、**不发请求**；`level="bogus"` → 归一 `info`（`Critical/high/urgent` 之类按近义词**往上归**，不复现"跌倒被降成 info"）；`GET /api/notifications` = `{unread:2, critical:1}`；订阅 `/api/events` 收到 `{"type":"notification","source":"cart","kind":"message",…}` —— **实时广播链路通**。子进程冒烟：stdout **一个字节都没有**（不污染 MCP 协议），日志有「robot-notice MCP server 就绪」。**沙箱内做不了**：真 MCP stdio 握手（`mcp` SDK `stdio_client` 拉子进程）被 `WinError 5` 拒（沙箱不许子进程管道），该路径由进程内 `MCPServer.call_tool` 用例 + `vision_mcp` 同款样板兜住，真机验收时一并确认。
+**未验（需用户真机）：** 管理端设置页打开 `mcp_enabled` → **重启后端** → `GET /api/tools` 出现 `notify_nurse`；对小车说"我胸口疼" → 护士台出 critical 卡；停掉后端再调用应返回 `ok:false`（模型不许编造"已通知"）。
+---
+
+## 2026-09-18 · 对话编排升级为有界 ReAct Agent
+
+### 实现口径
+
+- 对话工具循环改用模型原生 `tool_calls` / `role=tool` 协议；`auto` 模式第一次请求保持原有低延时，只有工具实际执行后，后续推理才升到 `high`。
+- 单次对话最多允许四轮工具行动；工具预算耗尽后禁用工具，并强制模型根据已有 Observation 输出最终总结，避免无限循环。
+- 工具返回 `ok:false` 与非法 JSON 都作为 Observation 回传模型，让模型能够纠错或解释失败；工具参数不是合法 JSON 对象时不执行工具。
+- 不新增也不持久化 Thought。`reasoning` 仍只用于界面展示，不进入 TTS、聊天历史或记忆沉淀。
+
+### 验证
+
+- 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
+- `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
+- 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。

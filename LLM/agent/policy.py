@@ -23,7 +23,9 @@ POLICY_DEFAULTS: dict[str, dict] = {
         # 只接"安全 + 只读"两类：状态播报与急停。
         # 依据规格 §3.3 能力矩阵：`车·状态查询（位姿/电量）✅ 只读播报`、`车·急停/呼救 ✅ 永远允许（R3）`。
         # 未识别的说话人也会回落到这一层 —— 急停必须可用（空列表 = 连急停都做不了，违反 R3）。
-        "allowed_tools": ["robot_status", "robot_stop"],
+        # notify_nurse 同属"呼救"一族：声纹识别失败时老人仍要能把话传到护士台（规格
+        # 2026-09-18-llm-notify-nurse-mcp-design.md D5；代价=未识别说话人可刷护士台，有 60s 去重兜底）。
+        "allowed_tools": ["robot_status", "robot_stop", "notify_nurse"],
         "data_scope": "none",
         "ward_context": True,
     },
@@ -31,7 +33,7 @@ POLICY_DEFAULTS: dict[str, dict] = {
     "elder": {
         "prompt_file": PROMPT_DIR / "elder.md",
         # R3：急停/呼救类工具永远在列（当前仅有 robot_stop 是安全动作）
-        "allowed_tools": ["robot_status", "robot_stop", "see_what"],
+        "allowed_tools": ["robot_status", "robot_stop", "see_what", "notify_nurse"],
         "data_scope": "self",
         "ward_context": True,
     },

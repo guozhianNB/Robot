@@ -24,15 +24,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
 from .store import db
 from .core import bus
 from .agent import chat, memory as rag, reminder, tools as tool_mod
+from .agent import notify          # 通知中心（护士台数据底座，模块 11）
 from .voice import voice_api
 from .agent import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
 from .agent import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
@@ -73,6 +74,10 @@ async def lifespan(app: FastAPI):
               ragstore=ragstore.status(), graph=graph.status())
 
     _seed_demo()
+    try:
+        notify.prune()            # 通知中心：启动清一次过期已处理通知（失败不得阻断启动）
+    except Exception as e:
+        audit.log("notify_prune_error", error=str(e))
     audit.log("map_io_change", mode=conf.MAPS_IO, root=(
         conf.MAPS_SSH_ROOT if conf.MAPS_IO == "ssh" else str(conf.MAPS_DIR)))
     reminder.start()          # 独立线程的定时提醒调度器
@@ -117,6 +122,25 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _no_store_entry_html(request: Request, call_next):
+    """入口 HTML（/、/admin/、/kiosk/、/nurse/ 的 index.html）禁止缓存。
+
+    为什么必须这样：index.html 里的 `<script src="assets/index-<hash>.js">` 是**唯一**指向
+    当前构建的指针。浏览器若缓存了旧 index.html，用户按 Ctrl+F5 也只是"刷新页面"，
+    加载的仍是旧 JS —— 表现就是"代码明明改好/重启了，界面还是老样子、参数还是老参数"
+    （2026-09-18 排查思考档位时踩过：新代码在跑，页面却还在用 9 天前的 bundle）。
+    带 hash 的 assets 可以放心长期缓存，所以只对 html 入口加 no-store。"""
+    resp = await call_next(request)
+    path = request.url.path.rstrip("/") or "/"
+    if path in ("", "/", "/admin", "/kiosk", "/nurse") or path.endswith("/index.html"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
 app.include_router(mapctl.router)   # /api/mapeditor/service{,/start,/stop}（仅管理员）
 
 
@@ -303,6 +327,27 @@ class AlarmIn(BaseModel):
     type: str = "sos"          # sos / fall / health / no_activity ...
     uid: str = ""
     message: str = ""
+    source: str = "kiosk"      # 告警来源（kiosk / vision ...）：带默认值，老调用不传也照旧
+
+
+class NoticeIn(BaseModel):
+    """通知投递体（`POST /api/notifications`）：`type` 必填，其余可省。
+
+    `type` 故意给空串默认值而不是 `str` 必填：Pydantic 必填缺失会抛 422，而本接口的契约
+    是**类型问题一律 400**（与旁边 `/api/alarm` 的宽松形状同族，投递方是机器，400 更好排查）。
+    """
+    type: str = ""             # 空/缺失 → 路由 400
+    source: str = ""
+    level: str = ""            # 空/非法 → notify.ingest 按类型兜底
+    uid: str = ""
+    title: str = ""
+    message: str = ""          # → ingest(body=…)，与 /api/alarm 的字段名保持一族
+    ref: str = ""
+
+
+class AckIn(BaseModel):
+    """确认体：`by` 可省（默认 admin）。"""
+    by: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +393,8 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
         try:
             for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking,
                                        settings, principal=principal):
+                # 只有 content 进 TTS：reasoning（思维链）**绝不允许**喂给 voice_api，
+                # 否则思考过程会被播报出来（规格 2026-09-17-thinking-mode-switch-design.md D3）。
                 if ev["type"] == "content":
                     voice_api.feed_text_reply(speech, ev.get("content") or "")
                 elif ev["type"] == "done":
@@ -1063,6 +1110,84 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
 
 
+# ---------------------------------------------------------------- 通知中心（模块 11）
+# 身份口径（2026-09-18 二次修订 D11）：
+#   投递口 `POST /api/notifications` **有意免鉴权**（需求文档模块 11："任何模块发现异常都往该
+#   端口 POST" —— 告警源可能是小车/语音/巡检等无口令的一方）；
+#   读/确认三条 `GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` **同样免鉴权**
+#   ——用户拍板 D11「护士台不再需要登录、也不会被弹」，护士台打开即用，后端不再判 principal
+#   （通知内容本就经免鉴权 SSE 广播公开，LAN 内部系统，阈值低）；
+#   唯一例外：`DELETE /{nid}` 仍要管理员（删记录是数据损失，不放宽）。
+def _notice_payload(n: dict) -> dict:
+    """列表一条：补 `uid_name`（「姓名 · 床号」，无档案/无 uid 则空串）。
+
+    拼接口径与广播 payload 的 `uid_name` **共用 `notify.uid_name()`**（两处必须一致，
+    否则护士台的列表显示与实时 toast 会不一样）。
+    """
+    n["uid_name"] = notify.uid_name(n.get("uid") or "")
+    return n
+
+
+def _notice_admin(x_surface: str) -> None:
+    """通知的**删除**口：非管理员一律 403（与同族 admin 路由同形）。
+
+    只有 `DELETE /api/notifications/{nid}` 还走这里 —— 读/确认三条已按 D11 免鉴权。
+    """
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理通知")
+
+
+@app.post("/api/notifications")
+async def notice_ingest(n: NoticeIn):
+    """投递通知（**有意免鉴权**，见上）。同 key 在窗口内自动合并。"""
+    if not (n.type or "").strip():
+        raise HTTPException(status_code=400, detail="type 不能为空")
+    try:
+        # 同步 SQLite 写 + 审计追加 + 档案查询绝不能在事件循环上跑：投递口按 D4 有意
+        # 免鉴权，任何局域网客户端都能用极廉价请求把 chat/voice/SSE 串行堵住。
+        # to_thread 是安全的：bus.publish 线程安全、db 有线程锁。
+        return await asyncio.to_thread(
+            notify.ingest, n.source, n.type, level=n.level, uid=n.uid,
+            title=n.title, body=n.message, ref=n.ref)
+    except ValueError as e:                     # type 为空 → 400（不是 5xx，也不是静默吞掉）
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/notifications")
+async def notices_list(state: str = Query("all"), limit: int = Query(0),
+                       before_id: int = Query(0)):
+    # 免鉴权（D11）：护士台免登录 → 不读 principal、不认 `X-Surface`；通知内容本就经免鉴权
+    # SSE 广播对局域网公开，读列表不新增暴露面。
+    items = await asyncio.to_thread(notify.list_notices, state, limit, before_id)
+    return {"ok": True, "items": [_notice_payload(i) for i in items],
+            "counts": await asyncio.to_thread(notify.counts)}
+
+
+@app.post("/api/notifications/{nid}/ack")
+async def notice_ack(nid: int, body: AckIn | None = None):
+    # 免鉴权（D11）：护士台免登录；标记已处理不删数据，且 `notify.ack` 照旧写 `notify_ack` 审计。
+    by = (body.by if body else "") or "admin"
+    if not await asyncio.to_thread(notify.ack, nid, by):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True, "id": nid}
+
+
+@app.post("/api/notifications/ack-all")
+async def notice_ack_all(body: AckIn | None = None):
+    # 免鉴权（D11）：同上 —— 全标已处理只是清待办角标，审计仍由 `notify.ack_all` 落。
+    by = (body.by if body else "") or "admin"
+    return {"ok": True, "acked": await asyncio.to_thread(notify.ack_all, by)}
+
+
+@app.delete("/api/notifications/{nid}")
+async def notice_delete(nid: int, x_surface: str = Header(default="kiosk")):
+    # 唯一仍受保护的通知端点（D11 明确不放宽）：删记录是数据损失，必须管理员口令。
+    _notice_admin(x_surface)
+    if not await asyncio.to_thread(notify.remove, nid):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- 紧急呼叫
 @app.post("/api/alarm")
 async def alarm_report(a: AlarmIn):
@@ -1074,6 +1199,15 @@ async def alarm_report(a: AlarmIn):
     # {"type": event_type, **payload}，payload 里再用 type 会覆盖事件类型，
     # 导致广播的事件 type 变成 "sos" 而非 "alarm"，前端会丢弃该事件
     bus.publish("alarm", level="critical", alarm_type=a.type, uid=a.uid, message=a.message)
+    # 落库到通知中心（模块 11）。**对 kiosk 这是救命通道，永远返回 {"ok": True}**：
+    # notify.ingest 在 type 为空时会抛 ValueError，落库失败绝不能把这条通道变成 500，
+    # 失败写审计（不许静默吞掉）。
+    try:
+        # 同上：落库放线程池，别在事件循环上做同步 SQLite 写（救命通道也是免鉴权写口）。
+        await asyncio.to_thread(notify.ingest, source=a.source, type=a.type,
+                                uid=a.uid, body=a.message)
+    except Exception as e:  # noqa: BLE001
+        audit.log("notify_ingest_failed", path="/api/alarm", type=a.type, error=str(e))
     return {"ok": True}
 
 
@@ -1203,6 +1337,7 @@ from fastapi.responses import FileResponse
 _FRONTEND_DIST = BASE_DIR / "frontend" / "packages"
 _KIOSK_DIST = _FRONTEND_DIST / "kiosk" / "dist"
 _ADMIN_DIST = _FRONTEND_DIST / "admin" / "dist"
+_NURSE_DIST = _FRONTEND_DIST / "nurse" / "dist"      # 护士台（模块 11 面板，规格 2026-09-18）
 
 
 def _serve_dist(dist: Path, path: str):
@@ -1214,6 +1349,8 @@ if _KIOSK_DIST.exists():
     _serve_dist(_KIOSK_DIST, "/kiosk")
 if _ADMIN_DIST.exists():
     _serve_dist(_ADMIN_DIST, "/admin")
+if _NURSE_DIST.exists():
+    _serve_dist(_NURSE_DIST, "/nurse")
 
 
 @app.get("/")
