@@ -21,6 +21,8 @@ launch/slam.launch.py
 maps/README.md
 resource/robot_bringup
 robot_bringup/__init__.py
+robot_bringup/odom_fusion.py
+robot_bringup/odom_relay.py
 robot_bringup/odom_to_tf.py
 rviz/mapping.rviz
 rviz/navigation.rviz

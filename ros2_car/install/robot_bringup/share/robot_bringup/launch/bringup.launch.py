@@ -7,7 +7,7 @@
     导航:   ros2 launch robot_bringup bringup.launch.py mode:=navigation map:=~/ros2/car_ws/maps/my_map.yaml
 
 可选参数:
-    odom_source:=rf2o|chassis  里程计来源（默认 rf2o：无底盘时激光里程计兜底；底盘接上后改 chassis）
+    odom_source:=rf2o|chassis|fused  里程计来源（fused=轮速+激光 EKF 双源融合，麦轮打滑场景用）
     use_ekf:=false|true        是否启用 EKF 里程计融合（需 odom_source:=chassis）
     rviz:=true|false           是否启动 rviz
 
@@ -39,7 +39,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mode', default_value='mapping',
                               description='mapping(建图) | navigation(导航)'),
         DeclareLaunchArgument('odom_source', default_value='rf2o',
-                              description='里程计来源: rf2o | chassis'),
+                              description='里程计来源: rf2o | chassis | fused（双源融合，麦轮推荐）'),
         DeclareLaunchArgument('use_ekf', default_value='false'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('map', default_value=os.path.join(share_dir, 'maps', 'my_map.yaml')),
