@@ -95,7 +95,12 @@ MAPS_SSH_USER = os.environ.get("MAPS_SSH_USER", "sunrise")
 MAPS_SSH_PORT = int(os.environ.get("MAPS_SSH_PORT", "22"))
 MAPS_SSH_ROOT = os.environ.get("MAPS_SSH_ROOT", "/home/sunrise/Robot/ros2_car/maps")
 MAPS_SSH_KEY = os.environ.get("MAPS_SSH_KEY", "")      # 私钥路径（空=用 ~/.ssh/id_* 默认）
-MAPS_SSH_PASSWORD = os.environ.get("MAPS_SSH_PASSWORD", "")  # 仅 paramiko 通道；从 .env 读，不入 git
+# 板卡 SSH 口令（仅 paramiko 通道能吃；cli 通道 BatchMode=yes 永远喂不了密码）。
+# 别名 ROBOT_PASSWORD：.env 里既有的板卡口令变量（与 ROBOT_IP 配套），免得同一台机器
+# 配两个名字；两者都在时以 MAPS_SSH_PASSWORD 为准。
+MAPS_SSH_PASSWORD = (os.environ.get("MAPS_SSH_PASSWORD")
+                     or os.environ.get("ROBOT_PASSWORD")
+                     or "").strip()
 MAPS_SSH_TRANSPORT = os.environ.get("MAPS_SSH_TRANSPORT", "auto")  # auto | paramiko | cli
 MAPS_SSH_TIMEOUT = float(os.environ.get("MAPS_SSH_TIMEOUT", "10"))  # 单次连接/命令超时（秒）
 

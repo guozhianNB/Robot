@@ -40,6 +40,12 @@ torchaudio
 # torch/torchaudio（CPU 版，单独装）：
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
+# ------------------------- 可选：地图 SSH 通道 -------------------------
+# maps/mapstore.py 的 SshMapStore 优先 paramiko —— 它是**唯一能用密码认证**的通道
+# （conf.MAPS_SSH_PASSWORD / .env 的 ROBOT_PASSWORD）。缺失则退回 ssh.exe/scp.exe
+# 子进程通道，那条通道硬编码 BatchMode=yes，只认密钥、喂不了密码。
+paramiko
+
 # ------------------------- 可选：板卡工具链 -------------------------
 # 仅地瓜派（RDK）上需要，本机不装（hobot_dnn 工具链需在板卡环境安装）。
 

@@ -467,12 +467,21 @@ class _CliTransport:
         return rows
 
     def stat(self, remote_path: str) -> tuple[float, int] | None:
+        """返回 ``(mtime, size)``；拿不到返回 ``None``（上层据此判"文件不存在"）。
+
+        分隔符必须用 ``:`` 而**不是** ``\\t``：GNU ``stat -c`` 与 ``find -printf``
+        不同，它**不解释**反斜杠转义 —— 实测 ``stat -c "%Y\\t%s"`` 输出的是字面
+        ``1789309341\\t124``。旧实现按真 TAB 切分，于是 ``len(parts) != 2`` 恒成立、
+        ``stat`` 永远返回 ``None``，cli 通道下**每一张图都被判成"远程文件不存在"**
+        （2026-09-19 实测：``read_with_meta`` 对 my_map/my_map2/my_map3 全报不存在，
+        而 ``find`` 列表一切正常 —— list 用的 ``-printf`` 才是会解释转义的那个）。
+        """
         out = self.run(
-            f"sh -c 'stat -c \"%Y\\t%s\" {shlex.quote(remote_path)} 2>/dev/null || true'"
+            f"sh -c 'stat -c \"%Y:%s\" {shlex.quote(remote_path)} 2>/dev/null || true'"
         ).decode("utf-8", "replace").strip()
         if not out:
             return None
-        parts = out.split("\t")
+        parts = out.split(":")
         if len(parts) != 2:
             return None
         try:

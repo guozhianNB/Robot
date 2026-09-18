@@ -9,7 +9,9 @@ rosbridge 连接层（规格 §5.4 / §B 通道决策）——「连接 + 降级
 
 约定：
   * 所有对外函数**不抛异常**，失败返回 ``None`` 或 ``{"ok": False, ...}``；
-  * 位姿/地图元数据都带 TTL（超时视为不可用），不拿旧值糊弄上层。
+  * 位姿/地图元数据都带 TTL（超时视为不可用），不拿旧值糊弄上层；
+  * **订阅是连接级的**：rosbridge 的 ``subscribe`` 不跨 socket 保留，换连接必须补发
+    （见 ``_connect()`` 里的说明，以及 ``subscribe()/drain()`` 的 ``_sub_ws`` 判定）。
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ _ws = None
 _ws_at = 0.0
 _ws_error = ""
 _retry_at = 0.0
+_sub_ws = None                     # 订阅发在**哪条连接**上（rosbridge 订阅不跨连接保留）
+_sub_topics: "tuple[str, str] | None" = None   # 上次订阅的话题，重连后据此补发
 
 
 def available() -> tuple[bool, str]:
@@ -50,14 +54,23 @@ def status() -> dict:
     with _lock:
         return {"ok": True, "available": ok, "reason": why,
                 "url": conf.ROSBRIDGE_URL, "connected": _ws is not None,
+                "subscribed": _sub_ws is not None and _sub_ws is _ws,
                 "last_error": _ws_error,
                 "connected_at": _ws_at or None,
                 "mock": bool(conf.ROSBRIDGE_MOCK_POSE)}
 
 
+def _drop_ws() -> None:
+    """把当前连接标记为已死（下次 ``_connect()`` 重建），订阅态一并解除。"""
+    global _ws, _sub_ws
+    with _lock:
+        _ws = None
+        _sub_ws = None
+
+
 def _connect() -> "websocket.WebSocket | None":
     """惰性建连（带 30s 复用窗口）。返回 ``None`` 表示不可用。"""
-    global _ws, _ws_at, _ws_error, _retry_at
+    global _ws, _ws_at, _ws_error, _retry_at, _sub_ws
     if not _WS_AVAILABLE:
         return None
     with _lock:
@@ -77,9 +90,15 @@ def _connect() -> "websocket.WebSocket | None":
             _ws_at = time.time()
             _ws_error = ""
             _retry_at = 0.0
+            # ★ 订阅态必须跟着连接走：rosbridge 的 subscribe 是**连接级**的，换一条
+            #   socket 就全没了。此前只用一个 `_subscribed` 布尔，30s 复用窗口一到就
+            #   重连、却永远在 subscribe() 里早退不再补订阅 —— 现象是"rosbridge 已连
+            #   但一条数据都收不到"（2026-09-19 实测：强制重连后 drain 恒为 0）。
+            _sub_ws = None
             return sock
         except Exception as e:      # noqa: BLE001
             _ws = None
+            _sub_ws = None
             _ws_error = f"{type(e).__name__}: {e}"
             _retry_at = time.monotonic() + conf.ROSBRIDGE_RETRY_S
             return None
@@ -108,10 +127,9 @@ def _call(payload: dict, expect: str = "", timeout: float | None = None) -> dict
             return msg
         return None
     except Exception as e:      # noqa: BLE001
-        global _ws_error, _ws
+        global _ws_error
         _ws_error = f"{type(e).__name__}: {e}"
-        with _lock:
-            _ws = None
+        _drop_ws()
         return None
 
 
@@ -132,7 +150,6 @@ _pose: dict | None = None
 _pose_at = 0.0
 _map_meta: dict | None = None
 _map_at = 0.0
-_subscribed = False
 
 
 def _on_message(raw: str) -> None:
@@ -177,32 +194,50 @@ def _yaw_from_quat(ori: dict) -> float | None:
     return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
-def subscribe(pose_topic: str = "/amcl_pose", map_topic: str = "/map") -> bool:
-    """订阅位姿与地图元数据（幂等）。返回是否成功发出订阅请求。"""
-    global _subscribed
-    sock = _connect()
-    if sock is None:
-        return False
-    if _subscribed:
-        return True
-    ok = True
-    for topic, typ in ((pose_topic, "geometry_msgs/PoseWithCovarianceStamped"),
-                       (map_topic, "nav_msgs/OccupancyGrid")):
+_POSE_TOPIC_TYPE = "geometry_msgs/PoseWithCovarianceStamped"
+_MAP_TOPIC_TYPE = "nav_msgs/OccupancyGrid"
+
+
+def _send_subscriptions(sock, pose_topic: str, map_topic: str) -> bool:
+    """在 ``sock`` 上发出两条订阅。失败返回 False 并把这条连接判死。"""
+    for topic, typ in ((pose_topic, _POSE_TOPIC_TYPE), (map_topic, _MAP_TOPIC_TYPE)):
         try:
             sock.send(json.dumps({"op": "subscribe", "topic": topic, "type": typ,
                                   "throttle_rate": 1000}))
-        except Exception:      # noqa: BLE001
-            ok = False
-            break
-    _subscribed = ok
+        except Exception:      # noqa: BLE001  发送失败 = 这条连接不能用了
+            _drop_ws()
+            return False
+    return True
+
+
+def subscribe(pose_topic: str = "/amcl_pose", map_topic: str = "/map") -> bool:
+    """订阅位姿与地图元数据（幂等）。返回是否成功发出订阅请求。
+
+    "幂等"的判据是 **同一连接**：换了 socket（30s 复用窗口到期重连、或上次发送失败
+    判死）就重新发一遍，否则会误以为还订阅着而永远收不到数据。
+    """
+    global _sub_ws, _sub_topics
+    sock = _connect()
+    if sock is None:
+        return False
+    if _sub_ws is sock:
+        return True
+    ok = _send_subscriptions(sock, pose_topic, map_topic)
+    _sub_ws = sock if ok else None
+    _sub_topics = (pose_topic, map_topic) if ok else None
     return ok
 
 
 def drain(seconds: float = 1.0) -> int:
-    """收一小段时间的消息（编辑器 1Hz 轮询就够用）。返回收到的消息条数。"""
+    """收一小段时间的消息（编辑器 1Hz 轮询就够用）。返回收到的消息条数。
+
+    若期间发生了重连（订阅不跨连接），先按上次的话题补发订阅再收。
+    """
     sock = _connect()
     if sock is None:
         return 0
+    if _sub_topics is not None and _sub_ws is not sock:
+        subscribe(*_sub_topics)
     n = 0
     deadline = time.time() + max(0.0, seconds)
     try:
@@ -240,7 +275,7 @@ def latest_map() -> dict | None:
 
 
 def close() -> None:
-    global _ws, _subscribed
+    global _ws, _sub_ws, _sub_topics
     with _lock:
         if _ws is not None:
             try:
@@ -248,14 +283,16 @@ def close() -> None:
             except Exception:      # noqa: BLE001
                 pass
         _ws = None
-        _subscribed = False
+        _sub_ws = None
+        _sub_topics = None
 
 
 def reset_for_test() -> None:
     """测试用：清掉连接与缓存。"""
-    global _pose, _pose_at, _map_meta, _map_at, _ws_error, _retry_at
+    global _pose, _pose_at, _map_meta, _map_at, _ws_error, _retry_at, _sub_topics
     close()
     with _lock:
         _pose, _pose_at, _map_meta, _map_at = None, 0.0, None, 0.0
         _ws_error = ""
         _retry_at = 0.0
+        _sub_topics = None
