@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import threading
 import time
 import uuid
@@ -30,13 +31,13 @@ class CarLink:
                ("/amcl_pose", "geometry_msgs/PoseWithCovarianceStamped"))
 
     def __init__(self, url=None, *, ws_factory=None, logger=None,
-                 heartbeat_ttl=3.0, probe_timeout=3.0, action_timeout=190.0):
+                 heartbeat_ttl=None, probe_timeout=None, action_timeout=None):
         self.url = conf.ROSBRIDGE_URL if url is None else url
         self._factory = ws_factory
         self._logger = logger
-        self.heartbeat_ttl = heartbeat_ttl
-        self.probe_timeout = probe_timeout
-        self.action_timeout = action_timeout
+        self.heartbeat_ttl = self._env_seconds("CAR_HEARTBEAT_TTL_S", heartbeat_ttl, 3.0)
+        self.probe_timeout = self._env_seconds("CAR_PROBE_TIMEOUT_S", probe_timeout, 3.0)
+        self.action_timeout = self._env_seconds("CAR_ACTION_TIMEOUT_S", action_timeout, 190.0)
         self._lock = threading.RLock()
         self._dispatch_lock = threading.Lock()
         self._readiness_lock = threading.Lock()
@@ -55,6 +56,16 @@ class CarLink:
         self._idle_override = False
         self._needs_idle_probe = False
         self._nav_available = False
+
+    @staticmethod
+    def _env_seconds(name, explicit, default):
+        if explicit is not None:
+            return float(explicit)
+        try:
+            value = float(os.environ.get(name, default))
+            return value if math.isfinite(value) and value > 0 else default
+        except (TypeError, ValueError):
+            return default
 
     def _error(self, error):
         detail = str(error) or type(error).__name__

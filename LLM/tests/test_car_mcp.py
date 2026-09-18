@@ -351,6 +351,17 @@ def test_missing_websocket_still_registers_and_returns_json(monkeypatch, car_ser
         car_server._close_resources(link, executor)
 
 
+def test_car_link_reads_child_process_timeout_environment(monkeypatch):
+    link_module = importlib.import_module("LLM.car_mcp.car_link")
+    monkeypatch.setenv("CAR_HEARTBEAT_TTL_S", "7.5")
+    monkeypatch.setenv("CAR_PROBE_TIMEOUT_S", "4.5")
+    monkeypatch.setenv("CAR_ACTION_TIMEOUT_S", "205")
+    link = link_module.CarLink(ws_factory=lambda *args, **kwargs: None)
+    assert link.heartbeat_ttl == 7.5
+    assert link.probe_timeout == 4.5
+    assert link.action_timeout == 205.0
+
+
 class FakeSocket:
     def __init__(self):
         self.inbox = queue.Queue()
