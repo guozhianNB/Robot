@@ -98,18 +98,24 @@ def _worker(link, action: str, request: dict, task_id: int) -> None:
     try:
         result = link.call_action(action, request, task_id=task_id)
         ok = isinstance(result, dict) and result.get("ok") is True
+        uncertain = isinstance(result, dict) and result.get("uncertain") is True
         detail = result if isinstance(result, dict) else str(result)
     except Exception as exc:
-        ok, detail = False, str(exc)
+        ok, uncertain, detail = False, True, str(exc)
     try:
-        link.finish_task(task_id, ok, detail)
+        if ok:
+            link.finish_task(task_id, True, detail)
+        elif uncertain:
+            link.mark_uncertain(task_id, detail)
+        else:
+            link.finish_task(task_id, False, detail)
     except Exception as exc:
         _log(f"finish_task failed task_id={task_id}: {exc}")
 
 
 def _start(link, executor, action: str, target: dict, request: dict, expected_state: str,
            summary: str, warnings=None, *, require_nav: bool = False,
-           tool_action: str | None = None) -> str:
+           transport_action: str | None = None) -> str:
     _, failure = _ready(link, require_nav=require_nav)
     if failure:
         return failure
@@ -123,14 +129,14 @@ def _start(link, executor, action: str, target: dict, request: dict, expected_st
     if not isinstance(task_id, int) or isinstance(task_id, bool):
         return _error("车控任务标识无效")
     try:
-        executor.submit(_worker, link, action, request, task_id)
+        executor.submit(_worker, link, transport_action or action, request, task_id)
     except Exception as exc:
         try:
             link.finish_task(task_id, False, str(exc))
         except Exception:
             pass
         return _error(f"后台执行器不可用: {exc}", status="error")
-    return _json({"ok": True, "status": "started", "action": tool_action or action, "summary": summary,
+    return _json({"ok": True, "status": "started", "action": action, "summary": summary,
                   "exec_state": expected_state, "target": target, "warnings": list(warnings or [])})
 
 
@@ -142,8 +148,8 @@ def _move(link, executor, direction, distance_m) -> str:
             return _error("distance_m 必须是有限数字且满足 0 < distance_m <= 5")
         distance = float(distance_m)
         target = {"direction": direction, "distance_m": distance}
-        return _start(link, executor, "move", target, target, "moving", f"移动 {direction} {distance:g} 米",
-                      tool_action=f"move_{direction}")
+        return _start(link, executor, f"move_{direction}", target, target, "moving", f"移动 {direction} {distance:g} 米",
+                      transport_action="move")
     except Exception as exc:
         return _error(f"robot_move 异常: {exc}")
 
@@ -172,9 +178,9 @@ def _goto(link, nav, executor, label: str, *args) -> str:
         if not all(_number(value) for value in (x, y, yaw)):
             return _error("目标坐标不是有限数字")
         request = {"place": "", "x": float(x), "y": float(y), "theta": float(yaw)}
-        return _start(link, executor, "navigate_to", target, request, "navigating",
+        return _start(link, executor, f"goto_{label}", target, request, "navigating",
                       f"前往 {resolved.get('summary_target') or label}", resolved.get("warnings"),
-                      require_nav=True, tool_action=f"goto_{label}")
+                      require_nav=True, transport_action="navigate_to")
     except Exception as exc:
         return _error(f"robot_goto_{label} 异常: {exc}")
 
@@ -199,7 +205,7 @@ def _stop(link) -> str:
         return _error(f"robot_stop 异常: {exc}")
 
 
-def _status(link) -> str:
+def _status(link, nav=None) -> str:
     try:
         started = _start_state(link)
         result = link.snapshot()
@@ -207,7 +213,22 @@ def _status(link) -> str:
                                         result.get("state_fresh") is False):
             reason = result.get("last_error") or (started or {}).get("error") or "执行状态未知或已过期，请检查车体连接"
             result = {**result, "ok": True, "status": "unavailable", "reason": reason}
-        return _json(result if isinstance(result, dict) else {"ok": True, "status": "unavailable", "reason": "状态格式无效"})
+        if not isinstance(result, dict):
+            result = {"ok": True, "status": "unavailable", "reason": "状态格式无效"}
+        if nav is not None:
+            try:
+                context = nav.status_context(result.get("pose"))
+                map_reason = context.get("reason") if isinstance(context, dict) else "地图状态格式无效"
+                if result.get("reason") and map_reason:
+                    context = {**context, "map_reason": map_reason, "reason": result["reason"]}
+                result = {**result, **context}
+            except Exception as exc:
+                reason = str(exc)
+                result = {**result, "map": None, "zone": None,
+                          "reason": result.get("reason") or reason,
+                          "map_reason": reason,
+                          "warnings": list(result.get("warnings") or [])}
+        return _json(result)
     except Exception as exc:
         return _json({"ok": True, "status": "unavailable", "reason": str(exc)})
 
@@ -285,7 +306,7 @@ def build_server(*, link=None, nav=None, executor=None):
 
         返回 JSON 字符串；连接或状态不可用时 ok:true/status:unavailable，不代表车已就绪。
         """
-        return _status(link)
+        return _status(link, nav)
 
     server._car_resources = (link, executor)
     return server

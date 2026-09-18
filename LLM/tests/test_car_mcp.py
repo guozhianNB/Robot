@@ -48,6 +48,7 @@ class ServerLink:
         self.stopped = 0
         self.closed = False
         self.fail_action = None
+        self.uncertain = []
 
     def readiness(self):
         return {"ok": True, "ready": self.ready, "exec_state": "idle",
@@ -70,6 +71,10 @@ class ServerLink:
     def finish_task(self, task_id, ok, detail):
         self.tasks.clear()
         self.finished.append((task_id, ok, detail))
+        return {"ok": True}
+
+    def mark_uncertain(self, task_id, detail):
+        self.uncertain.append((task_id, detail))
         return {"ok": True}
 
     def stop(self):
@@ -171,13 +176,26 @@ def test_started_returns_immediately_and_worker_sends_exact_ros_request(server_r
     assert link.finished[-1][1] is True
 
 
+def test_user_action_identity_is_distinct_from_ros_transport(server_rig):
+    module, link, nav, executor = server_rig
+    assert load_json(module._move(link, executor, "left", 1))["action"] == "move_left"
+    assert link.tasks[-1]["action"] == "move_left"
+    executor.run_next()
+    assert link.calls[-1][0] == "move"
+    link.tasks.clear()
+    assert load_json(module._goto_place(link, nav, executor, "desk"))["action"] == "goto_place"
+    assert link.tasks[-1]["action"] == "goto_place"
+    executor.run_next()
+    assert link.calls[-1][0] == "navigate_to"
+
+
 def test_worker_failure_is_recorded_after_started_response(server_rig):
     module, link, nav, executor = server_rig
     link.fail_action = RuntimeError("service offline")
     assert load_json(module._move(link, executor, "forward", 1))["status"] == "started"
     executor.run_next()
-    assert link.finished[-1][1] is False
-    assert "service offline" in str(link.finished[-1][2])
+    assert not link.finished
+    assert "service offline" in str(link.uncertain[-1][1])
 
 
 def test_busy_rejection_stop_bypass_status_degradation_and_lifecycle(server_rig):
@@ -226,6 +244,26 @@ def test_status_unavailable_keeps_snapshot_details(server_rig, snapshot):
     assert result["available"] == snapshot["available"]
 
 
+def test_status_adds_smallest_matching_zone_without_failing_base_status(server_rig):
+    module, link, _nav, executor = server_rig
+    link.snapshot = lambda: {"ok": True, "available": True, "state_fresh": True,
+                             "exec_state": "idle", "pose": {"x": 1.5, "y": 1.5}}
+    class Nav:
+        def status_context(self, pose):
+            assert pose == {"x": 1.5, "y": 1.5}
+            return {"map": "ward", "zone": {"uid": "small", "name": "床位区"}, "warnings": []}
+    result = load_json(module._status(link, Nav()))
+    assert result["map"] == "ward"
+    assert result["zone"]["uid"] == "small"
+
+    class BrokenNav:
+        def status_context(self, pose):
+            raise RuntimeError("map offline")
+    degraded = load_json(module._status(link, BrokenNav()))
+    assert degraded["ok"] is True and degraded["map"] is None and degraded["zone"] is None
+    assert "map offline" in degraded["reason"] and degraded["warnings"] == []
+
+
 def test_main_keeps_tools_when_link_unavailable_and_closes(monkeypatch, server_rig):
     module, link, nav, executor = server_rig
     def no_startup_probe():
@@ -262,6 +300,7 @@ def test_mcp_actions_return_json_and_preserve_ros_fields(server_rig, name, args,
     response = asyncio.run(server.call_tool(name, args))
     accepted = load_json(response.content[0].text)
     assert accepted["status"] == "started" and accepted["action"] == action
+    assert link.tasks[-1]["action"] == action
     executor.run_next()
     transport_action = "navigate_to" if action.startswith("goto_") else name.removeprefix("robot_")
     assert link.calls == [(transport_action, ros_request, 1)]
@@ -482,7 +521,7 @@ def test_readiness_failures_are_dict_errors(rig, failure):
     result = link.readiness()
     assert result["ok"] is False
     assert result["error"]
-    assert link.begin_task("move", {}, "moving")["status"] == "error"
+    assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
 
 
 @pytest.mark.parametrize("action,typ,arguments", [
@@ -493,7 +532,8 @@ def test_readiness_failures_are_dict_errors(rig, failure):
 def test_link_action_passthrough_and_service_success(rig, action, typ, arguments):
     link, ctrl, *_ = rig
     link.readiness()
-    task = link.begin_task(action, arguments, "navigating" if action == "navigate_to" else "moving")
+    task_action = "goto_point" if action == "navigate_to" else ("move_back" if action == "move" else action)
+    task = link.begin_task(task_action, arguments, "navigating" if action == "navigate_to" else "moving")
     ctrl.on_send = lambda req: ctrl.reply(req, {"success": True, "message": "done"})
     result = link.call_action(action, arguments, task_id=task["task_id"])
     assert result["ok"] and result["message"] == "done"
@@ -503,6 +543,27 @@ def test_link_action_passthrough_and_service_success(rig, action, typ, arguments
     assert ctrl.timeout > 189
     ctrl.on_send = lambda req: ctrl.reply(req, {"success": False, "message": "blocked"})
     assert link.call_action(action, arguments, task_id=task["task_id"])["ok"] is False
+
+
+def test_dispatched_transport_timeout_stays_occupied_until_authoritative_state(rig):
+    link, ctrl, _, _, state, _ = rig
+    link.readiness()
+    task = link.begin_task("move_forward", {"direction": "forward"}, "moving")
+    result = link.call_action("move", {"direction": "forward"}, timeout=0.01,
+                              task_id=task["task_id"])
+    assert result["ok"] is False
+    uncertain = link.mark_uncertain(task["task_id"], result)
+    assert uncertain["ok"] is True
+    snap = link.snapshot()
+    assert snap["current"]["task_id"] == task["task_id"]
+    assert snap["exec_state"] == "unknown"
+    assert snap["last"]["task_id"] == task["task_id"] and snap["last"]["at"]
+    assert link.begin_task("turn", {}, "moving")["status"] == "rejected"
+    publish(state, "/robot/exec_state", "moving")
+    eventually(lambda: link.snapshot()["current"]["seen_active"])
+    publish(state, "/robot/exec_state", "idle")
+    eventually(lambda: link.snapshot()["current"] is None)
+    assert link.snapshot()["last"]["at"]
 
 
 def test_link_ctrl_block_does_not_block_stop_probe_state(rig):
@@ -531,18 +592,18 @@ def test_link_ctrl_block_does_not_block_stop_probe_state(rig):
 
 def test_race_task_requires_fresh_idle_and_single_reservation(rig, monkeypatch):
     link, *_ = rig
-    assert link.begin_task("move", {}, "moving")["status"] == "error"
+    assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
     assert link.readiness()["ok"]
     module = importlib.import_module("LLM.car_mcp.car_link")
     now = module.time.monotonic()
     with monkeypatch.context() as patch:
         patch.setattr(module.time, "monotonic", lambda: now + 100)
-        assert link.begin_task("move", {}, "moving")["status"] == "error"
+        assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
     barrier = threading.Barrier(3)
     results = []
     def reserve():
         barrier.wait()
-        results.append(link.begin_task("move", {}, "moving"))
+        results.append(link.begin_task("move_forward", {}, "moving"))
     workers = [threading.Thread(target=reserve) for _ in range(2)]
     for worker in workers:
         worker.start()
@@ -555,7 +616,7 @@ def test_race_task_requires_fresh_idle_and_single_reservation(rig, monkeypatch):
 def test_race_old_idle_does_not_finish_new_task(rig):
     link, ctrl, _, _, state, _ = rig
     link.readiness()
-    task = link.begin_task("navigate_to", {"x": 1}, "navigating")
+    task = link.begin_task("goto_point", {"x": 1}, "navigating")
     publish(state, "/robot/exec_state", "navigating")
     publish(state, "/robot/arrived", False)
     eventually(lambda: link.snapshot()["arrived"] is False)
@@ -581,7 +642,7 @@ def test_race_old_idle_does_not_finish_new_task(rig):
 def test_stop_old_finish_and_state_cannot_overwrite_new_generation(rig):
     link, _, _, _, state, _ = rig
     link.readiness()
-    old = link.begin_task("navigate_to", {}, "navigating")
+    old = link.begin_task("goto_point", {}, "navigating")
     assert link.stop()["ok"]
     publish(state, "/robot/exec_state", "navigating")
     publish(state, "/robot/arrived", False)
@@ -590,9 +651,9 @@ def test_stop_old_finish_and_state_cannot_overwrite_new_generation(rig):
     assert not link.snapshot()["moving"]
     assert link.finish_task(old["task_id"], True, "late")["status"] == "stale"
     assert link.snapshot()["last"]["action"] == "stop"
-    assert link.begin_task("move", {}, "moving")["status"] == "error"
+    assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
     link.readiness()
-    new = link.begin_task("move", {}, "moving")
+    new = link.begin_task("move_forward", {}, "moving")
     assert new["task_id"] != old["task_id"]
     link.finish_task(old["task_id"], False, "late error")
     assert link.snapshot()["current"]["task_id"] == new["task_id"]
@@ -602,7 +663,7 @@ def test_stop_old_finish_and_state_cannot_overwrite_new_generation(rig):
 def test_stop_invalidates_task_before_dispatch(rig):
     link, ctrl, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     link.stop()
     assert link.call_action("move", {}, task_id=task["task_id"])["status"] == "stale"
     assert not ctrl.sent
@@ -620,7 +681,7 @@ def test_link_pose_bad_messages_deep_copy_and_close(rig):
     assert link.snapshot()["last_error"]
     link.readiness()
     target = {"nested": {"value": 1}}
-    link.begin_task("move", target, "moving")
+    link.begin_task("move_forward", target, "moving")
     target["nested"]["value"] = 2
     snap = link.snapshot()
     json.dumps(snap, allow_nan=False)
@@ -673,7 +734,7 @@ def test_stop_busy_probe_cannot_restore_motion_or_allow_new_task(rig):
         "ready": False, "exec_state": "navigating", "nav_available": True, "message": "busy"})
     assert not link.readiness()["ready"]
     assert link.snapshot()["exec_state"] == "idle"
-    assert link.begin_task("move", {}, "moving")["status"] != "accepted"
+    assert link.begin_task("move_forward", {}, "moving")["status"] != "accepted"
 
 
 def test_readiness_malformed_reply_invalidates_old_idle(rig):
@@ -681,7 +742,7 @@ def test_readiness_malformed_reply_invalidates_old_idle(rig):
     link.readiness()
     probe.on_send = lambda req: probe.reply(req, {"ready": True})
     assert not link.readiness()["ok"]
-    assert link.begin_task("move", {}, "moving")["status"] == "error"
+    assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
 
 
 def test_readiness_not_ready_idle_does_not_authorize_dispatch(rig):
@@ -689,7 +750,7 @@ def test_readiness_not_ready_idle_does_not_authorize_dispatch(rig):
     probe.on_send = lambda req: probe.reply(req, {
         "ready": False, "exec_state": "idle", "nav_available": False, "message": "initializing"})
     link.readiness()
-    assert link.begin_task("move", {}, "moving")["status"] != "accepted"
+    assert link.begin_task("move_forward", {}, "moving")["status"] != "accepted"
 
 
 def test_stop_old_probe_inflight_cannot_authorize_new_task(rig):
@@ -703,13 +764,13 @@ def test_stop_old_probe_inflight_cannot_authorize_new_task(rig):
     probe.reply(probe.sent[-1], {
         "ready": True, "exec_state": "idle", "nav_available": True, "message": "ready"})
     worker.join(1)
-    assert link.begin_task("move", {}, "moving")["status"] == "error"
+    assert link.begin_task("move_forward", {}, "moving")["status"] == "error"
 
 
 def test_link_ctrl_calls_remain_serial_and_ids_are_matched(rig):
     link, ctrl, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     entered = threading.Event()
     ctrl.on_send = lambda req: entered.set()
     results = []
@@ -731,7 +792,7 @@ def test_link_ctrl_calls_remain_serial_and_ids_are_matched(rig):
 def test_stop_failed_publish_preserves_current_task(rig):
     link, _, _, stop, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     def fail(_):
         raise ConnectionError("stop transport failed")
     stop.on_send = fail
@@ -798,6 +859,39 @@ def test_nav_fail_closed_map_and_validate_failures(nav, nav_deps):
         module = importlib.import_module("LLM.car_mcp.car_nav")
         obj = module.CarNav(**deps)
         assert obj.resolve_point(1, 2)["ok"] is False
+
+
+@pytest.mark.parametrize("field", ["resolve", "map_info", "validate_point"])
+def test_nav_rejects_any_stale_navigation_input(nav_deps, field):
+    deps = dict(nav_deps)
+    if field == "resolve":
+        original = deps[field]
+        deps[field] = lambda *a, **k: {**original(*a, **k), "stale": True}
+    elif field == "map_info":
+        original = deps[field]
+        deps[field] = lambda *a, **k: {**original(*a, **k), "stale": True}
+    else:
+        original = deps[field]
+        deps[field] = lambda *a, **k: {**original(*a, **k), "stale": True}
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    out = obj.resolve_point(1, 2)
+    assert out["ok"] is False and ("缓存" in out["error"] or "校验" in out["error"])
+
+
+def test_nav_status_context_selects_smallest_containing_zone(nav_deps):
+    deps = dict(nav_deps)
+    original = deps["resolve"]
+    def resolve(*args, **kwargs):
+        got = original(*args, **kwargs)
+        got["tags"]["zones"] = [
+            {"uid": "large", "name": "大区", "shape": "rect", "polygon": [[0, 0], [4, 0], [4, 4], [0, 4]]},
+            {"uid": "small", "name": "小区", "shape": "rect", "polygon": [[1, 1], [2, 1], [2, 2], [1, 2]]},
+        ]
+        return got
+    deps["resolve"] = resolve
+    obj = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+    context = obj.status_context({"x": 1.5, "y": 1.5})
+    assert context["map"] == "demo" and context["zone"]["uid"] == "small"
 
 
 def test_nav_zone_without_goal_does_not_create_centroid(nav, nav_deps):
@@ -871,7 +965,7 @@ def test_nav_zone_rejects_explicit_or_fallback_target_outside_zone(nav_deps):
 def test_race_dispatch_first_stop_publishes_immediately_then_again(rig):
     link, ctrl, _, stop, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     sending, release, immediate = threading.Event(), threading.Event(), threading.Event()
     def send(req):
         sending.set()
@@ -897,7 +991,7 @@ def test_race_dispatch_first_stop_publishes_immediately_then_again(rig):
 def test_race_stop_first_prevents_waiting_action_dispatch(rig):
     link, ctrl, _, stop, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     second_stop, release = threading.Event(), threading.Event()
     def send(_):
         if len([msg for msg in stop.sent if msg["op"] == "publish"]) == 2:
@@ -933,7 +1027,7 @@ def test_link_action_requires_task_id(rig):
 def test_link_action_rejects_invalid_task_id(rig, task_id):
     link, ctrl, *_ = rig
     link.readiness()
-    link.begin_task("move", {}, "moving")
+    link.begin_task("move_forward", {}, "moving")
     ctrl.on_send = lambda req: ctrl.reply(req, {"success": True})
     result = link.call_action("move", {}, task_id=task_id)
     assert result["ok"] is False
@@ -943,7 +1037,7 @@ def test_link_action_rejects_invalid_task_id(rig, task_id):
 def test_stop_invalidates_second_action_queued_on_ctrl(rig):
     link, ctrl, *_ = rig
     link.readiness()
-    task = link.begin_task("move", {}, "moving")
+    task = link.begin_task("move_forward", {}, "moving")
     sent, queued = threading.Event(), threading.Event()
     ctrl.on_send = lambda req: sent.set()
     results = []
@@ -1000,4 +1094,4 @@ def test_readiness_network_and_application_are_linearized(rig, monkeypatch, newe
     second.join(1)
     assert not overtook_application, "new probe overtook prior probe cache application"
     assert second_network.is_set()
-    assert link.begin_task("move", {}, "moving")["status"] != "accepted"
+    assert link.begin_task("move_forward", {}, "moving")["status"] != "accepted"

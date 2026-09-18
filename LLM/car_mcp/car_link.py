@@ -26,6 +26,8 @@ except Exception:  # 可选依赖不影响后端导入。
 class CarLink:
     SEND_TIMEOUT_S = 0.5
     _ACTIONS = {"move": "Move", "turn": "Turn", "navigate_to": "NavigateTo"}
+    _TASK_ACTIONS = {"move_forward", "move_back", "move_left", "move_right", "turn",
+                     "goto_point", "goto_zone", "goto_place"}
     _TOPICS = (("/robot/exec_state", "std_msgs/String"),
                ("/robot/arrived", "std_msgs/Bool"),
                ("/amcl_pose", "geometry_msgs/PoseWithCovarianceStamped"))
@@ -168,6 +170,7 @@ class CarLink:
 
     def _service(self, channel, service, typ, arguments, timeout, task_id=None):
         sock = None
+        dispatched = False
         try:
             with self._io_locks[channel]:
                 sock = self._connect(channel)
@@ -183,6 +186,7 @@ class CarLink:
                                 return {"ok": False, "status": "stale", "error": "任务已失效"}
                         sock.send(payload)
                         self.mark_dispatched(task_id)
+                        dispatched = True
                 else:
                     sock.send(payload)
                 deadline = time.monotonic() + timeout
@@ -212,7 +216,10 @@ class CarLink:
         except Exception as exc:
             if sock is not None:
                 self._drop(channel, sock)
-            return self._error(exc)
+            result = self._error(exc)
+            if channel == "ctrl" and dispatched:
+                result["uncertain"] = True
+            return result
 
     def readiness(self, timeout=None):
         # 包住收包及缓存应用，防同 generation 的旧 idle 覆盖较新 busy/error。
@@ -276,7 +283,7 @@ class CarLink:
                 return {"ok": False, "status": "error", "error": "执行状态未知或过期，请重新探测"}
             if self._exec_state != "idle":
                 return {"ok": False, "status": "rejected", "error": f"执行器忙：{self._exec_state}"}
-            if action not in self._ACTIONS or expected_state not in ("moving", "navigating"):
+            if action not in self._TASK_ACTIONS or expected_state not in ("moving", "navigating"):
                 return {"ok": False, "status": "error", "error": "invalid action or expected_state"}
             self._generation += 1
             self._idle_override = False
@@ -296,10 +303,25 @@ class CarLink:
         with self._lock:
             if not self._matches(task_id):
                 return {"ok": False, "status": "stale", "task_id": task_id}
+            at = time.time()
             self._last = {**self._current, "ok": bool(ok), "detail": copy.deepcopy(detail),
-                          "finished_at": time.time()}
+                          "at": at, "finished_at": at}
             self._current = None
             return {"ok": True, "status": "finished", "task_id": task_id}
+
+    def mark_uncertain(self, task_id, detail):
+        with self._lock:
+            if not self._matches(task_id):
+                return {"ok": False, "status": "stale", "task_id": task_id}
+            if not self._current.get("dispatched"):
+                return self.finish_task(task_id, False, detail)
+            at = time.time()
+            self._exec_state = "unknown"
+            self._state_at = at
+            self._state_mono = None
+            self._last = {**self._current, "ok": False, "detail": copy.deepcopy(detail),
+                          "at": at, "finished_at": at, "status": "uncertain"}
+            return {"ok": True, "status": "uncertain", "task_id": task_id}
 
     def stop(self):
         sock = None
@@ -313,8 +335,9 @@ class CarLink:
                     with self._lock:
                         self._generation += 1
                         self._current = None
+                        at = time.time()
                         self._last = {"task_id": self._generation, "action": "stop", "ok": True,
-                                      "finished_at": time.time(), "detail": "stop published"}
+                                      "at": at, "finished_at": at, "detail": "stop published"}
                         self._exec_state = "idle"
                         self._idle_override = self._needs_idle_probe = True
                         self._state_mono = None

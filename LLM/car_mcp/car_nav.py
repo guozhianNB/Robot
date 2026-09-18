@@ -2,6 +2,7 @@
 r"""导航目标解析与 fail-closed 安全校验。"""
 from __future__ import annotations
 
+import copy
 import math
 from typing import Callable
 
@@ -45,19 +46,21 @@ class CarNav:
             got = self.resolve_tags(name)
             if not isinstance(got, dict) or not got.get("ok") or not got.get("exists"):
                 return None, self._bad(str((got or {}).get("error") or "地图标记不存在"), "请在地图编辑器标记地点和区域")
+            if got.get("stale"):
+                return None, self._bad("地图标记缓存已过期", "请恢复地图连接后重试")
             tags = got.get("tags") or {}
             info = self.map_info(name)
             if (not isinstance(info, dict) or info.get("meta_ok") is False or
                     info.get("resolution") is None or not info.get("origin")):
                 return None, self._bad("yaml 元数据不可用", "请检查当前地图文件")
+            if info.get("stale"):
+                return None, self._bad("地图元数据缓存已过期", "请恢复地图连接后重试")
             fp = self.fingerprint_check(tags, info)
             if not isinstance(fp, dict) or not fp.get("ok") or fp.get("changed"):
                 return None, self._bad("地图指纹已变化，拒绝使用旧标记", "请在地图编辑器重新校准标记")
             warnings = list(got.get("warnings") or []) + list(fp.get("reasons") or [])
             if any("无指纹" in str(item) for item in warnings):
                 warnings.append("tags 无指纹")
-            if got.get("stale") and not fp:
-                return None, self._bad("地图标记缓存无法重新验证", "请检查地图文件")
             return (name, tags, warnings), None
         except Exception as exc:  # fail closed; no dependency errors leak
             return None, self._bad("地图解析失败", "请检查地图与导航状态")
@@ -69,6 +72,7 @@ class CarNav:
             return self._bad("地图无法校验", "请检查地图文件")
         reasons = list(checked.get("reasons") or []) if isinstance(checked, dict) else []
         reject = (not isinstance(checked, dict) or not checked.get("ok") or
+                  checked.get("stale") or
                   not checked.get("in_bounds", True) or checked.get("on_obstacle") or
                   checked.get("on_unknown"))
         for key in ("edge_margin_m", "clearance_m"):
@@ -80,6 +84,33 @@ class CarNav:
         return {"ok": True, "map": name,
                 "target": {"x": float(x), "y": float(y), "yaw_deg": float(yaw), "goal_source": source},
                 "warnings": warnings, "summary_target": f"{source} ({float(x):.2f}, {float(y):.2f})"}
+
+    @staticmethod
+    def _zone_area(zone) -> float:
+        points = zone.get("polygon") or []
+        try:
+            coords = [(float(point[0]), float(point[1])) for point in points
+                      if isinstance(point, (list, tuple)) and len(point) >= 2]
+            if len(coords) < 3:
+                return math.inf
+            return abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2)
+                           in zip(coords, coords[1:] + coords[:1]))) / 2.0
+        except (TypeError, ValueError, OverflowError):
+            return math.inf
+
+    def status_context(self, pose) -> dict:
+        if not isinstance(pose, dict) or not self._finite(pose.get("x")) or not self._finite(pose.get("y")):
+            return {"map": None, "zone": None, "reason": "位姿不可用", "warnings": []}
+        ctx, err = self._context()
+        if err:
+            return {"map": None, "zone": None, "reason": err["error"],
+                    "warnings": list(err.get("warnings") or [])}
+        name, tags, warnings = ctx
+        matches = [zone for zone in (tags.get("zones") or [])
+                   if isinstance(zone, dict) and self.zone_hit(zone, float(pose["x"]), float(pose["y"]))]
+        zone = min(matches, key=lambda item: (self._zone_area(item), str(item.get("uid", "")))) if matches else None
+        return {"map": name, "zone": copy.deepcopy(zone) if zone else None,
+                "reason": "" if zone else "当前位置不在已标区域", "warnings": warnings}
 
     def resolve_point(self, x, y, yaw_deg=0.0) -> dict:
         if not all(self._finite(v) for v in (x, y, yaw_deg)):
