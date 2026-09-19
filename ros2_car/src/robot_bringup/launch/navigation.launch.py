@@ -26,6 +26,7 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz')
     use_sim_time = LaunchConfiguration('use_sim_time')
     autostart = LaunchConfiguration('autostart')
+    use_costmap_cleaner = LaunchConfiguration('use_costmap_cleaner')
 
     declare_args = [
         DeclareLaunchArgument(
@@ -38,6 +39,9 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('autostart', default_value='true',
                               description='自动启动 nav2 生命周期节点'),
+        DeclareLaunchArgument(
+            'use_costmap_cleaner', default_value='true',
+            description='收到 /initialpose 时是否清空 global+local 代价地图'),
     ]
 
     # 定位：map_server + amcl
@@ -90,7 +94,18 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
+    # 代价地图清除：rviz 里点完 "2D Pose Estimate" 后，把按旧位姿打上的
+    # 障碍（鬼影）清掉再让 Nav2 重新规划。nav2 没就绪时它只告警不崩。
+    costmap_cleaner_node = Node(
+        package='robot_navigation',
+        executable='costmap_cleaner',
+        name='costmap_cleaner',
+        output='screen',
+        emulate_tty=True,
+        condition=IfCondition(use_costmap_cleaner),
+    )
+
     return LaunchDescription(
         declare_args + [localization, navigation, rviz_node,
-                        robot_actions_node, cmd_stop_node]
+                        robot_actions_node, cmd_stop_node, costmap_cleaner_node]
     )

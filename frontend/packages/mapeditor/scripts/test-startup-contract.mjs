@@ -11,6 +11,7 @@ const places = read("pages/PlacePanel.vue");
 const zones = read("pages/ZonePanel.vue");
 const canvas = read("pages/MapCanvas.vue");
 const types = read("lib/types.ts");
+const pixelNetio = fs.readFileSync(path.join(root, "public", "pixel-netio.js"), "utf8");
 
 assert.match(app, /:items="places"/, "PlacePanel 必须使用父组件的地点列表");
 assert.match(app, /:items="zones"/, "ZonePanel 必须使用父组件的区域列表");
@@ -35,6 +36,8 @@ assert.match(app, /@goal-point="onGoalPoint"/, "App 必须接收画布停靠点�
 assert.match(app, /:done-goal="doneGoal"/, "App 必须把停靠点传给 ZonePanel");
 assert.match(zones, /goal_validation/, "区域保存后必须显示停靠点校验警告");
 assert.match(zones, /未标停靠点/, "区域列表必须提示缺少停靠点");
+assert.match(pixelNetio, /yaml_text:\s*''/,
+  "像素编辑器只应上传 PGM；YAML 必须由后端以磁盘原文为准保留元数据");
 
 const service = fs.readFileSync(path.join(root, "src", "lib", "service.ts"), "utf8");
 assert.match(app, /保存并退出/, "编辑器顶部必须有「保存并退出」");
