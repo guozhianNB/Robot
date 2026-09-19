@@ -406,12 +406,10 @@
       exitAfterSave = false;
       return;
     }
-    readBlobText(yamlBlob).then(function (txt) {
-      return saveToServer(pgmBlob, txt || '');
-    }).catch(function (e) {
-      msg('error', '保存失败：' + errText(e));
-      exitAfterSave = false;              // 读取/提交异常同样是「没保存成功」
-    });
+    // 上游会用 js-yaml 重建 YAML；它只负责像素编辑，却可能把 origin 等元数据
+    // 序列化成失真的值。后端保存时本来就以磁盘 YAML 原文为准、只改 image，
+    // 因此这里只上传 PGM，明确不提交上游重建的 YAML。
+    saveToServer(pgmBlob);
   }
 
   function readBlobText(blob) {
@@ -441,7 +439,7 @@
 
   // ===================== 八、保存到服务器 =====================
 
-  function saveToServer(pgmBlob, yamlText) {
+  function saveToServer(pgmBlob) {
     if (!mapName) {
       msg('error', '未指定地图（URL 缺 ?map=<地图名>），无法保存。');
       exitAfterSave = false;
@@ -468,7 +466,7 @@
 
     var body = {
       pgm_b64: '',
-      yaml_text: yamlText || '',
+      yaml_text: '',
       mode: mode,
       new_name: newName,                       // 仅 saveas 用
       confirm: mode === 'overwrite'            // 覆盖必须 true，否则后端 409
