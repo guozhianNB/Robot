@@ -232,7 +232,8 @@ def test_mcp_numeric_inputs_rejected_before_sdk_coercion(server_rig, name, args)
 
 
 @pytest.mark.parametrize("snapshot", [
-    {"ok": True, "available": False, "last_error": "offline"},
+    {"ok": True, "available": False, "state_fresh": False, "exec_state": "unknown",
+     "last_error": "offline"},
     {"ok": True, "available": True, "state_fresh": False, "exec_state": "unknown"},
 ])
 def test_status_unavailable_keeps_snapshot_details(server_rig, snapshot):
@@ -241,7 +242,50 @@ def test_status_unavailable_keeps_snapshot_details(server_rig, snapshot):
     result = load_json(module._status(link))
     assert result["ok"] is True and result["status"] == "unavailable"
     assert result["reason"]
+    # 快照细节照旧透出（降级不改写它们），降级依据是 state_fresh
+    assert result["state_fresh"] is False and result["exec_state"] == "unknown"
     assert result["available"] == snapshot["available"]
+
+
+def test_status_ignores_available_flag_when_state_is_fresh(server_rig):
+    """**回归 2026-09-19**：`available`（旧口径=四通道 socket 全在）会在后端比 rosbridge
+    早起时永久为 false，把好链路报成 unavailable，模型据此说"链路没完全恢复"。降级只看
+    `state_fresh`。"""
+    module, link, _, _ = server_rig
+    link.snapshot = lambda: {"ok": True, "available": False,
+                             "channels": {"ctrl": True, "probe": True, "stop": False, "state": True},
+                             "state_fresh": True, "exec_state": "idle", "pose": None}
+    result = load_json(module._status(link))
+    assert "status" not in result and "reason" not in result
+    assert result["available"] is False          # 明细照旧透出，只是不再据此降级
+    assert result["exec_state"] == "idle"
+
+
+def test_status_marks_zone_computed_from_stale_or_suspect_pose(server_rig):
+    """**回归 2026-09-19**：区域是拿"最后一次收到的位姿"算的，位姿过期/未收敛时必须挑明。"""
+    module, link, _, _ = server_rig
+
+    class Nav:
+        def status_context(self, pose):
+            return {"map": "my_map3", "zone": {"name": "平台A", "uid": "z1"}, "reason": "",
+                    "warnings": []}
+
+    for flag, snapshot in (
+        ("stale", {"ok": True, "state_fresh": True, "exec_state": "idle", "pose_stale": True,
+                   "pose": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0, "at": time.time() - 300}}),
+        ("suspect", {"ok": True, "state_fresh": True, "exec_state": "idle", "pose_stale": False,
+                     "pose": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0, "suspect": True}}),
+        ("fresh", {"ok": True, "state_fresh": True, "exec_state": "idle", "pose_stale": False,
+                   "pose": {"x": 1.5, "y": 1.5, "yaw_deg": 0.0}}),
+    ):
+        link.snapshot = lambda s=snapshot: s
+        result = load_json(module._status(link, Nav()))
+        if flag == "fresh":
+            assert not result.get("zone_from_stale_pose")
+            assert result["warnings"] == []
+        else:
+            assert result["zone_from_stale_pose"] is True
+            assert any("平台A" in item for item in result["warnings"])
 
 
 def test_status_adds_smallest_matching_zone_without_failing_base_status(server_rig):
@@ -705,6 +749,130 @@ def test_link_state_reconnects_after_disconnect(rig):
         "/robot/exec_state", "/robot/arrived", "/amcl_pose"}
     publish(replacement, "/robot/exec_state", "idle")
     eventually(lambda: link.snapshot()["exec_state"] == "idle")
+
+
+class BareSock:
+    """只够连上、不做协议应答的假 socket（用于验"通道有没有连上"）。"""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, raw):
+        self.sent.append(raw)
+
+    def settimeout(self, _timeout):
+        pass
+
+    def recv(self):
+        raise TimeoutError("no data")
+
+    def shutdown(self):
+        pass
+
+
+def test_available_follows_state_channel_not_all_four(link_class):
+    """**回归 2026-09-19 现场**：后端比 rosbridge 早起 → `start()` 四通道全失败；之后
+    probe/state/ctrl 都会按需自愈，**只有 stop 通道只由 robot_stop 触碰、永不重连**。
+    旧口径 `available = all(四通道)` 于是永久 false，把好链路报成"没恢复"。
+    """
+    down = {"v": True}
+
+    def factory(url, timeout):
+        if down["v"]:
+            raise ConnectionRefusedError(111, "Connection refused")
+        return BareSock()
+
+    link = link_class("ws://fake:9090", ws_factory=factory)
+    try:
+        assert link.start()["ok"] is False                    # 四通道全失败
+        assert link.snapshot()["last_error"]                  # 记下错误
+        assert "Connection refused" in link.snapshot()["last_error"]
+
+        down["v"] = False                                     # rosbridge 起来了
+        for channel in ("probe", "state", "ctrl"):            # 三条会自愈
+            link._connect(channel)
+        snap = link.snapshot()
+        assert snap["channels"] == {"ctrl": True, "probe": True, "stop": False, "state": True}
+        assert snap["available"] is True                      # 旧代码这里是 False
+        assert snap["last_error"] == ""                       # 连接恢复 → 旧错误不再当现状报
+        assert snap["last_error_at"] is None
+
+        link.stop()                                           # 调一次急停，stop 才连上
+        assert link.snapshot()["channels"]["stop"] is True
+    finally:
+        link.close()
+
+
+def test_link_pose_marks_suspect_and_staleness(rig):
+    """位姿带可信度标记：恰好停在原点+协方差 0 = AMCL 未收敛（2026-09-19 发车时就是这个）；
+    静止时 AMCL 不发位姿 → 过期只做标记，不假装新鲜。"""
+    link, _, _, _, state, _ = rig
+    state.push({"op": "publish", "topic": "/amcl_pose", "msg": {"pose": {
+        "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                 "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
+        "covariance": [0.0, 0.0, 0.0]}}})
+    eventually(lambda: link.snapshot()["pose"] is not None)
+    snap = link.snapshot()
+    assert snap["pose"]["suspect"] is True and snap["pose"]["cov"] == 0.0
+    assert snap["pose_stale"] is False                  # 刚收到，只是"可疑"
+
+    state.push({"op": "publish", "topic": "/amcl_pose", "msg": {"pose": {
+        "pose": {"position": {"x": 0.48, "y": -0.21, "z": 0.0},
+                 "orientation": {"x": 0.0, "y": 0.0, "z": -0.18, "w": 0.98}},
+        "covariance": [0.037, 0.0, 0.0]}}})
+    eventually(lambda: link.snapshot()["pose"]["x"] == pytest.approx(0.48))
+    assert link.snapshot()["pose"]["suspect"] is False
+
+    with link._lock:                                    # 模拟"很久没收到位姿"
+        link._pose["at"] = time.time() - 300
+    snap = link.snapshot()
+    assert snap["pose_stale"] is True and snap["pose_age_s"] == pytest.approx(300, abs=5)
+
+
+def test_ready_error_messages_say_what_to_check(server_rig):
+    """**回归 2026-09-19**：原来把裸 `[Errno 111] Connection refused` 当"车体未就绪"报给模型，
+    人和模型都看不出该去查什么。现在分成 rosbridge 没起 / 车控服务没起两种可操作提示。"""
+    module, _, _, _ = server_rig
+
+    class Link:
+        url = "ws://127.0.0.1:9091"
+
+        def __init__(self, result):
+            self.result = result
+
+        def readiness(self):
+            return self.result
+
+    broken = load_json(module._ready(Link({"ok": False, "error": "[Errno 111] Connection refused"}))[1])
+    assert "rosbridge" in broken["error"] and "lat2" in broken["hint"]
+
+    missing = load_json(module._ready(Link({"ok": False, "error": "Service /robot/readiness does not exist"}))[1])
+    assert "车控服务没起来" in missing["error"] and "robot_actions" in missing["hint"]
+
+    other = load_json(module._ready(Link({"ok": False, "error": "奇怪的失败"}))[1])
+    assert other["error"] == "车体未就绪: 奇怪的失败" and "hint" not in other
+
+
+def test_status_probes_readiness_when_state_unknown(server_rig):
+    """**回归 2026-09-19**：后端刚起来时状态是 unknown，`robot_status` 该主动探一次 readiness
+    建立初始状态（规格 §六），而不是报 `exec_state=unknown` / `nav_available=false`，让模型
+    以为车没起来（与 `available` 同类的假警报）。"""
+    module, link, _, _ = server_rig
+    state = {"fresh": False}
+
+    link.snapshot = lambda: {"ok": True, "state_fresh": state["fresh"],
+                             "exec_state": "idle" if state["fresh"] else "unknown",
+                             "nav_available": state["fresh"], "pose": None}
+
+    def readiness():
+        state["fresh"] = True          # 真车：readiness 回来就等于建立了初始状态
+        return {"ok": True, "ready": True, "exec_state": "idle", "nav_available": True,
+                "message": "ready"}
+
+    link.readiness = readiness
+    result = load_json(module._status(link))
+    assert result["exec_state"] == "idle" and result["nav_available"] is True
+    assert "status" not in result and "reason" not in result
 
 
 def test_link_missing_dependency_and_connection_failure(link_class, monkeypatch):

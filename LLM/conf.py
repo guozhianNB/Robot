@@ -53,10 +53,10 @@ DEFAULT_SETTINGS = {
     "migrate_done": False,        # 记忆 v3 一次性迁移是否已完成
     "mcp_enabled": False,          # MCP 外部工具总开关（开启后在启动时拉起 MCP_SERVERS）
     # ---- 地图编辑器（第三个前端 /mapeditor，见 docs/superpowers/specs/2026-09-14-map-editor-design.md）----
-    "current_map": "my_map",            # 目标地图名（下次启动导航用；≠"车此刻在跑哪张图"，后者靠指纹自动识别）
+    "current_map": "my_map",            # **下次启动导航想用哪张**（人的意图，不是真相；真相=车实际加载的图，见 locator.current_map / map_server 的 yaml_filename）
     "map_boundary_margin_m": 0.3,       # 标点校验：距地图各边缩进（沿用 where_am_i.py 口径）
-    "map_topic_fingerprint_enabled": True,  # 是否用 /map 元数据指纹反查"车此刻在跑哪张图"
-    "mapeditor_auto_switch_map": False, # 打开编辑器时是否自动跳到指纹识别出的那张图
+    "map_topic_fingerprint_enabled": True,  # 是否用 /map 元数据指纹**推断**"车此刻在跑哪张图"（第一权威是 map_server 的 yaml_filename，不受本开关约束）
+    "mapeditor_auto_switch_map": False, # 打开编辑器时是否自动跳到识别出的那张图
     # ---- 分层用户体系（2026-09-14，规格 docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）----
     "admin_auth_required": True,     # 管理员口令门开关（D13：可在 UI 直接关掉，界面须警示）
     "admin_session_ttl_s": 300,      # 管理员提权后无操作自动降权秒数（D8）
@@ -65,7 +65,7 @@ DEFAULT_SETTINGS = {
     "ward_switch_debounce": 3,       # 自动切病房防抖：连续 N 次 tick 同病房才认（D18）
     "ward_zone_default_r": 3.0,      # 便捷录入病房区域的半径（米），以当前位姿为圆心采样 16 边形
     "manual_override_sec": 600,      # 手动切病房后，位置判定不覆盖的秒数（D18）
-    "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=/map 指纹反查（默认）；setting=用 current_map
+    "ward_map_source": "auto",       # 判定"车在跑哪张图"：auto=问导航（map_server 的 yaml_filename；读不到退回 /map 指纹）；setting=用 current_map 兜底（应急）
 }
 
 # ---- 地图编辑器独立服务（按需启动，见 docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md）----

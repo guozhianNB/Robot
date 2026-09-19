@@ -64,15 +64,38 @@ def _error(message: str, **extra) -> str:
     return _json({"ok": False, "status": "rejected", "error": str(message), **extra})
 
 
+def _explain(detail: str, url: str = "") -> tuple[str, str]:
+    """把裸异常翻译成"下一步该干什么"（车控规格 §十 的降级表）。返回 ``(message, hint)``。
+
+    为什么要有它：原来把 `[Errno 111] Connection refused` 原样当"车体未就绪"报给模型，
+    模型只能如实复述一句通信错误，人和模型都不知道该去查什么（2026-09-19 现场连踩两次）。
+    分不清的错误一律原样返回 —— 绝不编造原因。
+    """
+    text = str(detail or "")
+    low = text.lower()
+    # 注意别把「缺少可选依赖 websocket-client」也算成连不上 —— 那句本身就说清了原因。
+    if any(mark in low for mark in ("connection refused", "errno 111", "timed out", "timeout",
+                                    "getaddrinfo", "connection reset", "disconnected")):
+        return (f"连不上板卡 rosbridge（{url or '未配置 ROSBRIDGE_URL'}）：{text}",
+                "车控桥大概没起 —— 板卡上执行 ~/tools/nav_screen.sh lat2"
+                "（nav_screen.sh nav 会自动带起它）")
+    if "does not exist" in low or "not found" in low:
+        return (f"车控服务没起来：{text}",
+                "确认小车处于导航模式（板卡上 robot_actions 节点是否在跑）")
+    return text, ""
+
+
 def _ready(link, *, require_nav: bool = False):
     try:
         _start_state(link)
         result = link.readiness()
     except Exception as exc:
-        return None, _error(f"读取车体就绪状态失败: {exc}", status="error")
+        message, hint = _explain(f"读取车体就绪状态失败: {exc}", getattr(link, "url", ""))
+        return None, _error(message, status="error", **({"hint": hint} if hint else {}))
     if not isinstance(result, dict) or result.get("ok") is not True:
         detail = result.get("error") if isinstance(result, dict) else "返回格式无效"
-        return None, _error(f"车体未就绪: {detail}", status="error")
+        message, hint = _explain(f"车体未就绪: {detail}", getattr(link, "url", ""))
+        return None, _error(message, status="error", **({"hint": hint} if hint else {}))
     if result.get("ready") is not True or result.get("exec_state") != "idle":
         return None, _error("车体未就绪或执行器忙", exec_state=result.get("exec_state"))
     if require_nav and result.get("nav_available") is not True:
@@ -208,11 +231,23 @@ def _stop(link) -> str:
 def _status(link, nav=None) -> str:
     try:
         started = _start_state(link)
+        # 每次都探一次 readiness：状态查询要的是**此刻**的执行态与导航可用性，不是"上一次动作时"的。
+        # 不探的话——后端刚起、模型又只问状态不问动作时，nav_available 会一直停在冷启动的 false，
+        # 模型据此说"导航没起"（与 available 同类的假警报，2026-09-19）。readiness 只读、不动车。
+        try:
+            link.readiness()
+        except Exception:
+            pass
         result = link.snapshot()
-        if isinstance(result, dict) and (result.get("available") is False or
-                                        result.get("state_fresh") is False):
+        # 降级只看 state_fresh，**不看 available**：available 曾经是"四通道 socket 全在"，
+        # 而后端比 rosbridge 早起时那一条 stop 通道永不重连 → 好链路被永久报成 unavailable
+        # （2026-09-19 实测：模型据此说"链路没恢复"，其实 mobility 一路正常）。state_fresh 才
+        # 真正回答"我现在还能不能看到车"。
+        if isinstance(result, dict) and result.get("state_fresh") is False:
             reason = result.get("last_error") or (started or {}).get("error") or "执行状态未知或已过期，请检查车体连接"
-            result = {**result, "ok": True, "status": "unavailable", "reason": reason}
+            message, hint = _explain(reason, getattr(link, "url", ""))
+            result = {**result, "ok": True, "status": "unavailable", "reason": message,
+                      **({"hint": hint} if hint else {})}
         if not isinstance(result, dict):
             result = {"ok": True, "status": "unavailable", "reason": "状态格式无效"}
         if nav is not None:
@@ -222,6 +257,15 @@ def _status(link, nav=None) -> str:
                 if result.get("reason") and map_reason:
                     context = {**context, "map_reason": map_reason, "reason": result["reason"]}
                 result = {**result, **context}
+                pose = result.get("pose") or {}
+                # 区域是拿"最后一次收到的位姿"算的：位姿过期或可疑（AMCL 未收敛的那种 (0,0,0)）时
+                # 必须挑明，否则模型会把"你在平台A"当事实讲出来。
+                if context.get("zone") and (result.get("pose_stale") or pose.get("suspect")):
+                    why = "位姿还没收敛（疑似初始位姿未对齐）" if pose.get("suspect") else "位姿已过期"
+                    result = {**result, "zone_from_stale_pose": True,
+                              "warnings": list(result.get("warnings") or []) + [
+                                  f"区域「{context['zone'].get('name')}」是用{why}的位姿算的，"
+                                  "不是实时位置（AMCL 静止时不发位姿）"]}
             except Exception as exc:
                 reason = str(exc)
                 result = {**result, "map": None, "zone": None,
@@ -302,9 +346,13 @@ def build_server(*, link=None, nav=None, executor=None):
 
     @server.tool()
     def robot_status() -> str:
-        """查询执行状态、缓存位姿、当前与上一次任务结果。位姿可能滞后，不能当实时厘米级定位。
+        """查询执行状态、缓存位姿、当前与上一次任务结果。判断"到没到"看 last.ok，别看 arrived。
 
-        返回 JSON 字符串；连接或状态不可用时 ok:true/status:unavailable，不代表车已就绪。
+        返回 JSON 字符串，要点：`pose` 是**最后一次收到**的位姿，配合 `pose_stale`（true = 不能当
+        实时位置用：没收到/过期/新鲜度未知）与 `pose.suspect`（疑似 AMCL 未收敛，如恰好停在原点）
+        判断可信度 —— 两者为真时**不能**把坐标或区域当实时位置告诉用户；`zone_from_stale_pose`
+        表示区域就是这么算出来的。判断"到没到"看 `last.ok`，别看 `arrived`（只在变化时发布）。
+        连接或状态不可用时 `ok:true`/`status:unavailable`，不代表车已就绪。
         """
         return _status(link, nav)
 

@@ -44,7 +44,10 @@ export interface MapListItem {
   cached_at?: number | string | null;
   counts?: MapCounts;
   status?: string;
+  /** 车**此刻在跑**的图（`map_server/yaml_filename`，自动识别，不是人工声明） */
   current?: boolean;
+  /** 人工指定的"下次启动导航用哪张"（settings.current_map），与 `current` 是两回事 */
+  next?: boolean;
 }
 
 export interface MapListResp {
@@ -54,7 +57,12 @@ export interface MapListResp {
   maps?: MapListItem[];
   mode?: string;
   root?: string;
+  /** 车此刻在跑的图名（认不出为空串；不是 settings.current_map） */
   current_map?: string;
+  /** `map_server_param`（问导航）/ `map_topic`（退回指纹）/ `unknown` */
+  current_map_source?: "map_server_param" | "map_topic" | "unknown";
+  /** 人工指定的"下次启动用哪张" */
+  next_map?: string;
 }
 
 export interface MetaResp {

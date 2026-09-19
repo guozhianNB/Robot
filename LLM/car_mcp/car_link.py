@@ -55,6 +55,7 @@ class CarLink:
         self._pose = self._arrived = None
         self._arrived_at = None
         self._last_error = ""
+        self._last_error_at = None
         self._idle_override = False
         self._needs_idle_probe = False
         self._nav_available = False
@@ -73,12 +74,26 @@ class CarLink:
         detail = str(error) or type(error).__name__
         with self._lock:
             self._last_error = detail
+            self._last_error_at = time.time()
         if self._logger is not None:
             try:
                 self._logger(detail)
             except Exception:
                 pass
         return {"ok": False, "status": "error", "error": detail, "message": detail}
+
+    def _recovered(self):
+        """连接重新建立 → 把上一次的错误清掉。
+
+        为什么必须清：`snapshot()["last_error"]` 会在 `robot_status` 里被原样报给模型。**已经解决的**
+        连接错误留着当现状，模型就会说"链路没恢复"甚至不敢发车（2026-09-19 实测：rosbridge 晚起
+        那次留下的 `[Errno 111] Connection refused` 一直挂在状态里）。
+        只在**新连接建成**时清（不是复用已有 socket），这样"刚出错、还没恢复"的诊断信息不会丢；
+        诊断历史另有 `car_mcp.log` 与审计。
+        """
+        with self._lock:
+            self._last_error = ""
+            self._last_error_at = None
 
     def _dependency_error(self):
         if self._factory is None and websocket is None:
@@ -120,6 +135,7 @@ class CarLink:
             return sock
         factory = self._factory or websocket.create_connection
         sock = factory(self.url, timeout=0.3 if channel == "state" else self.probe_timeout)
+        self._recovered()          # 连接建成 = 链路恢复，旧错误不再当现状报
         try:
             if channel == "state":
                 sock.settimeout(0.2)
@@ -352,12 +368,31 @@ class CarLink:
     def snapshot(self):
         with self._lock:
             fresh = self._state_mono is not None and time.monotonic() - self._state_mono <= self.heartbeat_ttl
-            return copy.deepcopy({"ok": True, "available": all(self._sockets.values()),
-                                  "exec_state": self._exec_state, "state_fresh": fresh,
-                                  "moving": self._exec_state in ("moving", "navigating"),
-                                  "pose": self._pose, "arrived": self._arrived, "arrived_at": self._arrived_at,
-                                  "current": self._current, "last": self._last, "state_at": self._state_at,
-                                  "nav_available": self._nav_available, "last_error": self._last_error})
+            pose_at = None if self._pose is None else self._pose.get("at")
+            try:
+                age = None if pose_at is None else max(0.0, time.time() - float(pose_at))
+            except (TypeError, ValueError):
+                age = None
+            return copy.deepcopy({
+                # 「可不可用」看**状态通道**这一条。旧口径是"四通道 socket 全在"，但 probe/ctrl 都是
+                # 按需连接、**stop 只由 robot_stop 触碰**，于是后端比 rosbridge 早起时（四个通道全失败）
+                # 那一条 stop 永远不会重连 → available 永久 false，把好链路报成坏的（2026-09-19 实测复现）。
+                "ok": True, "available": self._sockets.get("state") is not None,
+                "channels": {name: sock is not None for name, sock in self._sockets.items()},
+                "exec_state": self._exec_state, "state_fresh": fresh,
+                "moving": self._exec_state in ("moving", "navigating"),
+                "pose": self._pose, "pose_age_s": age,
+                # 位姿"能不能当实时位置用"只做**标记**不丢弃：AMCL 静止时本就不发 /amcl_pose
+                # （nav2 阈值使然）。所以 pose_stale=True 包含三种情况：压根没收到、新鲜度未知、
+                # 超过 ROSBRIDGE_POSE_TTL_S —— 都**不能**当实时坐标；"最后一次知道的位置"仍有用。
+                # suspect = 恰好停在原点且协方差为 0（AMCL 未收敛的典型样子，口径同 locator.suspect）：
+                # 2026-09-19 发车那一刻 AMCL 报的就是 (0,0,0)，而真值在 (0.48,-0.21)。
+                "pose_stale": bool(self._pose is None or age is None or
+                                   age > conf.ROSBRIDGE_POSE_TTL_S),
+                "arrived": self._arrived, "arrived_at": self._arrived_at,
+                "current": self._current, "last": self._last, "state_at": self._state_at,
+                "nav_available": self._nav_available, "last_error": self._last_error,
+                "last_error_at": self._last_error_at})
 
     def _on_state(self, raw):
         message = json.loads(raw)
@@ -368,6 +403,8 @@ class CarLink:
         topic, body = message.get("topic"), message.get("msg")
         now = time.time()
         if topic == "/amcl_pose":
+            cov = body["pose"].get("covariance") or []
+            first_cov = cov[0] if isinstance(cov, (list, tuple)) and cov else None
             pose = body["pose"]["pose"]
             pos, ori = pose["position"], pose["orientation"]
             x, y = float(pos["x"]), float(pos["y"])
@@ -375,8 +412,12 @@ class CarLink:
             if not all(math.isfinite(v) for v in (x, y, qx, qy, qz, qw)):
                 raise ValueError("non-finite pose")
             yaw = math.degrees(math.atan2(2 * (qw*qz + qx*qy), 1 - 2 * (qy*qy + qz*qz)))
+            # 「恰好停在原点 + 协方差 0」= AMCL 还没收敛的默认位姿（口径同 locator.suspect）。
+            # 2026-09-19 现场：发车那一刻 AMCL 报的就是 (0,0,0)，而真值在 (0.48,-0.21)。
+            suspect = (first_cov == 0.0 and abs(x) < 1e-6 and abs(y) < 1e-6 and abs(yaw) < 1e-9)
             with self._lock:
-                self._pose = {"x": x, "y": y, "yaw_deg": yaw, "at": now}
+                self._pose = {"x": x, "y": y, "yaw_deg": yaw, "at": now,
+                              "cov": first_cov, "suspect": bool(suspect)}
         elif topic == "/robot/arrived":
             if not isinstance(body["data"], bool):
                 raise ValueError("invalid arrived")

@@ -1221,3 +1221,160 @@ goto，`robot_status` 也报不出所在区域。
 - 板卡 `settings.current_map` 仍是 `my_map`，而实际在跑 `my_map3_edited`；`nav_screen.sh nav`
   不带参数默认也是 `my_map.pgm`。现在认图不依赖这两个值了（读的是导航实际加载的图），
   但它们会让"下次启导航用哪张"有歧义，建议对齐。
+
+---
+
+## 2026-09-19（续）· 「哪张图」只留一个真相 + 防复发
+
+**背景**：上一条修完，用户重新建图（`my_map3`）并标好点，再让模型发 A 点，又失败 —— 这次
+错误从「车体未就绪」挪到了「当前地图未知」（`hint: map_unknown`），`robot_status` 报
+`available:false / nav_available:false / map:null`。
+
+### 现场结论（有一处判断需要更正）
+
+**重建地图 = 重启 base/slam/nav，而 `nav_screen.sh` 那套流程会把后端专用 rosbridge `lat2`（:9091）
+一起停掉，且它不自动恢复。** 所以这次断的不是底盘、也不是导航，而是**后端连不上 rosbridge**：
+连 `/robot/readiness` 都发不出去，于是 `nav_available:false` + 位姿拿不到 + 认图失败 —— 连锁反应
+看起来像"车坏了"。这是同一个坑 24 小时内第二次踩（上一条刚写进 `AGENTS.md`），故这次做了
+**结构性防复发**（见下）。
+
+顺带查出**第二个问题**：`robot_actions` 当时有**两个实例**在跑 —— 上一条临时补的 `raction`
+会话，加上新 nav launch 自带的那个（上一轮修好 `RobotReadiness` 之后，launch 已经能自己带起来了）。
+两个同名节点同跑会让 readiness/`exec_state` 的来源不确定。已收掉 `raction`，现在只由 nav launch 托管。
+
+### 根治：把「当前图」收敛到唯一真相
+
+**根因不是某个值没改对，而是"当前图"有两个来源**：
+
+| 名字 | 谁写 | 语义 |
+|---|---|---|
+| `locator.current_map()` | 车（`map_server` 的 `yaml_filename`） | **车此刻在跑哪张** —— 事实 |
+| `settings.current_map` | 人（地图编辑器「设为目标地图」按钮） | 下次启动想用哪张 —— 意图 |
+
+两者混用，就出现"车在跑 `my_map3`、设置里写着 `my_map`、列表把「当前」标在 `my_map` 上"。
+而且前端按钮的提示语**本来**就写的是"已把 X 设为**目标地图**，真要切图请执行 …" —— 只有列表徽章
+还在拿"意图"冒充"事实"。改法：
+
+1. **`/api/map/list` 的「当前」徽章改读车的真相**（`locator.current_map()`，一次探测供整表用；
+   认不出/抛异常时整列都不标，绝不让列表 500）。另加 `next` 字段标「下次启动」—— 两个概念
+   **并排显示**，不再互相冒充。`current_map`/`current_map_source`/`next_map` 一并回显。
+2. **编辑器文案**：徽章「当前」→「**在跑**」，另加「下次启动」标记；`App.vue` 默认打开的那张图
+   因此自动变成"车实际在跑的那张"（零手动）。
+3. `conf.py` 注释同步：`current_map` 明确是**人的意图**，`ward_map_source` 的 `auto` 档说明
+   第一权威是 map_server。
+
+**没有**做「拿车的事实回写 settings」的自动同步：那会把用户点过的"目标"悄悄改掉（意图就没了），
+且让 `ward_map_source="setting"` 这个应急档失去意义。分辨率靠"概念分开 + 各自标清楚"。
+
+### 板卡侧防复发（`~/tools/nav_screen.sh`，板卡本地、不进 git）
+
+- **`nav` 幂等拉起 `lat2`**：`start lat2 ...` 已是幂等（在跑就 skip），所以以后 `nav_screen.sh nav`
+  会顺手把后端专用 rosbridge 带起来 —— 重建/重启导航再也不会把后端桥搭进去。
+- **未指定地图时默认「`maps/` 下最近修改的那张 .yaml」**，不再硬编码 `my_map.pgm`：重建完直接
+  `nav_screen.sh nav` 就起对了（旧行为会静默加载一张过时的、没有 tags 的图，再让 goto 全被拒）。
+  显式传参的行为不变，且把选中哪张**回显**出来（`[map] 未指定地图 → 用最近修改的那张: …`）。
+  备份：`~/tools/nav_screen.sh.bak2-20260919`。
+
+### 验证
+
+- 板卡 `pytest tests/test_mapeditor.py LLM/tests/test_ward_autoswitch.py LLM/tests/test_settings_roles.py
+  LLM/tests/test_server_roles_routes.py -q` → **105 passed**（新增 2 例：列表徽章认车不认陈旧的设置、
+  认不出当前图时列表照常返回）。
+- `tests/test_mapeditor.py` 的 autouse fixture 扩成**整条认图路离线**（`node_string_param` 空串 +
+  `subscribe`/`drain` no-op）—— 因为 `/api/map/list` 现在也会认图，不切就会在板卡上真连 rosbridge。
+- `cd frontend && pnpm --filter mapeditor build:sandbox` → **构建通过**（沙箱内用这个等价命令，
+  `pnpm build` 会因 spawn EPERM 失败）。
+- 真机实测（不移动车）：`current_map → my_map3`（`map_server_param`）、`my_map3.tags.json` 指纹
+  与 yaml 一致（origin `[-2.55,-3.68]`）、`resolve_place("A点") → (0.46, -0.49)` 通过安全校验、
+  `readiness ready:true / nav_available:true`；`resolve_place("B点")` 如实拒绝并列出可用地点（新图只标了 A点）。
+
+### 没做 / 待办
+
+- **真机发车验收仍未做**（仍未发过车）。
+- 「连不上 rosbridge 时给出可操作文案」没做（用户本轮未选）：现在 `car_server._ready()` 仍会把
+  原始的 `[Errno 111] Connection refused` 当作「车体未就绪」报给模型 —— 建议后续按
+  `2026-09-19-car-mcp-design.md` §十 的降级表分成 rosbridge 没起 / `robot_actions` 没起 / 导航没起三种。
+- `ros2_car` 侧 `robot_actions.py` 顶层 import `RobotReadiness` 的脆弱性未改。
+- **仓库分叉**（需人工处理，不在本批次）：PC 端已推 `b922da6`（含本条之前的车控修复）与 `106d07b`
+  （建图体素），板卡端有一个本地提交 `586a90b 板卡提交` 未推；两条线都改了相同文件。合并时注意
+  `docs/log.md`、`AGENTS.md` 的同段落冲突。
+
+---
+
+## 2026-09-19（再续）· 车真的动了：核 LLM 的两条保留 + 修上报层的两类假象
+
+**背景**：车终于在 LLM 调用下动起来了（`robot_goto_place("A点")` → 受理 → 导航）。模型自己报了两条
+保留：① 顶层仍 `available=false / status=unavailable`，`last_error` 是旧的 `Connection refused`；
+② `pose` 报 `(0,0,0)`、比 `state_at` 早 282 s。要求核实。
+
+### 核实一：车**到位了**（但别盯 `arrived`）
+
+ROS 侧权威日志：
+
+```text
+robot_actions: [navigate_to] (0.46, -0.49) yaw=0°
+bt_navigator: Begin navigating from current location (0.00, 0.00) to (0.46, -0.49)
+controller_server: Reached the goal!      ← 7.3 s 后
+bt_navigator: Goal succeeded
+```
+
+模型看到 `arrived=false` 没错 —— 它是在**导航途中**查的。但 `/robot/arrived` **只在变化时发布**
+（`ros2 topic echo --once` 事后一条都收不到），所以判"到没到"要看 `robot_status` 的 **`last.ok`**，
+不能盯 `arrived`。已写进工具 docstring。
+
+### 核实二：`available=false` 是**假警报**，根因复现
+
+`available` 的旧口径是 `all(self._sockets.values())`（四通道 socket 全在）。但：
+
+- `probe` / `ctrl` / `state` 都会在**用到时**自己重连（readiness、动作调用、状态循环）；
+- **`stop` 只由 `robot_stop()` 触碰**；
+- `_start_state()` 有 WeakSet 守卫，`start()` 一辈子只跑一次。
+
+于是"后端比 rosbridge 早起"（本次 21:41 起后端、22:03 才起 lat2）→ 四通道全失败 → 之后三条自愈、
+stop 永远空 → `available` **永久** false，`last_error` 还留着已经解决的 `[Errno 111] Connection refused`。
+复现脚本打出来：`channels={'ctrl':True,'probe':True,'stop':False,'state':True}` 而 `available=False`；
+**调一次 `robot_stop` 就变 True**（证明只差这一条通道）。
+
+> 影响是**上报层**的：`_ready()` 走 readiness，不看你这个 `available`，车控本身没坏。但模型会据此说
+> "链路没完全恢复"、甚至不敢发车 —— 值得修。
+
+### 改法（三件事，全部落在 `LLM/car_mcp/`）
+
+| 改动 | 说明 |
+|---|---|
+| `available` 重新定义 | 只看**状态通道**（`_sockets["state"]`）；另加 `channels` 四通道明细，诊断信息不丢 |
+| `last_error` 恢复即清 | `_connect()` **新建**连接成功时清（复用已有 socket 不清），并加 `last_error_at` |
+| 降级门槛 | `robot_status` 只看 `state_fresh`，不再看 `available`；且**每次状态查询都探一次 readiness**——否则后端刚起、模型只问状态不问动作时，`nav_available` 会一直停在冷启动的 false，又是一条"看着像导航没起"的假警报 |
+| 位姿可信度 | `snapshot()` 新增 `pose_age_s` / `pose_stale`（**没收到 / 新鲜度未知 / 超过 `ROSBRIDGE_POSE_TTL_S` 都算 true** = 不能当实时位置）、`pose.cov` / `pose.suspect`（恰好停在原点且协方差 0 = AMCL 未收敛，口径同 `locator.suspect`）；`zone_from_stale_pose` + `warnings` 说明"区域是拿陈旧/未收敛位姿算的" |
+| 错误文案分类 | `_explain()`：连不上 rosbridge → 明确报 `ROSBRIDGE_URL` 并提示 `nav_screen.sh lat2`；`Service ... does not exist` → 提示查 `robot_actions`/导航模式；分不清就原样返回（**绝不编造原因**）。旧行为是把裸 `[Errno 111]` 当"车体未就绪"报给模型，人和模型都不知道去查什么 |
+
+### 核实三：`(0,0,0)` 不是"陈旧缓存"，是 **AMCL 没定位就发车**
+
+真位姿只能走 TF（`/amcl_pose` 静止时 0 Hz 是已知行为）：`tf2_echo map base_link` = **(0.480, -0.215)**。
+而 nav.log 里同一时刻写着 `Begin navigating from current location (0.00, 0.00)` —— **发车那一刻 AMCL
+报的就是 (0,0,0)，真值在 (0.48,-0.21)，差 0.52 m**。这次能到，是因为两者足够近、且行驶中 AMCL 收敛了。
+
+顺带核了 `zone: 平台A`：`(0,0)` 与真位姿**都**落在该区域内，所以这次答案碰巧对；但拿未收敛位姿算
+zone 本身有风险 —— 这正是上面加 `zone_from_stale_pose` 的原因。**操作建议：发车前确认 AMCL 已定位**
+（设初始位姿 / 看 TF 是否在真值附近），否则等于在错先验上导航。
+
+另：停稳后 `tf2_echo` 在 (0.480,-0.215)，距 A点目标 0.276 m，而 `xy_goal_tolerance` 是 0.25 m ——
+"Goal succeeded" 是当时的判定；**定位精度是当前的主要误差来源**。
+
+### 验证
+
+- 板卡 `pytest LLM/tests/test_car_mcp.py -q` → **104 passed**（新增 5 例：`available` 只看状态通道
+  的现场回归、恢复即清 `last_error`、位姿 suspect/stale 标记、`robot_status` 的陈旧位姿区域标注、
+  状态未知时主动探 readiness；另有错误文案分类 3 种；改掉 1 条旧断言：降级不再看 `available`）。
+- 真车实跑新代码（不移动车）：`available:true`、`channels` 四项全 true、`last_error:""`、
+  `nav_available:true`、`pose_stale:true`（车静止、AMCL 不发位姿 —— 如实标记而不是假装新鲜）。
+- **真机发车已实质发生一次**（LLM 调用下发到 A点，`Goal succeeded`）；但"0.3 m 前进 / 30° 转向 /
+  导航途中 1 秒急停"这三项专项验收仍未逐项做，`2026-09-19-car-mcp-design.md` §13.3 照旧。
+
+### 没做 / 待办
+
+- `ros2_car` 侧 `robot_actions.py` 顶层 import `RobotReadiness` 的脆弱性未改。
+- **AMCL 初始位姿的对齐纪律**：目前靠人在 rviz/Foxglove 里点；"发车前自动确认已定位"没做
+  （可考虑把 `pose.suspect` 接进 goto 的前置校验，即"位姿可疑时先拒绝发车并提示先定位"）。
+- 板卡配置仍是 `resolution: 0.05`（`106d07b` 的 0.025 未上板），要生效需 pull + `colcon build`
+  `robot_bringup` + 重启 base/slam + **重新扫图**。

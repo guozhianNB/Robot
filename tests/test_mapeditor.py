@@ -87,14 +87,21 @@ def _store():
 
 @pytest.fixture(autouse=True)
 def _offline_map_param(monkeypatch):
-    """切断「问 map_server 要 yaml_filename」这条权威路，保证本文件全程离线。
+    """把「认当前图」整条路切成离线，保证本文件不碰真 rosbridge。
 
-    它是 ``current_map()`` 的第一权威（见 ``locator._map_name_from_param``），会走 rosbridge
-    服务调用；不切断的话，跑在**有板卡的开发机/板卡本机**上会真连到板卡，把离线断言染成
-    "实际环境相关"。要验这条路的用例自己再 patch 回一个假路径（见
-    test_current_map_prefers_map_server_param*）。
+    两处都要切（`current_map()` 有两条路，且 `/api/map/list` 现在也要调它标「在跑」）：
+
+    * ``roslink.node_string_param``（第一权威：问 map_server 要 yaml_filename）→ 空串 = 问不到；
+    * ``roslink.subscribe`` / ``roslink.drain``（退回路上的 /map 取数）→ no-op，
+      否则跑在**板卡本机 / 有板卡的开发机**上会真连上 rosbridge，把离线断言染成"环境相关"
+      （实测踩过：测试真连上了板卡、认出了真实在跑的地图）。
+
+    要验权威路的用例自己把 ``node_string_param`` 换成假路径（见
+    test_current_map_prefers_map_server_param*）；注入型用例走 `_injected_map`，不受影响。
     """
     monkeypatch.setattr(roslink, "node_string_param", lambda *a, **k: "")
+    monkeypatch.setattr(roslink, "subscribe", lambda *a, **k: False)
+    monkeypatch.setattr(roslink, "drain", lambda *a, **k: 0)
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +678,47 @@ def test_current_map_falls_back_to_fingerprint_when_param_unavailable(env, monke
     out = locator.current_map(_store())
     assert out["source"] == "map_topic" and out["name"] == "my_map"
     locator.clear_injection()
+
+
+def test_map_list_badge_follows_car_not_stale_setting(env, monkeypatch):
+    """**回归 2026-09-19**：列表的「在跑」必须来自**车**，不是 settings.current_map。
+
+    现场事故：车在跑重建后的 `my_map3`，而 `settings.current_map` 还停在 `my_map`
+    （那是"下次启动想用哪张"的人工声明）→ 编辑器的「当前」标在错的图上。
+    """
+    from LLM.maps import mapapi as server
+
+    maps = env["maps"]
+    (maps / "my_map2.yaml").write_text(SAMPLE_YAML.replace("my_map.pgm", "my_map2.pgm"),
+                                       encoding="utf-8", newline="")
+    (maps / "my_map2.pgm").write_bytes(make_pgm(8, 6))
+    mapserver.clear_cache()
+    # 人工声明说"下次用 my_map2"，而车实际在跑 my_map
+    monkeypatch.setattr(server.db, "get_settings", lambda: {"current_map": "my_map2"})
+    monkeypatch.setattr(locator, "current_map",
+                        lambda *a, **k: {"ok": True, "source": "map_server_param", "name": "my_map"})
+
+    out = server._map_list_sync("")
+    by_name = {m["name"]: m for m in out["maps"]}
+    assert by_name["my_map"]["current"] is True          # 在跑 = 车的真相
+    assert by_name["my_map"]["next"] is False
+    assert by_name["my_map2"]["current"] is False        # 人工声明**不许**冒充"在跑"
+    assert by_name["my_map2"]["next"] is True            # 它是"下次启动"
+    assert out["current_map"] == "my_map" and out["current_map_source"] == "map_server_param"
+    assert out["next_map"] == "my_map2"
+
+
+def test_map_list_badge_survives_unknown_current_map(env, monkeypatch):
+    """认不出当前图时列表照常返回，只是整列都不标「在跑」（绝不因此 500）。"""
+    from LLM.maps import mapapi as server
+
+    def _boom(*a, **k):
+        raise RuntimeError("rosbridge 断了")
+
+    monkeypatch.setattr(locator, "current_map", _boom)
+    out = server._map_list_sync("")
+    assert out["ok"] is True and out["current_map"] == ""
+    assert all(m["current"] is False for m in out["maps"])
 
 
 def test_map_name_from_param_takes_basename_and_enforces_whitelist(monkeypatch):

@@ -349,7 +349,9 @@ watch(
       >
         <div class="row-main">
           <span class="nm">{{ m.name }}</span>
-          <span class="tag cur" v-if="m.current">当前</span>
+          <!-- 「在跑」来自车（map_server 加载的图），自动跟着导航走，不用手设；「下次启动」才是你点的那张 -->
+          <span class="tag cur" v-if="m.current">在跑</span>
+          <span class="tag" v-if="m.next">下次启动</span>
           <span class="tag bad" v-if="m.status && m.status !== 'ok'">{{ m.status }}</span>
           <span class="tag" v-if="m.tags_exists">tags ✓</span>
           <span class="tag bad" v-else-if="m.has_yaml">无 tags</span>

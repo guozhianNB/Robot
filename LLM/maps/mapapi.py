@@ -292,6 +292,16 @@ def _map_list_sync(source: str = ""):
                 "source": mapstore.current_source().get("id", ""),
                 "mode": conf.MAPS_IO, "root": store.root}
     counts = _tag_counts([e["name"] for e in entries])
+    # 「在跑哪张」= **车的真相**（map_server 的 yaml_filename，见 locator.current_map），不再看
+    # settings.current_map —— 那是**人工声明**，你重建一次地图它就漂（2026-09-19 现场：车在跑
+    # my_map3，设置里还写着 my_map，于是列表把「当前」标在错的图上）。
+    # 两者语义本就不同，故分开展示：`current` = 在跑（自动），`next` = 下次启动用（你设的目标）。
+    try:
+        running = locator.current_map(store) or {}
+    except Exception:      # noqa: BLE001  认不出就整列都不标「在跑」，绝不因此让列表 500
+        running = {}
+    running_name = str(running.get("name") or "")
+    next_name = str(db.get_settings().get("current_map") or "")
     maps = []
     for e in entries:
         item = dict(e)
@@ -314,11 +324,13 @@ def _map_list_sync(source: str = ""):
                              "stale": info.get("stale"), "cached_at": info.get("cached_at")})
             except mapstore.MapStoreError as ex:
                 item["problems"] = [str(ex)]
-        item["current"] = (db.get_settings().get("current_map") == e["name"])
+        item["current"] = (running_name == e["name"])
+        item["next"] = (next_name == e["name"])
         maps.append(item)
     audit.log("map_change", action="list", count=len(maps), mode=conf.MAPS_IO)
     return {"ok": True, "maps": maps, "mode": conf.MAPS_IO, "root": store.root,
-            "current_map": db.get_settings().get("current_map")}
+            "current_map": running_name, "current_map_source": running.get("source") or "unknown",
+            "next_map": next_name}
 
 
 @router.get("/api/map/current")
