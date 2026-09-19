@@ -989,3 +989,23 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
 - `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
 - 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。
+
+---
+
+## 2026-09-19 · 纳入 jie_ware 定位工具集（vendored）
+
+### 实现口径
+
+- `ros2_car/src/jie_ware/` 是从上游 `6-robot/jie_ware` 克隆的 ROS2 包（`lidar_loc` / `lidar_filter_node` / `costmap_cleaner` + `amcl_test`、`lidar_loc_test` 两个 launch）。
+- 克隆自带的内层 `.git` 让 `git add` 只生成 **gitlink（模式 160000）**：文件内容一个都不进主仓库，远端 clone 后只会看到空目录，且无 `.gitmodules`（既不是真子模块、也没内容）—— 这正是「git 不上去」的根因。已 `Remove-Item -Recurse -Force ros2_car/src/jie_ware/.git` 后按**自有代码 vendoring** 纳管，源码快照 10 个文件全部入索引。
+- 上游定版 `21bf8f5`、许可 **GPL-2.0-or-later**（copyleft）已记入 `使用开源代码记录.md`：vendoring 后主仓库不保留上游历史，不钉哈希将来无从 diff。
+
+### 验证
+
+- `git ls-files -s ros2_car/src/jie_ware | Where-Object {$_ -match '^160000'}` → **0**（无 gitlink 残留）；`git diff --cached --name-only` 与磁盘文件 1:1 对上（10 个）。
+- `git push origin main` → `0205dd6..5fe16ea`；`git ls-tree -r --name-only origin/main -- ros2_car/src/jie_ware` 列出全部 10 个文件。
+
+### 待办
+
+- 将来同步上游需按 `21bf8f5` 手动 diff（无 submodule 关联）。
+- GPL-2.0-or-later 的传染性对主仓库整体许可的影响未评估。
