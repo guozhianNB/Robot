@@ -1,0 +1,31 @@
+#!/bin/sh
+# 推送前闸门：这是"不会被上传到 GitHub"的**最后一道门**。
+#
+# 比 pre-commit 多查一样东西：**git 历史**（`git rev-list --all --objects`）——
+# 因为推送上传的就是历史里的对象，只要历史里有，GitHub 上就会有
+# （`.gitignore` 管不了历史，2026-09-19 的声纹事故就是这么发生的）。
+#
+# 启用：git config core.hooksPath .githooks
+# 临时跳过：git push --no-verify
+
+# 钩子被执行时 CWD 未必是仓库根目录，先定位过去（相对路径才对得上）
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+PY=""
+for c in ".venv/Scripts/python.exe" ".venv/bin/python" "python" "python3" "py"; do
+    if [ -x "$c" ]; then PY="$c"; break; fi
+    if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+
+if [ -z "$PY" ]; then
+    echo "[隐私闸门] 没找到 python，跳过检查。请手动跑：python scripts/check_privacy.py"
+    exit 0
+fi
+
+if "$PY" scripts/check_privacy.py --quiet; then
+    exit 0
+fi
+echo ""
+echo "[隐私闸门] 已阻止本次 push —— 历史或索引里有不该上传的东西。"
+echo "           确认无隐私问题可临时跳过：git push --no-verify"
+exit 1

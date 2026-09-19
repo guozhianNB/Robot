@@ -787,3 +787,696 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
   地点白名单解析、风险分级与二次确认状态机、admin「地点白名单」页签（规格 §6.3/§7）——**本轮未做**，
   待 MCP 线重启后另立计划。
 - **真实语音链路未联调**：声纹→角色→提示词分层这条链在本机只有单测覆盖，未接麦克风实测。
+
+---
+
+## 2026-09-15 —— 全量测试跑不完的根因：`LLM/bus.py` 收尾死锁（已修）+ YOLO 人脸检测起步
+
+### 背景与用户原话
+
+> 「后台跑完大概需要多久」→「哪里卡住了 / 图片读取失败，找找原因，需要我做什么」
+> 「按你说的做，如果仍旧超时就主动告知我，给出可能的错误原因，我来排查」
+> 「使用超时轮询的改动方式」
+
+现象：全量套件跑 4 分多钟仍无输出。实测进程存活 258 s 却只耗 27 s CPU —— **在等，不是在算**。
+
+**纠正一条旧归因**：本文件 2026-09-14（续一）§未做 第 4 条写的是"沙箱里 `TestClient(app)` 会卡在
+lifespan（MCP/voice 启动）"。实测**不是**：卡点在 lifespan 的**收尾**，且与 MCP/voice 无关
+（`tests/test_mcp_startup.py` 单独跑 1.4 s 通过）。
+
+### 根因（抓栈定位，可复现）
+
+`tests/test_modules_status.py` 单文件 >120 s 不返回。用 `faulthandler.dump_traceback_later` +
+自建看门狗（打印**线程名**：faulthandler 自己不给名字）拿到三方互等：
+
+- `asyncio_0`（事件循环**默认线程池**的 worker）停在 `concurrent/futures/thread.py:58 run` → `queue.get()`（**无超时阻塞取**）；
+- `Thread-2 (_do_shutdown)` 停在 `base_events.py:580 _default_executor.shutdown(wait=True)` → `t.join()`；
+- 主线程停在 `starlette/testclient.py:709 __exit__` → anyio portal `thread.join()`。
+
+即：**关闭事件循环要先 join 默认线程池的 worker，而该 worker 永远卡在 `_q.get()` 上**。
+`LLM/bus.py` 的 `await loop.run_in_executor(None, _q.get)` 就是那一行。关键认知：
+**`stop()` 置 `_stop` 标志打不断一个正在阻塞的调用** —— 而 `bus.stop()` 早已在 `server.py:1140`
+被调用，形同虚设。影响面不止测试：**uvicorn 重启 / Ctrl+C 同样退不掉，只能强杀**。
+
+### 实现（用户选定的"超时轮询"方案）
+
+`LLM/bus.py`：
+
+1. 新增 `POLL_SECS = 0.5`；
+2. `_drain()` 改 `run_in_executor(None, _q.get, True, POLL_SECS)`，并**单独** `except queue.Empty: continue`
+   （"没消息"不是异常，不能落进原来的退避 `sleep(0.5)` 分支）；
+3. `start_drain()` 复位 `_stop`（顺手加固：`stop()` 永久置位，同进程二次 lifespan 会让第二次的
+   drain 立刻自杀 → 提醒/报警推送**静默失效**，比报错更难查）。
+
+行为差异**只在收尾**：有消息时仍立即送达（实测 4 ms），无消息时每 0.5 s 回来看一次 `_stop`。
+
+### 测试（本机 Windows 实跑）
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 全量 `tests/ + LLM/tests/` | **跑不完**（4.3 min 仍无输出，27 s CPU） | **457 passed, 0 failed, 105.9 s** |
+| `tests/test_modules_status.py` | >120 s 不返回 | 3.6 s |
+| uvicorn 收 CTRL_BREAK（真发信号，等价 Ctrl+C） | 永不退出 | **0.24 s 干净退出** |
+| 真 HTTP：订阅 `/api/events` + `POST /api/alarm` | —— | **4 ms 收到**（实时推送未受影响） |
+
+- **新增 `tests/test_bus.py`（7 条）**：载荷/跨线程 publish/端到端 SSE 扇出/`stop()` 后一个窗口内退出/
+  订阅队列满的降级；核心回归 `test_loop_shutdown_not_blocked_even_without_stop`（**故意不调 `stop()`**，
+  旧实现在此永久挂住）。
+- `tests/test_modules_status.py`：修两处陈旧断言 —— 聚合键要含 `mcp`（后加的维度）、`voice.status`
+  词表要含 `degraded`（`worker.py` 的完整词表是 running / degraded / disabled / stopped）；
+  并断言 mcp 的 `available` / `missing_deps` / `servers` 形状。
+- `tests/test_unlock_switch.py`：**重写**（本文件 L573 记的 3 例"签名漂移"，实际停在**两代之前**的契约上）
+  —— ① `chat_fn` → `stream_fn`（返回 chat_stream **事件流**而非字符串）；② 两参
+  `_handle_speech(seg, settings)` → 三参 `(seg, text, settings)`；③ **锁定语义已移交会话层**
+  （`session._shared["locked"]`），直接赋值 `w.locked_uid` 不参与任何判定（那只是语音可用时才同步的
+  兼容镜像）。重写版改为驱动会话层，并把两处读库（`derive_role` / `db.get_profile`）换内存替身，
+  只测"这轮算谁说的"；另补第 4 条"锁定 + 未识别"组合。
+- `tests/test_vision.py`：`test_bgr_to_nv12_roundtrips_through_cv2_if_available` 的**期望值不成立** ——
+  拿随机噪声图要求 4:2:0 往返 `mean|err| < 12`，任何正确实现都过不了（实测 44~46；色度 2x2 平均对
+  逐像素噪声必然大量丢失）。拆成"平滑内容严格断言（实测 **1.52**，阈值 <3，才拦得住色序/口径写错）"
+  + "噪声只验不变量（Y 平面与 cv2 `BGR2YUV_I420` 同口径、误差有界 <60）"。
+
+复现/验证用临时脚本（`.ptmp_shim/`，未跟踪、可随时删）：`hang_probe2.py`（20 s 抓线程名+全栈）、
+`verify_uvicorn_shutdown.py`、`verify_sse_e2e.py`、`run_tests_per_file.py`（逐文件计时，用来把"挂"与"慢"分开）。
+
+### 顺带：本机 pytest 的沙箱坑（环境限制，非代码）
+
+沙箱下用 `mode=0o700` 建的目录会变成**不可列举**（`listdir` → WinError 5），而 pytest 的 tmpdir
+插件处处用 0o700 建 basetemp / `tmp_path` → `tests/conftest.py` 的 autouse 夹具在每个用例上直接
+PermissionError（87 例全 ERROR，看着像代码坏了）。绕过：`.ptmp_shim/ptmode.py` 仅测试期把 0o700
+放宽为 0o777，配 `pytest -p ptmode` 使用。
+
+### 另：YOLO 人脸检测起步（`vision/face.py`）
+
+- 模型：`deepghs/yolo-face` 的 `yolov8n-face` **ONNX**（12.1 MB，经 **hf-mirror** 下载 —— 本机
+  huggingface.co 直连不通、raw.githubusercontent 超时；`vision/models/` 已入 `.gitignore`）。
+  输出 `[1, 5, 8400]` = 4 框 + 1 类置信度（**无人脸关键点**）。
+- 运行期只需 `onnxruntime` + `cv2`（**不引入 torch**；与板卡"onnx → hbm"转换链路同口径）。
+  可选依赖缺失 / 模型不在盘上 → `available()` 返回原因、`FaceDetector` 抛 `FaceUnavailable`
+  （遵「系统稳健性」红线；`vision/__init__.py` **不**导入它）。
+- 实测：Lena 1 张脸（score 0.664，框位目视正确）；**Solvay 1927 合影 29 张**（真值 29 位与会物理学家）；
+  无人脸纹理图 **0 误检**；640 输入 30~73 ms、1280 输入 ~100 ms（CPU）。
+- `tests/test_face.py` 26 条（含 5 条真模型用例，缺权重时 skip）。
+- 硬件侧结论：板卡 RDK X5 **未接摄像头**（VIO 扫全部支持 sensor 的 chip ID 全 `0x00`、官方样例
+  `get chn from 1920x1080 failed` 同样失败、i2c-4/5/6/7 无器件），`/dev/video*` 不存在；
+  PC 侧真实摄像头可用，但**沙箱禁止设备访问**（提权后 `idx=0` DSHOW/MSMF/ANY 全部可开）。
+  跨机链路（PC 后端 → 板卡 `camera_server`，`VISION_HOST=100.65.82.93`）已用 `--mock` 验证通；
+  板卡 `vision/` 是 8-27 快照（只有 `--mock`，无 `--source`）。
+
+### 已知限制
+
+- **`bus.py` 的修复未在真机复验**：本机覆盖了单测 + 真 uvicorn + 真 SSE，但车前屏真实浏览器与
+  Tailscale 远程长连接（`/api/events` 挂数小时）未测。
+- 人脸只做"人脸在哪"：**识别（谁）与活体检测未做**，注册/比对链路（`docs/temp/face-recognition-notes.md`）
+  未动；板卡上跑 YOLO 需 BPU 转换（`.hbm`），本机只验了 CPU ONNX 路径。
+- 板卡 `vision/` 与仓库当前版本存在代差（缺 `--source` / `--list-cameras` / 新版诊断），插上
+  MIPI 摄像头后建议先同步该目录再上板复测。
+
+---
+
+## 2026-09-15（续）—— 人脸接口层：`LLM/face_api.py` 的"连续 N 帧一致"判定（为身份切换打底）
+
+### 背景与用户原话
+
+> 「是摄像头和光线的问题，正常情况下可以检测人脸，暂时无需添加两级检测，现在把"连续 N 帧一致"
+> 的判定写进接口层（为身份切换打底）」
+
+即：**不做** crop-and-zoom 两级检测（先把拍摄条件弄好），但要把"什么时候算稳定，可以据此切主体"
+这条口径先立到接口层。前置实测依据（同日上一条）：单人 15 帧里 **1 帧漏检**、两人场景远处那位分数
+只有 **0.46~0.53**、框会随身体晃动漂移 —— 按单帧切主体必然"有人路过就误切"。
+
+### 分层与实现
+
+沿用 `voice_api.py` 的三层结构：`vision/face.py`（纯检测）→ `LLM/face_api.py`（本模块：装配 +
+取帧 + 判定 + 降级）→ `LLM/server.py`（路由）。
+
+**判定口径（`StabilityTracker`，纯逻辑、无 numpy/onnx 依赖）**：
+
+1. **跨帧关联**：每帧的人脸框按 IoU（`FACE_TRACK_IOU`，默认 0.3）贪心关联到已有轨迹；
+2. **逐轨迹连续命中** `hits`：该轨迹**连续**被看到的帧数（中间丢一帧即归零，短暂遮挡保留轨迹
+   至 `FACE_TRACK_MAX_AGE` 帧）；
+3. **整体一致帧数** `frames`：连续多少帧"看到的是同一组轨迹"——**这就是"连续 N 帧一致"**；
+4. **`stable`**：`frames >= FACE_STABLE_FRAMES`（默认 5）且有轨迹 `hits` 够且**平均置信度**
+   `>= FACE_STABLE_CONF`（默认 0.60，低分轨迹不计入）；
+5. **`switchable`**：还要 `count == 1`（两人同时稳定 = 歧义，不切）**且身份也连续够 N 帧**。
+
+**关键设计点：身份不进 `frames` 的指纹。** 一开始我把 `identity` 并进"一致帧数"的指纹，两个用例
+立刻红了 —— 那会让"识别第一次给出结果"或"某帧没给出身份"把**检测**稳定也清零。实际是两件事：
+`frames` 管"脸连续出现了几帧"（检测层），`identity_hits` 管"同一身份连续几帧"（识别层），
+各按轨迹单独计。`reason` 因此区分 `no_face` / `not_enough_frames` / `low_score` /
+`multiple_faces` / `no_identity` / `identity_unstable` / `ok`。
+
+**为身份切换预留的接法**：识别模型（ArcFace 等）接上后，只要在每个 face 字典里补
+`{"identity": uid}`，轨迹会自动统计 `identity_hits`，`switchable` 自动变可用 —— **判定逻辑一行都不用改**。
+在此之前 `identity` 恒为 `None`、`switchable` 恒为 `False`（能判"有人脸稳定"，不能判"是谁"）。
+
+**配置（`conf.py`，新增 FACE_* 块）**：`FACE_DETECT_IMGSZ=640`（注释里写了实测依据：同一批帧
+1280 反而只检到 1 人、耗时 2.6 倍，要提升远处小脸应做"裁脸放大"而非整体放大输入）、
+`FACE_DETECT_CONF=0.25`、`FACE_CAMERA_CHANNEL=1`、`FACE_STABLE_FRAMES=5`、`FACE_STABLE_CONF=0.60`、
+`FACE_TRACK_IOU=0.30`、`FACE_TRACK_MAX_AGE=5`。
+
+**路由**：`GET /api/face/status` 从"占位 unavailable"升级为真状态（`detector` 与 `camera`
+**分开报** —— 两者缺一个都表现为"没人脸"，分开才好排查）；新增 `POST /api/face/probe`
+（抓一帧 + 检测 + 推进判定；取不到帧 → 503 + `ok:False`，与 `/api/vision/snapshot` 同口径）与
+`GET /api/face/state`（纯读，不取帧不推进）。**诊断器不做常驻后台抓帧** —— 由前端按 1~3 fps 轮询
+probe 攒判定，避免后端默认占着摄像头。
+
+### 测试
+
+- **新增 `tests/test_face_api.py`：21 条**（不需要摄像头/模型）——判定器纯逻辑（连续 N 帧才稳、
+  中断归零、换位置新轨迹、抖动仍同一轨迹、两人歧义、低分不计入、轨迹老化、纯读不推进、reset）
+  + identity 预演（接上即可切换、身份变化/丢失重算）+ 路由层替身（status 形状、state 不取帧、
+  probe 的 503/成功/连续 5 次转稳、channel 参数、缺依赖不抛穿）。
+- `LLM/tests/test_server_voice_routes.py::test_face_status_route`：不能再断言固定 `unavailable`
+  （有依赖+模型时它就是 running），改为断言形状 + 词表 + `switchable` 恒 False。
+- **活体验证**（真摄像头 + 真后端 + 真 HTTP，`.ptmp_shim/live_api_face_probe.py`）：
+
+```
+#     张数  score  frames stable switchable reason             框                     耗时ms
+1     1     0.857  1      False  False      not_enough_frames  [572,561,722,720]      849   ← 含模型加载
+2~4   1     0.856  2~4    False  False      not_enough_frames  [572,561,722,720]      264~329
+5     1     0.856  5      True   False      no_identity        [576,560,724,720]      276   ← 判定翻真
+6~8   1     0.73~  6~8    True   False      no_identity        框抖动数 px             251~340
+```
+  轨迹 `id=1 / hits=8 / misses=0 / avg_score=0.837`（抖动靠 IoU 关联吃住了，没断）；`GET /api/face/state`
+  连读两次 `frames` 不变（纯读不推进 ✅）。
+
+### 已知限制
+
+- **未接身份识别**：`identity` 恒 `None`、`switchable` 恒 `False`；识别（ArcFace + 样本库）与活体检测
+  仍未做（`docs/temp/face-recognition-notes.md`）。
+- **未接常驻 watcher 与 SSE**：现在靠调用方轮询 probe。要做"后端自己盯着"需加 watch 循环；若要往前端
+  推 `face_state` 事件，按 `AGENTS.md` 约定必须**同步**改 `frontend/packages/shared/src/events.ts`
+  （本轮未动前端契约）。
+- 前端未接 UI（kiosk 没有"检测到人脸"提示/开关）。
+- 板卡未验：本机验的是 PC webcam + CPU ONNX；板卡要 `--source mipi` + BPU 转换，且**目前板卡没有
+  摄像头硬件**（同日上一条已证）。
+- `probe` 单次实测 251~340 ms（取帧 + NV12 解码 + YOLO ~190 ms），故前端轮询别超过 ~3 fps，
+  否则会排队。
+
+---
+
+## 2026-09-15（续二）—— 接入 ArcFace 人脸识别 + 样本库 + 坑清单文档
+
+### 背景与用户原话
+
+> 「先把之前测试yolo建立的临时文件夹删掉，然后接入arcface模型，顺便在vision中新建一个md文件
+> 把你刚刚所说的可能出现的问题写入文件方便我之后查找」
+
+前情：上一条已把"连续 N 帧一致"判定做进接口层，但 `identity` 恒为 None（没有识别模型），
+`switchable` 因此恒为 False。本轮把识别接上，并把踩坑点固化成文档。
+
+### 清理（用户点名）
+
+- 删 `.ptmp_artifacts/`（5.4MB，含**真人摄像头帧**）与 `.ptmp_shim/face_dl/`（4.5MB）。
+- **但把 3 张正式测试图挪到 `vision/testdata/`**（Lena 单人脸 / graf 无脸负对照 / Solvay 合影 29 人），
+  并改 `tests/test_face.py` 的路径 —— 否则那 3 条真模型用例会**静默 skip**（不报错，最难发现）。
+  图为二进制不入库（`.gitignore`），来源与重取方式写在 `vision/testdata/README.md`。
+
+### 实现
+
+| 文件 | 内容 |
+|---|---|
+| `vision/faceid.py`（新） | ArcFace：对齐（框外扩）+ 预处理（**RGB**、`(x-127.5)/127.5`）+ 512 维归一化指纹 + 余弦；CLI `--status/--download/--compare/--embed` |
+| `LLM/face_lib.py`（新） | 样本库：`data/faces/<uid>/<时间>.jpg+.npz`、多样本**平均指纹**、1:N 比对（阈值 + 与第二名差距）、坏样本跳过、uid 白名单、数量上限 |
+| `LLM/face_api.py` | 串起来：`_annotate_identities()`（检测→裁脸→提指纹→比对→填 identity）；`enroll()`；`delete_person()`；`library()`；`status()` 增加 embedder/library |
+| `LLM/server.py` | 新增 `GET /api/face/people`、`POST /api/face/enroll`、`DELETE /api/face/people/{uid}`；`probe` 响应带 `identity_score/identity_margin` |
+| `LLM/conf.py` | `FACE_EMBED_VARIANT/DIM`、`FACE_ALIGN_MARGIN`、`FACE_DIR`、`FACE_MATCH_THRESHOLD/MIN_MARGIN`、样本与人数上限 |
+
+**模型选型（实测定的）**：两个变体都下到 `vision/models/`（不入库）——
+`w600k_r50`（ArcFace+ResNet50，174MB）**323.6 ms/张**，`w600k_mbf`（ArcFace+MobileFaceNet，13.6MB）
+**27.1 ms/张**（差 12 倍）。默认取 **mbf**（整条链还要叠加检测，用 R50 会让一轮到 500 ms 以上）。
+来源仍是 **hf-mirror.com**（huggingface.co 本机不通）；输出均为 512 维。
+
+**比对两道闸门**（不是单阈值）：`FACE_MATCH_THRESHOLD`（绝对阈值）+ `FACE_MATCH_MIN_MARGIN`
+（与第二名的差距）——"两位老人长得像/同一人多角度"会让前两名咬得很近，差距太小宁可不认
+（`reason="ambiguous"`，与声纹"宁问勿猜"一致）。
+
+### 测试（本机实跑）
+
+- **新增 `tests/test_face_lib.py`（20 条）**：存列删、平均指纹（归一化后平均再归一化）、
+  两道闸门（含"库里只有一人时 margin 必须是 None 而不是 0"）、坏 npz/维度不符跳过、
+  uid 目录穿越拒绝、人数与样本上限。
+- **新增 `tests/test_faceid.py`（18 条）**：对齐几何（外扩比例、贴边用边缘复制不补黑边）、
+  预处理形状/范围/**RGB 通道顺序**（BGR 直接送不报错、只会识别变差，必须用测试盯）、
+  归一化与余弦、降级；**3 条真模型用例**（512 维已归一化 / 同一张脸不同裁剪相似 / 不同人明显更低）。
+- `tests/test_face_api.py` 扩到 32 条：新增身份链路端到端（**替身识别器 + 真样本库**）——
+  库里已注册 → 连续 N 帧识别一致 → `switchable` 变真；未注册 → 不瞎认；空库 → `empty_library`；
+  `enroll` 存样本/取最大脸/只存 112×112 对齐小图；`no_face` 是 200 业务结果，依赖缺失才是 503。
+
+### 实测数据（阈值标定的起点）
+
+| 情形 | 余弦相似度 |
+|---|---|
+| 同一个人（同一张脸不同裁剪，mbf） | **0.514 ~ 0.777** |
+| 同一个人（**真摄像头**连续帧 vs 已注册样本） | **0.93**（好帧）/ 0.66（一般）/ 0.20（扭头那帧） |
+| 不同的人（Solvay 合影取 4 张两两） | **0.137 ~ 0.386** |
+| 人脸 vs 无脸纹理图 | 0.093 |
+
+→ 同人最低 0.514、异人最高 0.386，**留白 0.128**，中点 0.450 即默认阈值来源
+（`FACE_MATCH_THRESHOLD=0.45`）。**换模型/换摄像头/换对齐方式都要重标**。
+
+**活体验证（真摄像头 + 真后端 + 真 HTTP，`.ptmp_shim/live_arcface.py`）**：
+
+```
+注册本人 elder_test：HTTP 200 ok=True added=4/4 photos=4  用时 3.6s
+连续 probe：identity 前 4 帧 = elder_test（相似度 0.92~0.93）
+            第 5~6 帧扭头 → identity 丢失（0.204 / 0.446）→ identity_frames 重新起算
+            第 7 帧恢复（0.663）
+最终：stable=True（检测层稳） switchable=False reason=identity_unstable  ← 正是设计意图
+性能：识别 86 ms / 检测 343 ms / 整轮 473 ms（三者同机抢 CPU，比单独跑慢）
+```
+
+这轮正好演示两层计数的价值：**"有张脸稳定出现"与"确定这是谁"是两件事** —— 前者成立
+（stable=True），后者因身份抖动没够 N 帧，系统**不切换**（switchable=False）。
+
+### 文档
+
+- **新增 `vision/人脸识别注意事项.md`（12 节）**：无关键点导致对齐打折（含根治方案）、
+  红外夜视掉识别率、阈值必须自标定（含上表）、检测输入别盲目调大（640 vs 1280 实测）、
+  单帧不可信、性能预算、活体检测缺失、隐私红线、注册质量、多人歧义、环境与权限、自查清单。
+- `vision/README.md` 增加"人脸检测/识别"一节并链到该文档。
+
+### 已知限制
+
+- **对齐仍是无关键点的妥协**：侧脸/歪头掉分（实测同一个人扭头帧只有 0.20）。根治要换
+  SCRFD/RetinaFace 这类带 5 点的检测器。
+- **未做活体**：照片可骗过；正式上线前必须补（动作指令 / 红外深度 / 静默活体）。
+- **阈值只在本机标了起点**：仅 1 位真人 + 公开测试图，**未用真人群体标定**，也**未标红外条件**。
+- `elder_test` 这个开发用身份仍留在 `LLM/data/faces/`（本人 4 张样本）；删：
+  `DELETE /api/face/people/elder_test`。
+- 板卡侧完全未验：BPU 转换（onnx→hbm）没做，量化后阈值需重标。
+- 全量套件出现**间歇性失败**（时序敏感用例，累加已见 2 例：`test_chat_text_tts.py::…body_closes_after_done`、
+  `test_vision.py::test_end_to_end_webcam_source_serves_decodable_jpeg`）；两条都单独跑与整文件跑均通过
+  —— 疑似全量并发下的抖动，与本次改动无关（隔离验证结论见下）。
+
+---
+
+## 2026-09-15（续三）—— 图片入库 / 图片识别（"拍一次照就记住"）+ 清空真人样本
+
+### 背景与用户原话
+
+> 「1.先把我的个人数据删掉，后面需要测试的时候再拍 3.活体测试以后在加 4.进行更改
+> 对于第二点，要求能够记忆已经拍过照的人脸，在第二次检测时可以认出这个人，
+> 我给你发的文件是我之前做过的项目，可以识别人脸并记录，你可以进行参考」
+
+附参考文件：旧项目 `face_rec.py`（`ultralytics` YOLOv11n-face 检测 + OpenCV **LBPH/EigenFace/FisherFace**
+识别，数据集 `<人名>/*.jpg` → **训练** → `.yml` + labels JSON，数据变更自动重训）。
+
+### 用户数据清理
+
+- 删除 `LLM/data/faces/elder_test/`（本人 4 张照片 + 4 个 npz 指纹），库已空。
+- 顺带补了**隐私红线**：`.gitignore` 之前**没排除生物特征数据** —— `git status` 里能直接看到
+  `LLM/data/faces/`，声纹的 `LLM/data/speakers/` 同样漏了。已加规则并用 `git check-ignore` 复核。
+
+### 与旧方案的取舍（结论：保留 ArcFace 路线，吸收旧项目的工程点）
+
+| 维度 | 旧方案 LBPH/Eigen/Fisher | 现方案 ArcFace |
+|---|---|---|
+| 加一个人 | 数据集加图 → **重训** | **写一张 npz，无需训练、立刻生效** |
+| 依赖 | torch/ultralytics + opencv-contrib | onnxruntime + opencv（无 torch） |
+| 相似度 | 距离（越小越像，LBPH ~90） | 余弦（越大越像，0.45） |
+| 板卡 | 无 BPU 路径 | ONNX → `.hbm` |
+| 吸收的点 | 数据集布局、画面显示名字、样本数提示 | `enroll-dir`、`draw()` 画身份、`under_sampled` |
+
+"无需重训"正是"拍一次就记住"的关键：指纹＝磁盘上的 npz，比对**每次都重新扫目录** →
+新人立刻生效、重启后仍在、不需要旧方案那套"数据变了自动重训"的复杂度。
+
+### 实现（本轮新增）
+
+| 位置 | 内容 |
+|---|---|
+| `LLM/face_api.py` | `enroll_photo()`（单图入库，ndarray 或 **base64** 都能吃）、`enroll_dir()`（批量导入 `<目录>/<人名>/*.jpg`，兼容旧数据集）、`identify_photo()`（静态图识别，**不**推进稳定判定）、`_decode_image_b64()`（容忍 `data:` URL 前缀）、**CLI** `python -m LLM.face_api status\|people\|delete\|enroll-photo\|enroll-dir\|identify` |
+| `LLM/server.py` | 新增 `POST /api/face/enroll_photo`、`POST /api/face/identify`（错误码口径与 `/enroll` 一致：503 依赖 / 400 参数 / 200+`no_face` 业务结果） |
+| `vision/face.py` | `draw()` 画框时把 `identity`（姓名/uid）一起画出来 |
+| `LLM/face_lib.py` | `stats()` 增加 `min_samples` / `under_sampled`（样本太少的人点名提示） |
+| `LLM/conf.py` | `FACE_MIN_SAMPLES_PER_UID`；**`FACE_DIR` 支持环境变量重定位**（换加密盘/测试用） |
+
+**修掉一个显示 bug**：`identify` 的 `count` 曾同时被当作"检出数"和"返回数"用（`topk=1` 时
+合影 29 张脸却报"检出 1 张"）。现在区分 `detected`（实际检出）与 `count`（返回几张）。
+
+### 测试（本机实跑）
+
+`tests/test_face_api.py` 扩到 46 条、`test_face_lib.py` 20 条、`test_faceid.py` 18 条、
+`test_face.py` 26 条 —— **四个文件 110 passed**。本轮新增覆盖：
+图片入库→同图识别（替身）、base64 非法/非图片/无脸/`data:` 前缀、`topk` 只截断返回但如实报检出数、
+数据集目录批量导入（含单人覆盖）、`under_sampled` 提示；以及 **3 条真模型端到端**：照片入库→识别同一张
+认出、**跨进程 CLI 认出（等价重启）**、未入库的合影全部"未知"。
+
+### 实测（离线、不用摄像头，`FACE_DIR` 指到临时目录）
+
+```
+① python -m LLM.face_api enroll-photo lena_fixture portrait_lena.jpg
+   → ok=True added=1 samples=1
+② 另一个进程 people   → per_uid {"lena_fixture": 1}，under_sampled ["lena_fixture"]
+③ 再一个进程 identify portrait_lena.jpg → 检出 1 张脸，返回 1 张 → lena_fixture(1.000)
+④ identify group_solvay.jpg（未入库的 29 人合影）→ 未识别（0.113 < 0.45），不瞎认
+⑤ delete lena_fixture → removed=2（jpg + npz）
+```
+
+### 已知限制（本轮未变）
+
+- 活体检测按用户要求**以后再加**（当前照片可骗过）。
+- 阈值仍只是本机起点；真机群体标定与红外条件未标。
+- 无关键点对齐、板卡 BPU 未验（详见 `vision/人脸识别注意事项.md`）。
+
+---
+
+## 2026-09-15（续四）—— 真机闭环验收通过：注册 → 重启后端 → 认出并「可切换」
+
+用户要求「进行真机检验」，选定范围为 **PC + 真摄像头闭环**（板卡无摄像头硬件，认脸动作无法在板上验）。
+脚本 `.ptmp_shim/live_closed_loop.py`（临时工具，可重跑）：起真摄像头服务 + 真后端 → 倒计时 → 拍照注册 →
+**重启后端** → 连打 10 次 `/api/face/probe`。
+
+**实测结果（uid 自动取到真实档案 `elder_001`）**：
+
+```
+① 注册：HTTP 200 ok=True added=5/5 samples_total=5 photos=5  用时 4.4s
+        库：uids=1 samples=5 per_uid {"elder_001":5} under_sampled []
+② 重启后端：库仍 uids=1 samples=5            ← 记忆落盘（不是内存），服务重启不丢
+③ 连续识别 10 次：10/10 全部认出 elder_001
+   identity_score 0.652~0.793（阈值 0.45，余量充足）
+   frames 1→10 递增；**第 5 次起 switchable=True 且保持**，reason="ok"
+   最终：stable=True switchable=True identity=elder_001 identity_frames=10/5
+   性能：检测 564 ms / 识别 125 ms / 整轮 ~725 ms（三个进程同机抢 CPU，比单独跑慢）
+```
+
+**结论**：用户要求的两件事都成立且可复现 —— ① 拍过照就被记住；② 之后再检测能认出这个人，
+而且身份足够稳定到可以据此切换主体（`switchable`）。重启后端不影响（记忆是文件）。
+
+**验收留下的现场数据**：`elder_001` 名下 5 张样本（本人真人样本）**保留**在 `LLM/data/faces/elder_001/`；
+删除：`DELETE /api/face/people/elder_001` 或 `python -m LLM.face_api delete elder_001`。
+真人样本与声纹样本均已被 `.gitignore` 排除，不会误入库。
+
+**本次暴露的性能现实**：单轮 ~725 ms（≈1.4 帧/秒），攒够 5 帧稳定约需 3.5 s。原因是检测、识别、
+摄像头服务三者在同一台 PC 上抢 CPU（检测单独跑曾实测 190 ms，这里 564 ms）。生产上摄像头服务
+应跑在板卡/独立进程，前端轮询控制在 1~1.5 fps；板卡走 BPU 后这一项可大幅改善。
+
+---
+
+## 2026-09-18（续五）—— 真机踩坑与修正：**切换的门槛该看"认得多像"，而不是"框得多准"**
+
+### 背景与用户原话
+
+> 「将我的uid记为000，先将我注册」→（注册后追问）」→「命名为admin」
+> （另：此前选定的方案是"检测门槛降到 0.45 + 新增身份分门槛 0.55"）
+
+### 第一步：注册 uid=000 成功，但"不给切换"
+
+```
+建档 uid=000（kind 默认 elder）→ 拍 5 帧（added=5/5）→ 重启后端（库仍 5 样本，记忆落盘）
+连续识别 6 次：6/6 帧认出 000，身份相似度 0.947~0.970
+但 switchable 一直 False，第 5 帧起 reason 变成 **low_score**
+```
+
+原因不在识别，在**检测框置信度**：那批帧 YOLO 检测分只有 **0.437~0.534**（弱光/稍远），
+而 `FACE_STABLE_CONF` 当时是 **0.60** —— 于是"检测层不算稳定出现"，一路否决切换。
+
+### 第二步：按用户选定方案改成**两道独立门槛**
+
+`LLM/conf.py`：
+
+- `FACE_STABLE_CONF` **0.60 → 0.45**（只管"框得多准"，负责"算不算稳定出现"）；
+- 新增 `FACE_IDENTITY_CONF = 0.55`（只管"认得多像"，负责"能不能据此切换"）。
+
+`LLM/face_api.py`：`_Track` 增加身份相似度的**连续段累计**（`ident_sum/ident_n` + `avg_identity_score`，
+与 `identity_hits` 同步重置）；`StabilityTracker` 增加 `identity_conf`；`_verdict()` 新增闸门与
+`identity_low_score` 原因；`status().thresholds` 暴露两道门槛。相似度为 `None`（单测替身）时**跳过**
+该闸门以保持兼容。测试：新增 5 条（低分拦住切换/达标放行/检测分 0.47 与 0.40 的边界/
+身份分取连续段平均/无分数跳过闸门），相关五个测试文件 **122 passed**。
+
+### 第三步（当天最重要的发现）：同一个人**跨条件掉到 0.50**
+
+改了门槛后再测（这次用户坐得更亮更近）：
+
+| 场景 | 检测分 | 身份相似度 | 结果 |
+|---|---|---|---|
+| 注册时（偏暗、稍远） | 0.44~0.53 | **0.95~0.97** | 识别帧与样本**同条件** |
+| 换光照/距离再识别 | **0.70~0.77** | **0.50~0.51** | `identity_low_score`，仍不给切换 |
+| **补拍 3 张当前条件的样本后** | 0.76~0.81 | **0.87** | **第 5 次探测起 `switchable=True`，reason=ok** |
+
+即：**跨条件的相似度损失远大于"图像清不清晰"** —— 注册样本只有单一条件时，换个光照就腰斩。
+这正是 `vision/人脸识别注意事项.md` §9"每人 2~3 张不同光照/角度"的实测证据，也说明**新增的身份分
+闸门是有价值的**：它把"认出来了但不够确定"显式报成 `identity_low_score`（去补拍），而不是默默按
+一个弱匹配去切主体。
+
+### 收尾状态
+
+- 档案：`uid=000`，姓名 **`admin`**（用户指定；**纯显示名** —— 角色仍由 `profiles.kind='elder'`
+  决定，已核实 `derive_role` 只认 `uid=="admin"` 特例与 `kind`，**不会因此获得管理员权限**）；
+  另有演示档案 `elder_001`（张建国）/`elder_002`（aaa）。
+- 人脸库：`000` **8 张样本**（5 张原条件 + 3 张补拍），`under_sampled` 为空。
+- `docs`：`vision/人脸识别注意事项.md` 新增 **§15 实机实测记录**（两道门槛表、跨条件 0.95→0.50→0.87
+  的三段数据、完整闭环、按 `reason` 排查的口诀）。
+- 新增工具：`scripts/update_elder.py`（改档案字段的**安全读改写** —— `POST /api/profiles` 是全量
+  upsert，只传 uid+name 会清空病史/用药/备注，这个脚本只改点名要改的字段并写审计）。
+
+### 已知限制
+
+- `elder_002`（"aaa"）是演示档案，未做人脸样本。
+- 阈值仍是"单机单摄像头、单人"标定的起点：**未用真人群体**标定，也**未标红外/夜间**条件。
+- 活体检测仍未做（用户要求以后再加）；无关键点对齐、板卡 BPU 未验（同前）。
+
+### 补记（同日）：稀疏轮询下轨迹关联会断（已修）+ 改名 + 复测通过
+
+用户随后要求「打开摄像头检测一下是否能正常将我认出」，第一轮实测暴露第二个真机坑：
+
+```
+认出 8/8 帧（相似度 0.653~0.782，检测分 0.80~0.85），第 5 帧 switchable=True
+但第 6/7/8 帧 frames 变成 1/1/2 —— 刚亮就灭；且那时 reason 显示 "ok" 而 stable=False（误导）
+```
+
+**根因**：后端是"轮询一帧算一帧"（~0.8 s/轮），人在 0.8 秒里自然挪动，而跨帧关联**只用 IoU ≥ 0.30**；
+IoU 对位移极敏感 → 同一人被当成新目标 → 轨迹集合变 → "连续 N 帧"重新数。
+
+**修法**（`LLM/face_api.py` + `conf.py`）：
+
+1. `_Track.assoc()` 两级判据：IoU 命中优先；否则**中心位移 ≤ `FACE_TRACK_MAX_JUMP`(1.0) × 框短边
+   且尺寸比 ∈ [0.5, 2]** 仍算同一个人（新增配置 `FACE_TRACK_MAX_JUMP`）；
+2. `_verdict()` 新增 `reason="frames_reset"` —— 轨迹集合刚变过时不再谎报 `ok`。
+
+**复测（同一台摄像头）**：`frames` 1→8 连续不断，第 5 帧起 `switchable=True` 并**持续为真**，
+`reason=ok`，8/8 帧认出 `000`（相似度 0.631~0.757）。新增 4 条单测（兜底续上轨迹 / 远处新目标仍分开 /
+尺寸差 3 倍不算同一人 / `frames_reset`），相关五个测试文件 **126 passed**。
+
+**教训**：**"连续 N 帧一致"的关联判据必须与采样间隔匹配** —— 视频流（33 ms/帧）用 IoU 没问题，
+轮询式（0.5~1 s/帧）必须用中心位移/尺寸这类更宽容的判据。
+
+**同日改名**：`uid=000` 的姓名 `admin` → **`fuze`**（用户要求）。用 `scripts/update_elder.py` 改，
+只改 `name` 字段、其余原样回写；已核实 uid/kind/人脸样本（8 张）均未动。
+`vision/人脸识别注意事项.md` 补写 §15.5（含修复前后 `frames` 序列对比）。
+
+### 补记二：全量套件"偶发红"的真凶找到了 —— SSE 收尾依赖 GC（已修）
+
+本会话多次出现"全量跑偶发 1 例红、单独跑必绿"，红的一直是
+`LLM/tests/test_chat_text_tts.py::test_chat_submits_completed_turn_when_body_closes_after_done`。
+早先怀疑是并发抖动，这次把它**量了出来**（`.ptmp_shim/flaky_chat_probe.py`，同一路径 20 次）：
+
+```
+只用 aclose()（现状）：20 次里 8 次「收尾没被调用」   ← 40% 失败率
+aclose 后 gc.collect()：20 次里 0 次
+```
+
+**根因**：`/api/chat` 的 SSE 是一个**同步生成器**，其 `finally` 里做两件要紧事 ——
+`voice_api.end_text_reply(...)`（**把尾句送去播报**）与 `_bg.submit(_post_chat_jobs, ...)`（后台沉淀记忆）。
+而 starlette 1.6 的 `iterate_in_threadpool` 在 async 迭代器被 `aclose()`/取消时**不会同步关闭**
+底层同步生成器，`finally` 只能等 CPython 回收 → **"客户端收到 done 就断开"时尾句与沉淀有时丢**。
+这不是测试挑剔，是**真实缺陷**：老人听到的最后半句会丢，且那轮对话可能不沉淀。
+
+**修法**（`LLM/server.py`）：新增 `_closing_stream(sync_iter)` —— 仍用线程池消费（不阻塞事件循环），
+但在 `finally` 里**显式 `sync_iter.close()`**，把"收尾时机"从 GC 手里拿回来。
+修复后同一探针 **0/20**；`test_chat_text_tts.py` 连跑 3 次 4 passed。
+**教训**：凡"依赖生成器 `finally` 做关键收尾"的地方，都要确认框架在关闭时真的 close 了它 ——
+流式接口尤其如此（客户端随时可能断开）。
+
+**顺带更新**：此前本文件与 `vision/人脸识别注意事项.md` 里把这类失败记为"疑似并发抖动、与本轮改动无关"，
+现更正为：**是 SSE 收尾的确定性缺陷，已修**。
+
+---
+
+## 2026-09-19 —— 图形界面 `vision_test_start`：人脸录入 / 人脸检测（姓名画在头上）/ 删除数据
+
+### 背景与用户原话
+
+> 「帮我写一个前端界面，命名为 `vision_test_start.py`，放在 vision 文件夹，可以编写其它程序但要
+> 通过 `vision_test_start.py` 启动……1. 人脸录入（二级小窗开摄像头 + 「开始录入」；**没检测到人脸
+> 就退出、不动数据库**；有脸则弹三级小窗填姓名/称呼/床位/年龄，**uid 默认前一个 uid 加一**，录入完
+> 显示「已录入」，3 秒后回一级小窗）2. 人脸检测（二级小窗开摄像头，用 `face_check.py --live` 检测，
+> 用 yolo 找到人脸后与后台库比对，**把姓名显示在对应个人头上**）3. 删除数据（二级小窗输入姓名，
+> **按姓名反查 uid**，用 `update_elder.py uid --delete --yes` 删除后回一级小窗）。按 ctrl＋c 退出小窗。」
+
+### 交付物
+
+| 文件 | 内容 |
+|---|---|
+| `vision/vision_test_start.py`（新） | **唯一入口**：参数解析 → 定摄像头端口并写环境变量 → 起 Tk → mainloop；Ctrl+C/关窗退出 |
+| `vision/vtest/service.py`（新） | 摄像头共享服务子进程的起停 + 端口等待 + 日志尾巴（失败时把服务自己的报错带出来） |
+| `vision/vtest/pipeline.py`（新） | 后台取帧线程：抓帧 → 检测（+可选识别）→ 发布"最新一帧 + 人脸"；`identify`/`enabled` 两个开关 |
+| `vision/vtest/people.py`（新） | 档案侧：`next_uid`（前一个 uid + 1）、`check_uid`、`find_people`（按姓名反查）、`create_cmd`/`delete_cmd`、`run_update_elder`（子进程） |
+| `vision/vtest/ui.py`（新） | 三个 Tkinter 窗口（一级/二级/三级）+ Canvas 画框画字 + 非交互模式（`--auto`） |
+| `LLM/face_api.py` | 抽出 `analyze(bgr, identify=True, track=True)` —— 吃**现成帧**做检测+识别；`probe()` 改为 `analyze(_grab_frame())`（返回值形状不变） |
+| `tests/test_vtest.py`（新，52 条） | uid 生成/校验、姓名反查、命令拼装、取帧线程的开关与容错、服务小工具、入口参数 |
+
+### 三件需求的落法
+
+1. **人脸录入**：二级小窗实时画面，只有"当前帧有脸"时「开始录入」才可点（没脸时按钮灰着）；
+   点击时**再查一次**，仍没脸 → 弹提示 + 回一级小窗，**档案与样本库一个字节都不写**（实测断言过）。
+   有脸 → 三级小窗（姓名/称呼/床位/年龄 + uid 预填"前一个 uid + 1"）→ 先采人脸样本、再调
+   `update_elder.py <uid> --name … --nickname … --bed … --age …` 写档案 → 显示「已录入」→ **3 秒后自动回一级小窗**。
+2. **人脸检测**：二级小窗把 YOLO 检出的人脸画框、把库里比对出的**姓名**画在框上方
+   （不在库里画"未知" + 相似度），底部给稳定/可切换判定与等价命令。
+3. **删除数据**：二级小窗输入姓名 → 反查（uid 全等 > 姓名/称呼全等 > 包含）→ 候选列表 → 确认弹窗
+   （写明不可撤销 + 会自动备份）→ `update_elder.py <uid> --delete --yes` → 输出回显 → 成功 3 秒后回一级小窗。
+
+### 关键设计取舍（都有理由，不是随手写的）
+
+- **"人脸检测"没有去 subprocess 起 `face_check.py --live`**（用户原话是"使用指令"）：`face_check.py --live`
+  会**自己再起一个 `camera_server`**，而摄像头同一时刻只能被一个进程独占 —— 两个服务必然抢设备，
+  后起的那个直接打不开。改为**同进程复用 `LLM.face_api.analyze/probe` + 同一个 `camera_server`**，
+  判定门槛与轨迹逻辑和 `--live` 是同一份代码；附带好处是框与画面**同帧**（不会"框追不上脸"）。
+  窗口里直接标出等价命令，界面上不藏这个差异。
+- **`analyze()` 是为 GUI 抽的**：`probe()` 自己抓帧，GUI 的预览循环已经抓过一帧，再让 probe 抓一次
+  等于白做一次取帧、且画出来的框图与屏幕差一帧。别的地方别用 `analyze` 绕过 `probe` 的降级包装。
+- **中文姓名画在 Tk Canvas 上**：cv2 的 Hershey 字体**画不了中文**（"张桂芳"会变 `???`），
+  所以预览是 Canvas：底图 `PhotoImage` + 框/文字是 Canvas 图形项，坐标按画面→控件缩放换算。
+- **摄像头按需起停**：进二级小窗才起服务，返回一级小窗立刻停（用户是隐私敏感的，不常开摄像头）；
+  删除数据窗口用不到摄像头，所以从不起。
+- **抓帧/推理在工作线程，主线程只画**（`after(33)`，约 30fps 上限）：Tk 只能主线程碰控件，
+  放主线程会在每次推理（~250ms）卡住窗口。两张脸挂在 Canvas 图元上，脏数据（框不是数字）直接跳过。
+- **录入失败的回滚是有条件的**：先采样本、后写档案；档案写失败时**只有该 uid 原本没有任何样本**才回滚
+  刚采的样本（原来就有样本则明说"未回滚"，避免误删旧样本）。
+- **`FrameWorker` 的停止标志不能叫 `self._stop`**：`threading.Thread` 内部有私有方法 `_stop()`，
+  `join()` 会调它 —— 同名属性把它盖掉后 `join` 直接 `TypeError: 'Event' object is not callable`（实测踩到）。
+- **`_run_update_elder` 用临时文件收输出而不是管道**：管道在某些受限环境会被拒绝，且输出多时写满即死锁。
+
+### 验证（本机实跑，全部可重跑）
+
+- 全量 `pytest tests LLM/tests -q` → **602 passed**（含本轮新增 `tests/test_vtest.py` 52 条）；
+  `tests/test_face_api.py` 55 条在 `analyze` 重构后全绿（返回值形状未变）。
+- 无摄像头的通路验证（`.ptmp_shim/check_vtest_pipeline.py`）：mock 源起服务 → 线程取到 1280x720 帧、
+  帧号递增、`identify=False` 时 `reason=detect_only`、暂停模型后**预览继续抓帧而不再推理**、
+  `stop()` 后线程与服务都干净退出。
+- 真库路径验证（`.ptmp_shim/check_vtest_db.py`，跑完自动清理）：① 采样失败 → 档案与样本库**逐一比对快照、
+  确认零改动**；② 采样成功（替身）→ 真调 `update_elder.py` 建档，字段（uid/姓名/称呼/床位/年龄/kind）
+  逐项核对；③ 按删除命令连根删净（档案、人脸目录、声纹 npz 都不剩）。
+- 界面路径（Tk 真跑，`--source mock`）：`--selftest` 起停干净；`--open enroll --click start_enroll --auto`
+  → 打印"未检测到人脸 → 退出录入，档案与样本库都没有改动"；`--open delete --click find,delete
+  --click-arg <姓名> --auto --auto-yes` → 打桩档案 997 被查中 → 确认 → 删除 → 3 秒后回一级小窗 → 复查已不存在。
+- 画框画字（`.ptmp_shim/check_vtest_canvas.py`，喂合成帧 + 假人脸）：两张脸 → 2 框 2 文字，
+  文字为 `fuze（000）  0.71` / `未知  0.31`，颜色分已知/未知，坐标全部落在控件内、名字贴在框上沿，
+  状态栏报出"认出：fuze（000）"与"可切换主体=True"。
+
+### 另：`no_identity` 的排查口径（同日，用户问「终端中 no identity 是什么原因」）
+
+`no_identity` 是**整体结论**（"检到脸但说不清是谁"），`verdict.reason` 与每张脸的
+`face.identity_reason`（`below_threshold`/`empty_library`/`ambiguous`）是两个粒度。`scripts/face_check.py`
+的 `--live` 结论改为：把最后一次探测的 `identity_reason` + 相似度 + 进库阈值 + 与第二名差距一起打出来，
+并区分"这一帧其实已经认出、只是连续帧没够"（免得用户白去补拍）；该段抽成 `report_conclusion()`
+以便脱离摄像头用合成结果验证四条分支。`vision/人脸识别操作手册.md` §5 补了对应问答与
+`identity_reason` 对照表。
+
+### 已知限制
+
+- **真摄像头 + 真人脸这一跳未在本机复验**：DSH 沙箱打不开摄像头设备（`摄像头设备 0 打开失败`），
+  本机验的是 mock 源 + 合成帧 + 假人脸。需**用户侧**跑一次 `vision_test_start.py`（不带 `--source`）
+  做最终验收：`── ② 人脸检测` 应看到自己头上出现 `fuze（000）`。
+- 三级小窗只收了姓名/称呼/床位/年龄（用户点名的四个字段）；性别/备注/说话风格仍要命令行补。
+- 界面未接"活体检测""红外"等后续能力；阈值、无关键点对齐、板卡 BPU 等限制同前（见
+  `vision/人脸识别注意事项.md`）。
+- 板卡上跑界面需要 `--source mipi`（且板卡目前没有摄像头硬件）。
+
+### 补记（同日）：用户报"摄像头异常卡顿" —— 查出两个软件真凶并修掉
+
+用户原话：「摄像头异常卡顿，可能原因是什么」。查下来**两个都是软件问题**（不是摄像头坏），
+而且都能量化：
+
+| # | 真凶 | 实测 | 修法 |
+|---|---|---|---|
+| 1 | **NV12 转换走纯 numpy 全幅 float32**（`vision/webcam.py::bgr_to_nv12`） | 1280x720 **34.1 ms/帧**、640x480 10.0 ms/帧；面授的 `face_check.py`/GUI 都用 `--channels 1280x720,640x480` → 服务端每帧要算 **44 ms**，硬上限 ~22fps，还和 YOLO 抢 CPU | 新增 cv2 快路径：**Y 用 `BGR2YUV_I420`，色度自己按 2x2 平均**（720p **5.81 ms**，6 倍；640x480 1.15ms，9 倍）。逐像素与纯 numpy 参考差 ≤1（用例锁 ±2） |
+| 2 | **预览与推理在同一个线程里串行**（`vtest/pipeline.py`） | 一轮检测+识别 250~700ms → 画面每 0.25~0.7 秒才换一张；相机本身是 15~30fps | 拆成**抓帧线程 + 推理线程**：预览 ~30fps（`fps`），框 ~3fps 滞后（`analyze_fps`）。回归用例断言"1 秒内预览 +30 帧、推理 +3 次"（改前该断言必红） |
+
+**踩到的坑（值得记）**：不能整幅直接用 `cv2.COLOR_BGR2YUV_I420` 换掉纯 numpy —— OpenCV 那份
+I420 的色度是**取每个 2x2 块的左上角像素**（实测与"2x2 平均"最大差 55），会产生块状色噪，
+而且正是既有用例 `test_bgr_to_nv12_chroma_is_2x2_average_not_top_left` 守着的性质；也**不能**用
+`COLOR_BGR2YUV`（它的 Y 与 I420 差到 18、V 系数是另一套，实测与参考差 26）。所以快路径只借它
+拿 Y 平面，色度另算。
+
+**顺手加固的三处**（都在怀疑清单里，成本极低）：
+
+- USB 摄像头**优先要 MJPG**（`_try_mjpg`）：不设 FOURCC 时很多设备默认 YUY2，720p 在 USB2 上
+  只有 5~10fps；顺序是 FOURCC 在前、W/H 在后（设 FOURCC 可能重置分辨率）。
+- `CAP_PROP_BUFFERSIZE=1`：否则 `read()` 拿到的是驱动队列里**最旧**那帧，画面延迟越积越大
+  （"人已经不动了，画面还在动"）。两者都用 `getattr` 探测属性，驱动不支持就静默跳过。
+- 取帧改用 `CameraClient.get_next_frame()`（只在**真有新帧**时返回）：原先用 `get_frame()` 会把
+  同一帧反复解码 —— 实测空转到 **139 次/秒**，白烧 CPU，还把"帧率"显示成假的（真机率 15fps
+  被显示成 139）。
+- 摄像头打开时在服务日志打一行**实际协商格式**（`[webcam] 设备 0 实际格式：1280x720 @30.0fps
+  FOURCC=MJPG`）—— 排查卡顿的第一手证据：若显示 YUY2 或个位数帧率，瓶颈就在摄像头/USB 侧。
+
+**GUI 侧配套**：默认 `--channels 640x480`（只请求一路；多要一路让服务端每帧成本翻倍，而检测
+本来就把画面缩到 640）、`--camera-fps 30`、新增 `--channels` 开关；预览按**等比居中**缩放
+（4:3 画面塞进 16:9 画布不再压扁、框也不会错位）；状态栏把 `预览 fps / 推理 次/秒 / 检测 ms`
+分开报，并在 `vision/人脸识别注意事项.md` §6.1 与 `vision/README.md` 写了"卡顿怎么查"的对照表。
+
+**测试**：`tests/test_vision.py` 88 → **90 passed**（新增"快路径 vs 纯 numpy 参考 ±2"、"无 cv2 时
+退回 numpy 且逐字节一致"）；`tests/test_vtest.py` **53 passed**（含新的解耦回归）；全量
+`pytest tests LLM/tests` → **603 passed**。
+
+### 补记二（同日）：查"照片会不会被提交到 GitHub" —— 人脸库是干净的，但挖出声纹已在线上
+
+用户问「检测一下照片数据库是否会提交到 github 上」，随后要求「确保为人脸识别所拍的照片
+不会被上传到 github 即可」。
+
+**查证结论（三重独立确认）：**
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 索引里有没有 | `git ls-files LLM/data` | 只有 `feeds.json` + 两个声纹 npz，**没有任何 `faces/`** |
+| 历史里有没有 | `git log --all -- LLM/data/faces` / `git rev-list --all --objects` | 无记录、无对象 |
+| 线上能不能下到 | 抓 `raw.githubusercontent.com/.../LLM/data/faces/000/2026…jpg` | **404** |
+| 盘上的样本是否被忽略 | `git status --porcelain --ignored -- LLM/data/faces` | `!! LLM/data/faces/`（git 当它不存在） |
+
+`brain.db`（姓名/床位）、`audit.jsonl`、`chroma/`、`backup/`、`.env`、`vision/models/`、
+`vision/testdata/*.jpg` 同样：未跟踪 + 历史无 + 线上 404。
+
+**但顺手挖出一个真问题**：`LLM/data/speakers/elder_001.npz`、`elder_003.npz`（**声纹，生物特征**）
+是 `8d77d9b`（2026-08-27「debug」）提交进去的，**现在仍在 `origin/main` 里**，抓
+`raw.githubusercontent.com/guozhianNB/Robot/main/LLM/data/speakers/elder_001.npz` 能**无凭据拿到
+文件**（octet-stream）—— 顺带说明该仓库对这些路径是公开可读的。`.gitignore` 第 35 行那条
+`LLM/data/speakers/` 是后来补的，而 **`.gitignore` 管不了已跟踪文件、更管不了历史**（本次事故的
+教科书案例）。同类还有 `.research_sherpa/speech_0.wav`（5.61s 16kHz 人声，`4157ba3` 进来）、
+`.research_sherpa/` 整目录、`LLM/*/node_modules/**`（**3642 个文件**）—— 都是"规则写了但文件已跟踪"。
+另有 `.ptmp_shim/`（开发临时探针 + 测试日志 69 个文件）当时**没被忽略**，`git add -A` 会带进去。
+
+**本轮交付：把"不会进 GitHub"做成可执行的闸门**（用户选择自己处理声纹，故未做任何提交/清史）
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/check_privacy.py`（新） | 查**三条通道**：① `git ls-files`（下次 commit）② `git ls-files -o --exclude-standard`（下次 `git add -A`）③ `git rev-list --all --objects`（**已经推到 GitHub 的**）。命中人脸样本 → 退出码 1 并给出处理办法；`--strict` 把声纹/wav/db/模型/node_modules 也算失败；`--quiet` 供钩子用；`--no-history` 求快 |
+| `tests/test_privacy.py`（新，23 条） | ① 规则单测（认得出 `LLM/data/faces/**`、**时间戳命名**、`faces/<名>.jpg|npz`、`det_*.jpg`；**不误伤** `robot_interfaces/` 这种含 "faces/" 的同名目录）② 真仓库体检：索引/未跟踪/历史三处都没有人脸样本 + **盘上每个样本都确实被忽略** + 整条闸门跑一遍为 0。**只要 pytest 绿，就没有一张人脸照片能被提交** |
+| `.githooks/pre-commit`、`.githooks/pre-push`（新） | 启用：`git config core.hooksPath .githooks`。`pre-commit` 查索引+未跟踪，`pre-push` 连历史一起查（**推之前最后一道门**，因为上传的就是历史对象）；找不到 python 就跳过（绝不因环境问题阻断提交），要临时放行用 `--no-verify` |
+| `.gitignore` | 补 `vision/testdata/*.{jpeg,bmp,webp,gif}`、`/det_*.jpg|png`、根目录 `/*.jpg|jpeg|png`（防"摄像头帧落在仓库根"）、`.ptmp_shim/` |
+| 文档 | `vision/人脸识别注意事项.md` 新增 **§8.1「怎么确保照片没被推到 GitHub」**（含"`.gitignore` 给不了这个保证"的说明与清史办法）；`vision/README.md`、`AGENTS.md`（已知坑）各加一条 |
+
+**识别方式不依赖路径**：靠 `face_lib.add_sample()` 的固定文件名格式
+`<年月日>_<时分秒>_<微秒>.jpg/.npz` —— 所以 `FACE_DIR` 被环境变量重定位到仓库内任何角落都拦得住。
+
+**实测（本机）**：
+
+```
+python scripts/check_privacy.py
+  ① 索引 ✅ 干净   ② 未跟踪但未忽略 ✅ 干净   ③ 历史 ✅ 干净
+  ④ 盘上已被正确忽略的样本：人脸样本 22 个文件、声纹样本 0 个文件
+  ✅ 通过：人脸照片与指纹没有出现在索引、未忽略的未跟踪文件、或 git 历史里。   rc=0
+
+模拟事故 1（git add -f 一张假样本到 LLM/data/faces/）→ ❌ 拦截，rc=1
+模拟事故 2（把样本命名格式的文件放在 vision/ 下，未跟踪未忽略）→ ❌ 拦截（②通道），rc=1
+清理后复检 → rc=0
+```
+
+**已知限制**：`.githooks/` 里的 sh 钩子**没能在本机实跑**（DSH 沙箱禁止命名管道，
+MSYS bash 起不来：`couldn't create signal pipe, Win32 error 5`）；钩子调用的 python 入口
+（`--quiet`/`--quiet --no-history`）都单独验过（干净 rc=0、违规 rc=1），钩子本体逻辑只有
+"找 python → 调它 → 按退出码决定"，请在**你自己的普通终端**里首次提交时确认一次。
+`speech_0.wav` 的来源无法从仓库判定（没有任何脚本写它，只有一个 VAD 测试脚本读它）——
+若是自己录的请按生物特征对待。

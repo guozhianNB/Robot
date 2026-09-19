@@ -109,6 +109,50 @@ VISION_HOST = os.environ.get("VISION_HOST", "127.0.0.1")
 VISION_PORT = int(os.environ.get("VISION_PORT", "9540"))
 
 
+# 人脸：检测（vision/face.py）+ 稳定判定（LLM/face_api.py 的"连续 N 帧一致"）
+# 检测输入尺寸：**640 是实测工作点，别盲目调大** —— 本机双人场景 16/16 帧全中；
+# 同一批帧改 1280 反而只检到 1 人（远处那位分数本就 0.46~0.53，尺度一变掉到阈值下），
+# 且耗时 2.6 倍（203ms → 525ms）。要提升远处小脸检出率应做"裁脸放大"而非整体放大输入。
+FACE_DETECT_IMGSZ = int(os.environ.get("FACE_DETECT_IMGSZ", "640"))
+FACE_DETECT_CONF = float(os.environ.get("FACE_DETECT_CONF", "0.25"))   # 模型侧阈值
+FACE_CAMERA_CHANNEL = int(os.environ.get("FACE_CAMERA_CHANNEL", "1"))  # 取哪一路通道
+# "连续 N 帧一致"：稳定判定所需的连续帧数 / 所需平均置信度 / 跨帧关联 IoU / 允许丢帧数
+FACE_STABLE_FRAMES = int(os.environ.get("FACE_STABLE_FRAMES", "5"))
+# 检测框置信度门槛（"框得多准"）。**2026-09-18 真机实测后从 0.60 降到 0.45**：
+# 同一台 PC 摄像头在弱光/稍远时 YOLO 检测分只有 0.44~0.53，而身份相似度高达 0.95+；
+# 把"能不能切换"压在检测分 0.60 上会让系统永远不动作。切换的决定权交给下面那道
+# **身份分门槛**（"认得多像"），检测门槛只负责筛掉明显不可靠的框。
+FACE_STABLE_CONF = float(os.environ.get("FACE_STABLE_CONF", "0.45"))
+# 身份相似度门槛：`switchable` 要求同一身份连续 N 帧且**平均相似度**达标。
+# 与 `FACE_MATCH_THRESHOLD`（0.45，判"是不是库里的人"）分开：这里是"够不够确定到可以动作"。
+FACE_IDENTITY_CONF = float(os.environ.get("FACE_IDENTITY_CONF", "0.55"))
+FACE_TRACK_IOU = float(os.environ.get("FACE_TRACK_IOU", "0.30"))
+FACE_TRACK_MAX_AGE = int(os.environ.get("FACE_TRACK_MAX_AGE", "5"))
+# 跨帧关联的**兜底**：中心位移容差（单位 = 人脸框短边）。
+# 为什么需要：后端是"轮询一帧算一帧"（实测 ~0.8 s/轮），人在 0.8 秒里自然会晃，
+# IoU 对位移极敏感、会频繁掉到 FACE_TRACK_IOU 之下 → 同一人被当成新目标 →
+# "连续 N 帧"反复归零、switchable 刚亮就灭（2026-09-18 真机踩到）。
+# 判据：中心位移 ≤ 1.0×框短边 **且** 尺寸比在 [0.5, 2] → 仍算同一个人。
+FACE_TRACK_MAX_JUMP = float(os.environ.get("FACE_TRACK_MAX_JUMP", "1.0"))
+
+# 人脸识别（ArcFace）与样本库
+# 模型变体：mbf=MobileFaceNet（13.6MB，本机实测 27ms/张）；r50=ResNet50（174MB，324ms/张）
+# 默认轻量版（整条链还要叠加检测 ~190ms）；要最高精度可设 FACE_EMBED_VARIANT=r50。
+# **阈值按模型分别标定**：两个模型的余弦分布不同，换模型必须重新标。
+FACE_EMBED_VARIANT = os.environ.get("FACE_EMBED_VARIANT", "mbf")
+FACE_EMBED_DIM = 512                       # ArcFace 输出维度（用于样本维度校验）
+FACE_ALIGN_MARGIN = float(os.environ.get("FACE_ALIGN_MARGIN", "0.25"))  # 框外扩比例
+FACE_DIR = (Path(os.environ["FACE_DIR"]) if os.environ.get("FACE_DIR")
+            else DATA_DIR / "faces")       # 可用 FACE_DIR 重定位（换加密盘/临时目录，测试也用）
+# 比对两道闸门：绝对阈值 + 与第二名的差距（养老场景"两位老人长得像"要防误认）
+FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.45"))
+FACE_MATCH_MIN_MARGIN = float(os.environ.get("FACE_MATCH_MIN_MARGIN", "0.03"))
+FACE_LIB_MAX_UIDS = int(os.environ.get("FACE_LIB_MAX_UIDS", "200"))          # 人数上限
+FACE_LIB_MAX_SAMPLES_PER_UID = int(os.environ.get("FACE_LIB_MAX_SAMPLES_PER_UID", "20"))
+# 每人建议最少样本数（低于它会在库状态里被点名，注册引导据此提示"多拍几张"）
+FACE_MIN_SAMPLES_PER_UID = int(os.environ.get("FACE_MIN_SAMPLES_PER_UID", "3"))
+
+
 # 声纹录制
 VOICE_ENROLL_SECONDS = 15        # 注册/追加默认录制秒数
 VOICE_PENDING_TTL_S = 600        # 录制暂存（特征+音频）内存保留时长

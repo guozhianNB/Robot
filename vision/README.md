@@ -38,6 +38,14 @@ vision/
 ├── camera_client.py      # 客户端库（CameraClient / Frame）
 ├── webcam.py             # Windows/USB 摄像头后端（OpenCV，可选依赖）
 ├── webbridge.py          # HTTP 桥：给上位机浏览器看画面（/api/vision/*）
+├── face.py               # 人脸检测（YOLOv8n-face ONNX）
+├── faceid.py             # 人脸识别（ArcFace ONNX，512 维指纹）
+├── vision_test_start.py  # ★ 图形界面入口：人脸录入 / 人脸检测 / 删除数据
+├── vtest/                # 上面那个界面用到的内部零件（不要单独运行）
+│   ├── service.py        #   摄像头共享服务子进程的起停
+│   ├── pipeline.py       #   后台取帧线程（抓帧 → 检测/识别 → 发布最新帧）
+│   ├── people.py         #   档案：算下一个 uid、按姓名反查、调 update_elder.py
+│   └── ui.py             #   三个 Tkinter 窗口（一级/二级/三级）
 ├── __init__.py           # 包入口，导出 CameraClient、Frame
 └── examples/
     └── grab_and_save.py  # 示例：取一帧保存 + 订阅几帧
@@ -300,3 +308,91 @@ sudo systemctl status vision-camera
   （`open_cam` 多通道写法见 `09_web_display_camera_sample/`）
 - 依赖：服务端需要 `hobot_vio`（板卡系统 Python 自带）；客户端可选
   `numpy` / `opencv-python`（转数组/转彩色时才用，惰性导入）。
+
+## 人脸检测 / 识别（`vision/face.py`、`vision/faceid.py`）
+
+- 检测：`vision/face.py`（YOLOv8n-face ONNX，输出人脸框）；CLI
+  `python -m vision.face 图片.jpg --out 目录`，查设备/状态 `--status --download`。
+- 识别：`vision/faceid.py`（ArcFace ONNX，输出 512 维指纹）；CLI
+  `python -m vision.faceid --status | --download [--variant r50] | --compare A.jpg B.jpg`。
+- 权重在 `vision/models/`（不入库）：`yolov8n-face.onnx`(12MB)、`arcface_mbf.onnx`(13.6MB，
+  默认，本机 27ms/张)、`arcface_r50.onnx`(174MB，精度最高但 324ms/张)。
+- 样本库 `LLM/data/faces/<uid>/`、接口层与稳定判定 `LLM/face_api.py`、HTTP 接口
+  `/api/face/*`。
+- **⚠️ 上生产前必读：[人脸识别注意事项.md](人脸识别注意事项.md)** —— 关键点缺失导致的对齐打折、
+  红外夜视掉识别率、阈值必须自标定、活体检测缺失、隐私红线、性能预算与自查清单。
+- **🔒 照片绝不进 GitHub**：`python scripts\check_privacy.py` 一条命令查"索引 / 未忽略的未跟踪
+  文件 / git 历史"三条通道（`.gitignore` 管不了已跟踪文件与历史，2026-09-19 已有声纹事故）；
+  `tests/test_privacy.py` 会在每次 `pytest` 时自动把关，`.githooks/` 提供 commit/push 钩子
+  （`git config core.hooksPath .githooks` 启用）。详见[注意事项 §8.1](人脸识别注意事项.md)。
+- **⌨️ 只想敲命令：[人脸识别操作手册.md](人脸识别操作手册.md)** —— 添加新成员 / 检测人脸是否在库 /
+  删除成员 三条流程 + 全部参数说明 + 常见问题（`scripts/face_check.py`、`scripts/update_elder.py`、
+  `python -m LLM.face_api`）。
+
+## 图形界面：人脸测试台（`vision_test_start.py`）
+
+一个窗口把人脸链路的三件事做完 —— **这是本项目人脸能力的唯一 GUI 入口**
+（界面代码在 `vision/vtest/`，但只能通过本脚本启动）：
+
+```powershell
+.\.venv\Scripts\python.exe vision\vision_test_start.py
+```
+
+| 一级小窗的按钮 | 二级小窗 | 干什么 |
+| --- | --- | --- |
+| ① 人脸录入 | 实时画面 + 「开始录入」 | 镜头前**有脸**才让点；点了弹三级小窗填姓名/称呼/床位/年龄（uid 自动 = 前一个 uid + 1）→ 显示「已录入」，3 秒后回一级小窗。**镜头前没脸就直接退出，档案与样本库都不动** |
+| ② 人脸检测 | 实时画面（名字画在头上） | YOLO 检出人脸 → 比样本库 → 把**老人的姓名**画在对应人头上（不在库里显示"未知" + 相似度），底部给出稳定/可切换判定 |
+| ③ 删除数据 | 输入姓名 + 候选列表 | 按姓名/称呼反查 uid → 确认后 `update_elder.py <uid> --delete --yes`（先自动备份数据库）→ 删完回一级小窗 |
+
+退出：**Ctrl+C**（或关窗口）。
+
+它包装的命令（与手工敲完全同一条路径）：
+
+```
+人脸录入  python scripts\update_elder.py <uid> --name 姓名 --nickname 称呼 --bed 床位 --age 年龄
+人脸检测  python scripts\face_check.py --live
+删除数据  python scripts\update_elder.py <uid> --delete --yes
+```
+
+**一处故意的实现差异**（不是漏做）："人脸检测"不是 `subprocess` 起
+`face_check.py --live`，而是在同一进程里调它内部那套判定
+（`LLM.face_api.analyze/probe` + 同一个 `camera_server`）。硬约束是：
+`face_check.py --live` 会**自己再起一个** `camera_server`，而摄像头同一时刻只能被一个
+进程独占，两个服务必然抢设备、后起的那个直接打不开。同进程复用还有个好处 ——
+框与画面来自**同一帧**，不会"框追不上脸"。门槛与轨迹稳定逻辑和 `--live` 是同一份代码。
+
+细节与设计取舍：
+
+- **摄像头按需打开**：进二级小窗才起 `camera_server`，返回一级小窗立刻关（不常开）；
+- **中文姓名画在 Tk Canvas 上**，不用 cv2 画字 —— cv2 的 Hershey 字体画不了中文（"张桂芳"会变成 `???`）；
+- **抓帧/推理在工作线程**，主线程只做缩放+编码+画图（约 30fps 上限），所以窗口不卡；
+- 录入时先采人脸样本、再写档案；写档案失败且该 uid **原本没有样本**时会回滚刚采的样本（原来就有样本则不动，避免误删旧样本）。
+
+自测选项（无摄像头也能验通路）：
+
+```powershell
+# 冒烟：合成帧源 + 12 秒后自动退出（画面里没有人脸，只看界面与通路是否正常）
+.\.venv\Scripts\python.exe vision\vision_test_start.py --source mock --selftest 12
+
+# 自动打开某个二级小窗并"点"按钮（非交互，弹窗改成打印）
+.\.venv\Scripts\python.exe vision\vision_test_start.py --source mock --open enroll --click start_enroll --auto --selftest 12
+.\.venv\Scripts\python.exe vision\vision_test_start.py --source mock --open delete --click find,delete --click-arg 姓名 --auto --auto-yes --selftest 18
+```
+
+`--source mock` 是合成帧（协议完全一致、画面里没人脸）；`--auto` 把所有弹窗改成打印；
+`--auto-yes` 让确认类弹窗自动答"是"（会**真删数据**，只在拿废弃 uid 做验证时用）。
+单测见 `tests/test_vtest.py`（uid 生成/校验、姓名反查、命令拼装、取帧线程的开关与容错）。
+
+### 画面卡顿怎么查（先分清取帧慢 / 推理慢）
+
+窗口底部把两个速率**分开**显示：`预览 x fps   推理 y 次/秒（检测 z ms）`。
+
+| 现象 | 含义 | 怎么办 |
+| --- | --- | --- |
+| 预览高、推理低 | 正常。推理就是慢（一轮 0.25~0.7s），框会滞后，画面不该卡 | 不用管；想更快只能换模型/上 BPU |
+| 预览也低（个位数） | 取帧侧的问题：摄像头协商到 YUY2、被别的程序占用、USB 带宽不够、或服务端 CPU 被吃光 | 看服务日志那行 `[webcam] 设备 0 实际格式：…@…fps FOURCC=…`；降 `--channels 640x480`、`--camera-fps 15`；关掉占摄像头的程序（残留的 `camera_server`/后端/相机应用） |
+| 画面延迟越来越大（人不动了画面还在动） | 驱动缓冲里积压了旧帧 | 已内置 `CAP_PROP_BUFFERSIZE=1`；仍不行就换 `--device`/换 USB 口 |
+
+排查用的开关：`--channels`（默认 `640x480`，**只请求一路**；多要一路只是白费 CPU 与带宽，
+还会把服务端每帧的 NV12 转换成本翻倍）、`--camera-fps`（默认 30）、`--source webcam --device N`
+（换设备号）、`--list-cameras`（服务端参数，查哪些设备号真能出画面）。

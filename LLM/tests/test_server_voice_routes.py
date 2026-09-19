@@ -86,7 +86,17 @@ def test_voice_speakers_route_details(monkeypatch):
 
 
 def test_face_status_route():
+    """人脸状态：查询类永远 ok=True；检测器与摄像头两路状态分开报。
+
+    2026-09-15：该路由从"占位 unavailable"升级为真状态（`LLM/face_api.py`），
+    故不再断言固定值 —— 有依赖+模型时是 running，缺任一时才是 unavailable+reason。
+    """
     c = TestClient(server.app)
     r = c.get("/api/face/status")
     j = r.json()
-    assert r.status_code == 200 and j["ok"] is True and j["status"] == "unavailable"
+    assert r.status_code == 200 and j["ok"] is True
+    assert j["status"] in ("running", "unavailable")
+    assert "detector" in j and "camera" in j and "thresholds" in j
+    assert j["state"]["switchable"] is False        # 识别（是谁）未接入，永不可切换
+    if j["status"] == "unavailable":
+        assert j.get("reason")

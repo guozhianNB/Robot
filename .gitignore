@@ -28,9 +28,19 @@ LLM/data/*.log
 # 地图源注册表（运行时数据：首启由 ROBOT_IP/MAPS_IO 等环境变量种入，含主机与路径）
 LLM/data/maps_sources.json
 
+# ⚠️ 生物特征运行时数据**绝不入库**（隐私红线）：
+#   LLM/data/faces/<uid>/     人脸照片 + ArcFace 指纹（指纹可用于比对，等同凭证）
+#   LLM/data/speakers/<uid>.npz  声纹样本
+LLM/data/faces/
+LLM/data/speakers/
+# 数据库备份（删档案等破坏性操作前由 scripts/update_elder.py 自动落一份，不入库）
+LLM/data/backup/
+
 # 子代理驱动开发的临时工作产物（进度账本/简报/审查包，不入库）
 .superpowers/
 /.worktrees/
+# 开发期临时探针/一次性脚本（含跑测试留下的日志；不是产品代码，从不入库）
+.ptmp_shim/
 
 # ROS2 工作区构建产物（不入库，板卡上保留即可）
 ros2_car/build/
@@ -62,6 +72,22 @@ ros2_car/maps/.backup/
 
 # 语音：运行时模型与调研残留不入库
 LLM/models/
+# 视觉：人脸检测等 ONNX 权重（运行时下载，python -m vision.face --download，不入库）
+vision/models/
+# 视觉：人脸检测/识别的固定测试图（约 3.5MB 二进制，不入库；来源与重取见 vision/testdata/README.md）
+vision/testdata/*.jpg
+vision/testdata/*.png
+# 摄像头/人脸测试落的图（含 vision.face --out 的画框产物）：任何扩展名都不入库
+vision/testdata/*.jpeg
+vision/testdata/*.bmp
+vision/testdata/*.webp
+vision/testdata/*.gif
+/det_*.jpg
+/det_*.png
+/*.jpg
+/*.jpeg
+/*.png
+# 隐私闸门（scripts/check_privacy.py）与 git 钩子（.githooks/）**要入库**，别忽略它们
 .research_sherpa/
 .pip-cache/
 LLM/data/*.wal

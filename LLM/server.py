@@ -27,10 +27,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool   # SSE 收尾确定化用（见 _closing_stream）
 from openai import OpenAI
 from pydantic import BaseModel
 
 from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
+from . import face_api   # 人脸接口层（检测 + "连续 N 帧一致"稳定判定；内部降级，import 永远安全）
 from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
 from . import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
 from . import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
@@ -405,6 +407,30 @@ async def logs_warnings(limit: int = Query(50)):
     return {"ok": True, "logs": audit.read_warnings(limit=limit)}
 
 
+async def _closing_stream(sync_iter):
+    r"""把同步生成器交给线程池消费，并保证**关闭时同步执行它的 `finally`**。
+
+    为什么必须自己包这一层（2026-09-18 实测）：starlette 1.6 的
+    `iterate_in_threadpool` 在 async 迭代器被 `aclose()`/取消时**不会**同步关闭底层的
+    同步生成器 —— 那个生成器的 `finally` 只能等 CPython 回收。于是"客户端收到 done 就断开"
+    时，收尾（**尾句送播报** `end_text_reply` + 后台沉淀）有时跑了有时没跑：
+    实测同一路径 20 次里 **8 次没跑（40%）**，`gc.collect()` 后 20 次全跑 —— 即不确定性
+    来自 GC 时机。人真的断开时尾句丢了就是这个 bug。这里显式 `close()`，把不确定性消掉。
+
+    `close()` 可能撞上"生成器正被线程池执行"（罕见）→ 吞掉 `RuntimeError`：那种情况下
+    生成器会自己走完并执行 finally。
+    """
+    it = iterate_in_threadpool(sync_iter)
+    try:
+        async for chunk in it:
+            yield chunk
+    finally:
+        try:
+            sync_iter.close()
+        except Exception:                                # noqa: BLE001
+            audit.log("chat_stream_close", action="close_failed")
+
+
 @app.post("/api/chat")
 async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk")):
     settings = db.get_settings()
@@ -435,7 +461,7 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
                            principal["role"])
 
     return StreamingResponse(
-        gen(), media_type="text/event-stream",
+        _closing_stream(gen()), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
@@ -1108,9 +1134,119 @@ async def voice_speaker_delete(uid: str):
 
 @app.get("/api/face/status")
 async def face_status():
-    """人脸录入占位：本期未实现，返回 unavailable（前端据此置灰按钮）。"""
-    return {"ok": True, "status": "unavailable",
-            "reason": "人脸录入尚未接入（占位接口，见 docs/temp/face-recognition-notes.md）"}
+    """人脸模块状态（查询类：永远 ok=True，不可用时 status="unavailable" + reason）。
+
+    `detector`（能不能检测：依赖 + 模型）与 `camera`（能不能取帧：摄像头服务在不在听）
+    分开报 —— 两者缺一个的表现都是"没人脸"，分开才好排查。
+    """
+    return await asyncio.to_thread(face_api.status)
+
+
+@app.get("/api/face/state")
+async def face_state():
+    """当前稳定判定（不取帧、不推进计数，纯读）。供前端轮询/排查用。"""
+    return {"ok": True, **await asyncio.to_thread(face_api.status)}
+
+
+@app.post("/api/face/probe")
+async def face_probe(channel: int | None = None):
+    """抓一帧做检测 + 识别，并推进"连续 N 帧一致"判定（动作类：取不到帧就 503 + ok=False）。
+
+    返回 `verdict`：`stable` = 有人脸连续 N 帧稳定出现；`switchable` = 可用于切换主体
+    （需**唯一人脸 + 同一身份连续 N 帧**）。前端按 1~3 fps 轮询本接口即可攒出判定，
+    不需要后端常驻抓帧（隐私 + CPU 考虑）。
+    """
+    from fastapi.responses import JSONResponse
+    res = await asyncio.to_thread(face_api.probe, channel)
+    if not res.get("ok"):
+        return JSONResponse(status_code=503, content=res)
+    return res
+
+
+class FaceEnrollIn(BaseModel):
+    """人脸注册请求体：uid 必填；frames = 抓几帧取样本（默认 5）。"""
+    uid: str
+    frames: int = 5
+    save_photo: bool = True
+
+
+@app.get("/api/face/people")
+async def face_people():
+    """已注册人脸样本的人（查询类：永远 ok=True；样本库读不了时带 error）。"""
+    return await asyncio.to_thread(face_api.library)
+
+
+@app.post("/api/face/enroll")
+async def face_enroll(body: FaceEnrollIn):
+    """注册/追加人脸样本：抓 N 帧 → 取最大人脸 → 提指纹入库（写操作）。
+
+    三类失败分得很清（前端据此提示，别混成一种）：
+      * 依赖/模型不可用 → **503**（基础设施问题）；
+      * uid 非法 → **400**；
+      * **取景里没采到可用人脸 → 200 + ok:false + status:"no_face"**
+        （属业务结果，前端提示"请正对镜头"，不该当成后端故障）。
+    """
+    from fastapi.responses import JSONResponse
+    res = await asyncio.to_thread(face_api.enroll, body.uid, body.frames, None,
+                                  body.save_photo)
+    if res.get("ok"):
+        return res
+    kind = res.get("status")
+    code = 503 if kind == "unavailable" else (400 if kind == "bad_request" else 200)
+    return JSONResponse(status_code=code, content=res)
+
+
+@app.delete("/api/face/people/{uid}")
+async def face_person_delete(uid: str):
+    """删除某人的全部人脸样本（照片 + 指纹）。"""
+    from fastapi.responses import JSONResponse
+    res = await asyncio.to_thread(face_api.delete_person, uid)
+    return res if res.get("ok") else JSONResponse(status_code=500, content=res)
+
+
+class FaceEnrollPhotoIn(BaseModel):
+    """用图片注册：uid + base64 图片（前端 canvas/toDataURL 或手机拍照上传）。"""
+    uid: str
+    image_base64: str
+    save_photo: bool = True
+
+
+class FaceIdentifyIn(BaseModel):
+    """识别一张图片里是谁：base64 图片；topk 限制返回几张脸。"""
+    image_base64: str
+    topk: int | None = None
+
+
+def _face_error_response(res: dict):
+    """把 face_api 的 `status` 映射成 HTTP 码（与 /enroll 同一套口径）。"""
+    from fastapi.responses import JSONResponse
+    kind = res.get("status")
+    code = 503 if kind == "unavailable" else (400 if kind == "bad_request" else 200)
+    return JSONResponse(status_code=code, content=res)
+
+
+@app.post("/api/face/enroll_photo")
+async def face_enroll_photo(body: FaceEnrollPhotoIn):
+    """用**一张图片**（base64）注册人脸：护士手机拍的、浏览器上传的都走这里。
+
+    与 `POST /api/face/enroll`（抓摄像头帧）的分工：那个是"老人对着机器人拍"，
+    这个是"拿现成照片入库"，也是**批量导入旧数据集**的接口基础
+    （数据布局 `<目录>/<人名>/*.jpg`，见 `python -m LLM.face_api enroll-dir`）。
+    """
+    res = await asyncio.to_thread(face_api.enroll_photo, body.uid, body.image_base64,
+                                  body.save_photo)
+    return res if res.get("ok") else _face_error_response(res)
+
+
+@app.post("/api/face/identify")
+async def face_identify(body: FaceIdentifyIn):
+    """识别**一张图片**里是谁（不推进"连续 N 帧一致"判定，纯识别）。
+
+    返回每张脸的 `identity` / `identity_score` / `identity_margin`：
+    注册完立刻用同一张照片回测、或让护士核对"这是哪位老人"都用它。
+    """
+    res = await asyncio.to_thread(face_api.identify_photo, body.image_base64, body.topk)
+    return res if res.get("ok") else _face_error_response(res)
 
 
 # ---------------------------------------------------------------- 广播（提醒/告警 SSE）

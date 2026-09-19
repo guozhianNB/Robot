@@ -15,10 +15,19 @@ def test_modules_status_shape():
         data = r.json()
         assert data["ok"] is True
         mods = data["modules"]
-        assert set(mods.keys()) == {"voice", "embed", "ragstore", "graph"}
-        # voice：status 字段存在（running/stopped/unavailable 之一）
-        assert mods["voice"]["status"] in ("running", "stopped", "unavailable")
+        # 聚合维度：语音 / embedding / RAG 存储 / 知识图谱 / MCP 工具
+        # `mcp` 是后加的聚合项 —— 旧断言只认前四个（2026-09-15 补齐）
+        assert set(mods.keys()) == {"voice", "embed", "ragstore", "graph", "mcp"}
+        # voice：status 字段存在。完整词表见 LLM/voice/worker.py 的 self.status
+        # 注释：running / degraded / disabled / stopped —— `degraded` 是"依赖缺一点但
+        # 仍在降级跑"的正常状态（旧断言只认前三种，2026-09-15 补齐）
+        assert mods["voice"]["status"] in ("running", "degraded", "disabled", "stopped")
         # 其余三个：available 布尔字段存在
         for k in ("embed", "ragstore", "graph"):
             assert "available" in mods[k]
             assert isinstance(mods[k].get("missing"), list)
+        # mcp 的字段名与其他模块不同（mcp_client.status() 的口径）：
+        # available / missing_deps / started / servers / errors / tools
+        assert isinstance(mods["mcp"]["available"], bool)
+        assert isinstance(mods["mcp"].get("missing_deps"), list)
+        assert isinstance(mods["mcp"].get("servers"), dict)

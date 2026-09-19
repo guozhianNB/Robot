@@ -806,16 +806,79 @@ def test_bgr_to_nv12_rejects_odd_size_and_bad_shape():
 
 
 def test_bgr_to_nv12_roundtrips_through_cv2_if_available():
-    """与 cv2 的 NV12->BGR 往返应基本还原（口径配套；装了 cv2 才跑）。"""
+    """与 cv2 的 NV12->BGR 往返应基本还原（口径配套；装了 cv2 才跑）。
+
+    输入必须是**平滑内容**（真实摄像头画面的形态）：4:2:0 的色度是 2x2 平均，
+    平滑内容下块内色度几乎不变，故往返近乎无损。早前这条用例喂的是随机噪声，
+    块内四个像素颜色互不相干，误差天然 ~44（任何正确实现都过不了严格容差），
+    属于用例期望不成立而非实现有问题 —— 噪声输入的不变量见下一条用例。
+    """
     cv2 = pytest.importorskip("cv2")
-    rng = np.random.default_rng(0)
-    f = rng.integers(0, 256, size=(16, 16, 3), dtype=np.uint8)
-    nv12 = WC.bgr_to_nv12(f, 16, 16)
-    arr = np.frombuffer(nv12, np.uint8).reshape(16 * 3 // 2, 16)
+    w = h = 16
+    f = np.zeros((h, w, 3), np.uint8)
+    f[:, :, 0] = np.arange(w, dtype=np.uint8)[None, :] * 4      # B 横向渐变
+    f[:, :, 1] = np.arange(h, dtype=np.uint8)[:, None] * 4      # G 纵向渐变
+    f[:, :, 2] = 128                                           # R 常量
+    nv12 = WC.bgr_to_nv12(f, w, h)
+    arr = np.frombuffer(nv12, np.uint8).reshape(h * 3 // 2, w)
     back = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV12)
     assert back.shape == f.shape
-    # 色度 2x2 下采样本身有损，容差放宽到 ~12
-    assert np.abs(back.astype(int) - f.astype(int)).mean() < 12
+    # 实测 ~1.5；留一倍余量。容差写死 12 会放过"色序/口径写错"这类真 bug。
+    assert np.abs(back.astype(int) - f.astype(int)).mean() < 3
+
+
+def test_bgr_to_nv12_cv2_fastpath_matches_numpy_reference():
+    """cv2 快路径必须与纯 numpy 参考实现**逐像素等价**（±2）。
+
+    2026-09-19：纯 numpy 版在 1280x720 要 **34ms/帧**（两次 float32 全幅运算），
+    是"摄像头画面卡顿"的真实来源之一；加了 cv2 快路径后 5.8ms。这条用例防的是
+    "为了提速把色彩口径悄悄改坏" —— 顺带记一个坑：**不能整幅直接用
+    `COLOR_BGR2YUV_I420`**，它那份色度是取 2x2 块的左上角像素（实测与平均差 55），
+    会产生块状色噪；所以快路径只用它拿 Y 平面，色度自己按 2x2 平均算。
+    """
+    pytest.importorskip("cv2")
+    rng = np.random.default_rng(0)
+    for w, h in ((16, 16), (64, 48)):
+        f = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        fast = np.frombuffer(WC.bgr_to_nv12(f, w, h), np.uint8).astype(int)
+        ref = np.frombuffer(WC._bgr_to_nv12_numpy(f, w, h), np.uint8).astype(int)
+        hw = w * h
+        assert np.abs(fast[:hw] - ref[:hw]).max() <= 2, "Y 平面口径变了"
+        assert np.abs(fast[hw:] - ref[hw:]).max() <= 2, "UV 平面（含 U/V 顺序）口径变了"
+
+
+def test_bgr_to_nv12_falls_back_to_numpy_without_cv2(monkeypatch):
+    """没有 cv2 时必须退回纯 numpy 实现（口径完全一致，不是"降级到坏结果"）。"""
+    monkeypatch.setattr(WC, "_CV2", None)
+    monkeypatch.setattr(WC, "_CV2_TRIED", True)
+    rng = np.random.default_rng(1)
+    f = rng.integers(0, 256, size=(16, 16, 3), dtype=np.uint8)
+    assert WC.bgr_to_nv12(f, 16, 16) == WC._bgr_to_nv12_numpy(f, 16, 16)
+
+
+def test_bgr_to_nv12_noise_input_is_lossy_but_bounded():
+    """随机噪声输入：只断言**必须成立的不变量**，不追求像素级还原。
+
+    噪声图色度块间差异极大，4:2:0 往返误差天然在 ~44 量级（有损但应"有界、
+    不崩、亮度口径仍与 cv2 一致"）。这条替代了原先"用噪声图要求 <12"的错误期望。
+    """
+    cv2 = pytest.importorskip("cv2")
+    rng = np.random.default_rng(0)
+    w = h = 16
+    f = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+    nv12 = WC.bgr_to_nv12(f, w, h)
+    assert len(nv12) == w * h * 3 // 2
+    arr = np.frombuffer(nv12, np.uint8).reshape(h * 3 // 2, w)
+    back = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV12)
+    assert back.shape == f.shape
+
+    # 亮度平面必须与 cv2 同口径（limited range BT.601），实测 maxdiff <= 1
+    y_ours = arr[:h].astype(int)
+    y_ref = cv2.cvtColor(f, cv2.COLOR_BGR2YUV_I420)[:h].astype(int)
+    assert np.abs(y_ours - y_ref).max() <= 2
+
+    # 色度有损但误差有界（不是彻底崩坏/饱和错位）
+    assert np.abs(back.astype(int) - f.astype(int)).mean() < 60
 
 
 # ---- WebcamBackend ----

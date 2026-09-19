@@ -29,9 +29,17 @@ r"""Windows / USB 摄像头后端（OpenCV）。
 import sys
 import time
 
+try:
+    import numpy as np
+except ImportError:                               # noqa: BLE001
+    np = None            # 本模块需要 numpy 才能转 NV12；缺了也能 import（红线：别硬崩）
+
 # 默认设备号与探测上限
 DEFAULT_DEVICE = 0
 DEFAULT_PROBE_MAX_INDEX = 6
+
+_CV2 = None            # 缓存的 cv2 模块（None = 没有）
+_CV2_TRIED = False
 
 
 def _import_cv2():
@@ -81,27 +89,127 @@ def _open_capture(cv2, device):
     return cap
 
 
+def _set_prop(cv2, cap, name, value):
+    """尽力设一个 VideoCapture 属性；后端/驱动不支持时静默跳过（绝不因此打不开）。"""
+    prop = getattr(cv2, name, None)
+    if prop is None:
+        return False
+    try:
+        return bool(cap.set(prop, value))
+    except Exception:                             # noqa: BLE001
+        return False
+
+
+def _try_mjpg(cv2, cap):
+    """优先要 MJPG 压缩格式（USB 带宽友好）。拿不到就算了，不报错。"""
+    fourcc = getattr(cv2, "VideoWriter_fourcc", None)
+    prop = getattr(cv2, "CAP_PROP_FOURCC", None)
+    if fourcc is None or prop is None:
+        return False
+    try:
+        cap.set(prop, fourcc(*"MJPG"))
+        return True
+    except Exception:                             # noqa: BLE001
+        return False
+
+
+def _capture_format(cv2, cap, size):
+    """把设备**实际**给到的格式读出来（分辨率/帧率/FOURCC），只为打印一行诊断。
+
+    这行是排查"画面卡顿"的第一手证据：如果实际帧率只有 5~10fps、或 FOURCC 是
+    YUY2，就说明瓶颈在摄像头/USB 而不是软件。
+    """
+    def _get(name, cast):
+        prop = getattr(cv2, name, None)
+        if prop is None:
+            return None
+        try:
+            return cast(cap.get(prop))
+        except Exception:                         # noqa: BLE001
+            return None
+
+    fps = _get("CAP_PROP_FPS", float)
+    code = _get("CAP_PROP_FOURCC", int)
+    txt = "%dx%d" % size
+    if fps and 0.5 <= fps <= 240:
+        txt += " @%.1ffps" % fps
+    if code:
+        try:
+            txt += " FOURCC=%s" % "".join(chr((int(code) >> (8 * i)) & 0xFF)
+                                          for i in range(4))
+        except Exception:                         # noqa: BLE001
+            pass
+    return txt
+
+
 def bgr_to_nv12(frame, width, height):
     """BGR 帧 -> NV12 字节（Y 平面 + 交织 UV 平面）。
 
     ``frame``：numpy 数组，形状 ``(height, width, 3)``，通道序为 BGR
     （cv2 的默认输出）。返回 ``width*height*3//2`` 字节。
 
-    色彩规格：BT.601 **limited range**（与 ``Frame.bgr()`` 用的
-    ``cv2.COLOR_YUV2BGR_NV12`` 一致）。若改成 full range，往返转换会整体
-    偏色——所以这里必须与解码侧口径配套，别单独改。
-
-    色度按 **2x2 平均**下采样（不是取左上角像素），否则画面会出现块状色噪。
+    两条路：装了 cv2 就走 `cv2.cvtColor(..., BGR2YUV_I420)` 再把 U/V 交织成 NV12
+    （**快 20 倍**：1280x720 实测 1.5ms vs 纯 numpy 34ms —— 纯 numpy 那条要对整幅
+    图做 float32 运算，是"摄像头画面卡顿"的一个真实来源，2026-09-19 修）；没装 cv2
+    时退回纯 numpy 实现（数值口径一致：BT.601 limited range，色度 2x2 平均）。
     """
-    import numpy as np
-
+    if np is None:
+        raise RuntimeError("缺少依赖：numpy（NV12 转换需要）")
     if width % 2 or height % 2:
         raise ValueError("NV12 要求宽高为偶数，得到 %dx%d" % (width, height))
     if getattr(frame, "shape", None) != (height, width, 3):
         raise ValueError("帧形状应为 (%d, %d, 3)，得到 %r"
                          % (height, width, getattr(frame, "shape", None)))
 
-    # 用 float32 做中间计算：uint8 会溢出/截断，导致偏色
+    cv2 = _maybe_cv2()
+    if cv2 is not None:
+        return _bgr_to_nv12_cv2(cv2, frame, width, height)
+
+    return _bgr_to_nv12_numpy(frame, width, height)
+
+
+def _bgr_to_nv12_cv2(cv2, frame, width, height):
+    """快路径：Y 用 cv2 的 I420 转换，色度**自己按 2x2 平均**算（快 ~6 倍）。
+
+    为什么不能整幅直接用 `COLOR_BGR2YUV_I420`：OpenCV 那份 I420 的色度是
+    **取每个 2x2 块的左上角像素**（实测与"2x2 平均"最大差 55），会产生块状色噪 ——
+    本项目的 `test_bgr_to_nv12_chroma_is_2x2_average_not_top_left` 正是守这条。
+    所以只用它拿 Y 平面（逐像素与纯 numpy 版差 ≤1），色度改成：
+    先把 BGR 用 INTER_AREA 做 2x2 平均（cv2 的 SIMD，快），再在**四分之一大小**的
+    图上算 U/V 并交织 —— 结果与纯 numpy 版逐像素差 ≤2。
+    """
+    y = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420).reshape(-1)[:width * height]
+    small = cv2.resize(frame, (width // 2, height // 2),
+                       interpolation=cv2.INTER_AREA).astype(np.float32)
+    b, g, r = small[:, :, 0], small[:, :, 1], small[:, :, 2]
+    u = np.clip(-0.148 * r - 0.291 * g + 0.439 * b + 128.0, 0, 255).astype(np.uint8)
+    v = np.clip(0.439 * r - 0.368 * g - 0.071 * b + 128.0, 0, 255).astype(np.uint8)
+    out = np.empty(width * height * 3 // 2, dtype=np.uint8)
+    out[:width * height] = y
+    uv = out[width * height:].reshape(height // 2, width)
+    uv[:, 0::2] = u
+    uv[:, 1::2] = v
+    return out.tobytes()
+
+
+def _maybe_cv2():
+    """能不能用 cv2（惰性、只试一次）。没有就返回 None，让调用方走纯 numpy。"""
+    global _CV2, _CV2_TRIED
+    if not _CV2_TRIED:
+        _CV2_TRIED = True
+        try:
+            import cv2
+            _CV2 = cv2
+        except ImportError:                       # noqa: BLE001
+            _CV2 = None
+    return _CV2
+
+
+def _bgr_to_nv12_numpy(frame, width, height):
+    """纯 numpy 实现（不依赖 cv2；数值口径与 cv2 的 I420 一致）。
+
+    用 float32 做中间计算：uint8 会溢出/截断，导致偏色。
+    """
     f = frame.astype(np.float32)
     b, g, r = f[:, :, 0], f[:, :, 1], f[:, :, 2]
     y = 0.257 * r + 0.504 * g + 0.098 * b + 16.0
@@ -158,10 +266,17 @@ class WebcamBackend:
                 "摄像头设备 %d 打不开：可能没插摄像头、被其它程序占用，"
                 "或设备号不对（用 --list-cameras 查可用设备号）" % self._device)
         try:
+            # 先要** MJPG **再定分辨率：不设的话很多 USB 摄像头默认给 YUY2（未压缩），
+            # 1280x720 YUY2 在 USB2 上只有 5~10fps —— 画面就是一顿一顿的。
+            # 顺序很要紧：设 FOURCC 可能把分辨率重置，所以 FOURCC 在前、W/H 在后。
+            _try_mjpg(cv2, cap)
             # 按"最大的一路"去要分辨率；设备可能只给较小的
             want_w, want_h = max(self._channels, key=lambda c: c[0] * c[1])
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, want_h)
+            # 驱动缓冲只留 1 帧：否则 read() 拿到的是**队列里最旧**那帧，
+            # 画面延迟越积越大（"人已经不动了，画面还在动"）。
+            _set_prop(cv2, cap, "CAP_PROP_BUFFERSIZE", 1)
             ok, frame = self._read_with_retry(cap)
             if not ok or frame is None:
                 raise RuntimeError(
@@ -179,6 +294,12 @@ class WebcamBackend:
         # 设备真实尺寸记录了，用来把请求尺寸收窄到设备能力之内
         self._real = (real_w, real_h)
         self.channels = [self._effective(*c) for c in self._channels]
+        # 一行诊断（落进 camera_server 的日志）：排查"画面卡顿"先看这里 ——
+        # 实际帧率只有 5~10fps / FOURCC 是 YUY2 就说明瓶颈在摄像头侧。
+        print("[webcam] 设备 %d 实际格式：%s（通道 %s）"
+              % (self._device, _capture_format(cv2, cap, (real_w, real_h)),
+                 ",".join("%dx%d" % c for c in self.channels)),
+              file=sys.stderr, flush=True)
         return self
 
     def _effective(self, w, h):

@@ -132,6 +132,7 @@ docs/      需求/教程/接口契约/开发日志
 
 ## 已知坑
 
+- **生物特征数据绝不许进 GitHub（隐私红线）**：人脸照片/指纹在 `LLM/data/faces/`、声纹在 `LLM/data/speakers/`。**`.gitignore` 不等于保证** —— 它只对未跟踪文件生效，对已 `git add` 过的文件和历史提交都无效（2026-09-19 实测到声纹样本已经进了 `origin/main`）。提交前跑 `python scripts/check_privacy.py`（查索引/未跟踪/历史三条通道）；`tests/test_privacy.py` 已在 pytest 里自动把关，`.githooks/` 提供 commit/push 钩子（`git config core.hooksPath .githooks` 启用）。
 - `.gitignore` 排除了 `.venv/`、`.env`、`LLM/data/*.db*`、`LLM/data/audit.jsonl`（运行时数据不入库）。
 - `requirement.txt` 声明的语音依赖（numpy / sherpa-onnx / sounddevice / modelscope 等）在目标环境可能未装齐：新依赖记得固化进去，且后端必须容忍缺失、降级运行（见「系统稳健性」）。
 - 后端 run 用包方式 `LLM.server:app`（`server.py` 里路径基于 `Path(__file__).parent.parent` 定位 `.env`）。

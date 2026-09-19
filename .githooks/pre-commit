@@ -1,0 +1,34 @@
+#!/bin/sh
+# 提交前闸门：确保**人脸照片/指纹**（以及声纹）不会被提交进 git。
+#
+# 启用（一次即可）：
+#     git config core.hooksPath .githooks
+# 关闭：
+#     git config --unset core.hooksPath
+#
+# 为什么需要：`.gitignore` 只对"未跟踪"的文件生效，对已经 add 过的文件无效
+# （见 docs/log.md 2026-09-19 的声纹事故）。所以每次提交都主动查一遍"git 看得见什么"。
+#
+# 临时跳过（确认无隐私问题时）：git commit --no-verify
+
+# 钩子被执行时 CWD 未必是仓库根目录，先定位过去（相对路径才对得上）
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+PY=""
+for c in ".venv/Scripts/python.exe" ".venv/bin/python" "python" "python3" "py"; do
+    if [ -x "$c" ]; then PY="$c"; break; fi
+    if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+
+if [ -z "$PY" ]; then
+    echo "[隐私闸门] 没找到 python，跳过检查。请手动跑：python scripts/check_privacy.py"
+    exit 0
+fi
+
+if "$PY" scripts/check_privacy.py --quiet --no-history; then
+    exit 0
+fi
+echo ""
+echo "[隐私闸门] 已阻止本次提交 —— 上面列出的文件不能进 git。"
+echo "           处理后重试；确认没有隐私问题可临时跳过：git commit --no-verify"
+exit 1
