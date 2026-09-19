@@ -4,6 +4,7 @@
 .dsh-meow/
 # env隐私数据
 .env
+.env.*
 
 # 临时测试文件
 /stm32/control_test/
