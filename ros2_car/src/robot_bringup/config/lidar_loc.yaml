@@ -1,0 +1,51 @@
+# lidar_loc 参数（节点：robot_bringup/robot_bringup/lidar_loc.py）
+#
+# ⚠️ lidar_loc 会广播 map→odom，**不要与 AMCL 同时运行**。
+#    单独验证：ros2 launch robot_bringup lidar_loc.launch.py map:=<地图.yaml>
+lidar_loc:
+  ros__parameters:
+    # 坐标系：必须与 car.urdf / slam_toolbox_params.yaml 一致
+    # （本车没有 base_footprint 这一级，别照抄上游默认值）
+    base_frame: base_link
+    odom_frame: odom
+    laser_frame: laser_link
+
+    laser_topic: /scan
+    map_topic: /map
+    # 与后端 LLM/maps/roslink.py 的默认订阅保持一致，替换 AMCL 时后端不用改
+    pose_topic: /amcl_pose
+
+    # 代价场：与上游 processMap() 的 101×101 线性衰减核等价（半径 50 像素 = 2.5m）
+    max_dist_px: 50
+    pad_px: 50
+
+    # 爬山：5 平移 × 3 偏航 = 15 个候选，每次走 1 像素 / 1 度
+    step_xy_px: 1.0
+    step_yaw_deg: 1.0
+    # 迭代上限。上游没有上限（可能死循环）；有里程计先验时正常跟踪 1~3 步就收敛，
+    # 16 是"跟得上又不会长时间占住回调"的折中。
+    max_iters: 16
+
+    # 单帧修正量上限：定位结果必须与里程计先验自洽。
+    # 上板实测：种子给错时爬山会一路跑飞（8 帧漂 3.2m、yaw 转 60°），
+    # 所以超过这个偏离量就不认这一帧的解（退回按里程计推算）并告警。
+    # 正常跟踪时逐帧修正量在厘米级，0.5m 很宽松；发现被频繁拒绝 = 初始位姿不对。
+    max_correction_m: 0.3
+    max_correction_yaw_deg: 10.0
+
+    # 有效回波少于此数就跳过本帧（避免用残缺扫描把位姿带跑）
+    min_scan_points: 20
+
+    publish_tf: true
+    tf_rate: 20.0
+    transform_timeout: 0.2
+
+    # 局部跟踪器必须给初始位姿。false 时等 rviz 的 "2D Pose Estimate"。
+    set_initial_pose: false
+    initial_pose_x: 0.0
+    initial_pose_y: 0.0
+    initial_pose_yaw: 0.0
+
+    # 位姿协方差对角线 [x, y, z, roll, pitch, yaw]：
+    # z/roll/pitch 给大值表示平面车在这三个自由度上没有信息（同 odom_relay 口径）
+    pose_covariance: [0.25, 0.25, 1.0e6, 1.0e6, 1.0e6, 0.07]
