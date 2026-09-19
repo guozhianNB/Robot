@@ -221,7 +221,10 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: False
       robot_radius: 0.22
-      resolution: 0.05
+      # 必须与 slam_toolbox_params.yaml 的 resolution 一致（当前 0.025），
+      # 否则 StaticLayer 会把细图重采样回粗格，细节白丢。
+      # local_costmap（见下）保持 0.05：局部窗口细化的收益小、控制器算力代价大。
+      resolution: 0.025
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
