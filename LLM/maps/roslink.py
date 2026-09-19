@@ -152,6 +152,39 @@ _map_meta: dict | None = None
 _map_at = 0.0
 
 
+_GET_PARAMETERS_TYPE = "rcl_interfaces/srv/GetParameters"
+_PARAM_TYPE_STRING = 4          # rcl_interfaces/msg/ParameterType.STRING
+
+
+def node_string_param(node: str, name: str, timeout: float | None = None) -> str:
+    """读某个 ROS 节点**自己的**字符串参数（走 ``<node>/get_parameters``）。
+
+    为什么不走 rosapi 的 ``/rosapi/get_param``：Humble 上实测它对**节点参数**恒返回空串
+    （2026-09-19：``{name: "/map_server/yaml_filename"}`` → ``{"value": ""}``，
+    连不存在的参数也回同样的空串，等于不可用），只有直接问节点自己的
+    ``get_parameters`` 才拿得到真值。
+
+    读不到（节点没起 / 超时 / 参数不存在 / 不是字符串）一律返回空串 —— 连接层不抛异常。
+    """
+    node = str(node or "").rstrip("/")
+    if not node or not name:
+        return ""
+    try:
+        got = call_service(f"{node}/get_parameters", {"names": [str(name)]},
+                           service_type=_GET_PARAMETERS_TYPE, timeout=timeout)
+    except Exception:               # noqa: BLE001  连接层绝不把异常抛给业务层
+        return ""
+    values = (got or {}).get("values") if isinstance(got, dict) else None
+    entries = values.get("values") if isinstance(values, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return ""
+    first = entries[0]
+    if not isinstance(first, dict) or first.get("type") != _PARAM_TYPE_STRING:
+        return ""
+    return str(first.get("string_value") or "")
+
+
+
 def _on_message(raw: str) -> None:
     """把订阅到的消息分派到最新位姿 / 地图元数据缓存。"""
     global _pose, _pose_at, _map_meta, _map_at

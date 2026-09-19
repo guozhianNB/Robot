@@ -127,7 +127,11 @@ export interface PoseResp {
 
 export interface CurrentMapResp {
   ok: boolean;
-  source?: "map_topic" | "unknown";
+  /**
+   * `map_server_param` = 直接读导航加载的图（`map_server` 的 `yaml_filename`，第一权威，不做推断）；
+   * `map_topic` = 退回 `/map` 四项指纹反查且唯一命中；`unknown` = 认不出。
+   */
+  source?: "map_server_param" | "map_topic" | "unknown";
   name?: string | null;
   detail?: string;
   /** 多项命中时后端给的是**命中地图名列表**（不是布尔） */

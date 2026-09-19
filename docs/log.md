@@ -1112,3 +1112,112 @@ VOLATILE 的后来者**收不到**那张已经发过的图（会一直等地图�
 - **lidar_loc 没有真值对照**：上板冒烟只证明了链路通 + 护栏生效，**没有**证明精度
   （种子是随便给的，机器人实际位置未知）。要评估精度得在已知位置实测。
 - `costmap_cleaner` 的收益未实测（"改完初始位姿后代价地图残留"这个现象还没复现过）。
+
+---
+
+## 2026-09-19 · 车控 goto 全挂：三个叠在一起的故障 + 「导航拉起哪张图就认哪张」
+
+**现场症状**：老人说「前往A点」，模型正确调了 `robot_goto_place("A点")`，工具回
+`ok:false`「车体未就绪: [Errno 111] Connection refused」；而板卡上
+`ros2 run robot_navigation navigate_to_pose` 手动发目标是好的。
+
+排查下来是**三个独立故障叠在一起**（前两个修完才露出第三个），逐条记：
+
+### 故障 1 · 后端专用 rosbridge（:9091）根本没起
+
+`conf.ROSBRIDGE_URL`（板卡 `.env`）= `ws://127.0.0.1:9091`，而板卡上只有 `9090`
+（Foxglove 用的 `lat`）在听，`/tmp/lat2.log` 都不存在 → `Connection refused` 就是这一条。
+`~/tools/nav_screen.sh lat2` 拉起即好。**9090/9091 分流是既有设计**（见「已知坑」里
+rosbridge 订阅按 topic 共享那条），不是新问题，但"lat2 没起"这个状态**只能靠调用时报错发现**
+（设计上启动时不做网络探测），所以症状长得像"车坏了"。
+
+> 教训：`nav_screen.sh kill all` 会连 lat2 一起停且不自动恢复。后端连不上时先
+> `ss -lnt | grep 9091` 而不是去查车。
+
+### 故障 2 · 板卡 `robot_actions` 节点是死的（install 太旧）
+
+`/tmp/nav.log` 里它启动即崩：
+
+```text
+ImportError: cannot import name 'RobotReadiness' from 'robot_interfaces.srv'
+[ERROR] [robot_actions-12]: process has died [pid 11423, exit code 1]
+```
+
+`robot_interfaces` 的 `install/` 是**加 `RobotReadiness.srv` 之前**编的（install 里只有
+`_move/_turn/_navigate_to`）。于是 `/robot/move|turn|navigate_to|readiness` 与
+`/robot/exec_state` 全都不存在 —— 车控工具连"就绪探测"都发不出去。
+
+修：`colcon build --packages-select robot_interfaces`（33.7s）。**这次没有重启 Nav2**
+（Nav2 本身是好的，重启要重新定位）：单独
+`screen -dmS raction ... ros2 run robot_navigation robot_actions` 把缺的那个节点补上。
+（下次正常 `nav_screen.sh nav` 时 launch 会自己带起它，临时会话可 `screen -S raction -X quit`。）
+
+> 顺带暴露的脆弱点：`robot_actions.py` 在**模块顶层** import `RobotReadiness`，
+> 于是"新服务没编出来"会把整个节点（含本来能用的 move/turn）一起打死。规格 §十 要求
+> "依赖缺失只降级不崩"—— 这条留给后续（要么做惰性 import，要么保持 install 与源码同步的纪律）。
+
+### 故障 3 · 「当前地图未知」：像素编辑器另存副本让 `/map` 指纹**必然多命中**
+
+修完 1、2，`readiness` 已经通了，goto 仍被拒，这次是 `rejected「当前地图未知」`：
+
+```text
+my_map3        vs my_map3_edited
+yaml 只差 image: 一行；pgm 都是 88×107 / 0.05 / origin [-1.2,-1.38,0]（像素内容不同）
+```
+
+`current_map()` 旧口径是拿 `/map` 的四项元数据**反查**本地所有 yaml，唯一命中才认；两张图
+元数据完全相同 → `ambiguous: ["my_map3","my_map3_edited"]` → 按 fail-closed 判 `unknown`
+→ `session.running_map_name()` 返回 `("", "map_unknown")` → `car_nav._context()` 拒绝所有
+goto，`robot_status` 也报不出所在区域。
+
+**这不是配置错，是口径选错了**：像素编辑器「另存」出的副本**天然继承**原图元数据，所以
+"原图 + edited 副本并存"这种用法下，指纹反查**永远**会多命中。
+
+### 改法：认图的第一权威改成「导航自己加载的那张图」
+
+新增 `locator._map_name_from_param()`：读 **`map_server` 节点的 `yaml_filename` 参数**——
+`nav_screen.sh nav <地图>` 的 `map:=` 经 RewrittenYaml 就落在这个参数上，导航拉起哪张它就说哪张，
+**不做推断、不存在多命中**。`current_map()` 顺序变成：
+
+```text
+① map_server/yaml_filename  → source: "map_server_param"（第一权威，读不到才往下走）
+② /map 四项指纹反查唯一命中 → source: "map_topic"（旧口径，保留为回退）
+③ 都没有                    → source: "unknown"（仍然是 fail-closed）
+```
+
+要点：
+
+- 第一权威**不受 `map_topic_fingerprint_enabled` 约束**：那个开关管的是"用 /map 元数据**推断**"，
+  这里不是推断；关掉推断的人照样该知道在跑哪张图。也**不进缓存**（一次服务调用很便宜，
+  换图必须尽快跟着变，不能等 TTL）。
+- 参数值来自 ROS，**同样不可信**：只取 basename 去后缀，再过 `mapstore.check_name()` 白名单。
+- `session.running_map_name()` 同时接受 `map_server_param` 与 `map_topic` 两个 source。
+
+**踩到的工具坑（实测）**：`/rosapi/get_param`（`rosapi_msgs/srv/GetParam`）在 Humble 上
+**对节点参数恒返回空串** —— `{name: "/map_server/yaml_filename"}` 与一个不存在的参数回一样的
+`{"value": ""}`，等于不可用；要用节点自己的 `/<node>/get_parameters`
+（`rcl_interfaces/srv/GetParameters`，`names: ["yaml_filename"]`）才拿得到真值。
+故新增 `roslink.node_string_param()` 走后者。
+
+### 验证
+
+- 板卡上 `pytest tests/test_mapeditor.py LLM/tests/test_ward_autoswitch.py -q` → **73 passed**
+  （新增 6 例：权威路优先且不再走指纹、不受推断开关约束、两路都不可用仍 unknown、
+  basename+白名单、`node_string_param` 类型判定；外加 ward 自动切换认新 source 的回归）。
+- 另跑 `test_car_mcp.py` / `test_roslink_resubscribe.py` / `test_settings_roles.py` /
+  `test_server_roles_routes.py` / `test_policy_*.py` 无回归。
+- **离线性**：`tests/test_mapeditor.py` 新增 autouse fixture 把 `roslink.node_string_param`
+  切成空串 —— 否则跑在**板卡本机**（能连到真 rosbridge 且真在跑某张图）时，离线断言会变成
+  "实际环境相关"（我自己就踩到过：测试真连上了板卡）。
+- 真机实测（不移动车）：`readiness → ready:true / exec_state:idle / nav_available:true`；
+  `resolve_place("A点")` → `(1.23, 1.45) @my_map3_edited`、`resolve_place("B点")` →
+  `(0.60, 0.13)`、`resolve_zone("平台A")` → 回退地点 A点并带 warnings。
+
+### 没做 / 待办
+
+- **真机发车验收仍未做**（0.3m 前进、30° 转向、A点/B点导航、途中急停）—— 需现场净空确认，
+  不得标记为通过（`2026-09-19-car-mcp-design.md` §13.3 同样记着这条）。
+- `ros2_car` 侧 `robot_actions.py` 的顶层 import 脆弱性（见故障 2）未改。
+- 板卡 `settings.current_map` 仍是 `my_map`，而实际在跑 `my_map3_edited`；`nav_screen.sh nav`
+  不带参数默认也是 `my_map.pgm`。现在认图不依赖这两个值了（读的是导航实际加载的图），
+  但它们会让"下次启导航用哪张"有歧义，建议对齐。

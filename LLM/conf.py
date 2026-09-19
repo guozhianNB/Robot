@@ -121,6 +121,12 @@ ROSBRIDGE_RETRY_S = float(os.environ.get("ROSBRIDGE_RETRY_S", "5"))
 ROSBRIDGE_POSE_TTL_S = 10.0             # 位姿超过这么久没更新 → 视为不可用
 ROSBRIDGE_MOCK_POSE = os.environ.get("ROSBRIDGE_MOCK_POSE", "")  # "x,y,yaw" 注入假位姿（无 ROS 开发/测试）
 MAP_CURRENT_CACHE_TTL_S = 5.0           # 大于前端轮询周期；从扫描完成时计，避免慢 SSH 吞掉 TTL
+# 「车此刻在跑哪张图」的第一权威 = **导航自己加载的那张图**：map_server 的 yaml_filename 参数。
+# 为什么不让 /map 指纹当第一权威（2026-09-19 实锤）：像素编辑器另存出的副本（my_map3_edited）
+# 与原图元数据（宽/高/分辨率/原点）天然完全一致，指纹反查必然"多命中"→ 按不唯一口径判 unknown
+# → 车控 goto 三个工具全部 rejected「当前地图未知」。直接问 map_server 要路径则无歧义。
+MAPSERVER_NODE = os.environ.get("MAPSERVER_NODE", "/map_server")
+MAPSERVER_MAP_PARAM = os.environ.get("MAPSERVER_MAP_PARAM", "yaml_filename")
 
 # 摄像头共享服务（vision/camera_server.py，裸 TCP）—— webbridge 连它的地址
 # 默认**本机**：摄像头服务与后端通常一起跑（PC 上用 webcam 调试、板卡上用 MIPI）。

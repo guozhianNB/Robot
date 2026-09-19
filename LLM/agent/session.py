@@ -273,7 +273,8 @@ def running_map_name() -> tuple[str, str]:
     坐标系不通用；若拿位姿去比"旧图上的病房多边形"，会**静默切错病房**（D17 明令禁止）。
 
     取值口径（`settings.ward_map_source`）：
-      * `"auto"`（默认）：`locator.current_map()` 的 `/map` 四项指纹反查，唯一命中才认；
+      * `"auto"`（默认）：`locator.current_map()` —— **先问导航自己加载了哪张图**
+        （`map_server` 的 `yaml_filename`，无歧义），读不到再退回 `/map` 四项指纹反查；
       * `"setting"`：用 `settings.current_map`（一期语义="下次启导航用哪张图"）——
         给"指纹识别不可用但现场自己知道在跑哪张图"留一条手动阀。
     结果缓存 `_MAP_CACHE_S` 秒：`current_map()` 会列地图 + 逐图读元数据，`MAPS_IO=ssh` 下很贵。
@@ -293,7 +294,8 @@ def running_map_name() -> tuple[str, str]:
             got = locator.current_map()
         except Exception:               # noqa: BLE001  识别失败=不可用，绝不炸 tick
             got = {}
-        if got.get("source") == "map_topic" and got.get("name"):
+        # `map_server_param` = 直接读导航加载的图（第一权威）；`map_topic` = /map 指纹唯一命中（旧口径）。
+        if got.get("source") in ("map_server_param", "map_topic") and got.get("name"):
             name = str(got["name"])
         else:
             reason = "map_unknown"

@@ -12,18 +12,26 @@ r"""
   * ``/amcl_pose`` 恒为原点且未对齐时 → 给 ``suspect: True``（§7.5 的"位姿可疑"提示）；
   * 支持 ``set_pose_for_test()`` 注入假位姿 —— 无 ROS 环境（Windows 开发机）也能跑通全部逻辑。
 
-「当前地图识别」不靠人工声明：拿 ``/map`` 的 ``width/height/resolution/origin`` 四项与本地
-每张 yaml 的元数据比对，**唯一命中**才认（规格 §5.3）。
+「当前地图识别」的**第一权威是导航自己加载的那张图**：问 ``map_server`` 的 ``yaml_filename``
+参数（导航拉起哪张，这里就是哪张）。只有拿不到它（导航没起 / 不是 nav2 map_server / rosbridge 断）
+才退回旧口径 —— 拿 ``/map`` 的 ``width/height/resolution/origin`` 四项与本地每张 yaml 比对、
+**唯一命中**才认（规格 §5.3）。
+
+为什么改（2026-09-19 实锤）：像素编辑器「另存」出的副本与原图的四项元数据**天然完全一致**
+（`my_map3` vs `my_map3_edited`：yaml 只差 `image:` 一行，pgm 同 88×107/0.05/[-1.2,-1.38,0]），
+指纹反查必然"多命中" → 按不唯一口径判 unknown → 车控三个 goto 工具全部
+`rejected「当前地图未知」`。问 map_server 要路径则无歧义。
 """
 from __future__ import annotations
 
 import threading
 import time
 import copy
+from pathlib import PurePosixPath
 
 from .. import conf
 from . import mapserver, roslink
-from .mapstore import MapStoreError, get_store
+from .mapstore import MapStoreError, check_name, get_store
 
 _lock = threading.RLock()
 _injected_pose: dict | None = None
@@ -167,6 +175,28 @@ def clear_current_map_cache() -> None:
         _current_cache = None
 
 
+def _map_name_from_param() -> tuple[str, str]:
+    """导航**实际加载**的地图名 → ``(name, 认不出的原因)``；认不出返回 ``("", reason)``。
+
+    来源 = ``conf.MAPSERVER_NODE`` 的 ``conf.MAPSERVER_MAP_PARAM``（默认
+    ``/map_server`` 的 ``yaml_filename``）。导航用的是哪张图，这个参数就是哪张 ——
+    ``nav_screen.sh nav <地图>`` 的 ``map:=`` 经 RewrittenYaml 落到它上面。
+
+    名字只取 basename 去后缀，并过 ``mapstore.check_name()`` 白名单（地图名来自 ROS 参数，
+    同样不能信任：``../`` 之类一律当作认不出，退回指纹路）。
+    """
+    node = getattr(conf, "MAPSERVER_NODE", "/map_server")
+    param = getattr(conf, "MAPSERVER_MAP_PARAM", "yaml_filename")
+    raw = roslink.node_string_param(node, param)
+    if not raw:
+        return "", f"未取到 {node}/{param}（导航没起 / 不是 nav2 map_server / rosbridge 不通）"
+    stem = PurePosixPath(str(raw).replace("\\", "/")).stem
+    try:
+        return check_name(stem), ""
+    except MapStoreError as e:
+        return "", f"{node}/{param} 的值不可用：{e}"
+
+
 def _topic_map_meta() -> dict | None:
     with _lock:
         inj = dict(_injected_map) if _injected_map is not None else None
@@ -186,11 +216,22 @@ def _topic_map_meta() -> dict | None:
 def current_map(store=None) -> dict:
     """``GET /api/map/current`` 的载荷（规格 §5.3）。
 
-    * 唯一命中 → ``source: "map_topic"``；
+    * **第一权威**：``map_server`` 的 ``yaml_filename`` → ``source: "map_server_param"``
+      （导航拉起哪张就认哪张，不做推断、不存在多命中）；
+    * 读不到才退回 ``/map`` 四项指纹反查：唯一命中 → ``source: "map_topic"``；
     * 多项命中或零命中 → ``source: "unknown"`` 并说明原因；
     * rosbridge 不可用 → ``source: "unknown"``，但**编辑功能照常可用**。
+
+    第一权威不受 ``map_topic_fingerprint_enabled`` 约束：那个开关管的是「用 /map 元数据**推断**」，
+    而这里是直接读导航的配置，不是推断（关掉推断的人照样应该能知道在跑哪张图）。
+    它也**不进缓存**：一次服务调用很便宜，而换图后必须**尽快**跟着变，不能等 TTL。
     """
     global _current_cache
+    param_name, param_why = _map_name_from_param()
+    if param_name:
+        return {"ok": True, "source": "map_server_param", "name": param_name,
+                "detail": (f"{conf.MAPSERVER_NODE}/{conf.MAPSERVER_MAP_PARAM} = "
+                           f"{param_name}.yaml（导航实际加载的图）")}
     settings = None
     try:
         from ..store import db as _db
@@ -200,14 +241,14 @@ def current_map(store=None) -> dict:
     fp_enabled = (settings or conf.DEFAULT_SETTINGS).get("map_topic_fingerprint_enabled", True)
     if not fp_enabled:
         return {"ok": True, "source": "unknown", "name": None,
-                "detail": "「用 /map 元数据识别当前地图」已在设置里关闭"}
+                "detail": f"「用 /map 元数据识别当前地图」已在设置里关闭，且{param_why}"}
     topic = _topic_map_meta()
     if topic is None:
         ok, why = roslink.available()
         return {"ok": True, "source": "unknown", "name": None,
-                "detail": (f"导航未运行或 rosbridge 未启动（{why}）—— 看图与标点不受影响"
+                "detail": (f"导航未运行或 rosbridge 未启动（{why}）—— 看图与标点不受影响；{param_why}"
                            if not ok else
-                           f"未收到 /map（rosbridge {conf.ROSBRIDGE_URL} 已连但无数据）")}
+                           f"未收到 /map（rosbridge {conf.ROSBRIDGE_URL} 已连但无数据）；{param_why}")}
     key = _fingerprint(topic["width"], topic["height"], topic.get("resolution"),
                        topic.get("origin"))
     now = time.monotonic()

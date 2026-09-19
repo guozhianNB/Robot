@@ -170,6 +170,23 @@ def test_auto_map_source_uses_fingerprint(d, monkeypatch):
     assert session.current_ward() == "ward_102"
 
 
+def test_auto_map_source_accepts_map_server_param(d, monkeypatch):
+    """`map_server_param`（直接读导航加载的图）与旧 `map_topic` 同等有效。
+
+    回归 2026-09-19：认图口径改成"问 map_server 要 yaml_filename"后，这里不认就等于
+    病房自动切换 + 车控 goto 一起退化成 map_unknown。
+    """
+    monkeypatch.setattr(session, "_settings",
+                        lambda: {**_SETTINGS, "ward_map_source": "auto"})
+    monkeypatch.setattr(session.locator, "current_map",
+                        lambda *a, **k: {"ok": True, "source": "map_server_param", "name": _MAP})
+    locator.set_pose_for_test(20.0, 0.0, 0.0)
+    for _ in range(3):
+        session.tick()
+    assert session.current_ward() == "ward_102"
+    assert session.running_map_name() == (_MAP, "")
+
+
 def test_unknown_map_disables_autoswitch(d, monkeypatch):
     """指纹认不出当前图 → 不切（宁可不切也不误切）。"""
     monkeypatch.setattr(session, "_settings",

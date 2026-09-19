@@ -22,8 +22,12 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.par
 
 from LLM import conf
 from LLM.store import db
-from LLM.maps import locator, mapserver, mapsources, mapstore, maptags
+from LLM.maps import locator, mapserver, mapsources, mapstore, maptags, roslink
 from LLM.core import log as audit_log  # noqa: E402
+
+# 在 autouse fixture 把 `roslink.node_string_param` 换成假实现**之前**留一份真身，
+# 供「验它自己」的用例还原（见 test_node_string_param_reads_string_and_rejects_others）。
+_REAL_NODE_STRING_PARAM = roslink.node_string_param
 
 SAMPLE_YAML = """image: my_map.pgm
 mode: trinary
@@ -79,6 +83,18 @@ def env(tmp_path, monkeypatch):
 
 def _store():
     return mapstore.get_store()
+
+
+@pytest.fixture(autouse=True)
+def _offline_map_param(monkeypatch):
+    """切断「问 map_server 要 yaml_filename」这条权威路，保证本文件全程离线。
+
+    它是 ``current_map()`` 的第一权威（见 ``locator._map_name_from_param``），会走 rosbridge
+    服务调用；不切断的话，跑在**有板卡的开发机/板卡本机**上会真连到板卡，把离线断言染成
+    "实际环境相关"。要验这条路的用例自己再 patch 回一个假路径（见
+    test_current_map_prefers_map_server_param*）。
+    """
+    monkeypatch.setattr(roslink, "node_string_param", lambda *a, **k: "")
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +624,94 @@ def test_current_map_unknown_when_no_ros(env):
     locator.clear_injection()
     out = locator.current_map(_store())
     assert out["ok"] and out["source"] == "unknown" and out["detail"]
+
+
+def test_current_map_prefers_map_server_param(env, monkeypatch):
+    """**权威路**：导航实际加载哪张图，就认哪张 —— 不看 /map 指纹、也不受多命中影响。
+
+    回归 2026-09-19 现场事故：像素编辑器另存副本（my_map3_edited）与原图四项元数据完全一致
+    → 指纹反查"多命中"判 unknown → 车控 goto 全部 rejected「当前地图未知」。
+    """
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml")
+
+    def _should_not_scan():
+        raise AssertionError("权威路命中后不该再走 /map 指纹反查（那正是歧义来源）")
+
+    monkeypatch.setattr(locator, "_topic_map_meta", _should_not_scan)
+    locator.clear_current_map_cache()
+    out = locator.current_map(_store())
+    assert out["ok"] and out["source"] == "map_server_param"
+    assert out["name"] == "my_map3_edited" and "my_map3_edited" in out["detail"]
+
+
+def test_current_map_is_not_gated_by_fingerprint_switch(env, monkeypatch):
+    """权威路不是「用 /map 元数据**推断**」，所以关掉推断开关也照样认得出在跑哪张图。"""
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map.yaml")
+    monkeypatch.setattr(db, "get_settings",
+                        lambda: {**conf.DEFAULT_SETTINGS, "map_topic_fingerprint_enabled": False})
+    out = locator.current_map(_store())
+    assert out["source"] == "map_server_param" and out["name"] == "my_map"
+
+
+def test_current_map_fingerprint_switch_off_and_no_param_returns_unknown(env, monkeypatch):
+    """两条路都不可用时仍是 fail-closed 的 unknown（关掉推断 ≠ 乱认一张图）。"""
+    monkeypatch.setattr(db, "get_settings",
+                        lambda: {**conf.DEFAULT_SETTINGS, "map_topic_fingerprint_enabled": False})
+    locator.set_map_for_test(8, 6, 0.05, [-4.6, -1.91, 0.0])
+    out = locator.current_map(_store())
+    assert out["source"] == "unknown" and "关闭" in out["detail"]
+    locator.clear_injection()
+
+
+def test_current_map_falls_back_to_fingerprint_when_param_unavailable(env, monkeypatch):
+    """读不到 map_server 参数（导航没起 / 不是 nav2）→ 退回旧的唯一命中口径。"""
+    locator.set_map_for_test(8, 6, 0.05, [-4.6, -1.91, 0.0])
+    out = locator.current_map(_store())
+    assert out["source"] == "map_topic" and out["name"] == "my_map"
+    locator.clear_injection()
+
+
+def test_map_name_from_param_takes_basename_and_enforces_whitelist(monkeypatch):
+    """参数值来自 ROS，同样不可信：只取 basename，非法名字一律当作认不出（fail-closed）。"""
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml")
+    assert locator._map_name_from_param() == ("my_map3_edited", "")
+
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my map!.yaml")
+    name, why = locator._map_name_from_param()
+    assert name == "" and "不合法" in why
+
+    monkeypatch.setattr(roslink, "node_string_param", lambda *a, **k: "")
+    name, why = locator._map_name_from_param()
+    assert name == "" and "未取到" in why
+
+
+def test_node_string_param_reads_string_and_rejects_others(monkeypatch):
+    """``node_string_param`` 只认字符串参数；服务不存在/超时/非字符串一律回空串。"""
+    monkeypatch.setattr(roslink, "node_string_param", _REAL_NODE_STRING_PARAM)
+    seen = {}
+
+    def fake_call(service, args, service_type="", timeout=None):
+        seen.update(service=service, args=args, service_type=service_type)
+        return {"ok": True, "values": {"values": [
+            {"type": 4, "string_value": "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml"}]}}
+
+    monkeypatch.setattr(roslink, "call_service", fake_call)
+    assert roslink.node_string_param("/map_server", "yaml_filename") == \
+        "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml"
+    assert seen["service"] == "/map_server/get_parameters"
+    assert seen["args"] == {"names": ["yaml_filename"]}
+    assert seen["service_type"] == "rcl_interfaces/srv/GetParameters"
+
+    monkeypatch.setattr(roslink, "call_service", lambda *a, **k: {
+        "ok": True, "values": {"values": [{"type": 2, "string_value": ""}]}})
+    assert roslink.node_string_param("/map_server", "yaml_filename") == ""
+    monkeypatch.setattr(roslink, "call_service", lambda *a, **k: None)
+    assert roslink.node_string_param("/map_server", "yaml_filename") == ""
+    assert roslink.node_string_param("", "yaml_filename") == ""
 
 
 def test_current_map_reuses_scan_until_cache_is_cleared(monkeypatch):
