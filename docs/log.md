@@ -989,3 +989,126 @@ API：`/api/chat`（流式）、`/api/profiles`、`/api/memories`（查看/审�
 - 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
 - `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
 - 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。
+
+---
+
+## 2026-09-19 · 纳入 jie_ware 定位工具集（vendored）
+
+### 实现口径
+
+- `ros2_car/src/jie_ware/` 是从上游 `6-robot/jie_ware` 克隆的 **ROS1（catkin）** 包（`lidar_loc` / `lidar_filter_node` / `costmap_cleaner` + `amcl_test`、`lidar_loc_test` 两个 launch）。
+  > ⚠️ **更正（2026-09-19）**：本条原文写的是"ROS2 包"，**是错的**。依据：`CMakeLists.txt` 用 `find_package(catkin REQUIRED ...)` + `catkin_package()`、三个源码都 `#include <ros/ros.h>` / `ros::spin()`、`package.xml` 是 `<buildtool_depend>catkin</buildtool_depend>` —— 全是 ROS1。板卡是 ROS2 Humble，**没有 catkin / roscpp**，所以它在本工作区里既不能 `colcon build` 也不能直接运行。另需 `COLCON_IGNORE` 把它排除出构建（否则 `colcon build` 整个工作区报找不到 catkin）；对应的 ROS2 自研实现在下一条。
+- 克隆自带的内层 `.git` 让 `git add` 只生成 **gitlink（模式 160000）**：文件内容一个都不进主仓库，远端 clone 后只会看到空目录，且无 `.gitmodules`（既不是真子模块、也没内容）—— 这正是「git 不上去」的根因。已 `Remove-Item -Recurse -Force ros2_car/src/jie_ware/.git` 后按**自有代码 vendoring** 纳管，源码快照 10 个文件全部入索引。
+- 上游定版 `21bf8f5`、许可 **GPL-2.0-or-later**（copyleft）已记入 `使用开源代码记录.md`：vendoring 后主仓库不保留上游历史，不钉哈希将来无从 diff。
+
+### 验证
+
+- `git ls-files -s ros2_car/src/jie_ware | Where-Object {$_ -match '^160000'}` → **0**（无 gitlink 残留）；`git diff --cached --name-only` 与磁盘文件 1:1 对上（10 个）。
+- `git push origin main` → `0205dd6..5fe16ea`；`git ls-tree -r --name-only origin/main -- ros2_car/src/jie_ware` 列出全部 10 个文件。
+
+### 待办
+
+- 将来同步上游需按 `21bf8f5` 手动 diff（无 submodule 关联）。
+- GPL-2.0-or-later 的传染性对主仓库整体许可的影响未评估。
+
+---
+
+## 2026-09-19 · jie_ware 三件套落进 ros2_car（ROS2 重写，A/B/C 两段提交）
+
+### 背景与口径
+
+上游 `jie_ware` 是 **ROS1（catkin）** 包（见上一条更正），本车是 ROS2 Humble ——
+"融合"只能是**重写**，不存在装上去就能用。又因上游许可 **GPL-2.0-or-later**（copyleft），
+所以**不抄源码**，按算法清洁重写为自研代码（MIT，与 `ros2_car` 其余包一致），
+`ros2_car/src/jie_ware/` 只当参考快照留着。
+
+三个功能的价值并不相同，没有"照单全收"：
+
+| 上游节点 | 落地形态 | 判断 |
+|---|---|---|
+| `lidar_filter_node` | `robot_bringup/robot_bringup/scan_filter.py` | 值得做（去噪），但**默认不改变任何消费者** |
+| `costmap_cleaner` | `robot_navigation/robot_navigation/costmap_cleaner.py` | 可做但收益最小，Nav2 恢复行为树本就有 ClearCostmap |
+| `lidar_loc` | `robot_bringup/robot_bringup/lidar_loc.py` | **不替代 AMCL**，只作独立可选项（局部跟踪器，无全局重定位） |
+
+### 提交 A/B（`214e8f6`）
+
+- **`scan_filter`**：`/scan` → `/scan_filtered`，单点离群回波剔除 + 可选量程裁剪
+  （`clip_range`，默认关）。语义显式钉死：候选点须自身有效、**左右两侧都**不一致才剔除、
+  首尾点不动、剔除 = 置 `inf`、非有限邻居一律算不一致（否则"空区里的孤立回波"永远剔不掉）。
+  **默认只多发一路话题，不改任何消费者**（slam/nav2/amcl 仍吃 `/scan`）——
+  要生效必须按节点头部清单**一次切三处**（`slam.launch.py` 内联 `scan_topic`、
+  `nav2_params.yaml` 的 `amcl.scan_topic`、两个 costmap 的 `scan.topic`），
+  漏切任何一处 = "定位用的图"与"代价地图用的图"不是同一份。
+  ⚠️ 已知界限：404 束/360° ≈ 0.89°/束，3m 处一根 5cm 细杆只占 1 束，
+  **会被当成噪点删掉**（占 2 束及以上的不受影响，有测试）。
+- **`costmap_cleaner`**：`/initialpose` → 清 global + local 两个代价地图。
+  服务名是 **`/<name>/clear_entirely_<name>`**（依 nav2 源码 `clear_costmap_service.cpp`
+  的 `"clear_entirely_" + costmap_.getName()`，`getName()` 本身就带 `costmap`），
+  **不是** `..._costmap_costmap` —— 这个错法有测试钉死。非阻塞 `call_async`，
+  Nav2 未起时启动自检告警 + 静默跳过，不崩不刷屏。
+- **`COLCON_IGNORE`**：上游是 catkin 包，不排除的话 `colcon build` 整个工作区会失败。
+
+### 提交 C（`f388c86`，可整体 `git revert`）
+
+`lidar_loc` 重写时对上游做了四处**有意**改动（每处都有测试）：
+
+1. **收到 `/map` 不再清零位姿**：上游 `crop_map()` 末尾构造 (0,0,0) 假 initialpose 重置自己，
+   配 slam_toolbox 每 5s 发图 = 永远收敛不了 → 上游与建图模式根本互斥。
+2. **同时输出 `/amcl_pose` 形状位姿**：上游只发 TF；后端 `LLM/maps/roslink.py` 默认订阅
+   `/amcl_pose`，少了它会直接断掉后端位姿链路。
+3. **里程计先验做种子**：上游不用 `/odom` 增量，0.8 rad/s 转向每帧 4.6° 而偏航步长只有 1°。
+4. **爬山有迭代上限**：上游 `while(ros::ok())` 只在"连续 10 帧位移 < 5px/5°"时 break，
+   振荡时永不退出、挂死回调。
+
+第 5 处是**上板实测逼出来的**：首版冒烟种子给错（(0,0,0) 而车不在原点），
+实测 **8 帧从 (0,0) 漂到 3.2m 外、yaw 转 60°** —— 每帧都"有改进"，爬山对错种子毫无抵抗力。
+故加 `max_correction_m`/`max_correction_yaw_deg`（默认 0.3m / 10°）：解必须与里程计先验
+自洽，超限就退回按里程计推算并告警，而不是假装定位成功。
+
+代价场用一次**截断欧氏距离变换**（可分离、numpy 向量化）替换上游"给每个障碍像素铺
+101×101 线性衰减核再逐像素取 max"，复杂度 O(障碍数×101²) → O(像素数)，代价函数
+`max(0, 1 - 距离/50px)` 与上游等价。另不做上游那段"雷达倒装"启发式（本车 URDF 已有正确
+`laser_link`、驱动也配了 `inverted: true`，再翻一次就是双重翻转）。
+
+**关键 QoS 坑**：`/map` 订阅必须用 `TRANSIENT_LOCAL`。`map_server` 是 latched 发布，
+VOLATILE 的后来者**收不到**那张已经发过的图（会一直等地图）。
+
+**安全**：lidar_loc **不接进** `navigation.launch.py` / `bringup.launch.py` ——
+它与 AMCL 都广播 `map→odom`，同跑会在 TF 里出现两个发布者（违反 REP-105）。有测试锁死。
+
+### 验证
+
+- `pytest ros2_car/tests -q` → **122 passed**（新增 46 例：scan_filter 19 + 契约 14、
+  costmap_cleaner 8、lidar_loc core 51 + 契约 17 + 真实地图 4 组·3 子用例）。
+- **真实地图离线端到端**（`tests/test_lidar_loc_map.py`）：用 `my_map.pgm` 的真实几何
+  合成扫描，从 +0.15m/-0.15m/+3° 的扰动起点恢复了 3 个真值位姿（PGM 解析**复用**
+  `LLM/maps/mapserver.py`，不重造）。
+- **上板冒烟**（`ros2_car/tools/smoke_lidar_loc.sh`，新工具）→ **全 PASS**：
+  lidar_loc 收到 latched `/map`（证明 TRANSIENT_LOCAL 选对）、`/scan_filtered` 10.05 Hz、
+  `/amcl_pose` 有输出、`map→odom` TF 存在、**错种子下护栏拦住跑飞**（位姿停在 (0,0,0)
+  并打"偏离过大，已放弃"）。
+- 板卡 `colcon build --packages-select robot_bringup robot_navigation` 通过，
+  四个可执行文件与两个 launch 的 `--show-args` 均正常。
+
+### 踩到的坑（脚本侧，都已修）
+
+- **多行 URDF 不能经 `-p robot_description:=$(cat ...)` 传**：rcl 全局参数解析失败
+  （`RCLInvalidROSArgsError`）→ `robot_state_publisher` 直接 Aborted，现象是 `laser_link`
+  这个 frame 在 TF 里根本不存在。冒烟脚本改用 `--params-file`（纯 shell 生成 YAML）。
+- **`ros2 launch` 的子进程杀不干净**：只 kill launch 的 pid 会把真正的节点留成孤儿，
+  第二轮冒烟就出现两个 `map_server` 抢同一节点名 → lifecycle "Failed to change state"。
+  冒烟脚本改用 `setsid` + 按**进程组**整组杀。
+- **别拿 `timeout` 的退出码判断命令成功与否**：超时杀进程返回 124，用 `&&` 串会把
+  "其实成功"（tf2_echo 已经打出变换）判成失败。改成看日志内容。
+- **`pkill -f` 会匹配到执行命令的 shell 自己**（命令行里含同样字面量）→ 把自己杀掉、
+  命令静默失败。清场时要拆字面量或换 `-x`。
+- `source /opt/ros/humble/setup.bash` 期间必须 `set +u`（那些脚本引用未定义的
+  `AMENT_TRACE_SETUP_FILES`，开着 `set -u` 直接退出）。
+
+### 待办 / 未做
+
+- **`/scan_filtered` 还没接线**：消费者仍在 `/scan`。需要在 rviz 里对照 `/scan` vs
+  `/scan_filtered`（重点看细杆障碍有没有被误删），确认后再一次性切三处。
+- **lidar_loc 没有真值对照**：上板冒烟只证明了链路通 + 护栏生效，**没有**证明精度
+  （种子是随便给的，机器人实际位置未知）。要评估精度得在已知位置实测。
+- `costmap_cleaner` 的收益未实测（"改完初始位姿后代价地图残留"这个现象还没复现过）。
