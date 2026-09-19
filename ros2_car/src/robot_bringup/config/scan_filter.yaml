@@ -1,0 +1,15 @@
+# scan_filter 去噪参数（节点：robot_bringup/robot_bringup/scan_filter.py）
+#
+# 话题不在本文件里配：节点订阅相对名 `scan`、发布相对名 `scan_filtered`，
+# 由 launch 的 remapping 落到 /scan 与 /scan_filtered。
+scan_filter:
+  ros__parameters:
+    # 与左右邻居的差值都超过它就判为离群点（米）。
+    # 调大 → 更保守（少删）；调小 → 更激进（可能啃掉真实细障碍）。
+    outlier_threshold: 0.1
+
+    # >0 时把超过该距离的读数标成"无回波"（0 = 不裁）。
+    # Tmini Plus 量程标称 12m，室内 8m 以外的读数基本不可信 ——
+    # 这是"走廊尽头噪点"最便宜的解法，比空间滤波更对症。
+    # ⚠️ 先保持 0（不裁）跑一轮，确认没有把有用的远端墙裁掉再开。
+    clip_range: 0.0

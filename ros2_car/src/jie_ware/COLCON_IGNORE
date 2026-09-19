@@ -1,0 +1,7 @@
+# 这个目录是 ROS1 (catkin) 上游参考源码，不是本 colcon 工作区的包。
+# 它带 package.xml + CMakeLists(find_package(catkin ...))，若参与 colcon 构建会
+# 因 Humble 没有 catkin 而让整个 `colcon build` 失败 —— 故用 COLCON_IGNORE 排除。
+# 对应的 ROS2 实现见：
+#   robot_bringup/robot_bringup/scan_filter.py      (上游 lidar_filter_node)
+#   robot_navigation/robot_navigation/costmap_cleaner.py (上游 costmap_cleaner)
+#   robot_bringup/robot_bringup/lidar_loc.py        (上游 lidar_loc)

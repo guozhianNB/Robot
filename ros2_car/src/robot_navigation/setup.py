@@ -22,6 +22,7 @@ setup(
             'navigate_to_pose = robot_navigation.navigate_to_pose:main',
             'cmd_stop = robot_navigation.cmd_stop:main',
             'robot_actions = robot_navigation.robot_actions:main',
+            'costmap_cleaner = robot_navigation.costmap_cleaner:main',
         ],
     },
 )
