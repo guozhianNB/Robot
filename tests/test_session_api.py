@@ -7,7 +7,9 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from LLM import server, log as audit, session
+from LLM import server
+from LLM.core import log as audit
+from LLM.agent import session
 
 
 @pytest.fixture(autouse=True)

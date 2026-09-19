@@ -1,4 +1,4 @@
-import { apiGet, apiPost, type Surface } from "./client";
+import { apiDelete, apiGet, apiPost, type Surface } from "./client";
 
 export type Role = "admin" | "ward" | "elder";
 
@@ -46,6 +46,12 @@ export function setSessionUser(uid: string, locked: boolean, surface: Surface): 
   return apiPost<SessionUser>("/api/session/user", { uid, locked }, surface);   // 不传 role（R1）
 }
 
+/** 手动切当前病房（规格 D18）：只切**集体层背景变量** + 带 `manual_until` 覆盖窗口，
+ *  与「锁定主体」不同 —— 正在老人私聊时不抢会话（故返回体里 `locked` 仍是 false）。 */
+export function setWard(wardUid: string, surface: Surface): Promise<SessionUser> {
+  return apiPost<SessionUser>("/api/session/ward", { ward_uid: wardUid }, surface);
+}
+
 /** 口令门登管理员：成功返回 {ok:true, role, ttl_remain}；失败/冷却返回 {ok:false, error}（HTTP 仍 200）。 */
 export function login(password: string | null, surface: Surface) {
   return apiPost<{ ok: boolean; error?: string; role?: Role; ttl_remain?: number | null }>(
@@ -61,6 +67,12 @@ export function logout(surface: Surface): Promise<SessionUser> {
 export function changePassword(oldPw: string, newPw: string, surface: Surface) {
   return apiPost<{ ok: boolean; error?: string }>(
     "/api/session/password", { old: oldPw, new: newPw }, surface);
+}
+
+/** 恢复 `.env` 的 PASSWORD；成功后后端会立即注销所有管理员会话。 */
+export function restoreFactoryPassword(surface: Surface) {
+  return apiPost<{ ok: boolean; error?: string }>(
+    "/api/session/password/restore-factory", {}, surface);
 }
 
 export function getAdminAuth(surface: Surface) {
@@ -79,6 +91,11 @@ export function upsertWard(uid: string, name: string, wardMap: string, wardZone:
                           surface: Surface) {
   return apiPost<{ ok: boolean; ward?: Ward; error?: string }>(
     "/api/wards", { uid, name, ward_map: wardMap, ward_zone: wardZone }, surface);
+}
+
+export function deleteWard(uid: string, surface: Surface) {
+  return apiDelete<{ ok: boolean; uid?: string; error?: string }>(
+    `/api/wards/${encodeURIComponent(uid)}`, surface);
 }
 
 /** 便捷录入：以小车当前位姿为圆心、ward_zone_default_r 为半径，把当前房间记成病房区域。 */

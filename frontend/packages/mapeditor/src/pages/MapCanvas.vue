@@ -11,6 +11,7 @@ import type { Destination, DrawMode, MapMetaFields, PoseResp, Zone } from "../li
 const MODE_HINTS: Record<string, string> = {
   idle: "滚轮缩放 · 拖拽平移 · 双击复位 · 单击选中区域/地点",
   point: "标点模式：单击画布落点（取米坐标）",
+  goal: "停靠点模式：单击画布设置区域停靠点",
   polygon: "画多边形：连点加顶点，双击结束（至少 3 点）",
   rect: "画矩形：按住拖拽出矩形，松手完成",
 };
@@ -38,6 +39,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   (e: "point", p: { x: number; y: number }): void;
+  (e: "goal-point", p: { x: number; y: number }): void;
   (e: "polygon", poly: number[][]): void;
   (e: "rect", poly: number[][]): void;
   (e: "draft", poly: number[][]): void;
@@ -384,6 +386,20 @@ function drawZones() {
     const c = centroid(poly);
     const p = m2s(c[0], c[1]);
     ctx.fillText(`${z.name || z.uid}${z.kind ? `·${z.kind}` : ""}`, p[0] + 4, p[1] - 4);
+    if (z.goal) {
+      const g = m2s(Number(z.goal.x), Number(z.goal.y));
+      ctx.beginPath();
+      ctx.moveTo(g[0], g[1] - 7);
+      ctx.lineTo(g[0] + 7, g[1]);
+      ctx.lineTo(g[0], g[1] + 7);
+      ctx.lineTo(g[0] - 7, g[1]);
+      ctx.closePath();
+      ctx.fillStyle = "#22d3ee";
+      ctx.fill();
+      ctx.strokeStyle = "#083344";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
   ctx.restore();
 }
@@ -632,6 +648,11 @@ function onClick(e: MouseEvent) {
     emit("point", { x: round4(m[0]), y: round4(m[1]) });
     return;
   }
+  if (props.drawMode === "goal") {
+    emit("goal-point", { x: round4(m[0]), y: round4(m[1]) });
+    emit("mode-change", "idle");
+    return;
+  }
   if (props.drawMode === "polygon") {
     polyPts.value = [...polyPts.value, [round4(m[0]), round4(m[1])]];
     emit("draft", polyPts.value.slice());
@@ -759,7 +780,7 @@ watch(
       @mouseleave="onLeave"
       @click="onClick"
       @dblclick="onDblClick"
-      :class="{ point: drawMode === 'point', cross: drawMode === 'polygon' || drawMode === 'rect' }"
+      :class="{ point: drawMode === 'point' || drawMode === 'goal', cross: drawMode === 'polygon' || drawMode === 'rect' }"
     ></canvas>
 
     <div class="hud-tl">

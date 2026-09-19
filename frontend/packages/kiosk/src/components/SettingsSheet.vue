@@ -1,6 +1,12 @@
 <script setup lang="ts">
 // 设置弹层：老人相关项（语音/音量/亮度/唤醒词显示），共享后端设置（规格 §5）
 import { onMounted, ref } from "vue";
+import { THINKING_MODE_ORDER, THINKING_MODE_HINT, normalizeThinkingMode, type ThinkingMode } from "shared";
+
+// 老人端用大白话（与管理端"轻度/中度/重度"术语一一对应）
+const KIOSK_MODE_CN: Record<ThinkingMode, string> = {
+  auto: "自动", none: "不思考", low: "想一下", high: "认真想", max: "使劲想",
+};
 
 const emit = defineEmits<{ (e: "close"): void }>();
 
@@ -72,6 +78,16 @@ async function save(key: string, value: unknown) {
             云端合成（火山）
           </label>
         </div>
+        <div class="group">
+          <div class="group-title">思考档位（敏感问题始终会自动加深，不受此档限制）</div>
+          <label v-for="m in THINKING_MODE_ORDER" :key="m">
+            <input type="radio" name="thinking_mode" :value="m"
+                   :checked="normalizeThinkingMode(settings.thinking_mode) === m"
+                   @change="save('thinking_mode', m)" />
+            {{ KIOSK_MODE_CN[m] }}
+          </label>
+          <div class="group-hint">{{ THINKING_MODE_HINT[normalizeThinkingMode(settings.thinking_mode)] }}</div>
+        </div>
         <label>
           唤醒词：<b>{{ settings.wakeword ?? "小机器人" }}</b>
         </label>
@@ -93,6 +109,7 @@ async function save(key: string, value: unknown) {
 .sheet .group { display: flex; flex-direction: column; gap: 8px;
   padding: 10px 14px; border: 1px solid #374151; border-radius: 12px; }
 .sheet .group-title { font-size: 16px; color: #9ca3af; margin-bottom: 2px; }
+.sheet .group-hint { font-size: 15px; color: #9ca3af; line-height: 1.5; }
 .close { padding: 14px; border-radius: 12px; background: #374151;
   color: #f9fafb; border: none; font-size: 20px; }
 </style>

@@ -11,7 +11,7 @@
 - len: payload 字节数（<=32）
 - xor: 除末字节外**全部**字节（含帧头/len/cmd/payload）异或
 - 下行: 0x01 STOP / 0x03 SET_CAR_VEL / 0x04 TUNE_PID / 0x05 GET_STATUS
-- 上行: 0x81 ACK / 0x82 STATUS(26B payload)
+- 上行: 0x81 ACK / 0x82 STATUS(26B payload) / 0x83 IMU(8B payload)
 """
 
 import struct
@@ -27,8 +27,10 @@ CMD_GET_STATUS = 0x05
 # 上行命令（STM32 → 板卡）
 CMD_ACK = 0x81
 CMD_STATUS = 0x82
+CMD_IMU = 0x83
 
 STATUS_PAYLOAD_LEN = 26
+IMU_PAYLOAD_LEN = 8
 
 
 def build_frame(cmd: int, payload: bytes = b"") -> bytes:
@@ -112,3 +114,20 @@ def decode_status(payload: bytes):
     enc = struct.unpack_from("<4i", payload, 9)
     flags = payload[25]
     return seq, rpm, enc, flags
+
+
+def decode_imu(payload: bytes):
+    """解析 IMU(0x83) 的 8 字节 payload。
+
+    布局（小端，与固件 usb_proto.c::up_send_imu 一致）:
+        yaw      int16  0.01°    偏航角（正=逆时针/左转）
+        yaw_rate int16  0.1°/s   绕 Z 轴角速度（正=逆时针）
+        roll     int16  0.01°    仅诊断
+        pitch    int16  0.01°    仅诊断
+
+    :return: (yaw_deg, yaw_rate_dps, roll_deg, pitch_deg)
+    """
+    if len(payload) != IMU_PAYLOAD_LEN:
+        raise ValueError(f"IMU payload 长度错误: {len(payload)}，应为 {IMU_PAYLOAD_LEN}")
+    yaw, rate, roll, pitch = struct.unpack_from("<4h", payload, 0)
+    return yaw / 100.0, rate / 10.0, roll / 100.0, pitch / 100.0

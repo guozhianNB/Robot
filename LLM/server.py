@@ -24,18 +24,23 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.concurrency import iterate_in_threadpool   # SSE 收尾确定化用（见 _closing_stream）
 from openai import OpenAI
 from pydantic import BaseModel
 
-from . import db, bus, chat, memory as rag, reminder, tools as tool_mod, voice_api
-from . import face_api   # 人脸接口层（检测 + "连续 N 帧一致"稳定判定；内部降级，import 永远安全）
-from . import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
-from . import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
-from . import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
+from .store import db
+from .core import bus
+from .agent import chat, memory as rag, reminder, tools as tool_mod
+from .agent import notify          # 通知中心（护士台数据底座，模块 11）
+from .voice import voice_api
+from .agent import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
+from .agent import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
+from .maps import locator, maptags   # 病房位置自动切换 / 记录病房区域要用（编辑器路由已搬走）
+from .maps import mapctl         # 地图编辑器服务（独立进程）的启停管理
+from .core import log as audit  # 审计：本文件的登录冷却/病房变更在多处写审计，改顶层导入
 from .conf import MODEL, BASE_DIR
 from . import conf
 
@@ -55,21 +60,25 @@ _shutting_down = False                    # 退出中标志：幂等防重入（
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from . import log as audit
+    from .core import log as audit
     db.init_db()
 
     # 记忆 v3 迁移（幂等）+ 依赖自检
     try:
-        from . import migrate
+        from .store import migrate
         migrate.run()
     except Exception as e:
         audit.log("memory_change", action="migrate_error", error=str(e))
 
-    from . import embed as embed_mod, ragstore, graph
+    from .store import embed as embed_mod, ragstore, graph
     audit.log("memory_degraded", embed=embed_mod.status(),
               ragstore=ragstore.status(), graph=graph.status())
 
     _seed_demo()
+    try:
+        notify.prune()            # 通知中心：启动清一次过期已处理通知（失败不得阻断启动）
+    except Exception as e:
+        audit.log("notify_prune_error", error=str(e))
     audit.log("map_io_change", mode=conf.MAPS_IO, root=(
         conf.MAPS_SSH_ROOT if conf.MAPS_IO == "ssh" else str(conf.MAPS_DIR)))
     reminder.start()          # 独立线程的定时提醒调度器
@@ -102,6 +111,7 @@ async def lifespan(app: FastAPI):
     tick_task = asyncio.create_task(_role_tick())
 
     yield
+    mapctl.stop()             # 编辑器服务是本进程拉起的：主后端退出不该留孤儿
     mcp_client.stop()
     voice_api.stop_voice()
     drain_task.cancel()
@@ -113,6 +123,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _no_store_entry_html(request: Request, call_next):
+    """入口 HTML（/、/admin/、/kiosk/、/nurse/ 的 index.html）禁止缓存。
+
+    为什么必须这样：index.html 里的 `<script src="assets/index-<hash>.js">` 是**唯一**指向
+    当前构建的指针。浏览器若缓存了旧 index.html，用户按 Ctrl+F5 也只是"刷新页面"，
+    加载的仍是旧 JS —— 表现就是"代码明明改好/重启了，界面还是老样子、参数还是老参数"
+    （2026-09-18 排查思考档位时踩过：新代码在跑，页面却还在用 9 天前的 bundle）。
+    带 hash 的 assets 可以放心长期缓存，所以只对 html 入口加 no-store。"""
+    resp = await call_next(request)
+    path = request.url.path.rstrip("/") or "/"
+    if path in ("", "/", "/admin", "/kiosk", "/nurse") or path.endswith("/index.html"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+app.include_router(mapctl.router)   # /api/mapeditor/service{,/start,/stop}（仅管理员）
 
 
 def _seed_demo():
@@ -133,7 +163,7 @@ def _seed_demo():
         db.upsert_medication_reminder("elder_001", med["name"], med["dose"], med["time"])
     db.add_reminder("elder_001", "nurse", "护士建议", "今天记得多喝水，天气转凉注意保暖",
                     "once", "18:00", db.now_iso()[:10], created_by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="seed", uid="elder_001", note="示例数据")
 
 
@@ -163,10 +193,10 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
         # 异常会被 future 吞成静默失败 → 整条 post-chat 管线（记忆沉淀/摘要）一起丢。
         # fail-closed：取不到就按最保守的集体层（ward）处理——宁可不沉淀。
         try:
-            from . import session as role_session
+            from .agent import session as role_session
             role = role_session.get_principal("kiosk")["role"]
         except Exception as e:
-            from . import log as audit
+            from .core import log as audit
             audit.log("memory_change", action="role_lookup_failed", uid=uid, error=str(e))
             role = "ward"
     if str(role or "").strip().lower() not in ("elder", "admin"):
@@ -177,7 +207,7 @@ def _post_chat_jobs(uid: str, user_text: str, assistant: str, role: str | None =
     try:
         rag.note_turn(uid, user_text, assistant, client, MODEL, settings, role=role)
     except Exception as e:
-        from . import log as audit
+        from .core import log as audit
         audit.log("memory_change", action="note_error", uid=uid, error=str(e))
     try:
         if db.history_count(uid) >= chat.SUMMARY_THRESHOLD:
@@ -290,91 +320,35 @@ class WardAssignIn(BaseModel):
     ward_id: str = ""
 
 
+class WardSwitchIn(BaseModel):
+    ward_uid: str
+
+
 class AlarmIn(BaseModel):
     type: str = "sos"          # sos / fall / health / no_activity ...
     uid: str = ""
     message: str = ""
+    source: str = "kiosk"      # 告警来源（kiosk / vision ...）：带默认值，老调用不传也照旧
 
 
-# ---------------------------------------------------------------- 地图编辑器模型
-class MapMetaIn(BaseModel):
-    resolution: float | None = None
-    origin: list[float] | None = None
-    negate: int | None = None
-    occupied_thresh: float | None = None
-    free_thresh: float | None = None
-    confirm: bool = False
+class NoticeIn(BaseModel):
+    """通知投递体（`POST /api/notifications`）：`type` 必填，其余可省。
+
+    `type` 故意给空串默认值而不是 `str` 必填：Pydantic 必填缺失会抛 422，而本接口的契约
+    是**类型问题一律 400**（与旁边 `/api/alarm` 的宽松形状同族，投递方是机器，400 更好排查）。
+    """
+    type: str = ""             # 空/缺失 → 路由 400
+    source: str = ""
+    level: str = ""            # 空/非法 → notify.ingest 按类型兜底
+    uid: str = ""
+    title: str = ""
+    message: str = ""          # → ingest(body=…)，与 /api/alarm 的字段名保持一族
+    ref: str = ""
 
 
-class MapNameIn(BaseModel):
-    new_name: str
-    confirm: bool = False
-
-
-class DestinationIn(BaseModel):
-    map_name: str
-    name: str = ""
-    aliases: list[str] | str = []
-    x: float | None = None
-    y: float | None = None
-    yaw_deg: float | None = None
-    risk: str = "low"
-    elder_allowed: int = 1
-    note: str = ""
-    learned_by: str = "editor"
-
-
-class LearnIn(BaseModel):
-    map_name: str
-    name: str = ""
-    aliases: list[str] | str = []
-    risk: str = "low"
-    elder_allowed: int = 1
-    note: str = ""
-
-
-class ZoneIn(BaseModel):
-    map_name: str
-    name: str = ""
-    kind: str = "room"
-    shape: str = "polygon"
-    polygon: list[list[float]] = []
-    parent: str = ""
-    note: str = ""
-
-
-class ValidateIn(BaseModel):
-    map_name: str
-    x: float
-    y: float
-    margin_m: float | None = None
-
-
-class MapTagsIn(BaseModel):
-    version: int = 1
-    map: str = ""
-    resolution: float | None = None
-    origin: list[float] | None = None
-    destinations: list[dict] = []
-    zones: list[dict] = []
-
-
-class MapSaveIn(BaseModel):
-    pgm_b64: str = ""
-    yaml_text: str = ""
-    mode: str = "saveas"        # saveas | overwrite
-    new_name: str = ""
-    confirm: bool = False
-
-
-class PoseInjectIn(BaseModel):
-    x: float | None = None
-    y: float | None = None
-    yaw: float | None = None
-    width: int | None = None
-    height: int | None = None
-    resolution: float | None = None
-    origin: list[float] | None = None
+class AckIn(BaseModel):
+    """确认体：`by` 可省（默认 admin）。"""
+    by: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +364,7 @@ async def health():
 async def modules_status():
     """可选模块状态聚合：语音 / embedding / RAG 存储 / 知识图谱 / MCP 工具。
     各模块缺失依赖时自行降级（available=False / status=unavailable），接口照常返回。"""
-    from . import embed as e, ragstore, graph as g
+    from .store import embed as e, ragstore, graph as g
     return {"ok": True, "modules": {
         "voice":    voice_api.get_status(),
         "embed":    e.status(),
@@ -403,7 +377,7 @@ async def modules_status():
 @app.get("/api/logs/warnings")
 async def logs_warnings(limit: int = Query(50)):
     """最近警告/错误审计日志（服务端过滤，供前端排查用）。"""
-    from . import log as audit
+    from .core import log as audit
     return {"ok": True, "logs": audit.read_warnings(limit=limit)}
 
 
@@ -444,6 +418,8 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
         try:
             for ev in chat.chat_stream(client, MODEL, req.uid, req.message, req.thinking,
                                        settings, principal=principal):
+                # 只有 content 进 TTS：reasoning（思维链）**绝不允许**喂给 voice_api，
+                # 否则思考过程会被播报出来（规格 2026-09-17-thinking-mode-switch-design.md D3）。
                 if ev["type"] == "content":
                     voice_api.feed_text_reply(speech, ev.get("content") or "")
                 elif ev["type"] == "done":
@@ -467,17 +443,36 @@ async def chat_route(req: ChatRequest, x_surface: str = Header(default="kiosk"))
 
 
 @app.get("/api/chat/history")
-async def chat_history(uid: str = Query("elder_001"), limit: int = Query(200)):
-    """回读某位老人的历史对话（前端刷新后恢复显示）。"""
-    return {"ok": True, "history": db.load_history_full(uid=uid, limit=limit)}
+async def chat_history(uid: str = Query(""), limit: int = Query(200),
+                       x_surface: str = Header(default="kiosk")):
+    """回读某人的历史对话。
+
+    主体口径与 `/api/chat` 同源：**非管理员只能读自己**（传别人的 uid 一律 400）；管理员可以
+    指定 uid（管理台要按老人查看），但要落审计。
+    """
+    principal = session.get_principal(_surface(x_surface))
+    target = uid or principal["uid"]
+    if principal["role"] != "admin":
+        if uid and uid != principal["uid"]:
+            raise HTTPException(status_code=400, detail="只能读取自己的会话历史")
+        target = principal["uid"]
+    else:
+        audit.log("chat", action="history_read", uid=target, by="admin")
+    history = db.load_history_full(uid=target, limit=limit) if target else []
+    return {"ok": True, "history": history}
 
 
 @app.delete("/api/chat/history")
-async def chat_history_clear(uid: str = Query("elder_001")):
-    """清空某位老人的对话历史。"""
-    n = db.clear_history(uid)
-    from . import log as audit
-    audit.log("chat", action="clear_history", uid=uid, count=n, by="nurse")
+async def chat_history_clear(uid: str = Query(""), x_surface: str = Header(default="kiosk")):
+    """清空某人的对话历史（主体口径同 `GET`：非管理员只能删自己）。"""
+    principal = session.get_principal(_surface(x_surface))
+    target = uid or principal["uid"]
+    if principal["role"] != "admin":
+        if uid and uid != principal["uid"]:
+            raise HTTPException(status_code=400, detail="只能清空自己的会话历史")
+        target = principal["uid"]
+    n = db.clear_history(target) if target else 0
+    audit.log("chat", action="clear_history", uid=target, count=n, by=principal["role"])
     return {"ok": True, "cleared": n}
 
 
@@ -498,7 +493,7 @@ async def profiles_upsert(p: ProfileIn):
     for m in meds:
         if isinstance(m, dict) and m.get("name") and m.get("time"):
             db.upsert_medication_reminder(p.uid, m["name"], m.get("dose", ""), m["time"])
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="profile_upsert", uid=p.uid, name=p.name, by="nurse")
     return {"ok": True, "profile": prof}
 
@@ -512,7 +507,7 @@ async def memories_list(uid: str = Query(""), status: str = Query("")):
 @app.post("/api/memories")
 async def memories_add(m: MemoryIn):
     mid = db.add_memory(m.uid, m.type, m.content, status=m.status, source="manual")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="manual_add", uid=m.uid, mid=mid, type=m.type,
               content=m.content, by="nurse")
     return {"ok": True, "id": mid}
@@ -522,7 +517,7 @@ async def memories_add(m: MemoryIn):
 async def memories_confirm(mid: int):
     m = db.get_memory(mid)
     db.set_memory_status(mid, "confirmed")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="confirm", mid=mid, uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True}
 
@@ -531,7 +526,7 @@ async def memories_confirm(mid: int):
 async def memories_reject(mid: int):
     m = db.get_memory(mid)
     op_id = db.delete_memory(mid, uid=(m or {}).get("uid", ""), reason="reject", by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="reject", mid=mid, op_id=op_id,
               uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id, "note": "已软删，可在回收站恢复"}
@@ -563,13 +558,13 @@ async def recycle_restore(op_id: int):
     if table == "rag_memories":
         row = db.get_rag_memory(op["target_id"])
         if row and row.get("chroma_id"):
-            from . import ragstore as _rs
+            from .store import ragstore as _rs
             new_cid = _rs.reindex_row(row["uid"], row["type"], row["content"],
                                       importance=row.get("importance", 0),
                                       source=row.get("source", ""), old_chroma_id=row["chroma_id"])
             if new_cid and new_cid != row["chroma_id"]:
                 db.set_rag_chroma_id(op["target_id"], new_cid)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="restore", op_id=op_id, uid=op.get("uid", ""),
               table=table, by="nurse")
     return {"ok": True, "table": table, "op_id": op_id}
@@ -578,7 +573,7 @@ async def recycle_restore(op_id: int):
 @app.post("/api/memories/recycle/purge")
 async def recycle_purge(days: float = Query(30.0)):
     n = db.purge_soft_deleted(days=days)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="purge", count=n, days=days, by="nurse")
     return {"ok": True, "purged": n}
 
@@ -617,7 +612,7 @@ async def memories_portrait_set(p: PortraitIn):
 async def core_memories_delete(mid: int):
     m = db.get_core_memory(mid)
     op_id = db.delete_core_memory(mid, uid=(m or {}).get("uid", ""), reason="manual_delete", by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_delete", mid=mid, op_id=op_id,
               uid=(m or {}).get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id}
@@ -636,9 +631,9 @@ async def rag_memories_delete(rid: int):
         return {"ok": False, "error": "不存在"}
     op_id = db.delete_rag_memory(rid, uid=row.get("uid", ""), reason="manual_delete", by="nurse")
     if row.get("chroma_id"):
-        from . import ragstore as _rs
+        from .store import ragstore as _rs
         _rs.delete_by_chroma_id(row.get("uid", ""), row["chroma_id"])
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="rag_delete", mid=rid, op_id=op_id,
               uid=row.get("uid", ""), by="nurse")
     return {"ok": True, "op_id": op_id}
@@ -677,7 +672,7 @@ async def core_memories_confirm(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_authority(mid, "nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_confirm", mid=mid, uid=m.get("uid", ""),
               authority="nurse", by="nurse")
     return {"ok": True}
@@ -690,7 +685,7 @@ async def core_memories_unconfirm(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_authority(mid, "llm")
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_unconfirm", mid=mid, uid=m.get("uid", ""),
               authority="llm", by="nurse")
     return {"ok": True}
@@ -703,7 +698,7 @@ async def core_memories_pin(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_pinned(mid, True)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_pin", mid=mid, uid=m.get("uid", ""), by="nurse")
     return {"ok": True}
 
@@ -715,14 +710,14 @@ async def core_memories_unpin(mid: int):
     if not m:
         return {"ok": False, "error": "不存在"}
     db.set_core_pinned(mid, False)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="core_unpin", mid=mid, uid=m.get("uid", ""), by="nurse")
     return {"ok": True}
 
 
 @app.get("/api/memories/graph")
 async def graph_view(uid: str = Query("elder_001")):
-    from . import graph as g
+    from .store import graph as g
     return {"ok": True, "status": g.status(),
             "entities": g.list_entities(uid), "relations": g.list_relations(uid)}
 
@@ -737,7 +732,7 @@ async def expressions_list(uid: str = Query("elder_001")):
 async def expressions_approve(eid: int):
     """护士审核通过 → 该语录参与对话注入（对标 MaiBot checked_only）。"""
     db.set_expression_checked(eid, True)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="expression_approve", eid=eid, by="nurse")
     return {"ok": True}
 
@@ -746,7 +741,7 @@ async def expressions_approve(eid: int):
 async def expressions_reject(eid: int):
     """护士拒绝 → 软删（进回收站可恢复）。"""
     db.soft_delete_expression(eid)
-    from . import log as audit
+    from .core import log as audit
     audit.log("memory_change", action="expression_reject", eid=eid, by="nurse")
     return {"ok": True}
 
@@ -756,7 +751,7 @@ async def expressions_reject(eid: int):
 
 @app.get("/api/memories/health")
 async def memories_health():
-    from . import embed as e, ragstore, graph as g
+    from .store import embed as e, ragstore, graph as g
     return {"ok": True, "embed": e.status(), "ragstore": ragstore.status(), "graph": g.status()}
 
 
@@ -775,7 +770,7 @@ async def reminders_add(r: ReminderIn):
         r.uid, r.kind, r.title or (r.content[:12]), r.content,
         r.trigger_type, r.trigger_time, r.trigger_date,
         confirm_timeout_min=r.confirm_timeout_min, created_by="nurse")
-    from . import log as audit
+    from .core import log as audit
     audit.log("reminder", action="create", rid=rid, uid=r.uid, kind=r.kind,
               content=r.content[:200], by="nurse")
     return {"ok": True, "id": rid}
@@ -968,6 +963,22 @@ async def session_user_set(s: SessionUserIn, x_surface: str = Header(default="ki
     return res
 
 
+@app.post("/api/session/ward")
+async def session_set_ward(body: WardSwitchIn, x_surface: str = Header(default="kiosk")):
+    """手动切当前病房（D18）：带 `manual_until`，这段时间内位置判定不覆盖。
+
+    与"锁定主体"不同：这里只切**集体层背景变量**，正在老人私聊时不抢会话。
+    广播与审计都在 `session.manual_set_ward()` 内部完成（`ward_changed` / action=manual），
+    路由层**不再重复 publish**（否则前端会收到双事件）。
+    """
+    _surface(x_surface)                      # 本族的公共入口：兜底建表 + 非法端槽位显式 400
+    if db.get_profile_kind(body.ward_uid) != "ward":
+        raise HTTPException(status_code=400, detail=f"病房 uid 不存在：{body.ward_uid}")
+    res = dict(session.manual_set_ward(body.ward_uid))
+    res["ok"] = True                         # 与 `/api/session/user` 同款返回形状
+    return res
+
+
 @app.post("/api/session/login")
 async def session_login(body: LoginIn | None = None, x_surface: str = Header(default="kiosk")):
     slot = _surface(x_surface)
@@ -996,6 +1007,14 @@ async def session_password(body: PasswordIn, x_surface: str = Header(default="ki
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可改口令")
     return session.change_admin_password(body.old, body.new)
+
+
+@app.post("/api/session/password/restore-factory")
+async def session_password_restore_factory(x_surface: str = Header(default="kiosk")):
+    """恢复 `.env` 的 PASSWORD；只允许已登录管理员，成功后全部管理员槽位立即降权。"""
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可恢复出厂口令")
+    return session.restore_factory_password()
 
 
 @app.get("/api/session/admin-auth")
@@ -1041,6 +1060,19 @@ async def wards_upsert(w: WardIn, x_surface: str = Header(default="kiosk")):
     return {"ok": True, "ward": _ward_payload(db.get_profile(w.uid) or {"uid": w.uid})}
 
 
+@app.delete("/api/wards/{ward_uid}")
+async def ward_delete(ward_uid: str, x_surface: str = Header(default="kiosk")):
+    """删除病房档案并解除老人归属；关联的地图区域保留。"""
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    if not db.delete_ward(ward_uid):
+        return {"ok": False, "error": f"病房不存在：{ward_uid}"}
+    session.forget_ward(ward_uid)
+    audit.log("ward_change", source="admin", action="delete", ward=ward_uid)
+    bus.publish("ward_changed", uid=ward_uid, action="delete")
+    return {"ok": True, "uid": ward_uid}
+
+
 @app.post("/api/wards/{ward_uid}/zone")
 async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk")):
     """便捷录入：以当前位姿为圆心、`ward_zone_default_r` 为半径采样 16 边形写入**该图的
@@ -1049,6 +1081,9 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
     """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可管理病房")
+    ward = db.get_profile(ward_uid) or {}
+    if ward.get("kind") != "ward":
+        return {"ok": False, "error": f"uid 不存在：{ward_uid}"}
     pose = locator.get_pose()
     if not pose or pose.get("x") is None:
         return {"ok": False, "error": "拿不到小车位姿（rosbridge/定位未就绪）；可到地图编辑器手绘区域"}
@@ -1057,7 +1092,6 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
         return {"ok": False,
                 "error": f"认不出当前地图（{why}）：请确认导航在跑且 /map 指纹能唯一命中，"
                          f"或把设置 ward_map_source 改成 setting 并选好 current_map"}
-    ward = db.get_profile(ward_uid) or {}
     name = ward.get("name") or ward_uid
     r = float(db.get_settings().get("ward_zone_default_r", 3.0))
     try:
@@ -1065,7 +1099,9 @@ async def ward_set_zone(ward_uid: str, x_surface: str = Header(default="kiosk"))
                                           radius_m=r, kind="ward")
     except Exception as e:                 # noqa: BLE001  板卡不可达/名字非法等 → 只降级不 500
         return {"ok": False, "error": f"写地图标记失败：{e}"}
-    db.set_ward_zone(ward_uid, map_name, res["uid"])
+    n = db.set_ward_zone(ward_uid, map_name, res["uid"])
+    if not n:                              # 0 行 = uid 不存在：别把静默 no-op 报成 ok
+        return {"ok": False, "error": f"uid 不存在：{ward_uid}"}
     audit.log("ward_change", source="admin", action="zone", ward=ward_uid,
               map=map_name, zone=res["uid"])
     bus.publish("ward_changed", uid=ward_uid, action="zone")
@@ -1082,7 +1118,8 @@ async def profile_set_ward(uid: str, body: WardAssignIn,
     """
     if session.get_principal(_surface(x_surface))["role"] != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可分配病房")
-    db.set_profile_ward(uid, body.ward_id)
+    if not db.set_profile_ward(uid, body.ward_id):   # 0 行 = uid 不存在
+        return {"ok": False, "error": f"uid 不存在：{uid}"}
     audit.log("ward_change", source="admin", action="assign", elder=uid, ward=body.ward_id)
     bus.publish("ward_changed", uid=body.ward_id, action="assign")
     return {"ok": True, "uid": uid, "ward_id": body.ward_id}
@@ -1091,24 +1128,111 @@ async def profile_set_ward(uid: str, body: WardAssignIn,
 @app.get("/api/policy/roles")
 async def policy_roles(x_surface: str = Header(default="kiosk")):
     """策略矩阵：管理员看全量，其它角色只拿自己那份摘要。"""
-    from .policy import POLICY_DEFAULTS
+    from .agent.policy import POLICY_DEFAULTS
     role = session.get_principal(_surface(x_surface))["role"]
     if role != "admin":
         return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
 
 
+# ---------------------------------------------------------------- 通知中心（模块 11）
+# 身份口径（2026-09-18 二次修订 D11）：
+#   投递口 `POST /api/notifications` **有意免鉴权**（需求文档模块 11："任何模块发现异常都往该
+#   端口 POST" —— 告警源可能是小车/语音/巡检等无口令的一方）；
+#   读/确认三条 `GET /api/notifications`、`POST /{nid}/ack`、`POST /ack-all` **同样免鉴权**
+#   ——用户拍板 D11「护士台不再需要登录、也不会被弹」，护士台打开即用，后端不再判 principal
+#   （通知内容本就经免鉴权 SSE 广播公开，LAN 内部系统，阈值低）；
+#   唯一例外：`DELETE /{nid}` 仍要管理员（删记录是数据损失，不放宽）。
+def _notice_payload(n: dict) -> dict:
+    """列表一条：补 `uid_name`（「姓名 · 床号」，无档案/无 uid 则空串）。
+
+    拼接口径与广播 payload 的 `uid_name` **共用 `notify.uid_name()`**（两处必须一致，
+    否则护士台的列表显示与实时 toast 会不一样）。
+    """
+    n["uid_name"] = notify.uid_name(n.get("uid") or "")
+    return n
+
+
+def _notice_admin(x_surface: str) -> None:
+    """通知的**删除**口：非管理员一律 403（与同族 admin 路由同形）。
+
+    只有 `DELETE /api/notifications/{nid}` 还走这里 —— 读/确认三条已按 D11 免鉴权。
+    """
+    if session.get_principal(_surface(x_surface))["role"] != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可管理通知")
+
+
+@app.post("/api/notifications")
+async def notice_ingest(n: NoticeIn):
+    """投递通知（**有意免鉴权**，见上）。同 key 在窗口内自动合并。"""
+    if not (n.type or "").strip():
+        raise HTTPException(status_code=400, detail="type 不能为空")
+    try:
+        # 同步 SQLite 写 + 审计追加 + 档案查询绝不能在事件循环上跑：投递口按 D4 有意
+        # 免鉴权，任何局域网客户端都能用极廉价请求把 chat/voice/SSE 串行堵住。
+        # to_thread 是安全的：bus.publish 线程安全、db 有线程锁。
+        return await asyncio.to_thread(
+            notify.ingest, n.source, n.type, level=n.level, uid=n.uid,
+            title=n.title, body=n.message, ref=n.ref)
+    except ValueError as e:                     # type 为空 → 400（不是 5xx，也不是静默吞掉）
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/notifications")
+async def notices_list(state: str = Query("all"), limit: int = Query(0),
+                       before_id: int = Query(0)):
+    # 免鉴权（D11）：护士台免登录 → 不读 principal、不认 `X-Surface`；通知内容本就经免鉴权
+    # SSE 广播对局域网公开，读列表不新增暴露面。
+    items = await asyncio.to_thread(notify.list_notices, state, limit, before_id)
+    return {"ok": True, "items": [_notice_payload(i) for i in items],
+            "counts": await asyncio.to_thread(notify.counts)}
+
+
+@app.post("/api/notifications/{nid}/ack")
+async def notice_ack(nid: int, body: AckIn | None = None):
+    # 免鉴权（D11）：护士台免登录；标记已处理不删数据，且 `notify.ack` 照旧写 `notify_ack` 审计。
+    by = (body.by if body else "") or "admin"
+    if not await asyncio.to_thread(notify.ack, nid, by):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True, "id": nid}
+
+
+@app.post("/api/notifications/ack-all")
+async def notice_ack_all(body: AckIn | None = None):
+    # 免鉴权（D11）：同上 —— 全标已处理只是清待办角标，审计仍由 `notify.ack_all` 落。
+    by = (body.by if body else "") or "admin"
+    return {"ok": True, "acked": await asyncio.to_thread(notify.ack_all, by)}
+
+
+@app.delete("/api/notifications/{nid}")
+async def notice_delete(nid: int, x_surface: str = Header(default="kiosk")):
+    # 唯一仍受保护的通知端点（D11 明确不放宽）：删记录是数据损失，必须管理员口令。
+    _notice_admin(x_surface)
+    if not await asyncio.to_thread(notify.remove, nid):
+        return {"ok": False, "error": "通知不存在"}
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- 紧急呼叫
 @app.post("/api/alarm")
 async def alarm_report(a: AlarmIn):
     """紧急呼叫上报（规格 D6）：审计 + 广播；微信推送留给模块 11。"""
-    from . import log as audit
+    from .core import log as audit
     audit.log("alarm", action="report", type=a.type, uid=a.uid,
               message=a.message[:200], by="nurse")
     # 注意：payload 键用 alarm_type 而非 type —— bus.publish 内部构造
     # {"type": event_type, **payload}，payload 里再用 type 会覆盖事件类型，
     # 导致广播的事件 type 变成 "sos" 而非 "alarm"，前端会丢弃该事件
     bus.publish("alarm", level="critical", alarm_type=a.type, uid=a.uid, message=a.message)
+    # 落库到通知中心（模块 11）。**对 kiosk 这是救命通道，永远返回 {"ok": True}**：
+    # notify.ingest 在 type 为空时会抛 ValueError，落库失败绝不能把这条通道变成 500，
+    # 失败写审计（不许静默吞掉）。
+    try:
+        # 同上：落库放线程池，别在事件循环上做同步 SQLite 写（救命通道也是免鉴权写口）。
+        await asyncio.to_thread(notify.ingest, source=a.source, type=a.type,
+                                uid=a.uid, body=a.message)
+    except Exception as e:  # noqa: BLE001
+        audit.log("notify_ingest_failed", path="/api/alarm", type=a.type, error=str(e))
     return {"ok": True}
 
 
@@ -1268,9 +1392,11 @@ async def system_shutdown():
     if _shutting_down:
         return {"ok": True, "message": "系统正在退出…"}
     _shutting_down = True
-    from . import log as audit
+    from .core import log as audit
     audit.log("system", action="shutdown", by="nurse")
     try:
+        mapctl.stop(hard=True)               # 编辑器服务（独立进程）一起带走；马上 os._exit，
+                                             # 只留 1 秒，等不起 POSIX 上的 SIGTERM 优雅期（会留孤儿）
         reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
         voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
         bus.stop()                           # 3. 事件总线扇出
@@ -1293,896 +1419,6 @@ async def tools_list():
     return {"ok": True, "tools": tool_mod.tools_with_state(db.get_settings())}
 
 
-# ---------------------------------------------------------------------------
-# 地图编辑器（第三个前端 /mapeditor）
-# 规格：docs/superpowers/specs/2026-09-14-map-editor-design.md
-#   红线（§4）：标记的唯一真相是地图文件夹里的 <图名>.tags.json，brain.db 只是只读索引缓存；
-#               所有写接口都是「改文件 → maptags.sync_map() → 审计」，绝不"只改库不改文件"。
-# ---------------------------------------------------------------------------
-from . import mapserver, maptags, mapstore, locator   # noqa: E402  （放此处便于阅读，import 无副作用）
-from fastapi.responses import Response                 # noqa: E402
-
-_MAP_EXTS = ("yaml", "pgm", "tags")
-
-
-def _store(source: str = ""):
-    """「地图源」依赖：``source`` 空 = 用默认源（``mapsources.default``）。
-
-    **源未知一律转 HTTP 400**（附可用源清单）——这是用户可纠正的输入错误，不能变 500
-    （实测：未知源原来会抛 500）。作为 FastAPI 依赖使用时（``store=Depends(_store)``）
-    异常自动变成 400 响应；直接调用时抛 ``HTTPException``，路由无需各自 try/except。
-    """
-    from fastapi import HTTPException
-    from . import mapsources
-    try:
-        return mapstore.get_store(source)
-    except (mapstore.MapStoreError, mapsources.SourceError) as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-def _store_or_err(source: str = ""):
-    """``(store, None)`` 或 ``(None, 400 响应)``：所有带 ``?source=`` 的路由统一用它。
-
-    未知源是用户可纠正的输入错误，必须 400 + 可用源清单（实测直接抛会变 500）。
-    """
-    from . import mapsources
-    try:
-        return mapstore.get_store(source), None
-    except (mapstore.MapStoreError, mapsources.SourceError) as e:
-        return None, _err(str(e))
-
-
-def _err(msg: str, code: int = 400, **extra):
-    from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=code, content={"ok": False, "error": msg, **extra})
-
-
-def _name_of(path_name: str) -> str:
-    """路径参数 → 合法地图名；不合法直接抛（由各路由统一转 400）。"""
-    return mapstore.check_name(path_name)
-
-
-def _tag_counts(names: list[str]) -> dict[str, dict]:
-    """批量取各图的标记数量（读缓存，缺失即 0，不触发远程读）。"""
-    out: dict[str, dict] = {}
-    for n in names:
-        try:
-            out[n] = db.count_map_tags(n)
-        except Exception:      # noqa: BLE001
-            out[n] = {"destinations": 0, "zones": 0}
-    return out
-
-
-# ---------------------------------------------------------------- 地图源（sources）
-@app.get("/api/map/sources")
-async def map_sources_list(test: bool = Query(False)):
-    """列出全部地图源（只读；界面只做"选"、不手填路径）。
-
-    ``test=true`` 时对每个源真连一次（等价于 ``/test``），慢（ssh 每个源一次往返）；
-    默认只给配置态，连通性由前端按需点"自检"或对当前源调用 ``/test``。
-    """
-    from . import mapsources
-    doc = mapsources.load()
-    store_map = {}
-    if test:
-        for s in doc["items"]:
-            try:
-                store_map[s["id"]] = mapstore.get_store(s["id"])
-            except Exception:      # noqa: BLE001  单个源造不出来不影响列表
-                pass
-    return mapsources.view_list(store_map or None)
-
-
-@app.post("/api/map/sources")
-async def map_sources_upsert(body: dict = None):
-    """新增/修改一条源。**这是配置入口，不是给界面自由填路径用的**：界面只做选择。"""
-    from . import log as audit, mapsources
-    body = body or {}
-    src = body.get("source") if isinstance(body.get("source"), dict) else body
-    try:
-        doc = mapsources.upsert(src)
-    except mapsources.SourceError as e:
-        return _err(str(e))
-    mapstore.reset_store()                 # 源变了 → 丢掉缓存实例，下次按新配置重建
-    audit.log("map_source", action="upsert", source=src.get("id"), kind=src.get("kind"))
-    return {"ok": True, **mapsources.view_list(), "default": doc["default"]}
-
-
-@app.post("/api/map/sources/{sid}/default")
-async def map_sources_set_default(sid: str):
-    """把某源设为默认源（不传 ``?source=`` 时用它）。"""
-    from . import log as audit, mapsources
-    try:
-        doc = mapsources.set_default(sid)
-    except mapsources.SourceError as e:
-        return _err(str(e), 404)
-    mapstore.reset_store()
-    audit.log("map_source", action="set_default", source=sid)
-    return {"ok": True, "default": doc["default"], **mapsources.view_list()}
-
-
-@app.post("/api/map/sources/{sid}/test")
-async def map_sources_test(sid: str):
-    """对某个源做连通性自检（``list()`` 一次，**不改任何文件**）。"""
-    from . import mapsources
-    try:
-        mapstore.resolve_source(sid)
-    except (mapstore.MapStoreError, mapsources.SourceError) as e:
-        return _err(str(e), 404)
-    return await asyncio.to_thread(mapstore.io_test, sid)
-
-
-@app.delete("/api/map/sources/{sid}")
-async def map_sources_delete(sid: str):
-    """删一条源（默认源不允许删，见 mapsources.remove 的说明）。"""
-    from . import log as audit, mapsources
-    try:
-        mapsources.remove(sid)
-    except mapsources.SourceError as e:
-        return _err(str(e))
-    mapstore.reset_store()
-    audit.log("map_source", action="delete", source=sid)
-    return {"ok": True, **mapsources.view_list()}
-
-
-@app.get("/api/map/list")
-async def map_list(source: str = Query("", alias="source")):
-    """列地图（**必须排除 .backup/**，规格 §〇 第 4 条）。带尺寸/元数据/未知率/标记数/残缺态。"""
-    return await asyncio.to_thread(_map_list_sync, source)
-
-
-def _map_list_sync(source: str = ""):
-    """同步地图扫描在线程池执行，避免 SSH/PGM 工作阻塞 ASGI 事件循环。"""
-    from . import log as audit
-    from . import mapsources
-    try:
-        store = mapstore.get_store(source)
-    except (mapstore.MapStoreError, mapsources.SourceError) as e:
-        # 未知源 = 用户可纠正的输入错误 → 明确 400（含可用源），不要 500
-        return _err(str(e))
-    ok, why = store.available()
-    if not ok:
-        return {"ok": True, "status": "unavailable", "reason": why, "maps": [],
-                "source": mapstore.current_source().get("id", ""),
-                "mode": conf.MAPS_IO, "root": store.root}
-    try:
-        entries = store.list()
-    except mapstore.MapStoreError as e:
-        return {"ok": True, "status": "unavailable", "reason": str(e), "maps": [],
-                "source": mapstore.current_source().get("id", ""),
-                "mode": conf.MAPS_IO, "root": store.root}
-    counts = _tag_counts([e["name"] for e in entries])
-    maps = []
-    for e in entries:
-        item = dict(e)
-        item["counts"] = counts.get(e["name"], {"destinations": 0, "zones": 0})
-        item["status"] = ("残缺：有 pgm 没 yaml" if e["has_pgm"] and not e["has_yaml"]
-                          else "残缺：有 yaml 没 pgm" if e["has_yaml"] and not e["has_pgm"]
-                          else "ok")
-        item["meta_ok"] = False
-        item["width"] = item["height"] = None
-        item["resolution"] = item["origin"] = None
-        item["unknown_ratio"] = None
-        if e["has_yaml"]:
-            try:
-                info = mapserver.map_info(e["name"], store)
-                item.update({"width": info.get("width"), "height": info.get("height"),
-                             "resolution": info.get("resolution"), "origin": info.get("origin"),
-                             "unknown_ratio": info.get("unknown_ratio"),
-                             "meta_ok": bool(info.get("meta_ok")),
-                             "problems": info.get("problems") or [],
-                             "stale": info.get("stale"), "cached_at": info.get("cached_at")})
-            except mapstore.MapStoreError as ex:
-                item["problems"] = [str(ex)]
-        item["current"] = (db.get_settings().get("current_map") == e["name"])
-        maps.append(item)
-    audit.log("map_change", action="list", count=len(maps), mode=conf.MAPS_IO)
-    return {"ok": True, "maps": maps, "mode": conf.MAPS_IO, "root": store.root,
-            "current_map": db.get_settings().get("current_map")}
-
-
-@app.get("/api/map/current")
-async def map_current(source: str = Query("", alias="source"), store=Depends(_store)):
-    """车此刻在跑哪张图（**不靠人工声明**，指纹反查，规格 §5.3）。"""
-    return await asyncio.to_thread(locator.current_map, store)
-
-
-@app.get("/api/map/{name}/meta")
-async def map_meta(name: str):
-    return await asyncio.to_thread(_map_meta_sync, name)
-
-
-def _map_meta_sync(name: str, store):
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    try:
-        info = mapserver.map_info(n, store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 404)
-    counts = db.count_map_tags(n)
-    got = maptags.resolve(n, store)
-    return {"ok": True, "meta": info, "counts": counts,
-            "tags_exists": got["exists"], "tags_warnings": got.get("warnings") or [],
-            "tags_path": maptags.tags_path(n, store),
-            "fingerprint": got.get("fingerprint"),
-            "tags_mtime": maptags.file_mtime_iso(n, store)}
-
-
-@app.post("/api/map/{name}/meta")
-def map_meta_set(name: str, body: MapMetaIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """改 resolution/origin 等元数据：**先返回将失效的标记数并要求 confirm=true**（规格 §7.2）。"""
-    from . import log as audit
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    try:
-        info = mapserver.map_info(n, store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 404)
-    counts = db.count_map_tags(n)
-    affects = counts["destinations"] + counts["zones"]
-    patch: dict = {}
-    for field in ("resolution", "origin", "negate", "occupied_thresh", "free_thresh"):
-        v = getattr(body, field)
-        if v is not None:
-            patch[field] = v
-    if not patch:
-        return _err("没有要修改的字段", 400)
-    if body.resolution is not None and body.resolution <= 0:
-        return _err("resolution 必须为正数", 400)
-    if body.origin is not None and len(body.origin) < 2:
-        return _err("origin 至少要 2 个分量", 400)
-    if body.origin is not None and len(body.origin) > 2 and abs(float(body.origin[2])) > 1e-9:
-        return _err("origin 的 yaw 必须为 0（本项目不支持旋转地图）", 400)
-    if affects and not body.confirm:
-        return _err(f"本图有 {counts['destinations']} 个地点、{counts['zones']} 个区域，"
-                    f"改 resolution/origin 会让它们的坐标含义改变", 409,
-                    need_confirm=True, affects=counts)
-    try:
-        text = store.read(n, "yaml").decode("utf-8", "replace")
-        y = mapserver.parse_yaml_flat(text)
-        changes = []
-        for k, v in patch.items():
-            old = y.get(k)
-            if k == "origin":
-                v = [float(x) for x in v]
-            y[k] = v
-            changes.append(f"{k}: {old} → {v}")
-        new_text = _rewrite_yaml_fields(text, patch)
-        # 改元数据 = 覆盖语义 → 强制备份
-        backup = store.backup(n)
-        store.write(n, "yaml", new_text.encode("utf-8"))
-        mapserver.clear_cache()
-        locator.clear_current_map_cache()
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 500)
-    # §7.2 第 3 条：把"已确认改元数据"这件事也记录进 tags.json（用**新**的指纹覆写）
-    tags_updated = False
-    if affects:
-        try:
-            got = maptags.resolve(n, store)
-            if got["ok"] and got["exists"]:
-                tags = got["tags"]
-                tags["resolution"] = float(y.get("resolution")) if y.get("resolution") else None
-                org = y.get("origin")
-                if isinstance(org, list) and len(org) >= 2:
-                    tags["origin"] = [float(org[0]), float(org[1]),
-                                      float(org[2]) if len(org) > 2 else 0.0]
-                maptags.save(n, tags, store, action="meta_fingerprint_confirm",
-                             changes="; ".join(changes))
-                tags_updated = True
-        except mapstore.MapStoreError as e:
-            return _err(f"元数据已改，但刷新 tags.json 指纹失败：{e}", 500)
-    maptags.sync_map(n, store, force=True)
-    audit.log("map_change", action="meta_update", map=n, changes=changes,
-              backup=",".join(backup), affected=affects, tags_updated=tags_updated)
-    return {"ok": True, "changed": changes, "backup": backup, "affected": affects,
-            "tags_updated": tags_updated, "meta": mapserver.map_info(n, store)}
-
-
-def _rewrite_yaml_fields(text: str, patch: dict) -> str:
-    """在 yaml 原文上逐字段替换（保留注释、缩进与键顺序）。缺字段则追加。"""
-    lines = text.splitlines(keepends=True)
-    newline = "\r\n" if any(ln.endswith("\r\n") for ln in lines) else "\n"
-    if not lines:
-        lines = []
-    done = set()
-    for i, ln in enumerate(lines):
-        stripped = ln.lstrip()
-        if not stripped or stripped.startswith("#") or ":" not in stripped:
-            continue
-        key = stripped.split(":", 1)[0].strip()
-        if key not in patch:
-            continue
-        val = patch[key]
-        if isinstance(val, list):
-            val = "[" + ", ".join(str(v) for v in val) + "]"
-        indent = ln[: len(ln) - len(ln.lstrip())]
-        tail = newline if ln.endswith(("\n", "\r")) else ""
-        lines[i] = f"{indent}{key}: {val}{tail}"
-        done.add(key)
-    for key, val in patch.items():
-        if key in done:
-            continue
-        if isinstance(val, list):
-            val = "[" + ", ".join(str(v) for v in val) + "]"
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            lines[-1] = lines[-1] + newline
-        lines.append(f"{key}: {val}{newline}")
-    return "".join(lines)
-
-
-@app.post("/api/map/{name}/rename")
-def map_rename(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """重命名成对文件（.pgm/.yaml/.tags.json）并同步改 yaml 的 image: 与 tags 的 map:。"""
-    from . import log as audit
-    try:
-        n, new = _name_of(name), mapstore.check_name(body.new_name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    if n == new:
-        return _err("新名字与原图相同")
-    if store.exists(new, "yaml") or store.exists(new, "pgm"):
-        return _err(f"目标已存在：{new}", 409)
-    try:
-        store.rename(n, new)
-        # yaml 里的 image: 必须跟着走，否则 map_server 找不到 pgm
-        try:
-            text = store.read(new, "yaml").decode("utf-8", "replace")
-            store.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
-        except mapstore.MapStoreError:
-            pass
-        # tags.json 的 map 字段与文件名对齐（指纹不变）
-        if store.exists(new, "tags"):
-            got = maptags.resolve(new, store)
-            if got["ok"] and got["exists"]:
-                tags = got["tags"]
-                tags["map"] = new
-                tags["updated_at"] = db.now_iso()
-                import json as _json
-                store.write(new, "tags",
-                         _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
-        mapserver.clear_cache()
-        locator.clear_current_map_cache()
-        db.drop_map_tags(n)
-        maptags.sync_map(new, store, force=True)
-        if db.get_settings().get("current_map") == n:
-            db.set_settings({"current_map": new})
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 500)
-    audit.log("map_change", action="rename", old=n, new=new)
-    return {"ok": True, "old": n, "new": new}
-
-
-@app.post("/api/map/{name}/copy")
-def map_copy(name: str, body: MapNameIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """复制成对文件 → **标记随行**（指纹一致才复制，规格 §B5.2 第 6 步 / §B九 坑 13）。"""
-    from . import log as audit
-    try:
-        n, new = _name_of(name), mapstore.check_name(body.new_name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    if n == new:
-        return _err("新名字与原图相同")
-    warnings: list[str] = []
-    try:
-        got = maptags.resolve(n, store)
-    except mapstore.MapStoreError as e:
-        return _err(f"读取原图标记失败：{e}", 500)
-    try:
-        store.copy(n, new)                 # 会连带复制 tags.json（若存在）
-    except mapstore.MapStoreError as e:
-        # 目标已存在 / 源不存在 → 都是"用户可纠正"的冲突，给 409 而不是 500
-        code = 409 if "已存在" in str(e) else 404
-        return _err(str(e), code)
-    try:
-        try:
-            text = store.read(new, "yaml").decode("utf-8", "replace")
-            store.write(new, "yaml", mapserver.update_yaml_image(text, f"{new}.pgm").encode("utf-8"))
-        except mapstore.MapStoreError:
-            pass
-        # 指纹比对：一致则保留随行的标记，不一致就删掉新图的 tags（绝不静默错配）
-        copied_tags = False
-        if got["ok"] and got["exists"] and store.exists(new, "tags"):
-            try:
-                info = mapserver.map_info(new, store)
-                fp = maptags.fingerprint_check(got["tags"], info)
-                if fp.get("changed"):
-                    warnings.append(f"该图元数据与标记指纹不一致（{'; '.join(fp.get('reasons') or [])}），"
-                                    f"标记未随行")
-                    store.remove(new, "tags")
-                else:
-                    tags = got["tags"]
-                    tags["map"] = new
-                    tags["updated_at"] = db.now_iso()
-                    import json as _json
-                    store.write(new, "tags",
-                             _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
-                    copied_tags = True
-            except mapstore.MapStoreError as e:
-                warnings.append(f"标记随行失败：{e}")
-        mapserver.clear_cache()
-        locator.clear_current_map_cache()
-        maptags.sync_map(new, store, force=True)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 500)
-    if not copied_tags:
-        db.drop_map_tags(new)
-    audit.log("map_change", action="copy", src=n, dst=new, tags_copied=copied_tags,
-              warnings="; ".join(warnings))
-    return {"ok": True, "src": n, "dst": new, "tags_copied": copied_tags, "warnings": warnings}
-
-
-@app.delete("/api/map/{name}")
-def map_delete(name: str, confirm: bool = Query(False), source: str = Query("", alias="source"), store=Depends(_store)):
-    """删除成对文件（含 .tags.json）。本图有标记时必须 ``confirm=true``（规格 §5.1）。"""
-    from . import log as audit
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    counts = db.count_map_tags(n)
-    affects = counts["destinations"] + counts["zones"]
-    if affects and not confirm:
-        return _err(f"本图有 {affects} 个标记（{counts['destinations']} 地点 / {counts['zones']} 区域），"
-                    f"删除会一并移除", 409, need_confirm=True, affects=counts)
-    removed = []
-    try:
-        for ext in _MAP_EXTS:
-            if store.exists(n, ext):
-                store.remove(n, ext)
-                removed.append(ext)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 500)
-    if not removed:
-        return _err(f"地图不存在：{n}", 404)
-    mapserver.clear_cache()
-    locator.clear_current_map_cache()
-    db.drop_map_tags(n)
-    audit.log("map_change", action="delete", map=n, removed=",".join(removed), affected=affects)
-    return {"ok": True, "removed": removed, "affected": affects}
-
-
-@app.get("/api/map/{name}/download")
-def map_download(name: str, file: str = Query("yaml"), source: str = Query("", alias="source"), store=Depends(_store)):
-    """下载原始文件；``file`` **只接受 yaml/pgm/tags**（其他值报错，避免变成任意文件读取）。"""
-    if file not in _MAP_EXTS:
-        return _err(f"file 只接受 {'/'.join(_MAP_EXTS)}，收到 {file!r}")
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    try:
-        data, stale, at = store.read_with_meta(n, file)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 404)
-    media = {"yaml": "text/yaml; charset=utf-8", "pgm": "image/x-portable-graymap",
-             "tags": "application/json; charset=utf-8"}[file]
-    fn = {"yaml": f"{n}.yaml", "pgm": f"{n}.pgm", "tags": f"{n}.tags.json"}[file]
-    headers = {"Content-Disposition": f'attachment; filename="{fn}"'}
-    if stale:
-        # 断连时回落到本地缓存 → 前端显示「当前离线，显示缓存（时间）」（规格 §B4.2）
-        headers["X-Map-Stale"] = "1"
-        if at:
-            headers["X-Map-Cached-At"] = str(at)
-    return Response(content=data, media_type=media, headers=headers)
-
-
-@app.get("/api/map/{name}/image.png")
-async def map_image(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
-    """**后端把 PGM 转成灰度 PNG**（前端按阈值着色）；按 mtime+size 缓存（规格 §7.4）。"""
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    try:
-        png, stale, at = await asyncio.to_thread(mapserver.image_png, n, store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e), 404)
-    headers = {"Cache-Control": "no-cache"}
-    if stale:
-        headers["X-Map-Stale"] = "1"
-        if at:
-            headers["X-Map-Cached-At"] = str(at)
-    return Response(content=png, media_type="image/png", headers=headers)
-
-
-# ---------------------------------------------------------------- 地点与区域（§5.2）
-@app.get("/api/destinations")
-async def destinations_list(map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    if not map:
-        return _err("缺少 map 参数")
-    try:
-        n = _name_of(map)
-        rows = await asyncio.to_thread(maptags.get_destinations, n, store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return {"ok": True, "map": n, "destinations": rows}
-
-
-@app.post("/api/destinations")
-def destinations_add(d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """新增地点：服务端完整校验（名称唯一、坐标在地图内、障碍检查）并返回 ``warnings[]``。"""
-    from . import log as audit
-    try:
-        n = _name_of(d.map_name)
-        out = maptags.upsert_destination(n, d.model_dump(), store=store)
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", action="destination_add", map=d.map_name, error=str(e))
-        return _err(str(e))
-    return {"ok": True, "uid": out["uid"], "warnings": out["warnings"], "save": out["save"]}
-
-
-@app.post("/api/destinations/validate")
-def destinations_validate(v: ValidateIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """标点即校验（§7.6）：越界 / 障碍 / 未知 / 距障碍余量 —— **只警告不阻止**。
-
-    ⚠️ 本路由必须**定义在** ``POST /api/destinations/{uid}`` **之前**：否则 FastAPI 会先匹配
-    到 ``{uid}``，把 "validate" 当成一个地点 uid（实测就是 "地点不存在：validate"）。
-    """
-    try:
-        n = _name_of(v.map_name)
-        out = mapserver.validate_point(n, v.x, v.y, store, v.margin_m)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return out
-
-
-@app.post("/api/destinations/{uid}")
-def destinations_update(uid: str, d: DestinationIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
-    try:
-        n = _name_of(d.map_name)
-        out = maptags.upsert_destination(n, d.model_dump(), uid=uid, store=store)
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", action="destination_update", map=d.map_name,
-                  uid=uid, error=str(e))
-        return _err(str(e))
-    return {"ok": True, "uid": out["uid"], "warnings": out["warnings"], "save": out["save"]}
-
-
-@app.delete("/api/destinations/{uid}")
-def destinations_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
-    if not map:
-        return _err("缺少 map 参数")
-    try:
-        n = _name_of(map)
-        maptags.delete_destination(n, uid, store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    audit.log("map_change", action="destination_delete", map=n, uid=uid)
-    return {"ok": True, "uid": uid}
-
-
-@app.post("/api/destinations/learn")
-def destinations_learn(body: LearnIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """取**当前位姿**写入该图 tags.json（位姿不可用 → 明确失败并提示"可改为在图上点选"）。"""
-    from . import log as audit
-    try:
-        n = _name_of(body.map_name)
-        pose = locator.get_pose()
-        out = maptags.learn_here(n, body.model_dump(), pose, store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    audit.log("map_change", action="destination_learn", map=n, uid=out["uid"],
-              pose=out.get("pose"))
-    return {"ok": True, "uid": out["uid"], "warnings": out["warnings"], "pose": out.get("pose"),
-            "save": out["save"]}
-
-
-@app.get("/api/zones")
-async def zones_list(map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    if not map:
-        return _err("缺少 map 参数")
-    try:
-        n = _name_of(map)
-        rows = await asyncio.to_thread(maptags.get_zones, n, store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return {"ok": True, "map": n, "zones": rows}
-
-
-@app.post("/api/zones")
-def zones_add(z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
-    try:
-        n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), store=store)
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", action="zone_add", map=z.map_name, error=str(e))
-        return _err(str(e))
-    return {"ok": True, "uid": out["uid"]}
-
-
-@app.post("/api/zones/{uid}")
-def zones_update(uid: str, z: ZoneIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    try:
-        n = _name_of(z.map_name)
-        out = maptags.upsert_zone(n, z.model_dump(), uid=uid, store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return {"ok": True, "uid": out["uid"]}
-
-
-@app.delete("/api/zones/{uid}")
-def zones_delete(uid: str, map: str = Query("", alias="map"), source: str = Query("", alias="source"), store=Depends(_store)):
-    from . import log as audit
-    if not map:
-        return _err("缺少 map 参数")
-    try:
-        n = _name_of(map)
-        out = maptags.delete_zone(n, uid, store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    audit.log("map_change", action="zone_delete", map=n, uid=uid, orphaned=out.get("orphaned"))
-    return {"ok": True, "uid": uid, "orphaned": out.get("orphaned") or []}
-
-
-@app.get("/api/map/{name}/tags")
-def map_tags_get(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
-    """**直读该图 .tags.json 原文**（调试 / 迁移 / 人工核对用）。"""
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    store = _store(source)
-    got = maptags.resolve(n, store)
-    return {"ok": got["ok"], "map": n, "exists": got["exists"], "tags": got["tags"],
-            "warnings": got.get("warnings") or [], "stale": got.get("stale"),
-            "cached_at": got.get("cached_at"), "error": got.get("error") or "",
-            "fingerprint": got.get("fingerprint"), "path": maptags.tags_path(n, store)}
-
-
-@app.put("/api/map/{name}/tags")
-def map_tags_put(name: str, body: MapTagsIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """整份替换标记文件（高级用途，做 schema 校验）；写文件 + sync_map()。"""
-    try:
-        n = _name_of(name)
-        out = maptags.replace_all(n, body.model_dump(), store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return out
-
-
-@app.post("/api/map/{name}/tags/reindex")
-def map_tags_reindex(name: str, source: str = Query("", alias="source"), store=Depends(_store)):
-    """强制重建该图的索引缓存（缓存丢失或怀疑不一致时用）。"""
-    try:
-        n = _name_of(name)
-        out = maptags.reindex(n, store=store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    return {"ok": True, **out}
-
-
-@app.post("/api/map/reindex-all/tags")
-def map_tags_reindex_all(source: str = Query("", alias="source"), store=Depends(_store)):
-    """重建**所有**图的索引缓存（缓存整个丢了时的恢复入口，验收红线 3 用）。
-
-    路径特意避开 ``/api/map/{name}/...`` 前缀，免得和 ``{name}`` 参数路由抢匹配。
-    """
-    from . import log as audit
-    try:
-        out = maptags.reindex_all(store)
-    except mapstore.MapStoreError as e:
-        return _err(str(e))
-    audit.log("map_change", action="tags_reindex_all", maps=len(out))
-    return {"ok": True, "results": out}
-
-
-# ---------------------------------------------------------------- 位姿 / 当前地图 / IO 状态
-@app.get("/api/robot/pose")
-async def robot_pose():
-    """位姿（只读，rosbridge）。降级时 ``{"ok": True, "status": "unavailable"}``。"""
-    return await asyncio.to_thread(lambda: locator.pose_payload(db.get_settings()))
-
-
-@app.get("/api/mapeditor/status")
-async def mapeditor_status(source: str = Query("", alias="source")):
-    """编辑器顶部状态条的一份汇总：位姿 + rosbridge + 当前地图 + IO 模式。"""
-    store = _store(source)
-    io, loc = await asyncio.gather(
-        asyncio.to_thread(mapstore.io_status, "", source),
-        asyncio.to_thread(locator.status, store),
-    )
-    return {"ok": True, "io": io, "locator": loc}
-
-
-@app.get("/api/mapeditor/io")
-async def mapeditor_io(name: str = Query(""), source: str = Query("", alias="source")):
-    return {"ok": True, **(await asyncio.to_thread(mapstore.io_status, name, source))}
-
-
-@app.post("/api/mapeditor/io/test")
-async def mapeditor_io_test(source: str = Query("", alias="source")):
-    """主动连通性自检（``list()`` 一次），返回耗时与错误原因；**不改任何文件**。"""
-    return await asyncio.to_thread(mapstore.io_test, source)
-
-
-@app.post("/api/mapeditor/pose/inject")
-def mapeditor_pose_inject(body: PoseInjectIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """注入假位姿 / 假地图元数据（**无 ROS 环境开发与测试用**，规格 §5.4 / §nine 4）。"""
-    if body.x is None and body.width is None:
-        locator.clear_injection()
-        return {"ok": True, "cleared": True}
-    if body.x is not None:
-        locator.set_pose_for_test(body.x, body.y, body.yaw)
-    if body.width is not None:
-        locator.set_map_for_test(body.width, body.height, body.resolution, body.origin)
-    return {"ok": True, "pose": locator.pose_payload(), "current_map": locator.current_map(store)}
-
-
-# ---------------------------------------------------------------- 像素修图保存（B 篇 §B5.2）
-@app.post("/api/map/{name}/save")
-def map_save(name: str, body: MapSaveIn, source: str = Query("", alias="source"), store=Depends(_store)):
-    """保存像素改动：白名单 → 体积 → yaml 白名单校验 → 备份 → 标记随行 → 原子写 → 审计。"""
-    from . import log as audit
-    import base64
-    try:
-        n = _name_of(name)
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", map=name, error=str(e), stage="name")
-        return _err(str(e))
-    store = _store(source)
-
-    # 2) 体积校验
-    try:
-        pgm = base64.b64decode(body.pgm_b64 or "", validate=False)
-    except Exception as e:      # noqa: BLE001
-        audit.log("map_edit_reject", map=n, error=f"pgm base64 解码失败：{e}", stage="decode")
-        return _err(f"pgm base64 解码失败：{e}")
-    if not pgm:
-        return _err("pgm_b64 为空（编辑器没有回传像素数据）")
-    if len(pgm) > conf.MAPS_MAX_PGM_BYTES:
-        return _err(f"pgm 过大：{len(pgm)} B > {conf.MAPS_MAX_PGM_BYTES} B", 413)
-    yaml_in = body.yaml_text or ""
-    if len(yaml_in.encode("utf-8")) > conf.MAPS_MAX_YAML_BYTES:
-        return _err(f"yaml 过大：>{conf.MAPS_MAX_YAML_BYTES} B", 413)
-    if pgm[:2] not in (b"P5", b"P2"):
-        return _err(f"pgm 魔数不被接受：{pgm[:2]!r}（只认 P2/P5，与上游 parsePGM 一致）")
-
-    # 1) 白名单校验（红线 §B7.1）—— 必须**最早**做：它是 ssh 子进程模式唯一的一道命令注入防线，
-    #    也是唯一一处"连试都不该试"的输入。放在体积校验之前，避免"超大 body + 非法名字"绕过。
-    if body.mode not in ("saveas", "overwrite"):
-        return _err(f"mode 只接受 saveas/overwrite，收到 {body.mode!r}")
-    try:
-        target = (mapstore.check_name(body.new_name or f"{n}_edited")
-                  if body.mode == "saveas" else mapstore.check_name(n))
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", map=n, error=str(e), stage="name")
-        return _err(str(e))
-    if body.mode == "overwrite" and not body.confirm:
-        return _err("覆盖原图必须带 confirm=true", 409, need_confirm=True)
-
-    # 3) yaml 白名单校验：除 image 外任何字段与磁盘原值不一致 → 409
-    try:
-        disk_yaml = store.read(n, "yaml").decode("utf-8", "replace")
-    except mapstore.MapStoreError as e:
-        return _err(f"读磁盘原 yaml 失败：{e}", 404)
-    from_disk = mapserver.parse_yaml_flat(disk_yaml)
-    from_up = mapserver.parse_yaml_flat(yaml_in) if yaml_in.strip() else {}
-    diffs = []
-    for k, v in from_up.items():
-        if k == "image":
-            continue
-        if k not in from_disk:
-            diffs.append(f"{k}（磁盘上没有该字段，回传值 {v!r}）")
-        elif _same_value(from_disk[k], v) is False:
-            diffs.append(f"{k}（磁盘 {from_disk[k]!r} vs 回传 {v!r}）")
-    if diffs:
-        audit.log("map_edit_reject", map=n, mode=body.mode, diffs="; ".join(diffs), stage="yaml")
-        return _err("回传 yaml 与磁盘原值不一致（只允许改 image 字段）：" + "; ".join(diffs), 409,
-                    diffs=diffs)
-
-    # 5) 备份（覆盖：强制；另存：目标已存在时也备份）
-    backup: list[str] = []
-    warnings: list[str] = []
-    try:
-        if body.mode == "overwrite":
-            backup = store.backup(target)
-        elif store.exists(target, "yaml") or store.exists(target, "pgm"):
-            backup = store.backup(target)
-    except mapstore.MapStoreError as e:
-        if body.mode == "overwrite":
-            # 备份是覆盖的前置条件，不允许"备份失败但继续"（规格 §B八）
-            audit.log("map_edit_reject", map=n, error=str(e), stage="backup")
-            return _err(f"备份失败，已拒绝覆盖保存：{e}", 500)
-        warnings.append(f"目标已存在但备份失败：{e}")
-
-    # 6) 标记随行
-    tags_copied = False
-    if body.mode == "overwrite":
-        try:
-            got = maptags.resolve(n, store)
-            if got["ok"] and got["exists"]:
-                got["tags"]["updated_at"] = db.now_iso()
-                import json as _json
-                store.write(n, "tags",
-                         _json.dumps(got["tags"], ensure_ascii=False, indent=2).encode("utf-8"))
-                tags_copied = True
-        except mapstore.MapStoreError as e:
-            warnings.append(f"标记指纹更新失败：{e}")
-    else:
-        try:
-            got = maptags.resolve(n, store)
-            if got["ok"] and got["exists"]:
-                # 用**本次要写出的** pgm 元数据与原名指纹比对（像素改不了 resolution/origin）
-                info = mapserver.map_info(n, store)
-                fp = maptags.fingerprint_check(got["tags"], info)
-                if fp.get("changed"):
-                    warnings.append(f"该图元数据已变（{'; '.join(fp.get('reasons') or [])}），标记未随行")
-                else:
-                    tags = got["tags"]
-                    tags["map"] = target
-                    tags["updated_at"] = db.now_iso()
-                    import json as _json
-                    store.write(target, "tags",
-                             _json.dumps(tags, ensure_ascii=False, indent=2).encode("utf-8"))
-                    tags_copied = True
-        except mapstore.MapStoreError as e:
-            warnings.append(f"标记随行失败：{e}")
-
-    # 7) 写 pgm（原子）
-    try:
-        store.write(target, "pgm", pgm)
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", map=n, target=target, error=str(e), stage="pgm")
-        return _err(f"写 pgm 失败：{e}", 500)
-
-    # 8) 写 yaml：以磁盘原文为本，只替换 image: 一行
-    try:
-        out_yaml = mapserver.update_yaml_image(disk_yaml, f"{target}.pgm")
-        store.write(target, "yaml", out_yaml.encode("utf-8"))
-    except mapstore.MapStoreError as e:
-        audit.log("map_edit_reject", map=n, target=target, error=str(e), stage="yaml_write")
-        return _err(f"写 yaml 失败：{e}", 500)
-
-    mapserver.clear_cache()
-    locator.clear_current_map_cache()
-    if body.mode == "overwrite":
-        try:
-            maptags.sync_map(target, store, force=True)
-        except mapstore.MapStoreError as e:
-            warnings.append(f"刷新索引缓存失败：{e}")
-    else:
-        try:
-            maptags.sync_map(target, store, force=True)
-        except mapstore.MapStoreError:
-            pass
-
-    wrote = [f"{target}.pgm", f"{target}.yaml"]
-    if tags_copied:
-        wrote.append(f"{target}.tags.json")
-    audit.log("map_edit_save", map=n, target=target, mode=body.mode,
-              pgm_bytes=len(pgm), backup=",".join(backup), tags_copied=tags_copied,
-              warnings="; ".join(warnings))
-    return {"ok": True, "wrote": wrote, "backup": backup, "target": target,
-            "tags_copied": tags_copied, "warnings": warnings,
-            "restart_hint": f"~/tools/nav_screen.sh nav {target}",
-            "note": "map_server 启动时一次性读入地图，改完必须重启导航才生效"}
-
-
-def _same_value(a, b) -> bool:
-    """yaml 字段值比较：数字容忍 int/float 差异，其余按字符串比。"""
-    if isinstance(a, bool) or isinstance(b, bool):
-        return bool(a) == bool(b)
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return abs(float(a) - float(b)) < 1e-9
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
-    return str(a) == str(b)
-
-
 # ------------------------------------------------------------------ 摄像头 HTTP 桥
 # 摄像头共享服务（vision/camera_server.py）本身是裸 TCP，浏览器说不了那套协议；
 # 这里桥成 HTTP，**让上位机 PC 浏览器直接看板卡画面**（不必登录板卡/到现场）。
@@ -2198,8 +1434,8 @@ async def vision_status():
 async def vision_snapshot(channel: int = Query(1), quality: int = Query(80),
                           token: str = Query(None)):
     """单帧 JPEG 快照。`<img src="/api/vision/snapshot?channel=1">` 可直接显示。"""
-    from . import log as audit
-    from fastapi.responses import JSONResponse
+    from .core import log as audit
+    from fastapi.responses import JSONResponse, Response
     from vision import webbridge
     try:
         jpg, _w, _h, source = await asyncio.to_thread(
@@ -2236,8 +1472,7 @@ from fastapi.responses import FileResponse
 _FRONTEND_DIST = BASE_DIR / "frontend" / "packages"
 _KIOSK_DIST = _FRONTEND_DIST / "kiosk" / "dist"
 _ADMIN_DIST = _FRONTEND_DIST / "admin" / "dist"
-_MAPEDITOR_DIST = _FRONTEND_DIST / "mapeditor" / "dist"
-_MAPEDITOR_PUBLIC = _FRONTEND_DIST / "mapeditor" / "public"
+_NURSE_DIST = _FRONTEND_DIST / "nurse" / "dist"      # 护士台（模块 11 面板，规格 2026-09-18）
 
 
 def _serve_dist(dist: Path, path: str):
@@ -2249,28 +1484,8 @@ if _KIOSK_DIST.exists():
     _serve_dist(_KIOSK_DIST, "/kiosk")
 if _ADMIN_DIST.exists():
     _serve_dist(_ADMIN_DIST, "/admin")
-def _mount_editor():
-    """挂 `/mapeditor`：判据是**入口页 index.html 存在**，不是目录存在。
-
-    为什么这么判：`frontend/packages/mapeditor/dist/` 会被 dev 构建留下来，但如果它里面没有
-    `index.html`（例如只把 `public/` 拷过去、或 dist 只装了 `pixel-editor.html`），
-    直接挂 dist 会让 `/mapeditor/` 变 404 —— 此时必须回退到 `public/`。
-    两个候选都没有 `index.html` 时，退一步挂 `public/`（至少 `pixel-editor.html` 能打开），
-    并在启动日志里说清楚「前端未构建」，别让人对着 404 猜。
-    """
-    for cand, label in ((_MAPEDITOR_DIST, "dist（构建产物）"), (_MAPEDITOR_PUBLIC, "public（未构建回退）")):
-        if (cand / "index.html").exists():
-            _serve_dist(cand, "/mapeditor")
-            print(f"[mapeditor] 挂载 {label}：{cand}")
-            return
-    if _MAPEDITOR_PUBLIC.exists():
-        _serve_dist(_MAPEDITOR_PUBLIC, "/mapeditor")
-        print(f"[WARN] [mapeditor] 没有 index.html —— 只挂了 public/ 使 pixel-editor.html 可用："
-              f"{_MAPEDITOR_PUBLIC}\n"
-              f"        要打开地图编辑器主界面请先构建：cd frontend && pnpm --filter mapeditor build")
-
-
-_mount_editor()
+if _NURSE_DIST.exists():
+    _serve_dist(_NURSE_DIST, "/nurse")
 
 
 @app.get("/")

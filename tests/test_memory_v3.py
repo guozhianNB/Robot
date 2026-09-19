@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """memory v3 写回分流 + 红线测试（不依赖真实 LLM，直接调 _apply_v3）。"""
-from LLM import db, memory
+from LLM.store import db
+from LLM.agent import memory
 
 
 def test_semantic_goes_to_rag(monkeypatch, isolated_paths):
@@ -54,10 +55,11 @@ def _mk_client(judge_reply):
 
 
 def test_instant_correct_updates_core(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
-    monkeypatch.setattr("LLM.chat.llm_json",
+    monkeypatch.setattr("LLM.agent.chat.llm_json",
                         lambda c, m, p: {"correct": True, "mid": mid, "new_content": "老人姓王"})
     r = memory.correct_instant("elder_001", "我其实不姓张，我姓王", _mk_client("{}"), "test-model")
     assert r["corrected"] is True
@@ -65,10 +67,11 @@ def test_instant_correct_updates_core(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_instant_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人喜欢戏曲", importance=4)
-    monkeypatch.setattr("LLM.chat.llm_json",
+    monkeypatch.setattr("LLM.agent.chat.llm_json",
                         lambda c, m, p: {"correct": True, "mid": mid, "new_content": "姓名是李四"})
     r = memory.correct_instant("elder_001", "我其实姓李", _mk_client("{}"), "test-model")
     assert r["corrected"] is False
@@ -76,10 +79,11 @@ def test_instant_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_instant_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
-    monkeypatch.setattr("LLM.chat.llm_json",
+    monkeypatch.setattr("LLM.agent.chat.llm_json",
                         lambda c, m, p: {"correct": True, "mid": mid, "new_content": "老人姓王"})
     r = memory.correct_instant("elder_002", "我其实姓王", None, "test-model")
     assert r["corrected"] is False
@@ -87,7 +91,8 @@ def test_instant_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch
 
 
 def test_recall_v3_returns_core_and_rag(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     db.add_core_memory("elder_001", "preference", "喜欢听京剧", importance=5)
     monkeypatch.setattr(memory.ragstore, "query",
@@ -110,9 +115,10 @@ CONSOLIDATE_JSON = '''
 
 
 def test_consolidate_v3_routes_and_graph(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
-    monkeypatch.setattr("LLM.chat.llm_json", lambda c, m, p: __import__("json").loads(CONSOLIDATE_JSON))
+    monkeypatch.setattr("LLM.agent.chat.llm_json", lambda c, m, p: __import__("json").loads(CONSOLIDATE_JSON))
     monkeypatch.setattr(memory, "_take_pending", lambda uid: [{"role": "user", "content": "我好了，喜欢京剧"}])
     monkeypatch.setattr(memory, "_dedup_check", lambda uid, c, **kw: None)
     monkeypatch.setattr(memory.graph, "upsert_entity", lambda *a: None)
@@ -124,7 +130,8 @@ def test_consolidate_v3_routes_and_graph(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_apply_v3_correct_updates_old(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
     r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "老人姓王"})
@@ -133,7 +140,8 @@ def test_apply_v3_correct_updates_old(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_apply_v3_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人喜欢戏曲", importance=4)
     r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "姓名是李四"})
@@ -142,7 +150,8 @@ def test_apply_v3_correct_blocks_identity(tmp_path, isolated_paths, monkeypatch)
 
 
 def test_apply_v3_correct_blocks_medical(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人有高血压", importance=4)
     r = memory._apply_v3("elder_001", {"action": "correct", "correct_id": mid, "content": "每天吃两片降压药"})
@@ -151,7 +160,8 @@ def test_apply_v3_correct_blocks_medical(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_apply_v3_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     mid = db.add_core_memory("elder_001", "fact", "老人姓张", importance=4)
     r = memory._apply_v3("elder_002", {"action": "correct", "correct_id": mid, "content": "老人姓王"})
@@ -160,7 +170,8 @@ def test_apply_v3_correct_blocks_cross_user(tmp_path, isolated_paths, monkeypatc
 
 
 def test_portrait_medical_rejected(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, memory
+    from LLM.store import db
+    from LLM.agent import memory
     db.init_db()
     monkeypatch.setattr(memory.db, "set_portrait", lambda uid, p: None)
     called = []

@@ -22,8 +22,12 @@ slam_toolbox:
     transform_timeout: 0.2
     tf_buffer_duration: 30.0
 
-    # 分辨率
-    resolution: 0.05
+    # 分辨率（m/格）
+    # 0.025 = 0.05 的一半边长（格子面积 1/4）。下限受雷达角分辨率约束：
+    # YDLidar Tmini Plus ≈0.89°/点（4K@10Hz，Fixed Size 404），地面打点间距 = r×0.0157m，
+    # 2m 处 ≈3.1cm、5m 处 ≈7.9cm —— 再细下去只会把稀疏采样暴露成辐条状空洞，别下 0.02。
+    # 改这里必须同步 nav2_params.yaml 的 global_costmap.resolution，并重扫地图（老图不能"升级"）。
+    resolution: 0.025
     max_range: 12.0
     min_range: 0.03
 

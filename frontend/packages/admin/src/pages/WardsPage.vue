@@ -6,11 +6,15 @@
 //   1) 建病房档案；2) 把病房**关联**到已画好的区域（地图名 + 区域 uid）；
 //   3) 便捷入口「记录当前房间为病房区域」= 以小车当前位姿为圆心采样 16 边形写进该图 tags.json；
 //   4) 老人归入/移出病房（写 profiles.ward_id）。
-// 精确形状（多边形/矩形）请到 /mapeditor 画（类型选「ward 病区」）。
+// 精确形状（多边形/矩形）请到本壳的「地图编辑器」页签里画（类型选「ward 病区」）。
 import { onMounted, ref } from "vue";
 import {
-  assignElderWard, listWards, recordWardZone, upsertWard, type Ward,
+  assignElderWard, deleteWard, listWards, recordWardZone, upsertWard, type Ward,
 } from "shared";
+
+// 跳到同壳的「地图编辑器」页签（admin 没有路由表，只有 App.vue 的 active ref）。
+// 不能再用硬链 `<a href>` 指向编辑器：主后端已不再挂载该路径，硬链会 404。
+const emit = defineEmits<{ (e: "goto-mapeditor"): void }>();
 
 interface Profile { uid: string; name?: string; nickname?: string; bed?: string; ward_id?: string }
 
@@ -125,6 +129,22 @@ async function markHere(w: Ward) {
   }
 }
 
+async function remove(w: Ward) {
+  const label = w.name || w.uid;
+  if (!window.confirm(`确定删除病房“${label}”吗？\n该病房内的老人会自动移出，地图区域会保留。`)) return;
+  err.value = ""; msg.value = ""; busy.value = true;
+  try {
+    const r = await deleteWard(w.uid, "admin");
+    if (!r.ok) { err.value = r.error ?? "删除失败"; return; }
+    msg.value = `已删除病房 ${label}`;
+  } catch (e) {
+    err.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    busy.value = false;
+    await load();
+  }
+}
+
 async function assign(elderUid: string, wardId: string, ev?: Event) {
   err.value = ""; msg.value = "";
   busy.value = true;
@@ -161,7 +181,7 @@ onMounted(load);
       一个病房 = 一个「病房用户」（uid 形如 <code>ward_101</code>），它既是集体主体，也承载"车在哪间屋"
       的位置判定。区域几何的<b>唯一真相</b>在地图文件夹的 <code>&lt;图名&gt;.tags.json</code>：
       「记录当前房间为病房区域」按当前位姿生成 16 边形近似圆，精确形状请到
-      <a href="/mapeditor/" target="_blank" rel="noopener">地图编辑器</a> 画多边形/矩形（类型选「ward 病区」），
+      <button class="link" @click="emit('goto-mapeditor')">地图编辑器</button> 画多边形/矩形（类型选「ward 病区」），
       本页负责把病房关联到那个区域。
     </p>
 
@@ -196,6 +216,7 @@ onMounted(load);
           <td class="acts">
             <button :disabled="busy" @click="markHere(w)">记录当前房间为病房区域</button>
             <button :disabled="busy" @click="bind(w)">关联已画区域</button>
+            <button class="danger" :disabled="busy" @click="remove(w)">删除</button>
           </td>
         </tr>
         <tr v-if="loaded && !wards.length"><td colspan="5">还没有病房，先用上面的表单建一个</td></tr>
@@ -204,7 +225,7 @@ onMounted(load);
 
     <h4>关联已画好的区域</h4>
     <p class="hint">
-      先在下面填「地图名 + 区域 uid」（区域在地图编辑器里画好后从它的列表里抄 uid），
+      先在下面填「地图名 + 区域 uid」（区域在<button class="link" @click="emit('goto-mapeditor')">地图编辑器</button>里画好后从它的列表里抄 uid），
       再点目标病房那一行的「关联已画区域」。
     </p>
     <div class="row">
@@ -259,5 +280,8 @@ th { color: #94a3b8; font-weight: normal; }
 .row button, .acts button { padding: 8px 14px; border-radius: 8px; border: none;
   background: #1e3a5f; color: #e2e8f0; cursor: pointer; font-size: 13px; }
 .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.acts .danger { background: #7f1d1d; }
+button.link { background: none; border: none; color: #7dd3fc; padding: 0; font-size: inherit;
+  text-decoration: underline; cursor: pointer; }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>

@@ -20,7 +20,14 @@ import pytest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
-from LLM import conf, db, locator, log as audit_log, mapserver, mapsources, mapstore, maptags  # noqa: E402
+from LLM import conf
+from LLM.store import db
+from LLM.maps import locator, mapserver, mapsources, mapstore, maptags, roslink
+from LLM.core import log as audit_log  # noqa: E402
+
+# 在 autouse fixture 把 `roslink.node_string_param` 换成假实现**之前**留一份真身，
+# 供「验它自己」的用例还原（见 test_node_string_param_reads_string_and_rejects_others）。
+_REAL_NODE_STRING_PARAM = roslink.node_string_param
 
 SAMPLE_YAML = """image: my_map.pgm
 mode: trinary
@@ -76,6 +83,25 @@ def env(tmp_path, monkeypatch):
 
 def _store():
     return mapstore.get_store()
+
+
+@pytest.fixture(autouse=True)
+def _offline_map_param(monkeypatch):
+    """把「认当前图」整条路切成离线，保证本文件不碰真 rosbridge。
+
+    两处都要切（`current_map()` 有两条路，且 `/api/map/list` 现在也要调它标「在跑」）：
+
+    * ``roslink.node_string_param``（第一权威：问 map_server 要 yaml_filename）→ 空串 = 问不到；
+    * ``roslink.subscribe`` / ``roslink.drain``（退回路上的 /map 取数）→ no-op，
+      否则跑在**板卡本机 / 有板卡的开发机**上会真连上 rosbridge，把离线断言染成"环境相关"
+      （实测踩过：测试真连上了板卡、认出了真实在跑的地图）。
+
+    要验权威路的用例自己把 ``node_string_param`` 换成假路径（见
+    test_current_map_prefers_map_server_param*）；注入型用例走 `_injected_map`，不受影响。
+    """
+    monkeypatch.setattr(roslink, "node_string_param", lambda *a, **k: "")
+    monkeypatch.setattr(roslink, "subscribe", lambda *a, **k: False)
+    monkeypatch.setattr(roslink, "drain", lambda *a, **k: 0)
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +585,7 @@ def test_pose_injection_and_degrade(env):
 
 
 def test_rosbridge_connection_failure_has_retry_backoff(monkeypatch):
-    from LLM import roslink
+    from LLM.maps import roslink
 
     calls = 0
 
@@ -605,6 +631,135 @@ def test_current_map_unknown_when_no_ros(env):
     locator.clear_injection()
     out = locator.current_map(_store())
     assert out["ok"] and out["source"] == "unknown" and out["detail"]
+
+
+def test_current_map_prefers_map_server_param(env, monkeypatch):
+    """**权威路**：导航实际加载哪张图，就认哪张 —— 不看 /map 指纹、也不受多命中影响。
+
+    回归 2026-09-19 现场事故：像素编辑器另存副本（my_map3_edited）与原图四项元数据完全一致
+    → 指纹反查"多命中"判 unknown → 车控 goto 全部 rejected「当前地图未知」。
+    """
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml")
+
+    def _should_not_scan():
+        raise AssertionError("权威路命中后不该再走 /map 指纹反查（那正是歧义来源）")
+
+    monkeypatch.setattr(locator, "_topic_map_meta", _should_not_scan)
+    locator.clear_current_map_cache()
+    out = locator.current_map(_store())
+    assert out["ok"] and out["source"] == "map_server_param"
+    assert out["name"] == "my_map3_edited" and "my_map3_edited" in out["detail"]
+
+
+def test_current_map_is_not_gated_by_fingerprint_switch(env, monkeypatch):
+    """权威路不是「用 /map 元数据**推断**」，所以关掉推断开关也照样认得出在跑哪张图。"""
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map.yaml")
+    monkeypatch.setattr(db, "get_settings",
+                        lambda: {**conf.DEFAULT_SETTINGS, "map_topic_fingerprint_enabled": False})
+    out = locator.current_map(_store())
+    assert out["source"] == "map_server_param" and out["name"] == "my_map"
+
+
+def test_current_map_fingerprint_switch_off_and_no_param_returns_unknown(env, monkeypatch):
+    """两条路都不可用时仍是 fail-closed 的 unknown（关掉推断 ≠ 乱认一张图）。"""
+    monkeypatch.setattr(db, "get_settings",
+                        lambda: {**conf.DEFAULT_SETTINGS, "map_topic_fingerprint_enabled": False})
+    locator.set_map_for_test(8, 6, 0.05, [-4.6, -1.91, 0.0])
+    out = locator.current_map(_store())
+    assert out["source"] == "unknown" and "关闭" in out["detail"]
+    locator.clear_injection()
+
+
+def test_current_map_falls_back_to_fingerprint_when_param_unavailable(env, monkeypatch):
+    """读不到 map_server 参数（导航没起 / 不是 nav2）→ 退回旧的唯一命中口径。"""
+    locator.set_map_for_test(8, 6, 0.05, [-4.6, -1.91, 0.0])
+    out = locator.current_map(_store())
+    assert out["source"] == "map_topic" and out["name"] == "my_map"
+    locator.clear_injection()
+
+
+def test_map_list_badge_follows_car_not_stale_setting(env, monkeypatch):
+    """**回归 2026-09-19**：列表的「在跑」必须来自**车**，不是 settings.current_map。
+
+    现场事故：车在跑重建后的 `my_map3`，而 `settings.current_map` 还停在 `my_map`
+    （那是"下次启动想用哪张"的人工声明）→ 编辑器的「当前」标在错的图上。
+    """
+    from LLM.maps import mapapi as server
+
+    maps = env["maps"]
+    (maps / "my_map2.yaml").write_text(SAMPLE_YAML.replace("my_map.pgm", "my_map2.pgm"),
+                                       encoding="utf-8", newline="")
+    (maps / "my_map2.pgm").write_bytes(make_pgm(8, 6))
+    mapserver.clear_cache()
+    # 人工声明说"下次用 my_map2"，而车实际在跑 my_map
+    monkeypatch.setattr(server.db, "get_settings", lambda: {"current_map": "my_map2"})
+    monkeypatch.setattr(locator, "current_map",
+                        lambda *a, **k: {"ok": True, "source": "map_server_param", "name": "my_map"})
+
+    out = server._map_list_sync("")
+    by_name = {m["name"]: m for m in out["maps"]}
+    assert by_name["my_map"]["current"] is True          # 在跑 = 车的真相
+    assert by_name["my_map"]["next"] is False
+    assert by_name["my_map2"]["current"] is False        # 人工声明**不许**冒充"在跑"
+    assert by_name["my_map2"]["next"] is True            # 它是"下次启动"
+    assert out["current_map"] == "my_map" and out["current_map_source"] == "map_server_param"
+    assert out["next_map"] == "my_map2"
+
+
+def test_map_list_badge_survives_unknown_current_map(env, monkeypatch):
+    """认不出当前图时列表照常返回，只是整列都不标「在跑」（绝不因此 500）。"""
+    from LLM.maps import mapapi as server
+
+    def _boom(*a, **k):
+        raise RuntimeError("rosbridge 断了")
+
+    monkeypatch.setattr(locator, "current_map", _boom)
+    out = server._map_list_sync("")
+    assert out["ok"] is True and out["current_map"] == ""
+    assert all(m["current"] is False for m in out["maps"])
+
+
+def test_map_name_from_param_takes_basename_and_enforces_whitelist(monkeypatch):
+    """参数值来自 ROS，同样不可信：只取 basename，非法名字一律当作认不出（fail-closed）。"""
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml")
+    assert locator._map_name_from_param() == ("my_map3_edited", "")
+
+    monkeypatch.setattr(roslink, "node_string_param",
+                        lambda *a, **k: "/home/sunrise/Robot/ros2_car/maps/my map!.yaml")
+    name, why = locator._map_name_from_param()
+    assert name == "" and "不合法" in why
+
+    monkeypatch.setattr(roslink, "node_string_param", lambda *a, **k: "")
+    name, why = locator._map_name_from_param()
+    assert name == "" and "未取到" in why
+
+
+def test_node_string_param_reads_string_and_rejects_others(monkeypatch):
+    """``node_string_param`` 只认字符串参数；服务不存在/超时/非字符串一律回空串。"""
+    monkeypatch.setattr(roslink, "node_string_param", _REAL_NODE_STRING_PARAM)
+    seen = {}
+
+    def fake_call(service, args, service_type="", timeout=None):
+        seen.update(service=service, args=args, service_type=service_type)
+        return {"ok": True, "values": {"values": [
+            {"type": 4, "string_value": "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml"}]}}
+
+    monkeypatch.setattr(roslink, "call_service", fake_call)
+    assert roslink.node_string_param("/map_server", "yaml_filename") == \
+        "/home/sunrise/Robot/ros2_car/maps/my_map3_edited.yaml"
+    assert seen["service"] == "/map_server/get_parameters"
+    assert seen["args"] == {"names": ["yaml_filename"]}
+    assert seen["service_type"] == "rcl_interfaces/srv/GetParameters"
+
+    monkeypatch.setattr(roslink, "call_service", lambda *a, **k: {
+        "ok": True, "values": {"values": [{"type": 2, "string_value": ""}]}})
+    assert roslink.node_string_param("/map_server", "yaml_filename") == ""
+    monkeypatch.setattr(roslink, "call_service", lambda *a, **k: None)
+    assert roslink.node_string_param("/map_server", "yaml_filename") == ""
+    assert roslink.node_string_param("", "yaml_filename") == ""
 
 
 def test_current_map_reuses_scan_until_cache_is_cleared(monkeypatch):
@@ -666,9 +821,12 @@ def client(env):
     **刻意不进入 context manager**：那会触发 `lifespan`（拉起语音 worker / MCP / 提醒线程），
     在无音频设备的开发机上会长时间挂住；本文件测的是路由与数据层，不需要那些副作用
     （`db.init_db()` 已由 `env` 调过）。
+
+    被测 app：编辑器路由已拆到独立服务（规格 2026-09-15）；原「用 mapapi.router 现搭一个
+    等价 app」的临时回退已删，见下方 import。
     """
     from fastapi.testclient import TestClient
-    from LLM.server import app
+    from LLM.mapeditor_server import app   # 编辑器路由已拆到独立 app（规格 2026-09-15）
     return TestClient(app)
 
 
@@ -795,6 +953,20 @@ def test_api_meta_change_requires_confirm(client, env):
                        json={"origin": [0, 0, 0.5], "confirm": True}).status_code == 400
 
 
+def test_api_meta_read_ok(client):
+    """GET /api/map/{name}/meta 必须 200 且带 meta（回归：曾因 asyncio.to_thread 丢参而恒 500）。
+
+    为什么值得一条测试：编辑器每次选图都会调它（`App.vue::loadMeta()`），而全仓此前只有
+    **POST** `/{name}/meta`（改元数据）的用例，GET 一次都没有 —— 于是 ``_map_meta_sync``
+    少传 ``store``、函数体里又引用了未定义的 ``source`` 这两处必炸点，在搬迁那次逐字复制时
+    一起潜进 `mapapi.py`，一路没被任何断言照到。
+    """
+    r = client.get("/api/map/my_map/meta")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] is True and d["meta"] and d["meta"]["width"] > 0
+
+
 def test_api_save_saveas_then_overwrite(client, env):
     maps = env["maps"]
     yaml_disk = (maps / "my_map.yaml").read_text(encoding="utf-8")
@@ -910,7 +1082,7 @@ def test_map_list_does_not_block_event_loop(monkeypatch):
     import asyncio
     import time
 
-    from LLM import server
+    from LLM.maps import mapapi as server   # map_list/_store 已随编辑器路由搬到 mapapi（任务 1）
 
     class SlowStore:
         root = "slow-test"

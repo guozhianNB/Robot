@@ -62,7 +62,10 @@ watch(
   <div class="status-bar">
     <span class="dot" :style="{ background: color }"></span>
     <span class="label">{{ label }}</span>
-    <button class="user" @click="emit('open-switcher')">{{ badge }}</button>
+    <button class="user" title="切换用户和层级" @click="emit('open-switcher')">
+      <span class="identity">{{ badge }}</span>
+      <span class="switch-label">切换用户</span>
+    </button>
   </div>
 </template>
 
@@ -73,6 +76,10 @@ watch(
   font-size: 22px;
 }
 .dot { width: 14px; height: 14px; border-radius: 50%; }
-.user { margin-left: auto; background: none; border: 1px solid #374151;
-  color: #f9fafb; padding: 8px 16px; border-radius: 12px; font-size: 20px; }
+.user { margin-left: auto; display: flex; align-items: center; gap: 12px;
+  background: #1f2937; border: 1px solid #4b5563; color: #f9fafb;
+  padding: 8px 10px 8px 16px; border-radius: 8px; font-size: 20px; cursor: pointer; }
+.identity { white-space: nowrap; }
+.switch-label { padding: 6px 10px; border-left: 1px solid #4b5563; color: #bfdbfe;
+  font-size: 16px; white-space: nowrap; }
 </style>

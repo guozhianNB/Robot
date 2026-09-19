@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Move.srv"
   "srv/Turn.srv"
   "srv/NavigateTo.srv"
+  "srv/RobotReadiness.srv"
 )
 
 ament_export_dependencies(rosidl_default_runtime)

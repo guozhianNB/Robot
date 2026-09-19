@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from fastapi.testclient import TestClient
 
-from LLM import server, voice_api
+from LLM import server
+from LLM.voice import voice_api
 
 
 def _patch(monkeypatch):

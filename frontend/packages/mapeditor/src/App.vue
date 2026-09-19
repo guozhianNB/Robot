@@ -6,6 +6,7 @@ import PlacePanel from "./pages/PlacePanel.vue";
 import ZonePanel from "./pages/ZonePanel.vue";
 import MapFiles from "./pages/MapFiles.vue";
 import { enc, getJson, getSource, setSource, sourcesUrl } from "./lib/api";
+import { closeSelf, stopService } from "./lib/service";
 import type {
   CurrentMapResp,
   Destination,
@@ -49,6 +50,9 @@ const io = ref<IoStatus | null>(null);
 const fingerprint = ref<{ changed?: boolean; reasons?: string[] } | null>(null);
 const loadNote = ref("");
 const canvasStale = ref(false);
+const exitNote = ref("");
+const serviceDown = ref(false);      // 服务已停（或主编辑器被单独打开）→ 顶部红条 + 停轮询
+const exiting = ref(false);
 
 const drawMode = ref<DrawMode>("idle");
 const selectedUid = ref("");
@@ -58,6 +62,7 @@ const draftPoint = ref<{ x: number; y: number } | null>(null);
 const draftPoints = ref<number[][] | null>(null);
 const donePolygon = ref<number[][] | null>(null);
 const doneRect = ref<number[][] | null>(null);
+const doneGoal = ref<{ x: number; y: number } | null>(null);
 const wantDrawPolygon = ref(0);
 
 const canvasRef = ref<InstanceType<typeof MapCanvas> | null>(null);
@@ -176,6 +181,7 @@ async function pickMap(name: string) {
   draftPoints.value = null;
   donePolygon.value = null;
   doneRect.value = null;
+  doneGoal.value = null;
   meta.value = { name, width: null, height: null, resolution: null, origin: null,
     negate: null, occupied_thresh: null, free_thresh: null } as MapMetaFields;
   fingerprint.value = null;
@@ -218,6 +224,11 @@ async function statusTick() {
       pose.value = r.data.locator.pose;
       currentMap.value = r.data.locator.current_map;
       io.value = r.data.io;
+      serviceDown.value = false;
+    } else if (r.http === 0) {
+      // 连不上自己这个源 = 服务已被停掉/崩了：别再每 2.5 秒刷错误
+      serviceDown.value = true;
+      if (timer !== null) { window.clearInterval(timer); timer = null; }
     }
   } finally {
     statusPending = false;
@@ -269,6 +280,12 @@ function onRectDone(poly: number[][]) {
   tab.value = "zones";
 }
 
+function onGoalPoint(p: { x: number; y: number }) {
+  doneGoal.value = { ...p };
+  drawMode.value = "idle";
+  tab.value = "zones";
+}
+
 function onSelect(uid: string) {
   selectedUid.value = uid;
 }
@@ -296,6 +313,35 @@ function setPlacing(v: boolean) {
 function requestFocus(p: { x: number; y: number } | null) {
   if (!p) return;
   canvasRef.value?.focusOn(Number(p.x), Number(p.y));
+}
+
+/** 保存并退出：区域/地点是即时保存的，所以这里 = 停服务 + 关窗。
+ *  像素修图的改动手动保存要在它自己的窗口点「保存并退出」（本页不掌握那个窗口的状态）。 */
+async function saveAndExit() {
+  if (exiting.value) return;
+  if (!window.confirm(
+    "退出后地图编辑器服务会停止，需要再到管理台点「启动地图编辑器」才能进来。\n" +
+    "（像素修图的改动要在它自己的窗口点「保存并退出」）\n\n确定退出吗？")) return;
+  exiting.value = true;
+  try {
+    const ok = await stopService();
+    if (!ok) {
+      exitNote.value = "停止编辑器服务失败（服务可能仍在运行）：请看后端日志，或回管理台点「停止服务」";
+      return;
+    }
+    closeSelf();
+    exitNote.value = "地图编辑器服务已停止，请手动关闭本标签页";
+    serviceDown.value = true;
+  } finally {
+    exiting.value = false;
+  }
+}
+
+/** 只关窗、保留服务：给"开了两个窗口"兜底。 */
+function closeWindowOnly() {
+  closeSelf();
+  // 关得掉的话这行根本看不见；关不掉（手动开的标签页）时必须给一句话，否则按钮像坏了一样
+  exitNote.value = "若本页没有自动关闭（非脚本打开的标签页无法自关），请手动关闭；编辑器服务未受影响";
 }
 
 function onSelectMap(e: Event) {
@@ -338,6 +384,8 @@ function onSelectMap(e: Event) {
       <label class="chk"><input type="checkbox" v-model="showZones" /> 区域</label>
       <label class="chk"><input type="checkbox" v-model="showPlaces" /> 地点</label>
       <button class="mini" @click="refreshAll()">刷新</button>
+      <button class="mini" :disabled="exiting" @click="saveAndExit">保存并退出</button>
+      <button class="mini" @click="closeWindowOnly">仅关窗（保留服务）</button>
 
       <span class="spacer"></span>
 
@@ -368,6 +416,8 @@ function onSelectMap(e: Event) {
       <span v-if="pose?.note" class="bad">· {{ pose.note }}</span>
       <span v-if="io && !io.available" class="gray">· 地图存储：{{ io.reason }}</span>
       <span v-if="canvasStale" class="bad">· 当前离线，画布显示缓存</span>
+      <span v-if="serviceDown" class="bad">· 地图编辑器服务已停止，请关闭本页</span>
+      <span v-if="exitNote" class="bad">· {{ exitNote }}</span>
       <span v-if="sourcesNote" class="bad">· {{ sourcesNote }}</span>
       <span v-if="fpLine" class="gray">· {{ fpLine }}</span>
       <span v-if="loadNote" class="bad">· {{ loadNote }}</span>
@@ -388,6 +438,7 @@ function onSelectMap(e: Event) {
         :show-places="showPlaces"
         :show-zones="showZones"
         @point="onPoint"
+        @goal-point="onGoalPoint"
         @draft="onDraft"
         @polygon="onPolygonDone"
         @rect="onRectDone"
@@ -423,6 +474,7 @@ function onSelectMap(e: Event) {
             :draft-points="draftPoints"
             :done-polygon="donePolygon"
             :done-rect="doneRect"
+            :done-goal="doneGoal"
             :want-draw-polygon="wantDrawPolygon"
             @select="onSelect"
             @request-focus="requestFocus"

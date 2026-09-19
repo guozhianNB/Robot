@@ -54,6 +54,10 @@ amcl:
 map_server:
   ros__parameters:
     use_sim_time: False
+    # ⚠️ 走 navigation.launch.py 时这行【不生效】：launch 的 map:= 会经 nav2_common 的
+    #    RewrittenYaml 递归覆盖它（2026-09-13 板上实测）。换地图改启动参数即可：
+    #    ~/tools/nav_screen.sh nav <地图名>  /  ros2 launch ... map:=<绝对路径>
+    #    此处仅作直接跑 map_server（不经 launch）时的兜底。
     yaml_filename: "/home/sunrise/Robot/ros2_car/maps/my_map.yaml"
 
 controller_server:

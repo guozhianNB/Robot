@@ -4,16 +4,17 @@
 .dsh-meow/
 # env隐私数据
 .env
+.env.*
 
 # 临时测试文件
 /stm32/control_test/
 /stm32/led_test/
 .real_frame.jpg
-temp.*
 
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
 .tmp/
 temp.*
 
@@ -25,6 +26,8 @@ LLM/data/audit.jsonl
 LLM/data/graph
 LLM/data/chroma
 LLM/data/*.log
+/LLM/vision_mcp/*.log
+/LLM/notice_mcp/*.log
 # 地图源注册表（运行时数据：首启由 ROBOT_IP/MAPS_IO 等环境变量种入，含主机与路径）
 LLM/data/maps_sources.json
 

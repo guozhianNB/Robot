@@ -32,7 +32,7 @@ from . import camera_client as cc
 from . import protocol as P
 
 try:
-    from LLM import log as audit          # 项目审计日志（可选）
+    from LLM.core import log as audit      # 项目审计日志（可选）
 except ImportError:                       # vision/ 独立使用时静默降级
     class _NullAudit:
         @staticmethod

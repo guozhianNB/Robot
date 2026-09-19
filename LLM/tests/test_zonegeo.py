@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """区域几何判定测试（纯函数，无 DB、无 IO、无 ROS）。"""
-from LLM import zonegeo
+from LLM.core import zonegeo
 
 
 def test_point_inside_and_outside_square():

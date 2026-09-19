@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "default": "board",
+  "items": [
+    {
+      "id": "board",
+      "label": "板卡 100.65.82.93",
+      "kind": "ssh",
+      "host": "100.65.82.93",
+      "user": "sunrise",
+      "port": 22,
+      "root": "/home/sunrise/Robot/ros2_car/maps",
+      "key": ""
+    },
+    {
+      "id": "pc",
+      "label": "本机 仓库副本（调试）",
+      "kind": "local",
+      "root": "/home/sunrise/Robot/ros2_car/maps"
+    }
+  ]
+}

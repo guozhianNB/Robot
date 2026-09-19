@@ -28,6 +28,8 @@ setup(
         'console_scripts': [
             'odom_to_tf = robot_bringup.odom_to_tf:main',
             'odom_relay = robot_bringup.odom_relay:main',
+            'scan_filter = robot_bringup.scan_filter:main',
+            'lidar_loc = robot_bringup.lidar_loc:main',
         ],
     },
 )

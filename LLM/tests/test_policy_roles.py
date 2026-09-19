@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-from LLM import policy
+from LLM.agent import policy
+from LLM import conf
+
+# 集体层白名单的唯一真相（用例里三处复用，改策略只改这里）。
+# notify_nurse = "把话传到护士台"：与 robot_stop 同属**呼救**一族，未识别的说话人落到这层时
+# 也必须有求援手段（规格 docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md D5）。
+WARD_TOOLS = ["robot_status", "robot_stop", "notify_nurse"]
+CAR_ACTION_TOOLS = [
+    "robot_move", "robot_turn", "robot_goto_point", "robot_goto_zone", "robot_goto_place",
+]
 
 
 def test_policy_keys_cover_three_roles():
@@ -10,17 +19,18 @@ def test_ward_has_only_safety_tools_and_no_personal_scope():
     p = policy.POLICY_DEFAULTS["ward"]
     assert p["data_scope"] == "none"        # 不注入任何老人档案/私人记忆
     assert p["ward_context"] is True        # 但读得到本病房的集体上下文
-    # 集体层只接"安全 + 只读"：急停（R3 永远允许）+ 状态只读播报（规格 §3.3 矩阵）。
+    # 集体层只接"安全 + 只读"：急停（R3 永远允许）+ 状态只读播报（规格 §3.3 矩阵）
+    # + 喊护士（notify_nurse，R3 的呼救一族）。
     # 未识别的说话人会回落到这一层，所以这里**不能**是空列表。
-    assert p["allowed_tools"] == ["robot_status", "robot_stop"]
+    assert p["allowed_tools"] == WARD_TOOLS
 
 
 def test_role_policy_returns_copy_not_the_shared_table():
     """策略表是模块级共享常量：调用方原地 append 会污染全局白名单（往低权限角色里长工具）。"""
     a, b = policy.role_policy("ward"), policy.role_policy("ward")
     a["allowed_tools"].append("__注入__")
-    assert b["allowed_tools"] == ["robot_status", "robot_stop"]
-    assert policy.POLICY_DEFAULTS["ward"]["allowed_tools"] == ["robot_status", "robot_stop"]
+    assert b["allowed_tools"] == WARD_TOOLS
+    assert policy.POLICY_DEFAULTS["ward"]["allowed_tools"] == WARD_TOOLS
 
 
 def test_elder_reads_self_plus_ward_context():
@@ -28,6 +38,8 @@ def test_elder_reads_self_plus_ward_context():
     assert p["data_scope"] == "self"
     assert p["ward_context"] is True
     assert "robot_stop" in p["allowed_tools"]     # R3：安全动作永远在列
+    assert all(name in p["allowed_tools"] for name in CAR_ACTION_TOOLS)
+    assert not any(name in policy.POLICY_DEFAULTS["ward"]["allowed_tools"] for name in CAR_ACTION_TOOLS)
 
 
 def test_admin_reads_all_without_ward_context():
@@ -47,3 +59,11 @@ def test_unknown_role_falls_back_to_ward():
     assert policy.role_policy("nope") == policy.POLICY_DEFAULTS["ward"]
     assert policy.role_policy(None) == policy.POLICY_DEFAULTS["ward"]
     assert policy.role_policy("") == policy.POLICY_DEFAULTS["ward"]
+
+
+def test_base_prompt_sets_car_control_safety_rules():
+    text = (conf.BASE_DIR / "LLM" / "agent" / "prompt" / "base.md").read_text(encoding="utf-8")
+    assert "优先按地点名或区域名" in text
+    assert "禁止编造坐标" in text
+    assert "如实" in text and "失败" in text
+    assert "robot_stop" in text and "立即" in text

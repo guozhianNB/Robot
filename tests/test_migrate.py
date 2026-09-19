@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """db v3 表 CRUD 测试。"""
-from LLM import db
+from LLM.store import db
 
 
 def test_core_memories_crud(tmp_path, isolated_paths):
@@ -36,7 +36,7 @@ def test_core_memory_update_delete(tmp_path, isolated_paths):
 
 
 def test_migrate_idempotent(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, migrate
+    from LLM.store import db, migrate
     db.init_db()
     # 造旧数据
     db.add_memory("elder_001", "event", "上周感冒", status="confirmed", source="llm")
@@ -51,7 +51,7 @@ def test_migrate_idempotent(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_migrate_dedup_core(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, migrate
+    from LLM.store import db, migrate
     db.init_db()
     db.add_memory("elder_001", "preference", "喜欢京剧", status="confirmed", source="llm")
     monkeypatch.setattr(migrate.ragstore, "add", lambda uid, t, c, **kw: None)
@@ -65,7 +65,7 @@ def test_migrate_dedup_core(tmp_path, isolated_paths, monkeypatch):
 
 
 def test_migrate_dedup_episodic(tmp_path, isolated_paths, monkeypatch):
-    from LLM import db, migrate
+    from LLM.store import db, migrate
     db.init_db()
     db.add_memory("elder_001", "event", "上周感冒", status="confirmed", source="llm")
 

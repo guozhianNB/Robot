@@ -1,4 +1,4 @@
-// 灰度像素 → 颜色分类。口径与后端 LLM/mapserver.py 的 occupancy()/classify_pixel() 一致：
+// 灰度像素 → 颜色分类。口径与后端 LLM/maps/mapserver.py 的 occupancy()/classify_pixel() 一致：
 //   occ = negate ? pixel/255 : 1 - pixel/255      // 默认（negate=0）黑=占用、白=空闲、灰=未知
 //   occ > occupied_thresh → occupied（黑）
 //   occ < free_thresh     → free（白）

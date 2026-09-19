@@ -10,7 +10,8 @@ r"""语音后台线程：编排 采集→VAD→(KWS|流式ASR)→声纹→LLM→
   - 引擎选择：启动时读 settings.asr_provider（local|cloud），重启生效。
   - 应答编排：recognized 后启动应答线程消费 chat_stream——content 增量逐字广播
     chat_partial（前端上屏），完整句切出后按句合成入队播报（句级 TTS，tts_provider=cloud
-    时云端句失败自动回退本地引擎，不中断播报）；老人插话打断 = sink.stop() + _abort 置位
+    时云端句失败自动回退本地引擎，不中断播报）；**reasoning（思维链）只广播 chat_reasoning
+    上屏，绝不进分句缓冲与合成**；老人插话打断 = sink.stop() + _abort 置位
     （仅播放期 barge-in 语义），应答线程停止后续合成/入队；chat_new 与 post_turn 在
     整段流收尾后发（旧 _speak 整段合成已删，改由 _consume_reply/_answer 编排）。
   - 轮次代数防双线程重叠：_start_answer 每轮 self._turn += 1（int 原子读写）抢占"最新轮"
@@ -31,7 +32,8 @@ import time
 
 import numpy as np
 
-from .. import db, log as audit
+from ..store import db
+from ..core import log as audit
 from . import config
 from . import audio, vad as vad_mod, kws as kws_mod, asr as asr_mod, tts as tts_mod
 from . import speaker as spk_mod, identity as id_mod, session as session_mod
@@ -80,7 +82,7 @@ class VoiceWorker(threading.Thread):
         self.sub_status = {}
         self.current_uid = None
         # 手动锁定用户（规格 D11）——**兼容属性，不参与任何判定**：锁定语义的唯一真相是
-        # 会话层 `LLM/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
+        # 会话层 `LLM/agent/session.py`（`principal["locked"]` + 锁定时的主体 uid）。本镜像只在
         # 语音可用时被 `voice_api.set_session_uid` 同步，语音降级/管理台登出后会永久粘住，
         # 拿它判定就等于"陈旧的锁定一直带下去、只能重启恢复"。判定处一律读会话层。
         self.locked_uid = None
@@ -350,7 +352,7 @@ class VoiceWorker(threading.Thread):
         * **没认出来 → 主体不动**（集体层已由位置/手动维持，这里不许回写、更不许把旧主体
           当成"刚认出来的"——那会把位置自动切换的结果回退掉）。
 
-        注意：这里引的是**顶层角色会话层** `LLM/session.py`（≠ `LLM.voice.session`
+        注意：这里引的是**顶层角色会话层** `LLM/agent/session.py`（≠ `LLM.voice.session`
         语音状态机，后者在本模块 import 为 session_mod），故用 role_session 别名。
 
         **锁定语义读会话层**（不读 `self.locked_uid` 镜像）：镜像只在语音可用时被
@@ -362,7 +364,7 @@ class VoiceWorker(threading.Thread):
         退回上一主体（本方法不改任何内存态）。
         """
         try:
-            from LLM import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
+            from ..agent import session as role_session      # 顶层角色会话层（≠ LLM.voice.session）
             principal = role_session.get_principal("kiosk")
             if principal["role"] == "admin":
                 return
@@ -377,7 +379,7 @@ class VoiceWorker(threading.Thread):
         self.session.note_speech()
         audit.log("voice_asr", text=text[:200])
 
-        from LLM import session as role_session
+        from ..agent import session as role_session
         # 读会话层（= 读库）异常（`database is locked` 等）不许从 try 之外抛穿到 `run()` 的
         # except —— 那会 `_reconnect()` 掉这一整句：没有应答、没有 TTS。出问题只记审计，
         # 并用"上一次已知主体"（取 prev 失败时用空主体）继续把这一句答完。
@@ -485,6 +487,7 @@ class VoiceWorker(threading.Thread):
 
     def _consume_reply(self, uid, user_text, settings, turn):
         """同步消费 chat_stream 事件流（_answer 应答线程内调用；单测直接调用）：
+        reasoning → 广播 chat_reasoning（思维链上屏，**永不合成/播报**）；
         content → 广播 chat_partial(逐字上屏) → 分句缓冲 → 完整句合成入队（仅 speak 模式）；
         done → flush 尾句。返回完整 assistant 文本。
         turn = 本轮次代数：被新轮取代（self._turn != turn）或 _abort 置位时，检查点
@@ -562,7 +565,16 @@ class VoiceWorker(threading.Thread):
                 if self._abort.is_set() or self._turn != turn:
                     break                 # 打断 / 被新轮取代：停止后续消费与分句
                 t = ev.get("type")
-                if t == "content":
+                if t == "reasoning":
+                    # 思维链只上屏、**绝不入 TTS**（规格 2026-09-17-thinking-mode-switch-design.md D3）：
+                    # 走 chat_reasoning 总线事件给 kiosk 展示思考过程，不进分句缓冲、不调合成。
+                    delta = ev.get("content") or ""
+                    if delta:
+                        self._publish(
+                            "chat_reasoning",
+                            uid=settings.get("_voice_uid") or self.current_uid or "elder_001",
+                            delta=delta)
+                elif t == "content":
                     delta = ev.get("content") or ""
                     if delta:
                         if publish_text:

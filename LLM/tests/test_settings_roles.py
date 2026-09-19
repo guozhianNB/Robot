@@ -16,7 +16,7 @@ def test_role_settings_have_defaults():
 
 def test_new_float_setting_roundtrips_as_float():
     """新增的 float 键要能真的存进去并读回 float（任务 2 已给 get_settings 补 float 分支）。"""
-    from LLM import db
+    from LLM.store import db
     import os, tempfile
     tmp = tempfile.mkdtemp()
     old = db.DB_PATH

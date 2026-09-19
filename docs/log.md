@@ -1480,3 +1480,591 @@ MSYS bash 起不来：`couldn't create signal pipe, Win32 error 5`）；钩子�
 "找 python → 调它 → 按退出码决定"，请在**你自己的普通终端**里首次提交时确认一次。
 `speech_0.wav` 的来源无法从仓库判定（没有任何脚本写它，只有一个 VAD 测试脚本读它）——
 若是自己录的请按生物特征对待。
+## 2026-09-15 · 地图编辑器改为独立进程按需启动（`LLM.mapeditor_server:app` :8010 + admin 启停页签）
+
+- 规格：`docs/superpowers/specs/2026-09-15-map-editor-on-demand-service-design.md`（9 任务计划 `docs/superpowers/plans/2026-09-15-map-editor-on-demand-service.md`，台账见规格 §十一 / 计划附录 C）。**目标**：把地图编辑器（像素修图 + 划线/标点）从主后端拆成**独立进程**，默认不跑，按需由 admin 拉起、用完在编辑器里「保存并退出」停掉——主后端因此**可杀、可隔离、接口面缩小**（被强杀的编辑器不再拖住陪护功能）。
+
+### 后端（`LLM/`，新增 3 个模块）
+
+- `LLM/mapapi.py`（新，1031 行）：编辑器专属后端 = 9 个 pydantic 模型 + **34 条路由**（`@router.`）+ 5 个助手 + `mount_editor(app)`；**不 import `server`**，可被任意 app 复用。搬迁是**逐字**的（对 `HEAD:LLM/server.py` 原两段做逐字比对：`37876 == 37876`、`IDENTICAL: True`，唯一差异是 34 处 `@app.` → `@router.`）。
+- `LLM/mapeditor_server.py`（新）：独立进程薄壳 app —— 建 app、挂 CORS、`include_router(mapapi.router)`、`mount_editor`、`GET /` → `/mapeditor/` 跳转，外加两条服务自身接口 `GET /api/mapeditor/service`（状态）与 `POST /api/mapeditor/service/stop`（**自停**，先回响应、0.5s 后退出）。`_delayed_exit` 带 `pytest` 护栏（测试进程绝不真退）。
+- `LLM/mapctl.py`（新，主后端侧，**纯 stdlib**）：`status()/start()/stop()/reset_for_test()` + **3 条仅管理员接口** `GET /api/mapeditor/service` ｜ `POST /api/mapeditor/service/start` ｜ `POST /api/mapeditor/service/stop`（`X-Surface: admin`，非管理员 **403**）。probe-first：8010 已有东西在应答 → 报 `source="external"`、**不重复拉起**（这是"主后端被 kill -9 后留下的孤儿"能被识别与一键收掉的关键）。`stop()` 同时挂在 `lifespan` 收尾与 `/api/system/shutdown`，**主后端退出会把编辑器一起带走**。
+- `LLM/server.py`：**瘦身 995 行**（2210 → 1215）；顶层 import 改为 `from . import locator, maptags`（**保留**：`locator` 管病房位置自动切换、`maptags` 管 `POST /api/wards/{uid}/zone` 的「记录当前房间为病房区域」）；删掉编辑器模型/路由/`/mapeditor` 静态挂载；接上 `mapctl.router`。
+- `LLM/conf.py`：`MAP_EDITOR_PORT = 8010`、`MAP_EDITOR_START_TIMEOUT = 20.0`（**不加 `.env` 覆盖**，端口冲突时 `start` 明确报错并提示改 `conf.py`）。
+
+### 前端（admin 启停 + 编辑器两个「退出」）
+
+- `packages/shared`：`src/api/mapService.ts`（3 个客户端函数，全部透传 `X-Surface`）+ 单测 3 例。
+- `packages/admin`：新 `pages/MapEditorPage.vue`（状态卡 + 启动/停止 + 5 秒轮询 + `onUnmounted` 清定时器）；`App.vue` 加「地图编辑器」页签（共 **11** 个）；`WardsPage.vue` 两处硬链 `/mapeditor/` 改为 `goto-mapeditor` 事件（主后端已不挂该路径，硬链会 404）。
+- `packages/mapeditor`：`src/lib/service.ts`（同源自停 + 关窗 + 掉线探测）；主界面加「保存并退出」/「仅关窗（保留服务）」+ 服务掉线红条；`public/pixel-netio.js`（像素修图页）加「保存并退出」——**只有后端返回 `ok:true` 才停服务 + 关窗**，保存失败/409/空提交/网络异常一律只清退出意图，共 **17 处**清位出口（比计划多 5 处：`flushDownloads` 的 catch、`saveToServer` 的结果异常/`fetch` 异常、上游"未加载 yaml/pgm 只 alert"路径）。
+
+### 验证
+
+- 后端：`pytest LLM/tests tests -q` → **4 failed / 455 passed / 1 skipped**，判据是**失败集合不变**——4 个失败＝`test_modules_status.py::test_modules_status_shape` + `test_unlock_switch.py`×3（**既有红态，本批次一例未修**）；基线里那条环境相关的 `tests/test_vision.py`（未装 opencv / 取帧时序）本轮为绿（**红的具体是哪一条会飘**，不计入判据）。新增测试全绿：`test_map_service_split.py` 6 + `test_mapeditor_server.py` 6 + `test_mapctl.py` 11 + `tests/test_mapeditor.py` 50 + conftest 护栏回归用例。
+- 前端：shared vitest **19 passed**（基线 16 + 新 3）；mapeditor `pnpm test:startup` → `mapeditor startup contract: ok`（含 3 条新契约断言，变异验证证明断言非空转）；三个 admin SFC 编译 OK；像素修图页用一次性 DOM-stub 脚手架跑 **12/12 PASS**（删掉那 5 处补丁的反向对照 **10/12**，证明补丁承重）。
+- 本机真实进程冒烟：`uvicorn LLM.mapeditor_server:app --port 8011` → `GET /api/mapeditor/service` 200、`GET /mapeditor/` 200、`POST .../service/stop` 200 后端口连接被拒（进程真退）。
+
+### 本批次修掉的 3 个真缺陷（都不是"新功能没写好"，而是踩到了既有代码/测试的雷）
+
+1. **搬走模块级 `from fastapi.responses import Response` 打断 `/api/vision/snapshot`**（相机可用时 `NameError`→500）→ 改函数内 import + 补确定性回归测试（monkeypatch `get_jpeg`，不依赖摄像头）。
+2. **跑既有测试会真停掉本机正在跑的编辑器服务**（`tests/test_modules_status.py` 跑完整 `lifespan` → 收尾 `mapctl.stop()` 走 external 分支 → 探到真 8010 就 POST 自停）→ `tests/conftest.py` 加 **autouse 护栏** + 回归用例（RED 实证真打到 `.../service/stop`，GREEN 零调用）。
+3. **像素修图页退出意图泄漏**：计划只列 12 处「没保存成功」出口，实测 17 处——残留意图会让**下一次普通保存成功**误停服务 + 误关窗（反向对照实验 10/12 vs 12/12 证实）。
+
+### 已知限制与未做（**用户侧/真机项**）
+
+- **真实浏览器链路未验**：admin 点「启动地图编辑器」→ 弹窗打开 → 划线/标点 →「保存并退出」→ 自动关窗，这条 `window.open` → `window.close()` 链路只有真实浏览器能验（本机无浏览器；任务 5 的 `window.open` 已被改成"同步栈里先开 `about:blank` 再导航"以规避弹窗拦截）。
+- **`cd frontend && pnpm -r build` 三包构建 + 前端全量单测未在本机跑**（沙箱 esbuild `spawn EPERM`）；mapeditor 只跑了 `pnpm build:sandbox` 的等价产物（与 `vite build` 逐字节相同）。
+- **真机联动未验**：`MAPS_IO=ssh` 下编辑器经 SSH 读写板卡 `ros2_car/maps/` 的地图（本轮**不改地图 IO 口径**）；仍需板卡可达（`ssh sunrise@100.65.82.93`）。
+- **本轮明确不做**：新的全量一键 `start.py`（前后端 + ROS）、编辑器服务登录鉴权（与拆分前 `/mapeditor` 在 8000 上同样无鉴权，绑内网/本机）、"编辑器空闲 N 分钟自动退出"（YAGNI）。
+- **文档同步**：`AGENTS.md`（快速上手·前端 / 后端运行位置 / API 端点节的编辑器归属 / 地图修图入口）、规格 `2026-09-14-map-editor-design.md` 顶部口径表（追加**第 8 条**）、`start_UI.py`（定位改为**纯 UI 启动器**：`后端 + kiosk + admin`，**不含**地图编辑器；启动完成后打印一行"按需启动"提示）本轮已做；计划文档另追加「附录 C：计划回填与偏差」（让后来读者不被旧文本误导）。
+
+### 未纳入本条的并行项
+
+- `LLM/vision_mcp/`、`frontend/temp-esbuild-register.mjs`：本批次的未跟踪在途文件，**未提交**（提交一律带 pathspec）。
+
+---
+
+## 2026-09-17 · Qwen 视觉 MCP `see_what`
+
+### 做了什么
+
+- 新增独立 Python stdio MCP 服务 `LLM/vision_mcp/see_server.py`，注册工具 `see_what`；业务层支持摄像头当前帧和受限本地 JPEG/PNG/WebP 图片，并调用阿里云百炼 Qwen 视觉模型返回文字回答。
+- 摄像头通过 `vision.camera_server` 共享服务取帧，不直接占用摄像头硬件；本地图片仅允许位于 `VISION_SEE_IMAGE_DIRS` 白名单目录内，默认 `LLM/data/vision_inbox`。
+- `LLM/conf.py` 注册 vision MCP 子进程并继承 `DASHSCOPE_API_KEY`、`VISION_HOST`、`VISION_PORT`；后端启动时 `mcp_enabled` 关闭则不建连接，运行中关闭后拒绝工具调用，后端退出时清理 MCP 子进程。经本仓库后端策略，`elder`/`admin` 可见，`ward` 集体层禁用；独立 stdio 进程本身无角色鉴权。
+- README 补充了 `see_what` 输入示例、启动方式、Qwen 配置、阿里云上传隐私边界和缺依赖/摄像头/云端失败时的降级行为。
+
+### 验证状态
+
+- 相关回归（含视觉 MCP、权限、MCP 启动、摄像头和聊天工具日志）：193 passed、9 skipped、1 warning。
+- `import LLM.server` 成功；真实 MCP stdio `initialize`/`list_tools` 成功，`see_what` schema 中 `image`/`prompt` 为必填，`channel` 默认值为 `1`。
+- 配置有效 `DASHSCOPE_API_KEY` 后，使用 `linorobot2/docs/assets/linorobot2_launchfiles.png` 完成文件图片链路的真实 Qwen `qwen-vl-plus` 调用：返回 `ok: true`、`image/png`、`56120 bytes`，耗时约 `1375 ms`。审计和服务日志不记录图片、base64、回答正文或 prompt。
+- 启动 `vision.camera_server --mock` 后，通过真实 MCP stdio `call_tool` 调用 `see_what(image="camera", channel=2)`：共享服务产出合成 JPEG，阿里云接口返回 HTTP 200，结果为 `ok: true`、`source: camera`、`model: qwen-vl-plus`。本次只上传合成测试画面；真实硬件摄像头画面仍未做云端验收。
+- 首次沙箱网络调用遇到 `APIConnectionError`；获批联网后文件图片与 mock 摄像头图片调用均成功。验收日志未写入密钥、prompt 或模型回答正文。
+
+---
+
+## 2026-09-17 · LLM 后端按功能重新分层（29 个模块从包根归位到 core / store / agent / maps / voice）
+
+### 做了什么
+
+- **问题**：`LLM/` 根目录平铺了 29 个 `.py`（`server.py` 54KB、`db.py` 56KB、`mapapi.py` 46KB…），再加上 `prompt.md` 与 `prompt/` 目录同名混淆——"哪个模块属于哪一块"只能靠逐个读文件判断。
+- **分层结果**（依赖单向 `core → store → agent → server`，包根只留 2 个入口 + `conf.py`）：
+  - `core/` — `log`(审计) `bus`(SSE) `vectors`(轻量向量) `zonegeo`(几何)：零业务、零外部依赖
+  - `store/` — `db` `ragstore` `graph` `embed` `migrate`：一切"数据落在哪、怎么读写"
+  - `agent/` — `chat` `memory` `tools` `mcp_client` `reminder` `session` `policy` + `prompt/`
+  - `maps/` — `mapstore` `mapsources` `maptags` `mapserver` `locator` `roslink` + `mapapi` `mapctl`
+  - `voice/` — 原 `voice_api.py` 并入既有 voice 包
+- **`conf.py` 特意留在包根**：它的 `BASE_DIR = Path(__file__).resolve().parent.parent` 是 `.env`/`data/` 的定位锚点，移动它要同步改 3 处 `__file__` 推导，收益不抵风险。`server.py` / `mapeditor_server.py` 同理留根——**两个启动命令 `LLM.server:app`、`LLM.mapeditor_server:app` 一个字没变**。
+- **`prompt.md` → `agent/prompt/base.md`**：与角色片段 `ward/elder/admin.md` 同目录，消除"`prompt.md` vs `prompt/`"的歧义（`conf.PROMPT_FILE` + `policy.PROMPT_DIR` 各改 1 处）。
+- 迁移用 `git mv` 完成（保留重命名历史），import 重写脚本化（172 + 70 + 3 行，全部 dry-run 审查后落盘）。
+
+### 踩到的两个坑（都已在代码里留注释）
+
+- **`tools.py` 的 `__package__` 拼接**：自动加载本地工具原写 `f"{__package__}.tool.{name}"`；模块从包根搬进 `LLM/agent/` 后 `__package__` 变成 `"LLM.agent"`，拼出不存在的 `LLM.agent.tool.*` → 改用 `f"{_tool_pkg.__name__}.{name}"`（即 `LLM.tool.*`）。
+- **`from .. import db` 被漏改**：`voice/worker.py` 原本就用两点相对导入（两层包内合法），重写脚本最初只处理单点形态，结果 `voice_api` 整条链静默降级为"缺少依赖：cannot import name 'db' from 'LLM'"（`_VOICE_AVAILABLE=False`）。**这类"看起来像已迁移"的两点写法要单独扫**。
+
+### 验证状态
+
+- `pytest tests LLM/tests --collect-only -q` → **542 tests collected, 0 errors**（所有测试模块与新结构的 import 全部对上，这是本次重构最可能的破坏面）。
+- 不依赖 `tmp_path` 的纯逻辑子集实跑：**39 passed, 0 failed**。
+- 手动冒烟：`LLM.server`（80 routes）/ `LLM.mapeditor_server`（9 routes）/ `LLM.maps.mapapi`（34 routes）import 干净；`conf.PROMPT_FILE` 指向 `agent/prompt/base.md` 且文件存在；`chat._load_prompt_base()` 返回 836 字符、`_load_role_prompt('ward')` 返回 289 字符；`LLM.voice.voice_api` `_VOICE_AVAILABLE=True`（0 缺失依赖）；`vision.webbridge` 的审计桥接到真实 `LLM.core.log`（`vision_mcp` 那处**漏了**，见下节收尾修复）。
+- **`db.get_settings()` 实跑通过**：该路径会触发 `store/db.py` 里对 `agent.tools.TOOL_DEFAULTS` 的函数内延迟导入（全仓唯一的跨层循环出口），返回 34 个默认 key。
+- **环境限制（与本次改动无关）**：本机沙箱下 python 子进程对 pytest 自建 basetemp 的目录遍历被拒（`PermissionError WinError 5`），故依赖 `tmp_path` 的用例（约 500 例）本轮**未能实跑**；这些用例在本环境**重构前同样失败**（`sqlite3.OperationalError: unable to open database file`）。建议在无该限制的终端补跑一次全量。
+
+### 文档同步
+
+- `AGENTS.md`：新增「LLM/ 分层目录树 + 分层铁律（下层不 import 上层）」；架构与模块 24 条全部改到新路径；关键约定 §1（三件套 → `store/db.py`）、§2（`core/log.py`）、§4（`agent/chat.py` / `core/bus.py`）、§6（跨层相对导入写法）；已知坑补「`conf.py` 位置不可动」。
+- 活跃测试与 `vision/webbridge.py` 的引用同步更新；`docs/superpowers/plans|specs`、`.superpowers/**` 等历史归档**按原样保留**（它们记录的是当时的事实，不做回改）。
+
+### 收尾修复（子代理独立审查发现，同日补）
+
+派了一个独立子代理做只读的"残留引用"复查（全仓 grep + 实跑）。它发现一处**真会坏、且本轮现有验证手段抓不到**的遗漏：
+
+- **`LLM/vision_mcp/vision_client.py::_audit()`** 写的是 `from LLM import log as audit`（旧路径）。它包在 `try/except Exception: pass` 里 —— 失败被静默吞掉，后果是**视觉 MCP 的 `vision_see` 审计从此不再落盘、且不报任何错**。测试抓不到的原因：`tests/test_vision_mcp.py` 三处用例都直接 monkeypatch 掉了 `_audit` 本身，从未走过真实 log 桥；而 542 例 collection 与 import 冒烟都只覆盖模块顶层，碰不到函数体内的延迟导入。**已修**为 `from LLM.core import log as audit`，并用探针实证：monkeypatch `LLM.core.log.log` 后 `vc._audit(probe=1)` 收到 `(('vision_see',), {'probe': 1})`（修复前为空）。
+  → **遗留建议**：照 `tests/test_vision.py` 里 webbridge 那条审计桥用例的写法，给 `_audit` 补一条"真桥到 `LLM.core.log`"的用例，否则同类遗漏会再发生。**本轮未补**：`tests/test_vision_mcp.py` 是并行在途文件，避免动它。
+- **文档/注释/文案里的旧路径 18 处**一并清掉（不影响运行，但会误导后来读者）：后端 docstring 9 处（`mapeditor_server.py` / `maps/mapctl.py` / `maps/locator.py` / `vision_mcp/see_server.py`×2 / `car_mcp/car_server.py` / `agent/chat.py` / `agent/mcp_client.py` / `voice/worker.py`×2）、`tests/conftest.py` 注释、前端 3 处（`admin/src/pages/RolesPage.vue` 的**用户可见文案**、`mapeditor/src/lib/{coords,colorize}.ts`）、`requirement.txt` 注释、`limit.md` 权限矩阵的"事实来源"行、`docs/maibot参考/记忆系统差距分析.md`。
+- **风格统一**：`voice/worker.py` 两处函数内延迟导入原为绝对形式 `from LLM.agent import session`，改为 `from ..agent import session`，与关键约定 §6 一致。
+- **复查结论**：25 个新路径全部可导入、25 个旧路径全部不可导入；`conf.py` 三处 `__file__` 推导、`tools.py` 的 `pkgutil` 自动加载、`PROMPT_FILE`/`PROMPT_DIR` 均落位正确；`stm32/`、`ros2_car/`、`scripts/`、`vision/`、`UI(old)/`、根目录文档**无残留**。改完后重跑 `--collect-only` 仍是 **542 collected / 0 errors**。
+- **按原样保留**：`docs/log.md` ≤09-15 旧条目里的路径是"当日事实"（日记体），与 `docs/superpowers/plans|specs` 同理，不做回改。仅提示本文件里两条命令今天照抄会失败：`306` 的 `python -c "import LLM.tools"`、`492` 的 `py_compile … LLM\voice_api.py`。
+
+## 2026-09-17（续）· 思考档位手动切换 + 思维链上屏（不进 TTS）
+
+**依据：** 用户需求「现在的 llm 对话是默认快速不思考的。我希望你能在前端增加一个选择按钮，手动切换思考模式。但敏感词自动加深思考功能不改。当手选思考强度为不思考时触发敏感问题思考功能，以后者确定的思考深度为准。对话中要展示思维链，注意不要让思维链进入 tts」；规格 `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md`。
+
+### 改了什么
+
+| 文件 | 内容 |
+|------|------|
+| `LLM/agent/chat.py` | 新增 `_apply_thinking_mode()` / `_resolve_thinking_mode()`；`chat_stream` 的 `meta` 事件带 `router.mode` |
+| `LLM/conf.py` | `DEFAULT_SETTINGS["thinking_mode"] = "auto"`（非特权键，kiosk 也能改） |
+| `LLM/voice/voice_api.py` | 语音轮次调 `chat_stream` 时第 5 参数由 `"auto"` 改 `""`——**不改这一处，用户在界面上选的档位对语音完全无效** |
+| `LLM/voice/worker.py` | 新增 `reasoning` → 总线 `chat_reasoning` 广播（思维链上屏）；`content` 才分句合成 |
+| `LLM/server.py` | `chat_route` 把 content 喂 TTS 改显式分支 + 注释锁边界 |
+| `frontend/packages/shared/src/thinking.ts`（新） | `ThinkingMode` / `nextThinkingMode` / `normalizeThinkingMode` / `thinkingModeLabel` / `THINKING_MODE_HINT` |
+| `frontend/packages/shared/src/events.ts` | `ChatReasoningEvent` + `KNOWN_TYPES` 同步 |
+| `frontend/packages/admin/src/pages/ChatPage.vue` | 工具栏「🧠 思考：自动/强制/关闭」循环按钮（落 `settings.thinking_mode`，5s 轮询同步）+ 气泡内可折叠「💭 思考过程」 |
+| `frontend/packages/kiosk/src/App.vue` / `components/ChatArea.vue` / `components/SettingsSheet.vue` | 底部一键轮换按钮 + 设置弹层三档单选 + 对话区思考块（默认展开可收起） |
+
+### 关键决策
+
+- **`off` 关不掉安全网**：`on` 一律深思；`off` 只压制非敏感问题，命中 `THINKING_KEYWORDS`/情绪词/LLM 预判的问题**照旧加深**，且 `method` 如实上报 `keyword|emotion|llm`（reason 前缀「敏感话题已自动加深：」），绝不谎报成 `manual`。`auto` 行为不变。
+- **档位落地位置**：请求体显式值 > `settings.thinking_mode` > `auto`；只有**空串/缺省**才回读 settings。语音轮次不过前端，所以 `voice_api._stream_fn` 传空串（这一条有专门用例锁死）。
+- **思维链三不进**：不进 TTS（两条链路都只对 `content` 合成）、不进 DB（`append_history` 只写 assistant 正文，历史回读不重播思考）、不进语音播报文字广播。
+- 不加"思考强度档位"（`reasoning_effort` 仍固定 high）；不改 `route_thinking` 的判定逻辑一个字。
+
+### 验证
+
+- `pytest LLM/tests`：**4 failed, 166 passed, 135 errors** vs 基线（stash 后重跑）**4 failed, 150 passed, 135 errors** —— 失败集合完全一致（`test_policy_tools`×2、`test_settings_roles::test_new_float_setting_roundtrips_as_float`、`test_worker_events::test_speech_publishes_recognized`，均为既有的跨文件顺序污染/环境相关红态），新增 16 例全绿。135 errors 是本机沙箱下 `tmp_path` 不可建的既有环境限制。
+- 新增 `LLM/tests/test_thinking_mode.py`（档位优先级/安全网/meta/端到端）与 `test_worker_events.py::test_reasoning_is_shown_but_never_synthesized`（思维链广播了、但合成的字符串里一个字都没有）。
+- `pnpm -r test`：4 文件 24 例全绿（含新增 `shared/tests/thinking.test.ts` 5 例）；`pnpm --filter admin build`、`pnpm --filter kiosk build` 均成功，产物已由后端 8000 静态托管。
+- **未验**：真机/浏览器端到端（按按钮→敏感问题仍加深、语音不念思考过程）需人工；`vue-tsc` 在本机装不起来（`MODULE_NOT_FOUND`，本次改动前就坏的），故 Vue 模板类型未经 tsc 校验。
+
+### 2026-09-17（续二）· 修「选了强制也不思考」+ 思考档位改成五档阶梯
+
+**起因：** 用户实测反馈「强制模式下 llm 还是不思考啊。还有，我需要实现的样子是除了自动模式，还有强制"不思考、轻度、中度、重度"」。
+
+**根因（真 bug，已实测定位）：** 原实现把 `{"thinking": {...}, "reasoning_effort": "high"}` 整个塞进 `extra_body`。DeepSeek 只认 `extra_body.thinking`，**`reasoning_effort` 必须是顶层参数**（openai 3.3.1 的 `Completions.create` 签名里有这个形参），塞进 extra_body 会被当未知字段静默忽略——于是「开思考」生效、强度永远停在默认档，叠加当时前端根本不渲染 `reasoning` 事件，表现就是「强制也不思考」。修法：`extra_body` 只放 thinking 开关，`reasoning_effort` 走顶层形参（`_thinking_extra()` + 调用点）。
+
+**改成五档：** `auto` 自动 / `none` 不思考 / `low` 轻度 / `high` 中度 / `max` 重度。判定返回**强度**而不是布尔：
+- `low/high/max` → 该强度、`method=manual`；
+- `none` → 只压制非敏感问题，敏感词/情绪/LLM 预判命中照旧按 `high` 加深（`method` 仍如实报 `keyword|emotion|llm`）；
+- `auto` → 照思考路由；旧值 `on→high`、`off→none` 做别名，不迁移数据。
+
+**实测数据（2026-09-17，本机 key，模型 `deepseek-v4-flash`）：** 同一道工程题，思维链长度 `low≈150-450` / `high≈200` / `max≈353-1939` 字，三档确有区别；`ultra` 直接 **400**（`Failed to deserialize the JSON body`），官方文档里 `minimal/medium/xhigh/ultra` 均归并到 low/high/max。可用模型：`deepseek-flash`、`deepseek-v4-pro`。生产代码端到端复验（`mode=none/low/max` → reasoning `0/445/1939` 字）通过。
+
+**顺手补的兜底：** 思考档位下思维链也吃 `max_tokens`，实测敏感问题在 `max` 档出现「reasoning 有、`content` 全空」→ 老人一个字都听不到。故 `chat_stream` 加一次降级：本轮没正文就关思考重答一次（审计 `thinking_empty_fallback`，只降一次）。
+
+**前端：** admin 工具栏改成五档下拉；kiosk 底部大按钮点开五档菜单 + 设置弹层五档单选；`shared/thinking.ts` 的 `ThinkingMode` 扩到五档并兼容 `on/off`。
+
+**验证：** `pytest LLM/tests` **4 failed / 173 passed / 135 errors** vs 基线 **4 failed / 150 passed / 135 errors**（失败集合完全一致，全是既有红态）；`test_thinking_mode.py` 22 例全绿；`pnpm -r test` 25 例全绿；admin/kiosk 构建通过。
+**生效前提：** 后端改动需**重启 uvicorn**（当前 8000 上的进程跑的还是旧代码），前端需**硬刷新**（Ctrl+F5）——这正是用户上一轮「按了强制还是不思考」的另一个原因：前台 bundle 与后台进程都还是旧的。
+
+### 2026-09-18（续）· 小车 LLM 向护士后台传达信息：MCP 工具 `notify_nurse`
+
+**起因：** 用户「制作一个 mcp 工具，让小车 llm 能够向护士后台推送传达信息」。现状核查发现这**不是新需求缺口，而是人设红线早就承诺、却没有工具兑现**：`LLM/agent/prompt/base.md:36` 写着危险信号要「明确说出『我这就去通知护士』」，`elder.md:4` 写着「危险信号先安抚再叫护士」，需求文档模块 11 也要求「我帮您问护士，并把问题转达」——但模型手上没有任何工具能真的通知护士（通知只能来自 kiosk SOS 按钮、`reminder._escalate` 超时、外部 POST，**对话链路一条都进不去**），它只能说、不能做。
+
+**方案（用户拍板 A）：** 新建 MCP 子进程 `LLM/notice_mcp/`（`notice_client.py` = 纯 stdlib 业务层，可脱离 MCP 单测；`notice_server.py` = MCP 2.0 注册层），工具 `notify_nurse(message, level=info|warning|critical, uid="")`，HTTP 投递到免鉴权投递口 `POST /api/notifications`（通知中心规格 D4）→ `notify.ingest()` **唯一写入口** → 归一化/60s 去重合并/审计/`bus.publish` 广播全在，护士台 5 秒内弹卡。服务端固定 `source="cart"`（对上护士台「小车」筛选页签）、`type="message"`。
+
+**两个被否的方案与原因：** ① 本地工具 `LLM/tool/*.py` 直调 `notify.ingest`——不是 MCP、只在后端进程内可用；② 子进程直写 SQLite——绕过去向重复合并/审计/广播，护士台要等 30s 轮询才有卡，且违反"notify 是唯一写入口"。
+
+**"子进程回调后端"的自环裁定（D3）：** `vision_client.py` 里有一条"刻意不走后端 HTTP，那会形成自环"的既有评注，本设计**不违反**它——识图有本地可用路径（vision 包），绕后端纯属自找麻烦；而通知的真相**只能**由后端进程内的 `notify.ingest` 产出（SSE 总线是进程内的，子进程 publish 没有订阅者），走 HTTP 反而是唯一不丢实时性的路。安全边界：请求只发生在**工具调用瞬间**（那时后端必然在监听）；对话流是 sync 生成器交 Starlette 线程池（`server.py::chat_route`）跑的，**不占事件循环**，不会自锁；**启动不做任何网络探测**（后端重启期间工具不失踪，只在调用时返回 `ok:false`）。
+
+**接线（3 处既有文件最小插行）：** `conf.NOTICE_BACKEND_URL`（env 可覆盖，默认 `http://127.0.0.1:8000`，跨机部署零改动）+ `MCP_SERVERS["notice"]`（`command=sys.executable`、`roles=["elder","ward","admin"]`）；`policy.py` 把 `notify_nurse` 加进 ward/elder 白名单（admin 是 `None` 不裁剪）——**ward 也给**：声纹识别失败会 fail-closed 落到集体层，那里堵死等于"老人求助喊不出来"（R3 精神），代价是未识别的说话人也能刷护士台（60s 去重兜底），不要就把两处的 ward 那条删掉。**隐私**：闸门拒绝时的审计参数脱敏（`tools.py::_audit_args` 新增分支，只留 `{level, has_uid}`，不留 `message` 原文）。
+
+**验证：** 新增 `LLM/tests/test_notice_mcp.py` 31 例（HTTP 桩走 127.0.0.1 随机端口，**不碰 8000、不起 uvicorn**）；`pytest LLM/tests` **4 failed / 233 passed / 135 errors** vs 基线（`git worktree` 于 `1bad0c2` 独立重跑）**4 failed / 199 passed / 135 errors** —— 失败集合逐条一致（`test_policy_tools`×2、`test_settings_roles`、`test_worker_events`，均为既有的跨文件 DB_PATH 顺序污染/环境红态），净增 34 例全绿。规格里写的 `notice_client.available()` 未实现（没有"本地依赖缺失"可判，启动又不许探网），改为 `backend_url()/endpoint()` 两个调试入口。
+
+**独立审查子代理 + 修复轮（2026-09-18，同批）：** 裁定"需修复后通过"，两条必修 + 六条建议全部落地。
+- **M1（安全相关，必修）：合并语义会静默吞掉"同分钟内第二条不同的事"。** 去重键只有 `(source,type,uid)`，而新工具的 `uid` 通常为空 ⇒ **所有小车消息**在 60s 内塌成一条，且合并只 `count+1`、保留最早那条的正文与级别；实时广播却用新正文 ⇒ 护士台 ≤30s 后被列表轮询覆盖回最早那条，**critical 计数不涨、重开页面不再蜂鸣**（「张爷爷想喝水」吞掉「李奶奶摔倒了」）。**已修根因**（跨批次，共 3 处后端 + 3 条用例）：`db.find_unacked_notification` 合并键加 `body`；`db.bump_notification` 支持**只升不降**地提级别（`notify._higher_level` 算 max，级别词表留在 agent 层）；`notify.ingest` 合并时**广播与库里那一行对齐**。护士台规格 D5/§4.2 同步修订（前端一行未动）。**对 `/api/alarm`、`reminder._escalate` 这类"同一次事件重复上报"（正文相同）无行为变化**。
+- **M2（必修）：规格 §7 的"调用记录"没实现。** 已补：每次 `notify_nurse` 调用写一行 `notice_mcp.log`（`level/has_uid/ok/deduped/id`，**不记 message 原文**），异常分支也留痕（带异常文本）。
+- **建议项**：`level` 归一改为大小写不敏感 + 近义词**往上归**（`Critical/high/severe/urgent→critical`，`medium→warning`）——原实现把 `Critical` 静默降成 info，跌倒反而不响蜂鸣；成功判定收紧为 `{"ok": true}`（原来 `{"ok":false,"id":7}` 会被当成功、模型会对老人撒谎）；补 `conf._notice_mcp_env()` 让 `NOTICE_TIMEOUT_S`/`NOTICE_MCP_LOG` 真能传到子进程（原先只在单跑 server 时有效）；补两条防退化用例（`notify_nurse` 不在本地工具注册表、`MESSAGE_MAX == conf.NOTIFY_BODY_MAX`）；闸门拒绝用例断言收紧为精确文案 + 审计 `reason`（原来与总开关分支文案撞车、会因错误原因变绿）；`_post` 兜底错误带上异常文本；`main()` 的死代码分支补日志。
+- **审查侧副作用披露（已清理）**：审查子代理探测 `push(123)` 边界时，8000 上恰有实盘后端在跑，**真的投了一条 "123" 通知进真 `brain.db`**；已按行核对特征后删除（`notifications` 表恢复为空），护士台那张车卡 30s 内自行消失。教训：在跑着后端的机器上做"只读探测"也可能真写进生产数据 —— 探测一律先打桩。
+- **二轮定向复审（修复轮）裁定：通过**，另列 8 条非阻断残余，已基本清掉：`notify.py`/`db.py`/护士台规格两处旧口径注释、本文件里 `urgent→info` 的笔误；**工具回话的 `level` 改为回显后端生效级别**（合并升级时不再"工具说 info、护士台是红卡"）——这一条是端到端实测才暴露的：M1 修复后重跑真 HTTP 链路，发现 `push` 一直回显**请求**的级别而非库里那行的级别；`_higher_level` 先把词表外的级别归一到 `info` 再比；`NOTICE_MCP_LOG=""` 不再让文件日志静默失效；补"竞态回落的新行不许继承旧行级别"用例（钉住 `else: eff = lvl`）。未采纳项：`normalize_level` 收录 `alert/error` 等（规格口径是"未知兜底 info"，加词属猜测）。
+- **M1 修复的端到端复核（临时后端 8099 + 独立库）**：uid 空、type 相同、正文不同 → **各自成条**（`张爷爷想喝水`/info 与 `李奶奶摔倒了`/critical 两行）；同正文复报 → 合并 `count+1`；**拿 info 复报一条已在 critical 的行 → 仍为 critical**；`counts={unread:2, critical:1}`；SSE 级别序列 `info/critical/critical/critical` —— 紧急事件不再被静默降级或吞掉。
+
+**端到端实测（临时后端 8099 + 独立库，不碰用户 8000 与真 brain.db）：** `push(critical, uid=elder_001)` → `{ok:true,id:1,deduped:false}`，库里 `source="cart"/type="message"/title="通知"/uid_name="张建国 · 3-12"`；60 秒内重复投递同一条 → `deduped:true`、**同一行 count 自增**（护士台不刷屏）；全空白 message → 本地拒绝、**不发请求**；`level="bogus"` → 归一 `info`（`Critical/high/urgent` 之类按近义词**往上归**，不复现"跌倒被降成 info"）；`GET /api/notifications` = `{unread:2, critical:1}`；订阅 `/api/events` 收到 `{"type":"notification","source":"cart","kind":"message",…}` —— **实时广播链路通**。子进程冒烟：stdout **一个字节都没有**（不污染 MCP 协议），日志有「robot-notice MCP server 就绪」。**沙箱内做不了**：真 MCP stdio 握手（`mcp` SDK `stdio_client` 拉子进程）被 `WinError 5` 拒（沙箱不许子进程管道），该路径由进程内 `MCPServer.call_tool` 用例 + `vision_mcp` 同款样板兜住，真机验收时一并确认。
+**未验（需用户真机）：** 管理端设置页打开 `mcp_enabled` → **重启后端** → `GET /api/tools` 出现 `notify_nurse`；对小车说"我胸口疼" → 护士台出 critical 卡；停掉后端再调用应返回 `ok:false`（模型不许编造"已通知"）。
+---
+
+## 2026-09-18 · 对话编排升级为有界 ReAct Agent
+
+### 实现口径
+
+- 对话工具循环改用模型原生 `tool_calls` / `role=tool` 协议；`auto` 模式第一次请求保持原有低延时，只有工具实际执行后，后续推理才升到 `high`。
+- 单次对话最多允许四轮工具行动；工具预算耗尽后禁用工具，并强制模型根据已有 Observation 输出最终总结，避免无限循环。
+- 工具返回 `ok:false` 与非法 JSON 都作为 Observation 回传模型，让模型能够纠错或解释失败；工具参数不是合法 JSON 对象时不执行工具。
+- 不新增也不持久化 Thought。`reasoning` 仍只用于界面展示，不进入 TTS、聊天历史或记忆沉淀。
+
+### 验证
+
+- 聚焦测试：`python -m pytest LLM/tests/test_react_agent.py LLM/tests/test_thinking_mode.py LLM/tests/test_prompt_layers.py -q` → **80 passed in 6.33s**，退出码 **0**。
+- `LLM/tests` 全量（命令进程内设置 worktree `.test-tmp` 为 `TMP`/`TEMP`，并设置 dummy `OPENAI_API_KEY`）：**342 passed, 2 failed in 56.96s**，退出码 **1**。失败仅为已批准基线 `test_policy_tools.py::test_run_tool_denies_mcp_outside_server_roles` 与 `test_run_tool_denies_whitelisted_tool_excluded_by_server_roles`：新数据库默认 `mcp_enabled=False`，分别提前返回禁用结果以及记录 `mcp_disabled`，与本次 ReAct 改动无关。
+- 设置 dummy `OPENAI_API_KEY` 后执行 `import LLM.server; print('server import ok')`，输出 `server import ok`，退出码 **0**。
+
+---
+
+## 2026-09-19 · 纳入 jie_ware 定位工具集（vendored）
+
+### 实现口径
+
+- `ros2_car/src/jie_ware/` 是从上游 `6-robot/jie_ware` 克隆的 **ROS1（catkin）** 包（`lidar_loc` / `lidar_filter_node` / `costmap_cleaner` + `amcl_test`、`lidar_loc_test` 两个 launch）。
+  > ⚠️ **更正（2026-09-19）**：本条原文写的是"ROS2 包"，**是错的**。依据：`CMakeLists.txt` 用 `find_package(catkin REQUIRED ...)` + `catkin_package()`、三个源码都 `#include <ros/ros.h>` / `ros::spin()`、`package.xml` 是 `<buildtool_depend>catkin</buildtool_depend>` —— 全是 ROS1。板卡是 ROS2 Humble，**没有 catkin / roscpp**，所以它在本工作区里既不能 `colcon build` 也不能直接运行。另需 `COLCON_IGNORE` 把它排除出构建（否则 `colcon build` 整个工作区报找不到 catkin）；对应的 ROS2 自研实现在下一条。
+- 克隆自带的内层 `.git` 让 `git add` 只生成 **gitlink（模式 160000）**：文件内容一个都不进主仓库，远端 clone 后只会看到空目录，且无 `.gitmodules`（既不是真子模块、也没内容）—— 这正是「git 不上去」的根因。已 `Remove-Item -Recurse -Force ros2_car/src/jie_ware/.git` 后按**自有代码 vendoring** 纳管，源码快照 10 个文件全部入索引。
+- 上游定版 `21bf8f5`、许可 **GPL-2.0-or-later**（copyleft）已记入 `使用开源代码记录.md`：vendoring 后主仓库不保留上游历史，不钉哈希将来无从 diff。
+
+### 验证
+
+- `git ls-files -s ros2_car/src/jie_ware | Where-Object {$_ -match '^160000'}` → **0**（无 gitlink 残留）；`git diff --cached --name-only` 与磁盘文件 1:1 对上（10 个）。
+- `git push origin main` → `0205dd6..5fe16ea`；`git ls-tree -r --name-only origin/main -- ros2_car/src/jie_ware` 列出全部 10 个文件。
+
+### 待办
+
+- 将来同步上游需按 `21bf8f5` 手动 diff（无 submodule 关联）。
+- GPL-2.0-or-later 的传染性对主仓库整体许可的影响未评估。
+
+---
+
+## 2026-09-19 · jie_ware 三件套落进 ros2_car（ROS2 重写，A/B/C 两段提交）
+
+### 背景与口径
+
+上游 `jie_ware` 是 **ROS1（catkin）** 包（见上一条更正），本车是 ROS2 Humble ——
+"融合"只能是**重写**，不存在装上去就能用。又因上游许可 **GPL-2.0-or-later**（copyleft），
+所以**不抄源码**，按算法清洁重写为自研代码（MIT，与 `ros2_car` 其余包一致），
+`ros2_car/src/jie_ware/` 只当参考快照留着。
+
+三个功能的价值并不相同，没有"照单全收"：
+
+| 上游节点 | 落地形态 | 判断 |
+|---|---|---|
+| `lidar_filter_node` | `robot_bringup/robot_bringup/scan_filter.py` | 值得做（去噪），但**默认不改变任何消费者** |
+| `costmap_cleaner` | `robot_navigation/robot_navigation/costmap_cleaner.py` | 可做但收益最小，Nav2 恢复行为树本就有 ClearCostmap |
+| `lidar_loc` | `robot_bringup/robot_bringup/lidar_loc.py` | **不替代 AMCL**，只作独立可选项（局部跟踪器，无全局重定位） |
+
+### 提交 A/B（`214e8f6`）
+
+- **`scan_filter`**：`/scan` → `/scan_filtered`，单点离群回波剔除 + 可选量程裁剪
+  （`clip_range`，默认关）。语义显式钉死：候选点须自身有效、**左右两侧都**不一致才剔除、
+  首尾点不动、剔除 = 置 `inf`、非有限邻居一律算不一致（否则"空区里的孤立回波"永远剔不掉）。
+  **默认只多发一路话题，不改任何消费者**（slam/nav2/amcl 仍吃 `/scan`）——
+  要生效必须按节点头部清单**一次切三处**（`slam.launch.py` 内联 `scan_topic`、
+  `nav2_params.yaml` 的 `amcl.scan_topic`、两个 costmap 的 `scan.topic`），
+  漏切任何一处 = "定位用的图"与"代价地图用的图"不是同一份。
+  ⚠️ 已知界限：404 束/360° ≈ 0.89°/束，3m 处一根 5cm 细杆只占 1 束，
+  **会被当成噪点删掉**（占 2 束及以上的不受影响，有测试）。
+- **`costmap_cleaner`**：`/initialpose` → 清 global + local 两个代价地图。
+  服务名是 **`/<name>/clear_entirely_<name>`**（依 nav2 源码 `clear_costmap_service.cpp`
+  的 `"clear_entirely_" + costmap_.getName()`，`getName()` 本身就带 `costmap`），
+  **不是** `..._costmap_costmap` —— 这个错法有测试钉死。非阻塞 `call_async`，
+  Nav2 未起时启动自检告警 + 静默跳过，不崩不刷屏。
+- **`COLCON_IGNORE`**：上游是 catkin 包，不排除的话 `colcon build` 整个工作区会失败。
+
+### 提交 C（`f388c86`，可整体 `git revert`）
+
+`lidar_loc` 重写时对上游做了四处**有意**改动（每处都有测试）：
+
+1. **收到 `/map` 不再清零位姿**：上游 `crop_map()` 末尾构造 (0,0,0) 假 initialpose 重置自己，
+   配 slam_toolbox 每 5s 发图 = 永远收敛不了 → 上游与建图模式根本互斥。
+2. **同时输出 `/amcl_pose` 形状位姿**：上游只发 TF；后端 `LLM/maps/roslink.py` 默认订阅
+   `/amcl_pose`，少了它会直接断掉后端位姿链路。
+3. **里程计先验做种子**：上游不用 `/odom` 增量，0.8 rad/s 转向每帧 4.6° 而偏航步长只有 1°。
+4. **爬山有迭代上限**：上游 `while(ros::ok())` 只在"连续 10 帧位移 < 5px/5°"时 break，
+   振荡时永不退出、挂死回调。
+
+第 5 处是**上板实测逼出来的**：首版冒烟种子给错（(0,0,0) 而车不在原点），
+实测 **8 帧从 (0,0) 漂到 3.2m 外、yaw 转 60°** —— 每帧都"有改进"，爬山对错种子毫无抵抗力。
+故加 `max_correction_m`/`max_correction_yaw_deg`（默认 0.3m / 10°）：解必须与里程计先验
+自洽，超限就退回按里程计推算并告警，而不是假装定位成功。
+
+代价场用一次**截断欧氏距离变换**（可分离、numpy 向量化）替换上游"给每个障碍像素铺
+101×101 线性衰减核再逐像素取 max"，复杂度 O(障碍数×101²) → O(像素数)，代价函数
+`max(0, 1 - 距离/50px)` 与上游等价。另不做上游那段"雷达倒装"启发式（本车 URDF 已有正确
+`laser_link`、驱动也配了 `inverted: true`，再翻一次就是双重翻转）。
+
+**关键 QoS 坑**：`/map` 订阅必须用 `TRANSIENT_LOCAL`。`map_server` 是 latched 发布，
+VOLATILE 的后来者**收不到**那张已经发过的图（会一直等地图）。
+
+**安全**：lidar_loc **不接进** `navigation.launch.py` / `bringup.launch.py` ——
+它与 AMCL 都广播 `map→odom`，同跑会在 TF 里出现两个发布者（违反 REP-105）。有测试锁死。
+
+### 验证
+
+- `pytest ros2_car/tests -q` → **122 passed**（新增 46 例：scan_filter 19 + 契约 14、
+  costmap_cleaner 8、lidar_loc core 51 + 契约 17 + 真实地图 4 组·3 子用例）。
+- **真实地图离线端到端**（`tests/test_lidar_loc_map.py`）：用 `my_map.pgm` 的真实几何
+  合成扫描，从 +0.15m/-0.15m/+3° 的扰动起点恢复了 3 个真值位姿（PGM 解析**复用**
+  `LLM/maps/mapserver.py`，不重造）。
+- **上板冒烟**（`ros2_car/tools/smoke_lidar_loc.sh`，新工具）→ **全 PASS**：
+  lidar_loc 收到 latched `/map`（证明 TRANSIENT_LOCAL 选对）、`/scan_filtered` 10.05 Hz、
+  `/amcl_pose` 有输出、`map→odom` TF 存在、**错种子下护栏拦住跑飞**（位姿停在 (0,0,0)
+  并打"偏离过大，已放弃"）。
+- 板卡 `colcon build --packages-select robot_bringup robot_navigation` 通过，
+  四个可执行文件与两个 launch 的 `--show-args` 均正常。
+
+### 踩到的坑（脚本侧，都已修）
+
+- **多行 URDF 不能经 `-p robot_description:=$(cat ...)` 传**：rcl 全局参数解析失败
+  （`RCLInvalidROSArgsError`）→ `robot_state_publisher` 直接 Aborted，现象是 `laser_link`
+  这个 frame 在 TF 里根本不存在。冒烟脚本改用 `--params-file`（纯 shell 生成 YAML）。
+- **`ros2 launch` 的子进程杀不干净**：只 kill launch 的 pid 会把真正的节点留成孤儿，
+  第二轮冒烟就出现两个 `map_server` 抢同一节点名 → lifecycle "Failed to change state"。
+  冒烟脚本改用 `setsid` + 按**进程组**整组杀。
+- **别拿 `timeout` 的退出码判断命令成功与否**：超时杀进程返回 124，用 `&&` 串会把
+  "其实成功"（tf2_echo 已经打出变换）判成失败。改成看日志内容。
+- **`pkill -f` 会匹配到执行命令的 shell 自己**（命令行里含同样字面量）→ 把自己杀掉、
+  命令静默失败。清场时要拆字面量或换 `-x`。
+- `source /opt/ros/humble/setup.bash` 期间必须 `set +u`（那些脚本引用未定义的
+  `AMENT_TRACE_SETUP_FILES`，开着 `set -u` 直接退出）。
+
+### 待办 / 未做
+
+- **`/scan_filtered` 还没接线**：消费者仍在 `/scan`。需要在 rviz 里对照 `/scan` vs
+  `/scan_filtered`（重点看细杆障碍有没有被误删），确认后再一次性切三处。
+- **lidar_loc 没有真值对照**：上板冒烟只证明了链路通 + 护栏生效，**没有**证明精度
+  （种子是随便给的，机器人实际位置未知）。要评估精度得在已知位置实测。
+- `costmap_cleaner` 的收益未实测（"改完初始位姿后代价地图残留"这个现象还没复现过）。
+
+---
+
+## 2026-09-19 · 车控 goto 全挂：三个叠在一起的故障 + 「导航拉起哪张图就认哪张」
+
+**现场症状**：老人说「前往A点」，模型正确调了 `robot_goto_place("A点")`，工具回
+`ok:false`「车体未就绪: [Errno 111] Connection refused」；而板卡上
+`ros2 run robot_navigation navigate_to_pose` 手动发目标是好的。
+
+排查下来是**三个独立故障叠在一起**（前两个修完才露出第三个），逐条记：
+
+### 故障 1 · 后端专用 rosbridge（:9091）根本没起
+
+`conf.ROSBRIDGE_URL`（板卡 `.env`）= `ws://127.0.0.1:9091`，而板卡上只有 `9090`
+（Foxglove 用的 `lat`）在听，`/tmp/lat2.log` 都不存在 → `Connection refused` 就是这一条。
+`~/tools/nav_screen.sh lat2` 拉起即好。**9090/9091 分流是既有设计**（见「已知坑」里
+rosbridge 订阅按 topic 共享那条），不是新问题，但"lat2 没起"这个状态**只能靠调用时报错发现**
+（设计上启动时不做网络探测），所以症状长得像"车坏了"。
+
+> 教训：`nav_screen.sh kill all` 会连 lat2 一起停且不自动恢复。后端连不上时先
+> `ss -lnt | grep 9091` 而不是去查车。
+
+### 故障 2 · 板卡 `robot_actions` 节点是死的（install 太旧）
+
+`/tmp/nav.log` 里它启动即崩：
+
+```text
+ImportError: cannot import name 'RobotReadiness' from 'robot_interfaces.srv'
+[ERROR] [robot_actions-12]: process has died [pid 11423, exit code 1]
+```
+
+`robot_interfaces` 的 `install/` 是**加 `RobotReadiness.srv` 之前**编的（install 里只有
+`_move/_turn/_navigate_to`）。于是 `/robot/move|turn|navigate_to|readiness` 与
+`/robot/exec_state` 全都不存在 —— 车控工具连"就绪探测"都发不出去。
+
+修：`colcon build --packages-select robot_interfaces`（33.7s）。**这次没有重启 Nav2**
+（Nav2 本身是好的，重启要重新定位）：单独
+`screen -dmS raction ... ros2 run robot_navigation robot_actions` 把缺的那个节点补上。
+（下次正常 `nav_screen.sh nav` 时 launch 会自己带起它，临时会话可 `screen -S raction -X quit`。）
+
+> 顺带暴露的脆弱点：`robot_actions.py` 在**模块顶层** import `RobotReadiness`，
+> 于是"新服务没编出来"会把整个节点（含本来能用的 move/turn）一起打死。规格 §十 要求
+> "依赖缺失只降级不崩"—— 这条留给后续（要么做惰性 import，要么保持 install 与源码同步的纪律）。
+
+### 故障 3 · 「当前地图未知」：像素编辑器另存副本让 `/map` 指纹**必然多命中**
+
+修完 1、2，`readiness` 已经通了，goto 仍被拒，这次是 `rejected「当前地图未知」`：
+
+```text
+my_map3        vs my_map3_edited
+yaml 只差 image: 一行；pgm 都是 88×107 / 0.05 / origin [-1.2,-1.38,0]（像素内容不同）
+```
+
+`current_map()` 旧口径是拿 `/map` 的四项元数据**反查**本地所有 yaml，唯一命中才认；两张图
+元数据完全相同 → `ambiguous: ["my_map3","my_map3_edited"]` → 按 fail-closed 判 `unknown`
+→ `session.running_map_name()` 返回 `("", "map_unknown")` → `car_nav._context()` 拒绝所有
+goto，`robot_status` 也报不出所在区域。
+
+**这不是配置错，是口径选错了**：像素编辑器「另存」出的副本**天然继承**原图元数据，所以
+"原图 + edited 副本并存"这种用法下，指纹反查**永远**会多命中。
+
+### 改法：认图的第一权威改成「导航自己加载的那张图」
+
+新增 `locator._map_name_from_param()`：读 **`map_server` 节点的 `yaml_filename` 参数**——
+`nav_screen.sh nav <地图>` 的 `map:=` 经 RewrittenYaml 就落在这个参数上，导航拉起哪张它就说哪张，
+**不做推断、不存在多命中**。`current_map()` 顺序变成：
+
+```text
+① map_server/yaml_filename  → source: "map_server_param"（第一权威，读不到才往下走）
+② /map 四项指纹反查唯一命中 → source: "map_topic"（旧口径，保留为回退）
+③ 都没有                    → source: "unknown"（仍然是 fail-closed）
+```
+
+要点：
+
+- 第一权威**不受 `map_topic_fingerprint_enabled` 约束**：那个开关管的是"用 /map 元数据**推断**"，
+  这里不是推断；关掉推断的人照样该知道在跑哪张图。也**不进缓存**（一次服务调用很便宜，
+  换图必须尽快跟着变，不能等 TTL）。
+- 参数值来自 ROS，**同样不可信**：只取 basename 去后缀，再过 `mapstore.check_name()` 白名单。
+- `session.running_map_name()` 同时接受 `map_server_param` 与 `map_topic` 两个 source。
+
+**踩到的工具坑（实测）**：`/rosapi/get_param`（`rosapi_msgs/srv/GetParam`）在 Humble 上
+**对节点参数恒返回空串** —— `{name: "/map_server/yaml_filename"}` 与一个不存在的参数回一样的
+`{"value": ""}`，等于不可用；要用节点自己的 `/<node>/get_parameters`
+（`rcl_interfaces/srv/GetParameters`，`names: ["yaml_filename"]`）才拿得到真值。
+故新增 `roslink.node_string_param()` 走后者。
+
+### 验证
+
+- 板卡上 `pytest tests/test_mapeditor.py LLM/tests/test_ward_autoswitch.py -q` → **73 passed**
+  （新增 6 例：权威路优先且不再走指纹、不受推断开关约束、两路都不可用仍 unknown、
+  basename+白名单、`node_string_param` 类型判定；外加 ward 自动切换认新 source 的回归）。
+- 另跑 `test_car_mcp.py` / `test_roslink_resubscribe.py` / `test_settings_roles.py` /
+  `test_server_roles_routes.py` / `test_policy_*.py` 无回归。
+- **离线性**：`tests/test_mapeditor.py` 新增 autouse fixture 把 `roslink.node_string_param`
+  切成空串 —— 否则跑在**板卡本机**（能连到真 rosbridge 且真在跑某张图）时，离线断言会变成
+  "实际环境相关"（我自己就踩到过：测试真连上了板卡）。
+- 真机实测（不移动车）：`readiness → ready:true / exec_state:idle / nav_available:true`；
+  `resolve_place("A点")` → `(1.23, 1.45) @my_map3_edited`、`resolve_place("B点")` →
+  `(0.60, 0.13)`、`resolve_zone("平台A")` → 回退地点 A点并带 warnings。
+
+### 没做 / 待办
+
+- **真机发车验收仍未做**（0.3m 前进、30° 转向、A点/B点导航、途中急停）—— 需现场净空确认，
+  不得标记为通过（`2026-09-19-car-mcp-design.md` §13.3 同样记着这条）。
+- `ros2_car` 侧 `robot_actions.py` 的顶层 import 脆弱性（见故障 2）未改。
+- 板卡 `settings.current_map` 仍是 `my_map`，而实际在跑 `my_map3_edited`；`nav_screen.sh nav`
+  不带参数默认也是 `my_map.pgm`。现在认图不依赖这两个值了（读的是导航实际加载的图），
+  但它们会让"下次启导航用哪张"有歧义，建议对齐。
+
+---
+
+## 2026-09-19（续）· 「哪张图」只留一个真相 + 防复发
+
+**背景**：上一条修完，用户重新建图（`my_map3`）并标好点，再让模型发 A 点，又失败 —— 这次
+错误从「车体未就绪」挪到了「当前地图未知」（`hint: map_unknown`），`robot_status` 报
+`available:false / nav_available:false / map:null`。
+
+### 现场结论（有一处判断需要更正）
+
+**重建地图 = 重启 base/slam/nav，而 `nav_screen.sh` 那套流程会把后端专用 rosbridge `lat2`（:9091）
+一起停掉，且它不自动恢复。** 所以这次断的不是底盘、也不是导航，而是**后端连不上 rosbridge**：
+连 `/robot/readiness` 都发不出去，于是 `nav_available:false` + 位姿拿不到 + 认图失败 —— 连锁反应
+看起来像"车坏了"。这是同一个坑 24 小时内第二次踩（上一条刚写进 `AGENTS.md`），故这次做了
+**结构性防复发**（见下）。
+
+顺带查出**第二个问题**：`robot_actions` 当时有**两个实例**在跑 —— 上一条临时补的 `raction`
+会话，加上新 nav launch 自带的那个（上一轮修好 `RobotReadiness` 之后，launch 已经能自己带起来了）。
+两个同名节点同跑会让 readiness/`exec_state` 的来源不确定。已收掉 `raction`，现在只由 nav launch 托管。
+
+### 根治：把「当前图」收敛到唯一真相
+
+**根因不是某个值没改对，而是"当前图"有两个来源**：
+
+| 名字 | 谁写 | 语义 |
+|---|---|---|
+| `locator.current_map()` | 车（`map_server` 的 `yaml_filename`） | **车此刻在跑哪张** —— 事实 |
+| `settings.current_map` | 人（地图编辑器「设为目标地图」按钮） | 下次启动想用哪张 —— 意图 |
+
+两者混用，就出现"车在跑 `my_map3`、设置里写着 `my_map`、列表把「当前」标在 `my_map` 上"。
+而且前端按钮的提示语**本来**就写的是"已把 X 设为**目标地图**，真要切图请执行 …" —— 只有列表徽章
+还在拿"意图"冒充"事实"。改法：
+
+1. **`/api/map/list` 的「当前」徽章改读车的真相**（`locator.current_map()`，一次探测供整表用；
+   认不出/抛异常时整列都不标，绝不让列表 500）。另加 `next` 字段标「下次启动」—— 两个概念
+   **并排显示**，不再互相冒充。`current_map`/`current_map_source`/`next_map` 一并回显。
+2. **编辑器文案**：徽章「当前」→「**在跑**」，另加「下次启动」标记；`App.vue` 默认打开的那张图
+   因此自动变成"车实际在跑的那张"（零手动）。
+3. `conf.py` 注释同步：`current_map` 明确是**人的意图**，`ward_map_source` 的 `auto` 档说明
+   第一权威是 map_server。
+
+**没有**做「拿车的事实回写 settings」的自动同步：那会把用户点过的"目标"悄悄改掉（意图就没了），
+且让 `ward_map_source="setting"` 这个应急档失去意义。分辨率靠"概念分开 + 各自标清楚"。
+
+### 板卡侧防复发（`~/tools/nav_screen.sh`，板卡本地、不进 git）
+
+- **`nav` 幂等拉起 `lat2`**：`start lat2 ...` 已是幂等（在跑就 skip），所以以后 `nav_screen.sh nav`
+  会顺手把后端专用 rosbridge 带起来 —— 重建/重启导航再也不会把后端桥搭进去。
+- **未指定地图时默认「`maps/` 下最近修改的那张 .yaml」**，不再硬编码 `my_map.pgm`：重建完直接
+  `nav_screen.sh nav` 就起对了（旧行为会静默加载一张过时的、没有 tags 的图，再让 goto 全被拒）。
+  显式传参的行为不变，且把选中哪张**回显**出来（`[map] 未指定地图 → 用最近修改的那张: …`）。
+  备份：`~/tools/nav_screen.sh.bak2-20260919`。
+
+### 验证
+
+- 板卡 `pytest tests/test_mapeditor.py LLM/tests/test_ward_autoswitch.py LLM/tests/test_settings_roles.py
+  LLM/tests/test_server_roles_routes.py -q` → **105 passed**（新增 2 例：列表徽章认车不认陈旧的设置、
+  认不出当前图时列表照常返回）。
+- `tests/test_mapeditor.py` 的 autouse fixture 扩成**整条认图路离线**（`node_string_param` 空串 +
+  `subscribe`/`drain` no-op）—— 因为 `/api/map/list` 现在也会认图，不切就会在板卡上真连 rosbridge。
+- `cd frontend && pnpm --filter mapeditor build:sandbox` → **构建通过**（沙箱内用这个等价命令，
+  `pnpm build` 会因 spawn EPERM 失败）。
+- 真机实测（不移动车）：`current_map → my_map3`（`map_server_param`）、`my_map3.tags.json` 指纹
+  与 yaml 一致（origin `[-2.55,-3.68]`）、`resolve_place("A点") → (0.46, -0.49)` 通过安全校验、
+  `readiness ready:true / nav_available:true`；`resolve_place("B点")` 如实拒绝并列出可用地点（新图只标了 A点）。
+
+### 没做 / 待办
+
+- **真机发车验收仍未做**（仍未发过车）。
+- 「连不上 rosbridge 时给出可操作文案」没做（用户本轮未选）：现在 `car_server._ready()` 仍会把
+  原始的 `[Errno 111] Connection refused` 当作「车体未就绪」报给模型 —— 建议后续按
+  `2026-09-19-car-mcp-design.md` §十 的降级表分成 rosbridge 没起 / `robot_actions` 没起 / 导航没起三种。
+- `ros2_car` 侧 `robot_actions.py` 顶层 import `RobotReadiness` 的脆弱性未改。
+- **仓库分叉**（需人工处理，不在本批次）：PC 端已推 `b922da6`（含本条之前的车控修复）与 `106d07b`
+  （建图体素），板卡端有一个本地提交 `586a90b 板卡提交` 未推；两条线都改了相同文件。合并时注意
+  `docs/log.md`、`AGENTS.md` 的同段落冲突。
+
+---
+
+## 2026-09-19（再续）· 车真的动了：核 LLM 的两条保留 + 修上报层的两类假象
+
+**背景**：车终于在 LLM 调用下动起来了（`robot_goto_place("A点")` → 受理 → 导航）。模型自己报了两条
+保留：① 顶层仍 `available=false / status=unavailable`，`last_error` 是旧的 `Connection refused`；
+② `pose` 报 `(0,0,0)`、比 `state_at` 早 282 s。要求核实。
+
+### 核实一：车**到位了**（但别盯 `arrived`）
+
+ROS 侧权威日志：
+
+```text
+robot_actions: [navigate_to] (0.46, -0.49) yaw=0°
+bt_navigator: Begin navigating from current location (0.00, 0.00) to (0.46, -0.49)
+controller_server: Reached the goal!      ← 7.3 s 后
+bt_navigator: Goal succeeded
+```
+
+模型看到 `arrived=false` 没错 —— 它是在**导航途中**查的。但 `/robot/arrived` **只在变化时发布**
+（`ros2 topic echo --once` 事后一条都收不到），所以判"到没到"要看 `robot_status` 的 **`last.ok`**，
+不能盯 `arrived`。已写进工具 docstring。
+
+### 核实二：`available=false` 是**假警报**，根因复现
+
+`available` 的旧口径是 `all(self._sockets.values())`（四通道 socket 全在）。但：
+
+- `probe` / `ctrl` / `state` 都会在**用到时**自己重连（readiness、动作调用、状态循环）；
+- **`stop` 只由 `robot_stop()` 触碰**；
+- `_start_state()` 有 WeakSet 守卫，`start()` 一辈子只跑一次。
+
+于是"后端比 rosbridge 早起"（本次 21:41 起后端、22:03 才起 lat2）→ 四通道全失败 → 之后三条自愈、
+stop 永远空 → `available` **永久** false，`last_error` 还留着已经解决的 `[Errno 111] Connection refused`。
+复现脚本打出来：`channels={'ctrl':True,'probe':True,'stop':False,'state':True}` 而 `available=False`；
+**调一次 `robot_stop` 就变 True**（证明只差这一条通道）。
+
+> 影响是**上报层**的：`_ready()` 走 readiness，不看你这个 `available`，车控本身没坏。但模型会据此说
+> "链路没完全恢复"、甚至不敢发车 —— 值得修。
+
+### 改法（三件事，全部落在 `LLM/car_mcp/`）
+
+| 改动 | 说明 |
+|---|---|
+| `available` 重新定义 | 只看**状态通道**（`_sockets["state"]`）；另加 `channels` 四通道明细，诊断信息不丢 |
+| `last_error` 恢复即清 | `_connect()` **新建**连接成功时清（复用已有 socket 不清），并加 `last_error_at` |
+| 降级门槛 | `robot_status` 只看 `state_fresh`，不再看 `available`；且**每次状态查询都探一次 readiness**——否则后端刚起、模型只问状态不问动作时，`nav_available` 会一直停在冷启动的 false，又是一条"看着像导航没起"的假警报 |
+| 位姿可信度 | `snapshot()` 新增 `pose_age_s` / `pose_stale`（**没收到 / 新鲜度未知 / 超过 `ROSBRIDGE_POSE_TTL_S` 都算 true** = 不能当实时位置）、`pose.cov` / `pose.suspect`（恰好停在原点且协方差 0 = AMCL 未收敛，口径同 `locator.suspect`）；`zone_from_stale_pose` + `warnings` 说明"区域是拿陈旧/未收敛位姿算的" |
+| 错误文案分类 | `_explain()`：连不上 rosbridge → 明确报 `ROSBRIDGE_URL` 并提示 `nav_screen.sh lat2`；`Service ... does not exist` → 提示查 `robot_actions`/导航模式；分不清就原样返回（**绝不编造原因**）。旧行为是把裸 `[Errno 111]` 当"车体未就绪"报给模型，人和模型都不知道去查什么 |
+
+### 核实三：`(0,0,0)` 不是"陈旧缓存"，是 **AMCL 没定位就发车**
+
+真位姿只能走 TF（`/amcl_pose` 静止时 0 Hz 是已知行为）：`tf2_echo map base_link` = **(0.480, -0.215)**。
+而 nav.log 里同一时刻写着 `Begin navigating from current location (0.00, 0.00)` —— **发车那一刻 AMCL
+报的就是 (0,0,0)，真值在 (0.48,-0.21)，差 0.52 m**。这次能到，是因为两者足够近、且行驶中 AMCL 收敛了。
+
+顺带核了 `zone: 平台A`：`(0,0)` 与真位姿**都**落在该区域内，所以这次答案碰巧对；但拿未收敛位姿算
+zone 本身有风险 —— 这正是上面加 `zone_from_stale_pose` 的原因。**操作建议：发车前确认 AMCL 已定位**
+（设初始位姿 / 看 TF 是否在真值附近），否则等于在错先验上导航。
+
+另：停稳后 `tf2_echo` 在 (0.480,-0.215)，距 A点目标 0.276 m，而 `xy_goal_tolerance` 是 0.25 m ——
+"Goal succeeded" 是当时的判定；**定位精度是当前的主要误差来源**。
+
+### 验证
+
+- 板卡 `pytest LLM/tests/test_car_mcp.py -q` → **104 passed**（新增 5 例：`available` 只看状态通道
+  的现场回归、恢复即清 `last_error`、位姿 suspect/stale 标记、`robot_status` 的陈旧位姿区域标注、
+  状态未知时主动探 readiness；另有错误文案分类 3 种；改掉 1 条旧断言：降级不再看 `available`）。
+- 真车实跑新代码（不移动车）：`available:true`、`channels` 四项全 true、`last_error:""`、
+  `nav_available:true`、`pose_stale:true`（车静止、AMCL 不发位姿 —— 如实标记而不是假装新鲜）。
+- **真机发车已实质发生一次**（LLM 调用下发到 A点，`Goal succeeded`）；但"0.3 m 前进 / 30° 转向 /
+  导航途中 1 秒急停"这三项专项验收仍未逐项做，`2026-09-19-car-mcp-design.md` §13.3 照旧。
+
+### 没做 / 待办
+
+- `ros2_car` 侧 `robot_actions.py` 顶层 import `RobotReadiness` 的脆弱性未改。
+- **AMCL 初始位姿的对齐纪律**：目前靠人在 rviz/Foxglove 里点；"发车前自动确认已定位"没做
+  （可考虑把 `pose.suspect` 接进 goto 的前置校验，即"位姿可疑时先拒绝发车并提示先定位"）。
+- 板卡配置仍是 `resolution: 0.05`（`106d07b` 的 0.025 未上板），要生效需 pull + `colcon build`
+  `robot_bringup` + 重启 base/slam + **重新扫图**。

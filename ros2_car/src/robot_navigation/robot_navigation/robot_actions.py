@@ -40,7 +40,7 @@ from nav_msgs.msg import Odometry
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool, String
 
-from robot_interfaces.srv import Move, NavigateTo, Turn
+from robot_interfaces.srv import Move, NavigateTo, RobotReadiness, Turn
 
 # ---- 运动参数（养老院场景，保守低速）----
 MOVE_SPEED = 0.15        # m/s，直线/横移速度
@@ -67,6 +67,7 @@ class RobotActions(Node):
         # 三个服务共用一个互斥回调组：同一时刻只跑一个动作；
         # 订阅留在默认组 → 服务阻塞期间 /odom、/robot/cmd_stop 仍能被处理
         self._svc_group = MutuallyExclusiveCallbackGroup()
+        self._readiness_group = MutuallyExclusiveCallbackGroup()
 
         self._move_srv = self.create_service(Move, "robot/move",
                                              self._on_move, callback_group=self._svc_group)
@@ -74,6 +75,9 @@ class RobotActions(Node):
                                              self._on_turn, callback_group=self._svc_group)
         self._nav_srv = self.create_service(NavigateTo, "robot/navigate_to",
                                             self._on_navigate, callback_group=self._svc_group)
+        self._readiness_srv = self.create_service(
+            RobotReadiness, "robot/readiness", self._on_readiness,
+            callback_group=self._readiness_group)
 
         # ---- 上行状态 ----
         self._exec_state_pub = self.create_publisher(String, "robot/exec_state", 10)
@@ -89,6 +93,9 @@ class RobotActions(Node):
         # ---- 状态 ----
         self._odom = None          # 最近一帧 odom（订阅线程写，动作线程读，GIL 下安全）
         self._stop_requested = False
+        self._exec_state = "idle"
+        self._readiness_timer = self.create_timer(
+            1.0, self._publish_exec_state, callback_group=self._readiness_group)
         self._set_exec_state("idle")
         self.get_logger().info(
             "robot_actions 就绪：robot/move | robot/turn | robot/navigate_to | exec_state/arrived")
@@ -113,7 +120,23 @@ class RobotActions(Node):
 
     # ---------- 状态 ----------
     def _set_exec_state(self, state: str):
-        self._exec_state_pub.publish(String(data=state))
+        self._exec_state = state
+        self._publish_exec_state()
+
+    def _publish_exec_state(self):
+        self._exec_state_pub.publish(String(data=self._exec_state))
+
+    def _on_readiness(self, _request, response):
+        """Return a fast snapshot without waiting for Nav2 or an action to finish."""
+        nav_available = self._nav_client.server_is_ready()
+        response.ready = self._exec_state == "idle"
+        response.exec_state = self._exec_state
+        response.nav_available = nav_available
+        if response.ready:
+            response.message = "ready"
+        else:
+            response.message = f"busy: {self._exec_state}"
+        return response
 
     def _arrived(self, ok: bool):
         self._arrived_pub.publish(Bool(data=ok))

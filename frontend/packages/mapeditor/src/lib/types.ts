@@ -1,7 +1,7 @@
 // 地图编辑器前端类型（与后端 pydantic 模型一一对应，字段名禁止改动）
 
 /** 画布绘制模式（App / MapCanvas / ZonePanel 共用） */
-export type DrawMode = "idle" | "point" | "polygon" | "rect";
+export type DrawMode = "idle" | "point" | "goal" | "polygon" | "rect";
 
 export interface MapMetaFields {
   name: string;
@@ -44,7 +44,10 @@ export interface MapListItem {
   cached_at?: number | string | null;
   counts?: MapCounts;
   status?: string;
+  /** 车**此刻在跑**的图（`map_server/yaml_filename`，自动识别，不是人工声明） */
   current?: boolean;
+  /** 人工指定的"下次启动导航用哪张"（settings.current_map），与 `current` 是两回事 */
+  next?: boolean;
 }
 
 export interface MapListResp {
@@ -54,7 +57,12 @@ export interface MapListResp {
   maps?: MapListItem[];
   mode?: string;
   root?: string;
+  /** 车此刻在跑的图名（认不出为空串；不是 settings.current_map） */
   current_map?: string;
+  /** `map_server_param`（问导航）/ `map_topic`（退回指纹）/ `unknown` */
+  current_map_source?: "map_server_param" | "map_topic" | "unknown";
+  /** 人工指定的"下次启动用哪张" */
+  next_map?: string;
 }
 
 export interface MetaResp {
@@ -127,7 +135,11 @@ export interface PoseResp {
 
 export interface CurrentMapResp {
   ok: boolean;
-  source?: "map_topic" | "unknown";
+  /**
+   * `map_server_param` = 直接读导航加载的图（`map_server` 的 `yaml_filename`，第一权威，不做推断）；
+   * `map_topic` = 退回 `/map` 四项指纹反查且唯一命中；`unknown` = 认不出。
+   */
+  source?: "map_server_param" | "map_topic" | "unknown";
   name?: string | null;
   detail?: string;
   /** 多项命中时后端给的是**命中地图名列表**（不是布尔） */
@@ -169,10 +181,17 @@ export interface Zone {
   kind?: string;
   shape?: string;
   polygon?: number[][];
+  goal?: ZoneGoal | null;
   parent?: string;
   note?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface ZoneGoal {
+  x: number;
+  y: number;
+  yaw_deg?: number;
 }
 
 export interface ZoneIn {
@@ -181,6 +200,7 @@ export interface ZoneIn {
   kind: string;
   shape: string;
   polygon: number[][];
+  goal?: ZoneGoal | null;
   parent: string;
   note: string;
 }

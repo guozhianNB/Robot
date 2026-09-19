@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// admin 壳：登录门 + 10 页签 + SSE toast（规格 §6 / docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）
+// admin 壳：登录门 + 11 页签 + SSE toast（规格 §6 / docs/superpowers/specs/2026-09-14-layered-user-roles-design.md）
 //
 // 登录门（D13）：**判据是 `role !== "admin"`**。未登录时后端 `getSessionUser("admin")` 返回的
 // `role` 是 `"ward"`（fail-closed），所以「不是 admin」= 必须显示登录卡 —— 绝不能写成
@@ -17,6 +17,7 @@ import ToolLogPage from "./pages/ToolLogPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
 import VoiceStatusPage from "./pages/VoiceStatusPage.vue";
 import RolesPage from "./pages/RolesPage.vue";
+import MapEditorPage from "./pages/MapEditorPage.vue";
 
 const tabs = [
   { id: "overview", label: "监控总览" },
@@ -25,6 +26,7 @@ const tabs = [
   { id: "memories", label: "记忆" },
   { id: "reminders", label: "提醒" },
   { id: "wards", label: "病房管理" },
+  { id: "mapeditor", label: "地图编辑器" },
   { id: "tools", label: "工具日志" },
   { id: "voice", label: "语音状态" },
   { id: "roles", label: "身份与权限" },
@@ -164,10 +166,11 @@ onUnmounted(() => {
       <ChatPage v-else-if="active === 'chat'" />
       <MemoriesPage v-else-if="active === 'memories'" />
       <RemindersPage v-else-if="active === 'reminders'" />
-      <WardsPage v-else-if="active === 'wards'" />
+      <WardsPage v-else-if="active === 'wards'" @goto-mapeditor="active = 'mapeditor'" />
       <ToolLogPage v-else-if="active === 'tools'" />
       <VoiceStatusPage v-else-if="active === 'voice'" />
       <RolesPage v-else-if="active === 'roles'" />
+      <MapEditorPage v-else-if="active === 'mapeditor'" />
       <SettingsPage v-else-if="active === 'settings'" />
     </main>
     <div class="toasts">

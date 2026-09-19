@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ChromaDB 封装测试：add/query + SQLite 镜像 + 降级。"""
 import pytest
-from LLM import ragstore, db
+from LLM.store import ragstore, db
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def test_degraded_query_empty(monkeypatch):
 
 
 def test_init_failure_sets_unavailable(monkeypatch, tmp_path):
-    from LLM import ragstore
+    from LLM.store import ragstore
     import chromadb
 
     def boom(path):

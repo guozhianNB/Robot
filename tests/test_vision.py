@@ -1191,3 +1191,22 @@ def test_webbridge_status_reports_target(monkeypatch):
     st = webbridge.status(force=True)
     assert st["target"]["host"] == "127.0.0.1"
     assert st["status"] == "unavailable"
+
+
+def test_vision_snapshot_returns_jpeg(monkeypatch):
+    """回归守卫：取到帧后必须能返回 JPEG。
+
+    2026-09-15 的编辑器路由搬迁曾连带删掉 server.py 的模块级 `from fastapi.responses
+    import Response`，使本路由在"相机可用"这条路径上抛 NameError → 500（相机不可用时
+    走 except 分支返回 503，所以既有测试与全量都没抓到）。这里 monkeypatch 掉取帧，
+    不依赖真实摄像头。
+    """
+    from fastapi.testclient import TestClient
+    from vision import webbridge
+    from LLM.server import app
+
+    monkeypatch.setattr(webbridge, "get_jpeg",
+                        lambda *a, **k: (b"\xff\xd8\xff\xd9", 1, 1, "mock"))
+    r = TestClient(app).get("/api/vision/snapshot?channel=1")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "image/jpeg"

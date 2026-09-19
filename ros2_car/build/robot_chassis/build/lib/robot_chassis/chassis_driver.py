@@ -20,6 +20,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
@@ -30,9 +31,11 @@ except ImportError:
     serial = None
 
 from .usb_protocol import (
+    CMD_IMU,
     CMD_STATUS,
     build_set_car_vel,
     build_stop,
+    decode_imu,
     decode_status,
     FrameParser,
 )
@@ -76,6 +79,17 @@ class ChassisDriver(Node):
         self.declare_parameter("send_period", 0.05)      # 下发周期 s（20Hz）
         self.declare_parameter("watchdog_timeout", 0.5)  # cmd_vel 看门狗 s（键盘遥控需要放宽）
 
+        # ---- IMU（STM32 USART3 转发，USB 帧 0x83 → /imu，见 docs/目标文档及说明/USB车控接口.md v1.1）----
+        self.declare_parameter("publish_imu", True)
+        self.declare_parameter("imu_topic", "/imu")
+        self.declare_parameter("imu_frame_id", "imu_link")
+        # 符号标定：手托车体逆时针转，yaw / angular_velocity.z 应增大；反了改 -1
+        self.declare_parameter("imu_sign_yaw", 1.0)
+        self.declare_parameter("imu_sign_wz", 1.0)
+        # 协方差（必须非零：robot_localization 对被融合的 0 方差只加 1e-6 = 完全信任）
+        self.declare_parameter("imu_yaw_var", 0.02)   # rad^2
+        self.declare_parameter("imu_wz_var", 0.01)    # (rad/s)^2
+
         # Humble rclpy Node 没有 get_parameter_names()，显式列出已声明参数
         self._p = {p.name: p.value for p in self.get_parameters([
             "serial_port", "baudrate", "cmd_vel_topic", "odom_topic", "cmd_stop_topic",
@@ -83,6 +97,8 @@ class ChassisDriver(Node):
             "wheel_signs", "sign_vx", "sign_vy", "sign_wz",
             "max_vx", "max_vy", "max_wz", "accel_limit", "ang_accel_limit",
             "send_period", "watchdog_timeout",
+            "publish_imu", "imu_topic", "imu_frame_id",
+            "imu_sign_yaw", "imu_sign_wz", "imu_yaw_var", "imu_wz_var",
         ])}
         # launch 层（odom.launch.py）传 publish_tf 时是字符串，归一化为 bool
         if isinstance(self._p["publish_tf"], str):
@@ -113,6 +129,9 @@ class ChassisDriver(Node):
             Bool, self._p["cmd_stop_topic"], self._on_cmd_stop, 10)
         self._odom_pub = self.create_publisher(
             Odometry, self._p["odom_topic"], 10)
+        self._imu_pub = None
+        if self._p["publish_imu"]:
+            self._imu_pub = self.create_publisher(Imu, self._p["imu_topic"], 10)
         self._tf_broadcaster = TransformBroadcaster(self)
 
         # 发送定时器
@@ -248,6 +267,8 @@ class ChassisDriver(Node):
             cmd, payload = frame
             if cmd == CMD_STATUS:
                 self._on_status(payload)
+            elif cmd == CMD_IMU:
+                self._on_imu(payload)
             # ACK 忽略（仅日志级信息可扩展）
 
     def _on_status(self, payload):
@@ -314,6 +335,38 @@ class ChassisDriver(Node):
             t.transform.rotation.z = math.sin(yaw / 2.0)
             t.transform.rotation.w = math.cos(yaw / 2.0)
             self._tf_broadcaster.sendTransform(t)
+
+    def _on_imu(self, payload):
+        """IMU(0x83) 帧 → sensor_msgs/Imu。
+
+        只提供 yaw 与绕 Z 角速度：roll/pitch 与加速度的方差给大值 / -1（未提供），
+        避免被 robot_localization 当成有效测量。
+        """
+        if self._imu_pub is None:
+            return
+        try:
+            yaw_deg, rate_dps, _roll_deg, _pitch_deg = decode_imu(payload)
+        except ValueError as e:
+            self.get_logger().warn(f"IMU 解析失败: {e}")
+            return
+
+        yaw = math.radians(yaw_deg) * self._p["imu_sign_yaw"]
+        wz = math.radians(rate_dps) * self._p["imu_sign_wz"]
+
+        m = Imu()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = self._p["imu_frame_id"]
+        m.orientation.z = math.sin(yaw / 2.0)
+        m.orientation.w = math.cos(yaw / 2.0)
+        m.orientation_covariance[0] = 1e6   # roll 不可信
+        m.orientation_covariance[4] = 1e6   # pitch 不可信
+        m.orientation_covariance[8] = self._p["imu_yaw_var"]
+        m.angular_velocity.z = wz
+        m.angular_velocity_covariance[0] = 1e6
+        m.angular_velocity_covariance[4] = 1e6
+        m.angular_velocity_covariance[8] = self._p["imu_wz_var"]
+        m.linear_acceleration_covariance[0] = -1.0   # 未提供加速度（REP 约定）
+        self._imu_pub.publish(m)
 
 
 def main(args=None):
