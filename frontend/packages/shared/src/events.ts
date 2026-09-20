@@ -110,6 +110,55 @@ export interface NotificationAckEvent {
   id?: number; all?: boolean; by?: string; n?: number;
 }
 
+export interface PlanEventSummary {
+  id: number;
+  display_no: string;
+  status: string;
+  priority: string;
+}
+
+export interface PlanEventStep {
+  id: number;
+  [field: string]: unknown;
+}
+
+export interface PlanCreatedEvent {
+  type: "plan_created";
+  /** 后端当前事件未携带；未来若增加业务分类，只使用 kind，不能覆盖 type。 */
+  kind?: string;
+  plan_id: number;
+  version: number;
+  plan: PlanEventSummary;
+  step?: PlanEventStep | null;
+}
+
+export interface PlanUpdatedEvent {
+  type: "plan_updated";
+  kind?: string;
+  plan_id: number;
+  version: number;
+  plan: PlanEventSummary;
+  step?: PlanEventStep | null;
+}
+
+export interface PlanStepChangedEvent {
+  type: "plan_step_changed";
+  kind?: string;
+  plan_id: number;
+  version: number;
+  plan: PlanEventSummary;
+  step: PlanEventStep;
+}
+
+export interface PlanNeedsReviewEvent {
+  type: "plan_needs_review";
+  kind?: string;
+  plan_id: number;
+  version: number;
+  plan: PlanEventSummary;
+  step?: PlanEventStep | null;
+}
+
 export type BusEvent =
   | ReminderEvent
   | ReminderConfirmedEvent
@@ -124,7 +173,11 @@ export type BusEvent =
   | AdminAuthChangedEvent
   | WardChangedEvent
   | NotificationEvent
-  | NotificationAckEvent;
+  | NotificationAckEvent
+  | PlanCreatedEvent
+  | PlanUpdatedEvent
+  | PlanStepChangedEvent
+  | PlanNeedsReviewEvent;
 
 const KNOWN_TYPES = new Set([
   "reminder",
@@ -141,6 +194,10 @@ const KNOWN_TYPES = new Set([
   "ward_changed",
   "notification",
   "notification_ack",
+  "plan_created",
+  "plan_updated",
+  "plan_step_changed",
+  "plan_needs_review",
 ]);
 
 /** 解析 SSE 原始帧（"data: {...}" 或心跳注释行）→ BusEvent | null */
