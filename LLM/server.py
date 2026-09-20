@@ -58,10 +58,23 @@ _shutting_down = False                    # 退出中标志：幂等防重入（
 # ---------------------------------------------------------------------------
 # 应用生命周期
 # ---------------------------------------------------------------------------
+def _audit_config_warnings() -> None:
+    """Flush import-time config fallbacks without making conf depend on core."""
+    pending = list(conf.CONFIG_WARNINGS)
+    conf.CONFIG_WARNINGS.clear()
+    for warning in pending:
+        try:
+            audit.log("config_warning", action="fallback", level="warning", **warning)
+        except Exception as exc:  # config fallback must never prevent startup
+            conf.CONFIG_WARNINGS.append(warning)
+            print(f"[WARN] 配置回退审计写入失败：{exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from .core import log as audit
     db.init_db()
+    _audit_config_warnings()
 
     # 记忆 v3 迁移（幂等）+ 依赖自检
     try:

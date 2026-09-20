@@ -28,6 +28,7 @@ def _plan(**changes):
         "creator_uid": "admin",
         "creator_role": "admin",
         "creator_surface": "admin",
+        "report_json": {"notify": True, "speak_if_present": False},
         "wake_at": None,
         "deadline_at": "2026-09-22 09:00:00",
     }
@@ -65,7 +66,7 @@ def test_schema_contains_all_plan_fields_constraints_and_indexes(plan_db):
         "plans": {
             "id", "display_no", "kind", "title", "priority", "preemption", "status",
             "owner_uid", "source_kind", "source_id", "creator_uid", "creator_role",
-            "creator_surface", "current_step_id", "wake_at", "deadline_at", "version",
+            "creator_surface", "report_json", "current_step_id", "wake_at", "deadline_at", "version",
             "created_at", "updated_at",
         },
         "plan_steps": {
@@ -129,9 +130,47 @@ def test_create_plan_roundtrip(plan_db):
     assert got["display_no"] == f"PL-{made['id']:04d}"
     assert got["version"] == 1
     assert got["deadline_at"] == "2026-09-22 09:00:00"
+    assert got["report_json"] == {"notify": True, "speak_if_present": False}
     assert got["steps"][0]["args_json"]["x"] == 1.0
     assert got["steps"][0]["target_json"]["name"] == "A 点"
     assert got["steps"][0]["attempts"] == []
+
+
+def test_init_db_migrates_report_json_into_existing_plans(tmp_path, monkeypatch):
+    path = tmp_path / "legacy-plan.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE plans (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, display_no TEXT NOT NULL DEFAULT '',
+           kind TEXT NOT NULL, title TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'P2',
+           preemption TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'draft',
+           owner_uid TEXT, source_kind TEXT NOT NULL DEFAULT 'manual', source_id TEXT,
+           creator_uid TEXT, creator_role TEXT, creator_surface TEXT, current_step_id INTEGER,
+           wake_at TEXT, deadline_at TEXT, version INTEGER NOT NULL DEFAULT 1,
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+    )
+    conn.execute(
+        """INSERT INTO plans
+           (display_no,kind,title,priority,preemption,status,source_kind,version,
+            created_at,updated_at)
+           VALUES ('PL-0001','care','旧计划','P2','queue','draft','manual',1,
+                   '2026-09-21 10:00:00','2026-09-21 10:00:00')"""
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+
+    db.init_db()
+
+    conn = db._conn()
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(plans)")}
+    finally:
+        conn.close()
+    assert "report_json" in columns
+    migrated = db.get_plan(1)
+    assert migrated["title"] == "旧计划"
+    assert migrated["report_json"] == {}
 
 
 def test_create_plan_rolls_back_if_second_step_fails(plan_db):

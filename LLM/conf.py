@@ -20,6 +20,29 @@ PROMPT_DIR = Path(__file__).resolve().parent / "agent" / "prompt"
 PROMPT_FILE = PROMPT_DIR / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
 REACT_PROMPT_FILE = PROMPT_DIR / "react.md"  # ReAct 工具决策规则（每次请求实时读取）
 FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
+CONFIG_WARNINGS: list[dict[str, object]] = []
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive integer environment setting without breaking imports."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (AttributeError, TypeError, ValueError):
+        value = 0
+    if value > 0:
+        return value
+    warning = {"name": name, "value": raw, "fallback": default}
+    CONFIG_WARNINGS.append(warning)
+    print(f"[WARN] 配置 {name}={raw!r} 非法，回退默认值 {default}")
+    return default
+
+
+PLAN_MOVE_TIMEOUT_S = _positive_int_env("PLAN_MOVE_TIMEOUT_S", 45)
+PLAN_TURN_TIMEOUT_S = _positive_int_env("PLAN_TURN_TIMEOUT_S", 45)
+PLAN_GOTO_TIMEOUT_S = _positive_int_env("PLAN_GOTO_TIMEOUT_S", 200)
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
 DEFAULT_SETTINGS = {

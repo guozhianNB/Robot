@@ -282,6 +282,12 @@ def fingerprint_check(tags: dict, info: dict) -> dict:
             "yaml": {"resolution": res_now, "origin": y_org}}
 
 
+def content_fingerprint(tags: dict) -> str:
+    """Return the stable content fingerprint used by Plan snapshots and the cache manifest."""
+    raw = json.dumps(tags, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return "sha1:" + hashlib.sha1(raw).hexdigest()  # noqa: S324 内容变更指纹，非安全用途
+
+
 # ---------------------------------------------------------------------------
 # 写：内存 → tags.json（原子写，唯一写入口）
 # ---------------------------------------------------------------------------
@@ -370,8 +376,7 @@ def sync_map(map_name: str, store=None, force: bool = False) -> dict:
     fp = got.get("fingerprint") or {}
     if fp.get("changed"):
         warn = warn + list(fp.get("reasons") or [])
-    raw = json.dumps(tags, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    sha = hashlib.sha1(raw).hexdigest()          # noqa: S324 非安全用途，仅做变更指纹
+    sha = content_fingerprint(tags).removeprefix("sha1:")
     dests = [{
         "uid": d["uid"], "name": d["name"], "aliases": ",".join(d.get("aliases") or []),
         "x": d["x"], "y": d["y"], "yaw_deg": d["yaw_deg"], "risk": d["risk"],

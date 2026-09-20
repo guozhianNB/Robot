@@ -2,11 +2,11 @@
 r"""Plan candidate validation and deterministic navigation-target compilation."""
 from __future__ import annotations
 
-import hashlib
-import json
 import math
+import re
 from datetime import datetime
 
+from .. import conf
 from ..core import log as audit
 from ..store import db
 
@@ -19,16 +19,14 @@ PLAN_ACTIONS = frozenset({
 })
 
 _TOP_LEVEL_FIELDS = frozenset({"title", "priority", "owner_uid", "steps", "report"})
-_STEP_FIELDS = frozenset({"type", "action", "args", "label", "wait_kind", "wake_at"})
+_STEP_FIELDS = {
+    "action": frozenset({"type", "action", "args", "label"}),
+    "wait": frozenset({"type", "wait_kind", "wake_at", "label"}),
+    "manual": frozenset({"type", "label"}),
+}
 _WAIT_KINDS = frozenset({"time", "device", "external"})
 _DIRECTIONS = frozenset({"forward", "back", "left", "right"})
-_ACTION_DEFAULTS = {
-    "robot_move": (60, "none", 1),
-    "robot_turn": (60, "none", 1),
-    "robot_goto_point": (180, "safe_goto_only", 2),
-    "robot_goto_place": (180, "safe_goto_only", 2),
-    "robot_goto_zone": (180, "safe_goto_only", 2),
-}
+_SHA1_FINGERPRINT = re.compile(r"^sha1:[0-9a-f]{40}$")
 
 
 def _finite(value) -> bool:
@@ -88,27 +86,12 @@ def _resolver_or_default(resolver):
     return CarNav()
 
 
-def _fingerprint_value(resolver, resolved: dict, map_name: str) -> str | None:
-    for value in (resolved.get("tags_fingerprint"), resolved.get("fingerprint")):
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if isinstance(value, dict):
-            sha1 = value.get("sha1")
-            if isinstance(sha1, str) and sha1.strip():
-                return f"sha1:{sha1.strip().removeprefix('sha1:')}"
-
-    tags = resolved.get("tags")
-    if not isinstance(tags, dict) and hasattr(resolver, "resolve_tags"):
-        got = resolver.resolve_tags(map_name)
-        if isinstance(got, dict):
-            direct = got.get("tags_fingerprint") or got.get("sha1")
-            if isinstance(direct, str) and direct.strip():
-                return f"sha1:{direct.strip().removeprefix('sha1:')}"
-            tags = got.get("tags")
-    if not isinstance(tags, dict):
-        return None
-    raw = json.dumps(tags, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return "sha1:" + hashlib.sha1(raw).hexdigest()  # noqa: S324 内容变更指纹，非安全用途
+def _action_defaults(action: str) -> tuple[int, str, int]:
+    if action == "robot_move":
+        return conf.PLAN_MOVE_TIMEOUT_S, "none", 1
+    if action == "robot_turn":
+        return conf.PLAN_TURN_TIMEOUT_S, "none", 1
+    return conf.PLAN_GOTO_TIMEOUT_S, "safe_goto_only", 2
 
 
 def _compile_target(action: str, args: dict, resolver) -> tuple[dict, dict]:
@@ -133,6 +116,12 @@ def _compile_target(action: str, args: dict, resolver) -> tuple[dict, dict]:
         raise ValueError(f"{action} 目标解析失败：坐标无效")
     point = {"x": float(target["x"]), "y": float(target["y"]), "yaw_deg": float(yaw)}
     map_name = str(resolved.get("map") or "").strip()
+    if not map_name:
+        raise ValueError(f"{action} 目标解析失败：缺少地图名")
+    tags_fingerprint = resolved.get("tags_fingerprint")
+    if not isinstance(tags_fingerprint, str) or not _SHA1_FINGERPRINT.fullmatch(
+            tags_fingerprint):
+        raise ValueError(f"{action} 目标解析失败：缺少合法 tags 指纹")
     snapshot = {
         "source_action": action,
         "x": point["x"], "y": point["y"], "yaw_deg": point["yaw_deg"],
@@ -141,9 +130,9 @@ def _compile_target(action: str, args: dict, resolver) -> tuple[dict, dict]:
     if name is not None:
         snapshot["name"] = name
     return point, {
-        "map_name": map_name or None,
+        "map_name": map_name,
         "target_json": snapshot,
-        "tags_fingerprint": _fingerprint_value(nav, resolved, map_name) if map_name else None,
+        "tags_fingerprint": tags_fingerprint,
     }
 
 
@@ -164,12 +153,12 @@ def compile_steps(raw_steps: list[dict], resolver) -> list[dict]:
     for seq, raw in enumerate(raw_steps, 1):
         if not isinstance(raw, dict):
             raise ValueError(f"步骤 {seq} 必须是对象")
-        extra = set(raw) - _STEP_FIELDS
-        if extra:
-            raise ValueError(f"步骤 {seq} 包含不允许字段：{', '.join(sorted(extra))}")
         step_type = raw.get("type")
         if step_type not in STEP_TYPES:
             raise ValueError(f"步骤 {seq} type 必须是 action/wait/manual")
+        extra = set(raw) - _STEP_FIELDS[step_type]
+        if extra:
+            raise ValueError(f"步骤 {seq} {step_type} 包含不允许字段：{', '.join(sorted(extra))}")
         label = raw.get("label", "")
         if not isinstance(label, str):
             raise ValueError(f"步骤 {seq} label 必须是字符串")
@@ -180,7 +169,7 @@ def compile_steps(raw_steps: list[dict], resolver) -> list[dict]:
             if action not in PLAN_ACTIONS:
                 raise ValueError(f"动作 {action!r} 不在 Plan 自动执行白名单")
             args = _normalize_action_args(action, raw.get("args", {}))
-            timeout, retry, attempts = _ACTION_DEFAULTS[action]
+            timeout, retry, attempts = _action_defaults(action)
             out.update({"action": action, "args_json": args, "timeout_sec": timeout,
                         "retry_policy": retry, "max_attempts": attempts})
             if action.startswith("robot_goto_"):
@@ -188,8 +177,6 @@ def compile_steps(raw_steps: list[dict], resolver) -> list[dict]:
                 out.update(target_fields)
                 out.update({"action": "robot_goto_point", "args_json": point})
         elif step_type == "wait":
-            if raw.get("action") not in (None, ""):
-                raise ValueError(f"步骤 {seq} wait 不能包含 action")
             wait_kind = raw.get("wait_kind")
             if wait_kind not in _WAIT_KINDS:
                 raise ValueError(f"步骤 {seq} wait_kind 必须是 time/device/external")
@@ -205,21 +192,8 @@ def compile_steps(raw_steps: list[dict], resolver) -> list[dict]:
             elif wake_at not in (None, ""):
                 raise ValueError(f"步骤 {seq} 只有 time wait 可以设置 wake_at")
             out["wait_kind"] = wait_kind
-            args = raw.get("args", {})
-            if not isinstance(args, dict):
-                raise ValueError(f"步骤 {seq} wait.args 必须是对象")
-            out["args_json"] = dict(args)
         else:
-            if raw.get("action") not in (None, ""):
-                raise ValueError(f"步骤 {seq} manual 不能包含 action")
-            if raw.get("wait_kind") not in (None, "", "manual"):
-                raise ValueError(f"步骤 {seq} manual 的 wait_kind 只能是 manual")
-            if raw.get("wake_at") not in (None, ""):
-                raise ValueError(f"步骤 {seq} manual 不能包含 wake_at")
-            args = raw.get("args", {})
-            if not isinstance(args, dict):
-                raise ValueError(f"步骤 {seq} manual.args 必须是对象")
-            out.update({"wait_kind": "manual", "args_json": dict(args)})
+            out["wait_kind"] = "manual"
         compiled.append(out)
     return compiled
 
@@ -243,11 +217,13 @@ def create_candidate(payload: dict, creator: dict, resolver=None) -> dict:
     if not isinstance(owner_uid, str):
         raise ValueError("owner_uid 必须是字符串")
     report = payload.get("report")
+    normalized_report = {"notify": False, "speak_if_present": False}
     if report is not None:
         if not isinstance(report, dict) or set(report) - {"notify", "speak_if_present"}:
             raise ValueError("report 只允许 notify 和 speak_if_present")
         if any(not isinstance(value, bool) for value in report.values()):
             raise ValueError("report 字段必须是布尔值")
+        normalized_report.update(report)
 
     steps = compile_steps(payload.get("steps"), resolver)
     principal = dict(creator or {})
@@ -259,13 +235,17 @@ def create_candidate(payload: dict, creator: dict, resolver=None) -> dict:
         "creator_uid": principal.get("uid") or None,
         "creator_role": principal.get("role") or None,
         "creator_surface": principal.get("slot") or None,
+        "report_json": normalized_report,
     }
     made = db.create_plan(plan_row, steps)
-    stored = db.get_plan(made["id"], include_steps=True) or {**made, "steps": steps}
+    stored = made
     summary = f"{stored['display_no']} {stored['title']}（{len(steps)} 步）"
-    audit.log("plan", action="create", plan_id=stored["id"],
-              display_no=stored["display_no"], priority=priority,
-              creator_uid=plan_row["creator_uid"], creator_role=plan_row["creator_role"])
+    try:
+        audit.log("plan", action="create", plan_id=stored["id"],
+                  display_no=stored["display_no"], priority=priority,
+                  creator_uid=plan_row["creator_uid"], creator_role=plan_row["creator_role"])
+    except Exception as exc:  # committed state must not be reported as a failed tool call
+        print(f"[WARN] Plan {stored['display_no']} 已创建，但审计写入失败：{exc}")
     return {"ok": True, "plan": stored, "summary": summary}
 
 

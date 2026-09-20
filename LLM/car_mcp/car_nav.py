@@ -61,11 +61,11 @@ class CarNav:
             warnings = list(got.get("warnings") or []) + list(fp.get("reasons") or [])
             if any("无指纹" in str(item) for item in warnings):
                 warnings.append("tags 无指纹")
-            return (name, tags, warnings), None
+            return (name, tags, warnings, _maptags.content_fingerprint(tags)), None
         except Exception as exc:  # fail closed; no dependency errors leak
             return None, self._bad("地图解析失败", "请检查地图与导航状态")
 
-    def _safe_point(self, name, x, y, yaw, source, warnings):
+    def _safe_point(self, name, x, y, yaw, source, warnings, tags_fingerprint):
         try:
             checked = self.validate_point(name, float(x), float(y))
         except Exception:
@@ -83,6 +83,7 @@ class CarNav:
             return self._bad("目标点安全校验未通过：" + ("；".join(map(str, reasons)) or "地图无法校验"), "请选择地图内的可通行停靠点")
         return {"ok": True, "map": name,
                 "target": {"x": float(x), "y": float(y), "yaw_deg": float(yaw), "goal_source": source},
+                "tags_fingerprint": tags_fingerprint,
                 "warnings": warnings, "summary_target": f"{source} ({float(x):.2f}, {float(y):.2f})"}
 
     @staticmethod
@@ -105,7 +106,7 @@ class CarNav:
         if err:
             return {"map": None, "zone": None, "reason": err["error"],
                     "warnings": list(err.get("warnings") or [])}
-        name, tags, warnings = ctx
+        name, tags, warnings, _tags_fingerprint = ctx
         matches = [zone for zone in (tags.get("zones") or [])
                    if isinstance(zone, dict) and self.zone_hit(zone, float(pose["x"]), float(pose["y"]))]
         zone = min(matches, key=lambda item: (self._zone_area(item), str(item.get("uid", "")))) if matches else None
@@ -117,8 +118,8 @@ class CarNav:
             return self._bad("坐标和 yaw 必须是有限数字", "请传入数值坐标")
         ctx, err = self._context()
         if err: return err
-        name, _tags, warnings = ctx
-        return self._safe_point(name, x, y, yaw_deg, "point", warnings)
+        name, _tags, warnings, tags_fingerprint = ctx
+        return self._safe_point(name, x, y, yaw_deg, "point", warnings, tags_fingerprint)
 
     def resolve_place(self, place: str) -> dict:
         try:
@@ -131,7 +132,7 @@ class CarNav:
             return self._bad("地点名称不能为空", "请提供地点名称")
         ctx, err = self._context()
         if err: return err
-        name, tags, warnings = ctx
+        name, tags, warnings, tags_fingerprint = ctx
         needle = place.strip()
         matches = [d for d in tags.get("destinations", [])
                    if needle == str(d.get("name", "")).strip() or needle in [str(a).strip() for a in (d.get("aliases") or [])]]
@@ -143,7 +144,8 @@ class CarNav:
         d = matches[0]
         if not all(self._finite(d.get(k)) for k in ("x", "y", "yaw_deg")):
             return self._bad("地点坐标无效", "请在地图编辑器修正该地点")
-        return self._safe_point(name, d["x"], d["y"], d["yaw_deg"], "destination", warnings)
+        return self._safe_point(name, d["x"], d["y"], d["yaw_deg"], "destination", warnings,
+                                tags_fingerprint)
 
     def resolve_zone(self, zone: str) -> dict:
         try:
@@ -156,7 +158,7 @@ class CarNav:
             return self._bad("区域名称不能为空", "请提供区域名称")
         ctx, err = self._context()
         if err: return err
-        name, tags, warnings = ctx
+        name, tags, warnings, tags_fingerprint = ctx
         matches = [z for z in tags.get("zones", []) if zone.strip() == str(z.get("name", "")).strip()]
         if not matches: return self._bad("未找到区域", "当前图可用区域：" + ", ".join(str(z.get("name")) for z in tags.get("zones", [])))
         if len(matches) > 1: return self._bad("区域名称不唯一", "请使用精确区域名")
@@ -166,7 +168,8 @@ class CarNav:
             yaw = goal.get("yaw_deg", 0.0)
             if not self._finite(yaw) or not self.zone_hit(z, float(goal["x"]), float(goal["y"])):
                 return self._bad("区域显式目标不在区域内", "请在地图编辑器修正区域停靠点")
-            return self._safe_point(name, goal["x"], goal["y"], yaw, "explicit", warnings)
+            return self._safe_point(name, goal["x"], goal["y"], yaw, "explicit", warnings,
+                                    tags_fingerprint)
         candidates = [d for d in tags.get("destinations", [])
                       if self._finite(d.get("x")) and self._finite(d.get("y")) and
                       self._finite(d.get("yaw_deg")) and self.zone_hit(z, d["x"], d["y"])]
@@ -175,5 +178,7 @@ class CarNav:
         cx = sum(float(p[0]) for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2) / max(1, len(poly))
         cy = sum(float(p[1]) for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2) / max(1, len(poly))
         d = min(candidates, key=lambda q: (q["x"]-cx)**2 + (q["y"]-cy)**2)
-        out = self._safe_point(name, d["x"], d["y"], d.get("yaw_deg", 0.0), "destination", warnings + [f"区域无显式目标，回退地点：{d.get('name')}" ] )
+        out = self._safe_point(name, d["x"], d["y"], d.get("yaw_deg", 0.0), "destination",
+                               warnings + [f"区域无显式目标，回退地点：{d.get('name')}"],
+                               tags_fingerprint)
         return out

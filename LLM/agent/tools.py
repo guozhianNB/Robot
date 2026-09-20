@@ -68,6 +68,22 @@ def _run_fn(fn, args: dict):
     return fn(**kwargs)
 
 
+def _local_args_error(reg: dict, args) -> str:
+    """Validate the top-level object contract needed before signature filtering."""
+    if not isinstance(args, dict):
+        return "工具参数必须是对象"
+    parameters = reg.get("schema", {}).get("function", {}).get("parameters", {})
+    required = set(parameters.get("required") or [])
+    missing = required - set(args)
+    if missing:
+        return f"缺少必填字段：{', '.join(sorted(missing))}"
+    if parameters.get("additionalProperties") is False:
+        unknown = set(args) - set(parameters.get("properties") or {})
+        if unknown:
+            return f"不允许字段：{', '.join(sorted(unknown))}"
+    return ""
+
+
 def _audit_args(name: str, args: dict | None):
     """Keep image and prompt payloads out of policy-denial audit records."""
     if name == "see_what":
@@ -228,6 +244,9 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not is_local:
         return mcp_client.call_tool(name, args or {})
+    args_error = _local_args_error(reg, args)
+    if args_error:
+        return {"ok": False, "error": f"工具参数不符合 schema：{args_error}"}
     token = _CURRENT_PRINCIPAL.set(dict(p))
     try:
         return _run_fn(reg["fn"], args or {})

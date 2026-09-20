@@ -9,6 +9,7 @@ WARD_TOOLS = ["robot_status", "robot_stop", "notify_nurse", "create_plan"]
 CAR_ACTION_TOOLS = [
     "robot_move", "robot_turn", "robot_goto_point", "robot_goto_zone", "robot_goto_place",
 ]
+ELDER_TOOLS = set(WARD_TOOLS + CAR_ACTION_TOOLS + ["see_what"])
 
 
 def test_policy_keys_cover_three_roles():
@@ -37,8 +38,7 @@ def test_elder_reads_self_plus_ward_context():
     p = policy.POLICY_DEFAULTS["elder"]
     assert p["data_scope"] == "self"
     assert p["ward_context"] is True
-    assert "robot_stop" in p["allowed_tools"]     # R3：安全动作永远在列
-    assert all(name in p["allowed_tools"] for name in CAR_ACTION_TOOLS)
+    assert set(p["allowed_tools"]) == ELDER_TOOLS
     assert not any(name in policy.POLICY_DEFAULTS["ward"]["allowed_tools"] for name in CAR_ACTION_TOOLS)
 
 

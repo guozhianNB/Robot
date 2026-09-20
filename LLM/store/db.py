@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS plans (
   creator_uid     TEXT,
   creator_role    TEXT,
   creator_surface TEXT,
+  report_json     TEXT NOT NULL DEFAULT '{}',
   current_step_id INTEGER,
   wake_at         TEXT,
   deadline_at     TEXT,
@@ -263,6 +264,9 @@ def init_db():
                     "deleted_at": "deleted_at TEXT DEFAULT ''",
                 })
             _ensure_columns(conn, "rag_memories", {"external_id": "external_id TEXT DEFAULT ''"})
+            _ensure_columns(conn, "plans", {
+                "report_json": "report_json TEXT NOT NULL DEFAULT '{}'",
+            })
             # P0c 账本定稿：authority=llm(模型归纳) | nurse(护士定稿) | claim(档案账本)
             _ensure_columns(conn, "core_memories", {"authority": "authority TEXT DEFAULT 'llm'"})
             # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
@@ -1795,9 +1799,10 @@ def prune_notifications(before_iso: str) -> int:
 _PLAN_FIELDS = (
     "display_no", "kind", "title", "priority", "preemption", "status", "owner_uid",
     "source_kind", "source_id", "creator_uid", "creator_role", "creator_surface",
-    "current_step_id", "wake_at", "deadline_at", "created_at", "updated_at",
+    "report_json", "current_step_id", "wake_at", "deadline_at", "created_at", "updated_at",
 )
-_PLAN_MUTABLE_FIELDS = set(_PLAN_FIELDS) - {"display_no", "created_at", "updated_at"}
+_PLAN_MUTABLE_FIELDS = set(_PLAN_FIELDS) - {
+    "display_no", "report_json", "created_at", "updated_at"}
 _STEP_FIELDS = (
     "plan_id", "seq", "step_type", "action", "label", "args_json", "status",
     "wait_kind", "wake_at", "map_name", "target_json", "tags_fingerprint", "timeout_sec",
@@ -1843,7 +1848,7 @@ def _decode_json_fields(row, fields) -> dict | None:
 
 
 def _plan_row(row) -> dict | None:
-    return dict(row) if row is not None else None
+    return _decode_json_fields(row, {"report_json": {}})
 
 
 def _step_row(row) -> dict | None:
@@ -1899,16 +1904,17 @@ def create_plan(plan: dict, steps: list[dict]) -> dict:
             cur = conn.execute(
                 """INSERT INTO plans
                    (display_no,kind,title,priority,preemption,status,owner_uid,source_kind,
-                    source_id,creator_uid,creator_role,creator_surface,current_step_id,wake_at,
-                    deadline_at,version,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                    source_id,creator_uid,creator_role,creator_surface,report_json,current_step_id,
+                    wake_at,deadline_at,version,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
                 (
                     plan.get("display_no", ""), plan.get("kind", "care"),
                     plan.get("title", ""), plan.get("priority", "P2"),
                     plan.get("preemption", "queue"), plan.get("status", "draft"),
                     plan.get("owner_uid"), plan.get("source_kind", "manual"),
                     plan.get("source_id"), plan.get("creator_uid"), plan.get("creator_role"),
-                    plan.get("creator_surface"), plan.get("current_step_id"),
+                    plan.get("creator_surface"), _json_text(plan.get("report_json"), {}),
+                    plan.get("current_step_id"),
                     plan.get("wake_at"), plan.get("deadline_at"), now, now,
                 ),
             )
@@ -1936,8 +1942,11 @@ def create_plan(plan: dict, steps: list[dict]) -> dict:
                         step.get("last_progress_at"), step.get("last_error", ""),
                     ),
                 )
+            created = _get_plan_conn(conn, plan_id, include_steps=True)
+            if created is None:
+                raise sqlite3.IntegrityError(f"created plan {plan_id} cannot be read back")
             conn.commit()
-            return _get_plan_conn(conn, plan_id)
+            return created
         except Exception:
             conn.rollback()
             raise

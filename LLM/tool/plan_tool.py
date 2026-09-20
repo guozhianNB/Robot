@@ -15,17 +15,20 @@ from ..agent.tools import tool
             "steps": {
                 "type": "array", "minItems": 1,
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string", "enum": ["action", "wait", "manual"]},
-                        "action": {"type": "string"},
-                        "args": {"type": "object"},
-                        "label": {"type": "string"},
-                        "wait_kind": {"type": "string", "enum": ["time", "device", "external", "manual"]},
-                        "wake_at": {"type": "string"},
-                    },
-                    "required": ["type"],
-                    "additionalProperties": False,
+                    "oneOf": [
+                        {"type": "object", "properties": {
+                            "type": {"const": "action"}, "action": {"type": "string"},
+                            "args": {"type": "object"}, "label": {"type": "string"}},
+                         "required": ["type", "action", "args"], "additionalProperties": False},
+                        {"type": "object", "properties": {
+                            "type": {"const": "wait"},
+                            "wait_kind": {"type": "string", "enum": ["time", "device", "external"]},
+                            "wake_at": {"type": "string"}, "label": {"type": "string"}},
+                         "required": ["type", "wait_kind"], "additionalProperties": False},
+                        {"type": "object", "properties": {
+                            "type": {"const": "manual"}, "label": {"type": "string"}},
+                         "required": ["type"], "additionalProperties": False},
+                    ],
                 },
             },
             "report": {
