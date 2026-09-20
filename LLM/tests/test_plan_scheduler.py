@@ -1,10 +1,113 @@
 # -*- coding: utf-8 -*-
-"""共享车控动作闸门与 Plan MCP 入口契约测试。"""
+"""共享车控动作闸门与确定性 Plan 调度器测试。"""
 
-from LLM.agent import action_gate, tools
+import pytest
+import json
+
+from LLM.agent import action_gate, plan_scheduler, tools
+
+
+@pytest.mark.parametrize("raw,kind", [
+    ({"ok": False, "message": "断开"}, "transport_error"),
+    ({"ok": True, "result": '{"ok":false,"status":"error"}'}, "action_error"),
+    ({"ok": True, "result": '{"ok":true,"status":"unavailable"}'}, "unavailable"),
+    ({"ok": True, "result": "not json"}, "malformed"),
+])
+def test_parse_result_is_fail_closed(raw, kind):
+    assert plan_scheduler.parse_tool_result(raw).kind == kind
+
+
+def test_parse_started_requires_task_id_and_never_means_success():
+    result = plan_scheduler.parse_tool_result(
+        {"ok": True, "result": '{"ok":true,"status":"started","task_id":7}'})
+    assert result.kind == "started"
+    assert result.task_id == 7
+    assert plan_scheduler.parse_tool_result(
+        {"ok": True, "result": '{"ok":true,"status":"started"}'}).kind == "malformed"
+
+
+def test_reconcile_ignores_wrong_task_id_and_matches_last_once():
+    step = {"action": "robot_move", "timeout_sec": 45,
+            "attempt": {"car_task_id": 7, "started_at_mono": 0}}
+    wrong = {"ok": True, "last": {"task_id": 8, "ok": True}}
+    assert plan_scheduler.reconcile_step(step, wrong, 2) == "waiting"
+    done = {"ok": True, "last": {"task_id": 7, "ok": True}}
+    assert plan_scheduler.reconcile_step(step, done, 2) == "succeeded"
+    assert plan_scheduler.reconcile_step(step, done, 3) == "succeeded"
+
+
+def test_reconcile_unavailable_grace_then_review():
+    step = {"action": "robot_move", "timeout_sec": 45,
+            "attempt": {"car_task_id": 7, "started_at_mono": 0,
+                         "unavailable_since": 10}}
+    payload = {"ok": True, "status": "unavailable"}
+    assert plan_scheduler.reconcile_step(step, payload, 20) == "waiting"
+    assert plan_scheduler.reconcile_step(step, payload, 26) == "needs_review"
+
+
+def test_tick_dispatches_once_then_advances_on_matching_last(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "巡逻", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "action", "action": "robot_move",
+          "args_json": {"direction": "forward", "distance_m": 0.2},
+          "timeout_sec": 45, "retry_policy": "none", "max_attempts": 1}],
+    )
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        name: {"server": "car", "schema": {}}
+        for name in ("robot_move", "robot_status")
+    })
+    calls = []
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda name, args: (
+        calls.append(name) or ({"ok": True, "result": json.dumps({
+            "ok": True, "status": "started", "task_id": 9})}
+            if name == "robot_move" else {"ok": True, "result": json.dumps({
+                "ok": True, "last": {"task_id": 9, "ok": True}})})))
+    plan_scheduler.tick_once(100)
+    assert calls == ["robot_move"]
+    running = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert running["steps"][0]["status"] == "running"
+    plan_scheduler.tick_once(101)
+    assert calls == ["robot_move", "robot_status"]
+    finished = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert finished["status"] == "succeeded"
+    assert finished["steps"][0]["status"] == "succeeded"
+
+
+def test_move_timeout_never_retries(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "移动", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "action", "action": "robot_move",
+          "args_json": {"direction": "forward", "distance_m": 0.2},
+          "timeout_sec": 1, "retry_policy": "none", "max_attempts": 1}],
+    )
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        name: {"server": "car", "schema": {}}
+        for name in ("robot_move", "robot_status")
+    })
+    calls = []
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda name, args: (
+        calls.append(name) or ({"ok": True, "result": json.dumps({
+            "ok": True, "status": "started", "task_id": 4})}
+            if name == "robot_move" else {"ok": True, "result": json.dumps({
+                "ok": True, "exec_state": "moving", "current": {"task_id": 4}})})))
+    plan_scheduler.tick_once(10)
+    plan_scheduler.tick_once(12)
+    plan_scheduler.tick_once(13)
+    assert calls.count("robot_move") == 1
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["steps"][0]["status"] == "needs_review"
 
 
 def test_dialog_action_is_busy_while_plan_owns_slot(monkeypatch):
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     token = action_gate.claim("plan", "plan:7:step:2")
     assert token is not None
     try:
@@ -21,6 +124,7 @@ def test_dialog_action_is_busy_while_plan_owns_slot(monkeypatch):
 
 
 def test_stop_and_status_bypass_action_gate(monkeypatch):
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     token = action_gate.claim("plan", "plan:7:step:2")
     assert token is not None
     try:
