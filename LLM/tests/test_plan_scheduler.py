@@ -395,3 +395,45 @@ def test_finish_cannot_overwrite_newer_manual_transition(monkeypatch, tmp_path):
     assert got["version"] == newer["version"]
     assert got["status"] == "running"
     assert got["steps"][0]["status"] == "running"
+
+
+def test_prepare_cas_conflict_after_priority_change_does_not_review(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "调级并发", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "action", "action": "robot_goto_point",
+          "status": "pending", "args_json": {"x": 1, "y": 2}}],
+    )
+    stale = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    step = stale["steps"][0]
+    step["_plan_version"] = stale["version"]
+    changed = plan.change_priority(made["id"], stale["version"], "P1", {"uid": "n"})
+    assert changed["ok"] is True
+    plan_scheduler._dispatch(step, 1.0)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["priority"] == "P1"
+    assert got["status"] == "queued"
+    assert got["steps"][0]["status"] == "pending"
+
+
+def test_prepare_cas_conflict_after_manual_confirm_does_not_review(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "人工完成并发", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "manual", "status": "pending", "wait_kind": "manual"}],
+    )
+    stale = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    step = stale["steps"][0]
+    step.update({"step_type": "action", "action": "robot_goto_point",
+                 "_plan_version": stale["version"]})
+    changed = plan.confirm_step(made["id"], stale["version"], stale["steps"][0]["id"],
+                                "complete", "护士确认", {"uid": "n"})
+    assert changed["ok"] is True
+    plan_scheduler._dispatch(step, 1.0)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["status"] == "succeeded"
+    assert got["steps"][0]["status"] == "succeeded"

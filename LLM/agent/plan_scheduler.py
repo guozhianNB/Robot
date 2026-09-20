@@ -422,6 +422,12 @@ def _dispatch(step: dict, now: float) -> None:
                         if item.get("id") == step.get("id")), None)
         if current is not None:
             current["_plan_version"] = latest.get("version")
+            # The Attempt CAS failed because a human/API writer advanced the
+            # aggregate.  This tick is stale; never turn the newer decision
+            # (priority change, manual completion, etc.) into needs_review.
+            if (step.get("_plan_version") is not None and
+                    latest.get("version") != step.get("_plan_version")):
+                return
             if latest.get("status") in {"cancelling", "cancelled", "needs_review"}:
                 return
             # Includes the legacy half-state (pending + prepared attempt).  It

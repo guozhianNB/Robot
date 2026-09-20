@@ -40,3 +40,5 @@ $env:OPENAI_API_KEY='test'; ..\..\.venv\Scripts\python.exe -m pytest --basetemp=
 随后又收紧了 Attempt 准备与 Plan 取消之间的竞态：`prepare_plan_attempt()` 支持
 `expected_version`，调度器若在准备前后观察到 `cancelling/cancelled/needs_review` 会放弃派发，
 不会把人工终态改回 `running`。上述 94 个回归测试仍全部通过。
+
+增量复审修复：Attempt 准备 CAS 失败时，scheduler 先比较最新 Plan version；确认是调级、人工完成或其他 API 写入造成的旧 tick 后直接放弃，不再调用 `_mark_review`。补充了 priority/manual confirm 并发回归，最终相关测试共 **96 passed**。
