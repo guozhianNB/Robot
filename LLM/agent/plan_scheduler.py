@@ -54,8 +54,10 @@ class ToolResult:
 
 def parse_stop_result(raw: dict) -> tuple[bool, str]:
     """Validate robot_stop's MCP envelope and inner car response."""
-    if not isinstance(raw, dict) or raw.get("ok") is not True:
-        return False, str((raw or {}).get("error") or (raw or {}).get("message") or "MCP 急停调用失败")
+    if not isinstance(raw, dict):
+        return False, "MCP 急停调用返回无效结果"
+    if raw.get("ok") is not True:
+        return False, str(raw.get("error") or raw.get("message") or "MCP 急停调用失败")
     body = raw.get("result")
     if not isinstance(body, str):
         return False, "急停结果不是 JSON 字符串"
@@ -63,8 +65,10 @@ def parse_stop_result(raw: dict) -> tuple[bool, str]:
         payload = json.loads(body)
     except (TypeError, ValueError):
         return False, "急停结果不是合法 JSON"
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return False, str((payload or {}).get("error") or (payload or {}).get("message") or "车控急停失败")
+    if not isinstance(payload, dict):
+        return False, "车控急停结果必须是对象"
+    if payload.get("ok") is not True:
+        return False, str(payload.get("error") or payload.get("message") or "车控急停失败")
     if payload.get("status") in {"error", "rejected", "uncertain", "unavailable", "stale"}:
         return False, str(payload.get("error") or payload.get("status"))
     return True, ""
