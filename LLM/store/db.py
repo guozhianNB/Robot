@@ -146,6 +146,79 @@ CREATE TABLE IF NOT EXISTS notifications (
   ack_by     TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+
+-- ===== 可恢复的连续任务计划 =====
+CREATE TABLE IF NOT EXISTS plans (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  display_no      TEXT NOT NULL DEFAULT '',
+  kind            TEXT NOT NULL,
+  title           TEXT NOT NULL,
+  priority        TEXT NOT NULL DEFAULT 'P2',
+  preemption      TEXT NOT NULL DEFAULT 'queue',
+  status          TEXT NOT NULL DEFAULT 'draft',
+  owner_uid       TEXT,
+  source_kind     TEXT NOT NULL DEFAULT 'manual',
+  source_id       TEXT,
+  creator_uid     TEXT,
+  creator_role    TEXT,
+  creator_surface TEXT,
+  current_step_id INTEGER,
+  wake_at         TEXT,
+  deadline_at     TEXT,
+  version         INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plans_status_priority_created
+  ON plans(status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS plan_steps (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id          INTEGER NOT NULL,
+  seq              INTEGER NOT NULL,
+  step_type        TEXT NOT NULL,
+  action           TEXT,
+  label            TEXT NOT NULL DEFAULT '',
+  args_json        TEXT NOT NULL DEFAULT '{}',
+  status           TEXT NOT NULL DEFAULT 'pending',
+  wait_kind        TEXT,
+  wake_at          TEXT,
+  map_name         TEXT,
+  target_json      TEXT,
+  tags_fingerprint TEXT,
+  timeout_sec      INTEGER NOT NULL DEFAULT 0,
+  retry_policy     TEXT NOT NULL DEFAULT 'none',
+  max_attempts     INTEGER NOT NULL DEFAULT 1,
+  started_at       TEXT,
+  finished_at      TEXT,
+  last_progress_at TEXT,
+  last_error       TEXT NOT NULL DEFAULT '',
+  UNIQUE(plan_id, seq),
+  FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_seq ON plan_steps(plan_id, seq);
+
+CREATE TABLE IF NOT EXISTS plan_step_attempts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id          INTEGER NOT NULL,
+  step_id          INTEGER NOT NULL,
+  attempt_no       INTEGER NOT NULL,
+  idempotency_key  TEXT NOT NULL UNIQUE,
+  dispatch_state   TEXT NOT NULL DEFAULT 'prepared',
+  car_task_id      TEXT,
+  request_json     TEXT NOT NULL DEFAULT '{}',
+  accept_json      TEXT,
+  result_json      TEXT,
+  started_at       TEXT,
+  last_checked_at  TEXT,
+  finished_at      TEXT,
+  outcome          TEXT,
+  UNIQUE(step_id, attempt_no),
+  FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE,
+  FOREIGN KEY(step_id) REFERENCES plan_steps(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_plan_attempts_car_task_id
+  ON plan_step_attempts(car_task_id);
 """
 
 
@@ -153,6 +226,7 @@ def _conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -1664,5 +1738,367 @@ def prune_notifications(before_iso: str) -> int:
                 "DELETE FROM notifications WHERE ack_at!='' AND last_at<?", (before_iso,))
             conn.commit()
             return cur.rowcount
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- plans
+_PLAN_FIELDS = (
+    "display_no", "kind", "title", "priority", "preemption", "status", "owner_uid",
+    "source_kind", "source_id", "creator_uid", "creator_role", "creator_surface",
+    "current_step_id", "wake_at", "deadline_at", "created_at", "updated_at",
+)
+_PLAN_MUTABLE_FIELDS = set(_PLAN_FIELDS) - {"display_no", "created_at", "updated_at"}
+_STEP_FIELDS = (
+    "plan_id", "seq", "step_type", "action", "label", "args_json", "status",
+    "wait_kind", "wake_at", "map_name", "target_json", "tags_fingerprint", "timeout_sec",
+    "retry_policy", "max_attempts", "started_at", "finished_at", "last_progress_at",
+    "last_error",
+)
+_STEP_MUTABLE_FIELDS = set(_STEP_FIELDS) - {"plan_id"}
+_ATTEMPT_MUTABLE_FIELDS = {
+    "dispatch_state", "car_task_id", "request_json", "accept_json", "result_json",
+    "started_at", "last_checked_at", "finished_at", "outcome",
+}
+_ACTIVE_STEP_STATES = ("dispatching", "running", "interrupting")
+_PLAN_LIST_MAX = 200
+
+
+def _json_text(value, default):
+    if value is None:
+        value = default
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _decode_json_fields(row, fields) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    for field, default in fields.items():
+        raw = item.get(field)
+        if raw in (None, ""):
+            item[field] = default
+            continue
+        try:
+            item[field] = json.loads(raw)
+        except (TypeError, ValueError):
+            item[field] = default
+    return item
+
+
+def _plan_row(row) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+def _step_row(row) -> dict | None:
+    return _decode_json_fields(row, {"args_json": {}, "target_json": None})
+
+
+def _attempt_row(row) -> dict | None:
+    return _decode_json_fields(
+        row, {"request_json": {}, "accept_json": None, "result_json": None})
+
+
+def _get_plan_conn(conn, plan_id: int, *, include_steps=False,
+                   include_attempts=False) -> dict | None:
+    plan = _plan_row(conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone())
+    if plan is None:
+        return None
+
+    steps = []
+    if include_steps or include_attempts:
+        steps = [
+            _step_row(row) for row in conn.execute(
+                "SELECT * FROM plan_steps WHERE plan_id=? ORDER BY seq, id", (plan_id,)
+            ).fetchall()
+        ]
+    if include_steps:
+        plan["steps"] = steps
+
+    if include_attempts:
+        attempts = [
+            _attempt_row(row) for row in conn.execute(
+                "SELECT * FROM plan_step_attempts WHERE plan_id=? ORDER BY step_id, attempt_no, id",
+                (plan_id,),
+            ).fetchall()
+        ]
+        plan["attempts"] = attempts
+        by_step = {}
+        for attempt in attempts:
+            by_step.setdefault(attempt["step_id"], []).append(attempt)
+        for step in steps:
+            step["attempts"] = by_step.get(step["id"], [])
+        if not include_steps:
+            plan["steps"] = steps
+    return plan
+
+
+def create_plan(plan: dict, steps: list[dict]) -> dict:
+    """Create a Plan and all of its steps atomically."""
+    now = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN")
+            cur = conn.execute(
+                """INSERT INTO plans
+                   (display_no,kind,title,priority,preemption,status,owner_uid,source_kind,
+                    source_id,creator_uid,creator_role,creator_surface,current_step_id,wake_at,
+                    deadline_at,version,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                (
+                    plan.get("display_no", ""), plan.get("kind", "care"),
+                    plan.get("title", ""), plan.get("priority", "P2"),
+                    plan.get("preemption", "queue"), plan.get("status", "draft"),
+                    plan.get("owner_uid"), plan.get("source_kind", "manual"),
+                    plan.get("source_id"), plan.get("creator_uid"), plan.get("creator_role"),
+                    plan.get("creator_surface"), plan.get("current_step_id"),
+                    plan.get("wake_at"), plan.get("deadline_at"), now, now,
+                ),
+            )
+            plan_id = cur.lastrowid
+            display_no = plan.get("display_no") or f"PL-{plan_id:04d}"
+            conn.execute("UPDATE plans SET display_no=? WHERE id=?", (display_no, plan_id))
+
+            for step in steps:
+                conn.execute(
+                    """INSERT INTO plan_steps
+                       (plan_id,seq,step_type,action,label,args_json,status,wait_kind,wake_at,
+                        map_name,target_json,tags_fingerprint,timeout_sec,retry_policy,max_attempts,
+                        started_at,finished_at,last_progress_at,last_error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        plan_id, step.get("seq"), step.get("step_type", "action"),
+                        step.get("action"), step.get("label", ""),
+                        _json_text(step.get("args_json"), {}),
+                        step.get("status", "pending"), step.get("wait_kind"),
+                        step.get("wake_at"), step.get("map_name"),
+                        _json_text(step.get("target_json"), None),
+                        step.get("tags_fingerprint"), int(step.get("timeout_sec") or 0),
+                        step.get("retry_policy", "none"), int(step.get("max_attempts") or 1),
+                        step.get("started_at"), step.get("finished_at"),
+                        step.get("last_progress_at"), step.get("last_error", ""),
+                    ),
+                )
+            conn.commit()
+            return _get_plan_conn(conn, plan_id)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def get_plan(plan_id: int, *, include_steps=False, include_attempts=False) -> dict | None:
+    conn = _conn()
+    try:
+        return _get_plan_conn(
+            conn, plan_id, include_steps=include_steps, include_attempts=include_attempts)
+    finally:
+        conn.close()
+
+
+def list_plans(states: tuple[str, ...] = (), limit=50, before_id=0) -> list[dict]:
+    sql = "SELECT * FROM plans"
+    where = []
+    args = []
+    if states:
+        where.append(f"status IN ({','.join('?' for _ in states)})")
+        args.extend(states)
+    if before_id:
+        where.append("id<?")
+        args.append(before_id)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(max(0, min(int(limit or 0), _PLAN_LIST_MAX)))
+    conn = _conn()
+    try:
+        return [_plan_row(row) for row in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def plan_counts() -> dict:
+    conn = _conn()
+    try:
+        rows = conn.execute("SELECT status, COUNT(*) AS count FROM plans GROUP BY status").fetchall()
+        return {row["status"]: row["count"] for row in rows}
+    finally:
+        conn.close()
+
+
+def _checked_changes(changes: dict, allowed: set[str], json_fields=()) -> dict:
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
+    values = dict(changes)
+    for field in json_fields:
+        if field in values:
+            default = {} if field in {"args_json", "request_json"} else None
+            values[field] = _json_text(values[field], default)
+    return values
+
+
+def update_plan_versioned(plan_id: int, version: int, **changes) -> tuple[str, dict | None]:
+    values = _checked_changes(changes, _PLAN_MUTABLE_FIELDS)
+    values["updated_at"] = now_iso()
+    assignments = ",".join(f"{field}=?" for field in values)
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE plans SET {assignments},version=version+1 WHERE id=? AND version=?",
+                (*values.values(), plan_id, version),
+            )
+            if cur.rowcount:
+                conn.commit()
+                return "updated", _get_plan_conn(conn, plan_id)
+            current = _get_plan_conn(conn, plan_id)
+            return ("conflict", current) if current is not None else ("missing", None)
+        finally:
+            conn.close()
+
+
+def update_step(step_id: int, **changes) -> dict | None:
+    values = _checked_changes(
+        changes, _STEP_MUTABLE_FIELDS, json_fields=("args_json", "target_json"))
+    if not values:
+        conn = _conn()
+        try:
+            return _step_row(
+                conn.execute("SELECT * FROM plan_steps WHERE id=?", (step_id,)).fetchone())
+        finally:
+            conn.close()
+    assignments = ",".join(f"{field}=?" for field in values)
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE plan_steps SET {assignments} WHERE id=?", (*values.values(), step_id))
+            conn.commit()
+            if not cur.rowcount:
+                return None
+            return _step_row(
+                conn.execute("SELECT * FROM plan_steps WHERE id=?", (step_id,)).fetchone())
+        finally:
+            conn.close()
+
+
+def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN")
+            step = conn.execute("SELECT plan_id FROM plan_steps WHERE id=?", (step_id,)).fetchone()
+            if step is None:
+                raise ValueError(f"plan step not found: {step_id}")
+            plan_id = step["plan_id"]
+            cur = conn.execute(
+                """INSERT INTO plan_step_attempts
+                   (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json,
+                    started_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    plan_id, step_id, attempt_no, f"{plan_id}:{step_id}:{attempt_no}", "prepared",
+                    _json_text(request, {}), now_iso(),
+                ),
+            )
+            conn.commit()
+            return _attempt_row(conn.execute(
+                "SELECT * FROM plan_step_attempts WHERE id=?", (cur.lastrowid,)).fetchone())
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def update_plan_attempt(attempt_id: int, **changes) -> dict | None:
+    values = _checked_changes(
+        changes, _ATTEMPT_MUTABLE_FIELDS,
+        json_fields=("request_json", "accept_json", "result_json"),
+    )
+    if not values:
+        conn = _conn()
+        try:
+            return _attempt_row(conn.execute(
+                "SELECT * FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone())
+        finally:
+            conn.close()
+    assignments = ",".join(f"{field}=?" for field in values)
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE plan_step_attempts SET {assignments} WHERE id=?",
+                (*values.values(), attempt_id),
+            )
+            conn.commit()
+            if not cur.rowcount:
+                return None
+            return _attempt_row(conn.execute(
+                "SELECT * FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone())
+        finally:
+            conn.close()
+
+
+def active_plan_step() -> dict | None:
+    placeholders = ",".join("?" for _ in _ACTIVE_STEP_STATES)
+    conn = _conn()
+    try:
+        row = conn.execute(
+            f"""SELECT s.* FROM plan_steps AS s
+                JOIN plans AS p ON p.id=s.plan_id
+                WHERE s.status IN ({placeholders})
+                ORDER BY CASE p.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1
+                         WHEN 'P2' THEN 2 ELSE 3 END, p.created_at, p.id, s.seq
+                LIMIT 1""",
+            _ACTIVE_STEP_STATES,
+        ).fetchone()
+        step = _step_row(row)
+        if step is not None:
+            step["plan"] = _get_plan_conn(conn, step["plan_id"])
+        return step
+    finally:
+        conn.close()
+
+
+def recover_running_plan_steps() -> int:
+    placeholders = ",".join("?" for _ in _ACTIVE_STEP_STATES)
+    now = now_iso()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                f"SELECT id, plan_id FROM plan_steps WHERE status IN ({placeholders})",
+                _ACTIVE_STEP_STATES,
+            ).fetchall()
+            if not rows:
+                conn.commit()
+                return 0
+            step_ids = [row["id"] for row in rows]
+            plan_ids = sorted({row["plan_id"] for row in rows})
+            step_marks = ",".join("?" for _ in step_ids)
+            plan_marks = ",".join("?" for _ in plan_ids)
+            conn.execute(
+                f"UPDATE plan_steps SET status='needs_review' WHERE id IN ({step_marks})", step_ids)
+            conn.execute(
+                f"""UPDATE plan_step_attempts
+                    SET dispatch_state='uncertain', outcome='uncertain', last_checked_at=?
+                    WHERE step_id IN ({step_marks}) AND dispatch_state IN ('prepared','dispatched')""",
+                (now, *step_ids),
+            )
+            conn.execute(
+                f"""UPDATE plans SET status='needs_review', version=version+1, updated_at=?
+                    WHERE id IN ({plan_marks})""",
+                (now, *plan_ids),
+            )
+            conn.commit()
+            return len(step_ids)
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
