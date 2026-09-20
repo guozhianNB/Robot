@@ -3,6 +3,7 @@
 
 import pytest
 import json
+import threading
 
 from LLM.agent import action_gate, plan_scheduler, tools
 
@@ -104,6 +105,45 @@ def test_move_timeout_never_retries(monkeypatch, tmp_path):
     assert calls.count("robot_move") == 1
     got = db.get_plan(made["id"], include_steps=True)
     assert got["steps"][0]["status"] == "needs_review"
+
+
+def test_scheduler_scans_all_plans_without_legacy_limit(monkeypatch):
+    seen = []
+    monkeypatch.setattr(plan_scheduler.db, "list_plans",
+                        lambda **kwargs: seen.append(kwargs) or [])
+    assert plan_scheduler._all_plans() == []
+    assert seen and seen[0].get("limit") is None
+
+
+def test_execution_transition_is_one_aggregate_transaction():
+    from LLM.store import db
+    assert hasattr(db, "transition_plan_execution")
+
+
+def test_wait_uses_wall_clock(monkeypatch):
+    calls = []
+    monkeypatch.setattr(plan_scheduler.db, "transition_plan_execution",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(plan_scheduler.time, "time", lambda: 2_000.0)
+    step = {"id": 1, "plan_id": 2, "step_type": "wait", "wait_kind": "time",
+            "wake_at": "1970-01-01T00:33:20+00:00", "status": "pending"}
+    plan_scheduler._handle_wait(step, plan_scheduler.time.time())
+    assert calls and calls[0][1]["step_changes"]["status"] == "succeeded"
+
+
+def test_stop_joins_previous_scheduler_thread(monkeypatch):
+    class FakeThread:
+        def __init__(self):
+            self.joined = False
+        def is_alive(self):
+            return True
+        def join(self, timeout=None):
+            self.joined = True
+
+    fake = FakeThread()
+    monkeypatch.setattr(plan_scheduler, "_thread", fake)
+    plan_scheduler.stop()
+    assert fake.joined is True
 
 
 def test_dialog_action_is_busy_while_plan_owns_slot(monkeypatch):

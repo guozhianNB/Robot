@@ -1975,8 +1975,10 @@ def list_plans(states: tuple[str, ...] = (), limit=50, before_id=0) -> list[dict
         args.append(before_id)
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
-    args.append(max(0, min(int(limit or 0), _PLAN_LIST_MAX)))
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(max(0, min(int(limit or 0), _PLAN_LIST_MAX)))
     conn = _conn()
     try:
         return [_plan_row(row) for row in conn.execute(sql, args).fetchall()]
@@ -2145,6 +2147,80 @@ def update_plan_attempt(attempt_id: int, **changes) -> dict | None:
             conn.commit()
             return _attempt_row(conn.execute(
                 "SELECT * FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone())
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def transition_plan_execution(plan_id: int, *, step_id: int | None = None,
+                              step_changes: dict | None = None,
+                              attempt_id: int | None = None,
+                              attempt_changes: dict | None = None,
+                              plan_changes: dict | None = None) -> dict | None:
+    """Atomically update one execution aggregate and bump its Plan once.
+
+    Scheduler state transitions must not be assembled from separate commits:
+    a process crash or an optimistic conflict between those writes can leave
+    a Step and its Attempt disagreeing.  This API validates ownership of every
+    child row, applies all requested changes in one transaction, and increments
+    the Plan version exactly once.
+    """
+    step_values = _checked_changes(
+        step_changes or {}, _STEP_MUTABLE_FIELDS, json_fields=("args_json", "target_json"))
+    attempt_values = _checked_changes(
+        attempt_changes or {}, _ATTEMPT_MUTABLE_FIELDS,
+        json_fields=("request_json", "accept_json", "result_json"))
+    plan_values = _checked_changes(plan_changes or {}, _PLAN_MUTABLE_FIELDS)
+    if plan_values:
+        plan_values["updated_at"] = now_iso()
+    if not step_values and not attempt_values and not plan_values:
+        return get_plan(plan_id, include_steps=True, include_attempts=True)
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN")
+            plan = conn.execute("SELECT id FROM plans WHERE id=?", (plan_id,)).fetchone()
+            if plan is None:
+                conn.commit()
+                return None
+            if step_id is not None:
+                step = conn.execute(
+                    "SELECT plan_id FROM plan_steps WHERE id=?", (step_id,)).fetchone()
+                if step is None or step["plan_id"] != plan_id:
+                    raise ValueError("step does not belong to plan")
+                if step_values:
+                    assignments = ",".join(f"{field}=?" for field in step_values)
+                    conn.execute(
+                        f"UPDATE plan_steps SET {assignments} WHERE id=?",
+                        (*step_values.values(), step_id),
+                    )
+            elif step_values:
+                raise ValueError("step_id is required for step changes")
+            if attempt_id is not None:
+                attempt = conn.execute(
+                    "SELECT plan_id FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone()
+                if attempt is None or attempt["plan_id"] != plan_id:
+                    raise ValueError("attempt does not belong to plan")
+                if attempt_values:
+                    assignments = ",".join(f"{field}=?" for field in attempt_values)
+                    conn.execute(
+                        f"UPDATE plan_step_attempts SET {assignments} WHERE id=?",
+                        (*attempt_values.values(), attempt_id),
+                    )
+            elif attempt_values:
+                raise ValueError("attempt_id is required for attempt changes")
+            if plan_values:
+                assignments = ",".join(f"{field}=?" for field in plan_values)
+                conn.execute(
+                    f"UPDATE plans SET {assignments} WHERE id=?",
+                    (*plan_values.values(), plan_id),
+                )
+            _bump_plan_version(conn, plan_id)
+            result = _get_plan_conn(conn, plan_id, include_steps=True, include_attempts=True)
+            conn.commit()
+            return result
         except Exception:
             conn.rollback()
             raise

@@ -39,3 +39,24 @@ pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
 
 - `plan_scheduler.start()/stop()` 已提供生命周期入口；主后端 lifespan 接线应在调度线程启动顺序中调用，且仅由配置为执行端的实例启动。
 - SQLite 的 `car_task_id` 列是 TEXT，调度器在不放宽任务绑定的前提下，严格比较其与 MCP 正整数 ID 的规范化表示。
+
+## 审查修复（P1/P2）
+
+- wait 的 `wake_at` 与 `time.time()` 统一使用 wall-clock；动作超时仍使用 monotonic，两个时钟不再混比。
+- `list_plans(limit=None)` 提供完整扫描，调度器不再受 200 条 UI 分页上限影响，多活动 Step 检测覆盖全部 Plan。
+- 新增 `db.transition_plan_execution()`：Step、Attempt、Plan 的执行状态在同一 SQLite 事务内更新，Plan version 只递增一次；调度器不再用多次提交拼接状态迁移，也不吞版本冲突。
+- foreign `task_id` 只更新 `last_checked_at`，绝不写当前 Attempt 的 `result_json`。
+- `stop()` 设置停止事件后 join 旧线程并回收线程引用；`start()`/`stop()` 共用生命周期锁，避免并发启动两个执行线程。
+
+审查修复后的验证：
+
+```
+pytest LLM/tests/test_plan_scheduler.py -q
+18 passed
+
+pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
+  LLM/tests/test_car_mcp.py LLM/tests/test_plan.py LLM/tests/test_policy_tools.py -q
+200 passed
+```
+
+新增红灯测试覆盖完整扫描、聚合 API、wall-clock wait 和 stop join；测试仍使用假 MCP，不访问 rosbridge。

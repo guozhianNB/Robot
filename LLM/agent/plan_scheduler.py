@@ -158,7 +158,9 @@ def reconcile_step(step: dict, status_payload: dict, now: float) -> str:
 
 def _all_plans() -> list[dict]:
     plans = []
-    for row in db.list_plans(limit=200):
+    # ``None`` deliberately requests an unbounded scan.  A 200-row UI page is
+    # not a safe source for execution ownership or multi-active detection.
+    for row in db.list_plans(limit=None):
         full = db.get_plan(row["id"], include_steps=True, include_attempts=True)
         if full is not None:
             plans.append(full)
@@ -169,19 +171,25 @@ def _set_plan_status(plan_id: int, status: str) -> None:
     current = db.get_plan(plan_id)
     if current is None or current.get("status") == status:
         return
-    outcome, _ = db.update_plan_versioned(plan_id, current["version"], status=status)
-    if outcome != "updated":
-        raise RuntimeError(f"Plan {plan_id} 状态更新冲突: {outcome}")
+    if db.transition_plan_execution(plan_id, plan_changes={"status": status}) is None:
+        raise RuntimeError(f"Plan {plan_id} 状态更新失败")
 
 
 def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
+    attempt_changes = None
+    attempt_id = None
     if attempt and attempt.get("id"):
-        db.update_plan_attempt(
-            attempt["id"], dispatch_state="uncertain", outcome="uncertain",
-            result_json={"reason": reason}, last_checked_at=db.now_iso(),
-        )
-    db.update_step(step["id"], status="needs_review", last_error=reason)
-    _set_plan_status(step["plan_id"], "needs_review")
+        attempt_id = attempt["id"]
+        attempt_changes = {
+            "dispatch_state": "uncertain", "outcome": "uncertain",
+            "result_json": {"reason": reason}, "last_checked_at": db.now_iso(),
+        }
+    db.transition_plan_execution(
+        step["plan_id"], step_id=step["id"],
+        step_changes={"status": "needs_review", "last_error": reason},
+        attempt_id=attempt_id, attempt_changes=attempt_changes,
+        plan_changes={"status": "needs_review"},
+    )
     audit.log("plan", action="needs_review", plan_id=step["plan_id"],
               step_id=step["id"], reason=reason)
 
@@ -189,27 +197,29 @@ def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
 def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
     final_step = "succeeded" if outcome == "succeeded" else "failed"
     now_iso = db.now_iso()
-    db.update_plan_attempt(
-        attempt["id"], dispatch_state="finished", outcome=outcome,
-        result_json=payload, last_checked_at=now_iso, finished_at=now_iso,
-    )
-    db.update_step(
-        step["id"], status=final_step, finished_at=now_iso,
-        last_progress_at=now_iso,
-        last_error="" if outcome == "succeeded" else str(payload.get("detail") or "动作失败"),
-    )
-    _attempt_started.pop(step["id"], None)
-    _unavailable_since.pop(step["id"], None)
     plan = db.get_plan(step["plan_id"], include_steps=True)
     if plan is None:
         return
-    if outcome != "succeeded":
-        _set_plan_status(step["plan_id"], "failed")
-    elif all(item.get("status") in _TERMINAL_STATES for item in plan.get("steps", [])):
-        if all(item.get("status") == "succeeded" for item in plan.get("steps", [])):
-            _set_plan_status(step["plan_id"], "succeeded")
-    else:
-        _set_plan_status(step["plan_id"], "running")
+    plan_status = "failed"
+    if outcome == "succeeded":
+        statuses = ["succeeded" if item.get("id") == step["id"] else item.get("status")
+                    for item in plan.get("steps", [])]
+        plan_status = "succeeded" if all(item == "succeeded" for item in statuses) else "running"
+    db.transition_plan_execution(
+        step["plan_id"], step_id=step["id"],
+        step_changes={"status": final_step, "finished_at": now_iso,
+                      "last_progress_at": now_iso,
+                      "last_error": "" if outcome == "succeeded" else str(
+                          payload.get("detail") or "动作失败")},
+        attempt_id=attempt["id"], attempt_changes={
+            "dispatch_state": "finished", "outcome": outcome,
+            "result_json": payload, "last_checked_at": now_iso,
+            "finished_at": now_iso,
+        },
+        plan_changes={"status": plan_status},
+    )
+    _attempt_started.pop(step["id"], None)
+    _unavailable_since.pop(step["id"], None)
 
 
 def _poll(step: dict, now: float) -> None:
@@ -251,9 +261,13 @@ def _poll(step: dict, now: float) -> None:
         changes = {"last_checked_at": checked_at}
         if matching:
             changes["result_json"] = payload
-        db.update_plan_attempt(attempt["id"], **changes)
+        db.transition_plan_execution(
+            step["plan_id"], step_id=step["id"],
+            step_changes={"last_progress_at": checked_at} if decision == "running" else None,
+            attempt_id=attempt["id"], attempt_changes=changes,
+        )
         if decision == "running":
-            db.update_step(step["id"], last_progress_at=checked_at)
+            pass
         return
     if decision == "needs_review":
         reason = ("车控状态不可用超过恢复宽限期" if parsed.kind == "unavailable"
@@ -280,22 +294,31 @@ def _dispatch(step: dict, now: float) -> None:
         parsed = parse_tool_result(tools.run_plan_tool(step["action"], request["args"]))
         if parsed.kind == "started":
             accepted = parsed.payload or {}
-            db.update_plan_attempt(
-                attempt["id"], dispatch_state="dispatched", car_task_id=parsed.task_id,
-                accept_json=accepted, last_checked_at=db.now_iso(),
+            started_at = db.now_iso()
+            db.transition_plan_execution(
+                step["plan_id"], step_id=step["id"],
+                step_changes={"status": "running", "started_at": started_at,
+                              "last_progress_at": started_at},
+                attempt_id=attempt["id"], attempt_changes={
+                    "dispatch_state": "dispatched", "car_task_id": parsed.task_id,
+                    "accept_json": accepted, "last_checked_at": started_at,
+                },
+                plan_changes={"status": "running"},
             )
-            db.update_step(step["id"], status="running", started_at=db.now_iso(),
-                           last_progress_at=db.now_iso())
             return
         if parsed.kind == "action_error":
-            db.update_plan_attempt(
-                attempt["id"], dispatch_state="finished", outcome="rejected",
-                accept_json=parsed.payload, result_json=parsed.payload,
-                last_checked_at=db.now_iso(), finished_at=db.now_iso(),
+            finished_at = db.now_iso()
+            db.transition_plan_execution(
+                step["plan_id"], step_id=step["id"],
+                step_changes={"status": "failed", "finished_at": finished_at,
+                              "last_error": parsed.message},
+                attempt_id=attempt["id"], attempt_changes={
+                    "dispatch_state": "finished", "outcome": "rejected",
+                    "accept_json": parsed.payload, "result_json": parsed.payload,
+                    "last_checked_at": finished_at, "finished_at": finished_at,
+                },
+                plan_changes={"status": "failed"},
             )
-            db.update_step(step["id"], status="failed", finished_at=db.now_iso(),
-                           last_error=parsed.message)
-            _set_plan_status(step["plan_id"], "failed")
             return
         _mark_review(step, parsed.message or f"动作受理结果不确定: {parsed.kind}", attempt)
     except (ValueError, RuntimeError) as exc:
@@ -311,24 +334,33 @@ def _dispatch(step: dict, now: float) -> None:
         action_gate.release(token)
 
 
-def _handle_wait(step: dict, now: float) -> None:
+def _handle_wait(step: dict, wall_now: float) -> None:
     if step.get("wait_kind") != "time":
         if step.get("status") != "waiting":
-            db.update_step(step["id"], status="waiting")
-            _set_plan_status(step["plan_id"], "waiting")
+            db.transition_plan_execution(
+                step["plan_id"], step_id=step["id"],
+                step_changes={"status": "waiting"},
+                plan_changes={"status": "waiting"},
+            )
         return
     try:
         wake = datetime.fromisoformat(str(step.get("wake_at"))).timestamp()
     except (TypeError, ValueError, OSError):
         _mark_review(step, "time wait 的 wake_at 无法解析")
         return
-    if now < wake:
+    if wall_now < wake:
         if step.get("status") != "waiting":
-            db.update_step(step["id"], status="waiting")
-            _set_plan_status(step["plan_id"], "waiting")
+            db.transition_plan_execution(
+                step["plan_id"], step_id=step["id"],
+                step_changes={"status": "waiting"},
+                plan_changes={"status": "waiting"},
+            )
         return
-    db.update_step(step["id"], status="succeeded", finished_at=db.now_iso())
-    _set_plan_status(step["plan_id"], "running")
+    db.transition_plan_execution(
+        step["plan_id"], step_id=step["id"],
+        step_changes={"status": "succeeded", "finished_at": db.now_iso()},
+        plan_changes={"status": "running"},
+    )
 
 
 def _choose_pending(plans: list[dict]) -> dict | None:
@@ -354,6 +386,7 @@ def tick_once(now: float | None = None) -> None:
         return
     try:
         mono_now = time.monotonic() if now is None else float(now)
+        wall_now = time.time()
         plans = _all_plans()
         active = [step for plan in plans for step in plan.get("steps", [])
                   if step.get("status") in _ACTIVE_STATES]
@@ -377,7 +410,7 @@ def tick_once(now: float | None = None) -> None:
         if step.get("step_type") == "action" and step.get("status") == "pending":
             _dispatch(step, mono_now)
         elif step.get("step_type") in {"wait", "manual"}:
-            _handle_wait(step, mono_now)
+            _handle_wait(step, wall_now)
     except Exception as exc:
         audit.log("plan", action="scheduler_error", error=str(exc))
     finally:
@@ -407,5 +440,13 @@ def start() -> None:
 
 
 def stop() -> None:
-    """Wake the scheduler and request shutdown without waiting on slow MCP I/O."""
-    _stop_evt.set()
+    """Request shutdown and reclaim the previous daemon before returning."""
+    global _thread
+    with _start_lock:
+        thread = _thread
+        _stop_evt.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=max(1.0, float(conf.PLAN_TICK_S) * 2.0))
+    with _start_lock:
+        if _thread is thread and (thread is None or not thread.is_alive()):
+            _thread = None
