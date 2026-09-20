@@ -356,10 +356,16 @@ def _handle_wait(step: dict, wall_now: float) -> None:
                 plan_changes={"status": "waiting"},
             )
         return
+    plan = db.get_plan(step["plan_id"], include_steps=True)
+    if plan is None:
+        return
+    statuses = ["succeeded" if item.get("id") == step["id"] else item.get("status")
+                for item in plan.get("steps", [])]
+    plan_status = "succeeded" if all(status == "succeeded" for status in statuses) else "running"
     db.transition_plan_execution(
         step["plan_id"], step_id=step["id"],
         step_changes={"status": "succeeded", "finished_at": db.now_iso()},
-        plan_changes={"status": "running"},
+        plan_changes={"status": plan_status},
     )
 
 
@@ -445,8 +451,11 @@ def stop() -> None:
     with _start_lock:
         thread = _thread
         _stop_evt.set()
-    if thread is not None and thread is not threading.current_thread():
-        thread.join(timeout=max(1.0, float(conf.PLAN_TICK_S) * 2.0))
-    with _start_lock:
+        # Keep the lifecycle lock across join: a concurrent start must wait
+        # for this decision, then either start a fresh thread or observe the
+        # still-live reference.  Releasing before join silently dropped starts
+        # in the stop/start race.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, float(conf.PLAN_TICK_S) * 2.0))
         if _thread is thread and (thread is None or not thread.is_alive()):
             _thread = None

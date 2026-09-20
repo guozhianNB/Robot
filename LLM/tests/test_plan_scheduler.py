@@ -123,6 +123,8 @@ def test_wait_uses_wall_clock(monkeypatch):
     calls = []
     monkeypatch.setattr(plan_scheduler.db, "transition_plan_execution",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(plan_scheduler.db, "get_plan",
+                        lambda *args, **kwargs: {"steps": [{"id": 1, "status": "pending"}]})
     monkeypatch.setattr(plan_scheduler.time, "time", lambda: 2_000.0)
     step = {"id": 1, "plan_id": 2, "step_type": "wait", "wait_kind": "time",
             "wake_at": "1970-01-01T00:33:20+00:00", "status": "pending"}
@@ -143,6 +145,95 @@ def test_stop_joins_previous_scheduler_thread(monkeypatch):
     monkeypatch.setattr(plan_scheduler, "_thread", fake)
     plan_scheduler.stop()
     assert fake.joined is True
+
+
+def test_final_time_wait_completes_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "等待", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "wait", "wait_kind": "time",
+          "wake_at": "1970-01-01T00:00:01+00:00"}],
+    )
+    monkeypatch.setattr(plan_scheduler.time, "time", lambda: 2.0)
+    plan_scheduler.tick_once(10.0)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["steps"][0]["status"] == "succeeded"
+    assert got["status"] == "succeeded"
+
+
+def test_transition_rejects_attempt_from_different_step_without_bump(tmp_path, monkeypatch):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "归属", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "action", "action": "robot_move"},
+         {"seq": 2, "step_type": "action", "action": "robot_turn"}],
+    )
+    first, second = made["steps"]
+    attempt = db.prepare_plan_attempt(first["id"], 1, {"action": "robot_move"})
+    before = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    with pytest.raises(ValueError):
+        db.transition_plan_execution(
+            made["id"], step_id=second["id"], step_changes={"status": "running"},
+            attempt_id=attempt["id"], attempt_changes={"dispatch_state": "dispatched"},
+        )
+    after = db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert after["version"] == before["version"]
+    assert after["steps"][1]["status"] == "pending"
+    assert after["attempts"][0]["dispatch_state"] == "prepared"
+
+
+def test_join_timeout_keeps_live_thread_and_blocks_start(monkeypatch):
+    class LiveThread:
+        def __init__(self):
+            self.joined = False
+        def is_alive(self):
+            return True
+        def join(self, timeout=None):
+            self.joined = True
+
+    old = LiveThread()
+    monkeypatch.setattr(plan_scheduler, "_thread", old)
+    monkeypatch.setattr(plan_scheduler.conf, "PLAN_TICK_S", 0.001)
+    plan_scheduler.stop()
+    assert old.joined is True
+    assert plan_scheduler._thread is old
+
+
+def test_start_after_joined_stop_creates_new_thread(monkeypatch):
+    class ThreadStub:
+        def __init__(self, *args, **kwargs):
+            self.started = False
+            self.alive = False
+        def is_alive(self):
+            return self.alive
+        def start(self):
+            self.started = True
+            self.alive = True
+        def join(self, timeout=None):
+            self.alive = False
+
+    class OldThread(ThreadStub):
+        def __init__(self):
+            super().__init__()
+            self.alive = True
+        def join(self, timeout=None):
+            self.alive = False
+
+    old = OldThread()
+    created = []
+    monkeypatch.setattr(plan_scheduler, "_thread", old)
+    monkeypatch.setattr(plan_scheduler.threading, "Thread",
+                        lambda *args, **kwargs: created.append(ThreadStub()) or created[-1])
+    monkeypatch.setattr(plan_scheduler.db, "recover_running_plan_steps", lambda: 0)
+    monkeypatch.setattr(plan_scheduler.conf, "PLAN_EXECUTOR_ENABLED", True)
+    plan_scheduler.stop()
+    plan_scheduler.start()
+    assert created and created[0].started is True
+    plan_scheduler.stop()
 
 
 def test_invalid_plan_config_enters_lifespan_warning_queue(monkeypatch):

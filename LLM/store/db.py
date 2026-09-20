@@ -2200,9 +2200,13 @@ def transition_plan_execution(plan_id: int, *, step_id: int | None = None,
                 raise ValueError("step_id is required for step changes")
             if attempt_id is not None:
                 attempt = conn.execute(
-                    "SELECT plan_id FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone()
+                    "SELECT plan_id, step_id FROM plan_step_attempts WHERE id=?",
+                    (attempt_id,),
+                ).fetchone()
                 if attempt is None or attempt["plan_id"] != plan_id:
                     raise ValueError("attempt does not belong to plan")
+                if step_id is not None and attempt["step_id"] != step_id:
+                    raise ValueError("attempt does not belong to step")
                 if attempt_values:
                     assignments = ",".join(f"{field}=?" for field in attempt_values)
                     conn.execute(

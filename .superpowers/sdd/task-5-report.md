@@ -64,3 +64,22 @@ pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
 配置告警链补充验证：非法 `PLAN_TICK_S=nan` 会进入 `conf.CONFIG_WARNINGS`，由现有
 `server.lifespan()` 的 `_audit_config_warnings()` 统一写入 `config_warning` 审计；相关测试与
 Plan 配置回退测试均通过（2 passed）。
+
+## 最终复审修复
+
+- 到期 time wait 先读取同一 Plan 的其它步骤，在同一聚合事务中将当前 Step 标记成功，并把最后一步的 Plan 标记为 `succeeded`。
+- `stop()` 在生命周期锁内完成 join；join 超时保留存活线程引用，后续 `start()` 不会与旧线程并行，旧线程回收后才允许新线程启动。
+- `transition_plan_execution()` 在事务内校验 Attempt 的 `step_id` 与传入 Step 一致；错配直接回滚且不递增 Plan version。
+
+最终复审回归：
+
+```
+pytest LLM/tests/test_plan_scheduler.py -q
+23 passed
+
+pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
+  LLM/tests/test_car_mcp.py -q
+152 passed
+
+包含 Plan 编译与策略回归的完整集合：205 passed。
+```
