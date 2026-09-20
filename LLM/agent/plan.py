@@ -405,7 +405,9 @@ def cancel_plan(plan_id: int, version: int, reason: str, actor: dict | None = No
                                   "result_json": {"reason": str(exc)},
                                   "last_checked_at": db.now_iso()} if attempt.get("id") else None),
                 plan_changes={"status": "needs_review"})
-            latest = reviewed or _read_plan(plan_id)
+            if reviewed is None:
+                return _conflict(_read_plan(plan_id), "version_conflict")
+            latest = reviewed
             if latest:
                 _committed(latest, actor=actor, action="cancel_stop_failed",
                            step=step, notify_type="plan_needs_review", level="critical")
