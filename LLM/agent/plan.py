@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
 from datetime import datetime
 
 from .. import conf
@@ -264,6 +265,37 @@ def create_from_tool(title, steps, priority="P2", owner_uid="", report=None) -> 
     made = out["plan"]
     return {"ok": True, "plan_id": made["id"], "display_no": made["display_no"],
             "status": made["status"], "summary": out["summary"]}
+
+
+def create_from_reminder(reminder: dict) -> dict:
+    """Create the one manual Plan associated with a due reminder."""
+    rid = reminder.get("id")
+    title = str(reminder.get("title") or "").strip()
+    content = str(reminder.get("content") or "").strip()
+    if rid in (None, "") or not (title or content):
+        audit.log("plan", action="create_from_reminder_skipped", reminder_id=rid,
+                  reason="reminder has no legal manual step")
+        return {"ok": True, "created": False, "skipped": True}
+
+    steps = compile_steps([{"type": "manual", "label": content or title}], None)
+    plan_row = {
+        "kind": "reminder", "title": title or content, "priority": "P1",
+        "preemption": "queue", "status": "queued",
+        "owner_uid": str(reminder.get("uid") or "").strip() or None,
+        "source_kind": "reminder", "source_id": str(rid),
+        "creator_uid": str(reminder.get("created_by") or "").strip() or None,
+        "creator_role": None, "creator_surface": "system",
+        "report_json": {"notify": True, "speak_if_present": False},
+    }
+    try:
+        made = db.create_plan(plan_row, steps)
+    except sqlite3.IntegrityError as exc:
+        if "plans.source_kind, plans.source_id" not in str(exc):
+            raise
+        return {"ok": True, "created": False, "duplicate": True}
+    audit.log("plan", action="create_from_reminder", reminder_id=rid,
+              plan_id=made["id"], display_no=made["display_no"])
+    return {"ok": True, "created": True, "plan": made}
 
 
 # ---------------------------------------------------------------- 人工状态迁移

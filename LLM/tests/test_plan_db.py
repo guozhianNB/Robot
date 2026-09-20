@@ -24,7 +24,7 @@ def _plan(**changes):
         "status": "queued",
         "owner_uid": "elder-1",
         "source_kind": "manual",
-        "source_id": "source-1",
+        "source_id": None,
         "creator_uid": "admin",
         "creator_role": "admin",
         "creator_surface": "admin",
@@ -171,6 +171,51 @@ def test_init_db_migrates_report_json_into_existing_plans(tmp_path, monkeypatch)
     migrated = db.get_plan(1)
     assert migrated["title"] == "旧计划"
     assert migrated["report_json"] == {}
+
+
+def test_init_db_preserves_and_unlinks_duplicate_legacy_plan_sources(
+        tmp_path, monkeypatch):
+    path = tmp_path / "legacy-duplicate-source.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE plans (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, display_no TEXT NOT NULL DEFAULT '',
+           kind TEXT NOT NULL, title TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'P2',
+           preemption TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'draft',
+           owner_uid TEXT, source_kind TEXT NOT NULL DEFAULT 'manual', source_id TEXT,
+           creator_uid TEXT, creator_role TEXT, creator_surface TEXT, current_step_id INTEGER,
+           wake_at TEXT, deadline_at TEXT, version INTEGER NOT NULL DEFAULT 1,
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    for display_no in ("PL-0001", "PL-0002"):
+        conn.execute(
+            """INSERT INTO plans
+               (display_no,kind,title,status,source_kind,source_id,created_at,updated_at)
+               VALUES (?, 'reminder', '旧提醒计划', 'queued', 'reminder', '42', ?, ?)""",
+            (display_no, "2026-09-20 08:00:00", "2026-09-20 08:00:00"),
+        )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+    from LLM.core import log as audit
+    records = []
+    monkeypatch.setattr(audit, "log", lambda event, **fields: records.append(
+        {"event": event, **fields}))
+
+    db.init_db()
+
+    conn = db._conn()
+    try:
+        rows = conn.execute("SELECT id,source_id FROM plans ORDER BY id").fetchall()
+        index = next(row for row in conn.execute("PRAGMA index_list(plans)")
+                     if row["name"] == "idx_plans_source")
+    finally:
+        conn.close()
+    assert [(row["id"], row["source_id"]) for row in rows] == [(1, "42"), (2, None)]
+    assert index["unique"] == 1
+    migrated = [row for row in records if row.get("action") == "dedupe_source_migration"]
+    assert migrated == [{"event": "plan", "action": "dedupe_source_migration",
+                         "source_kind": "reminder", "source_id": "42",
+                         "kept_plan_id": 1, "unlinked_plan_ids": [2]}]
 
 
 def test_create_plan_rolls_back_if_second_step_fails(plan_db):

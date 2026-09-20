@@ -39,6 +39,8 @@ _PLAN_ATTEMPTS_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_plan_attempts_car_t
 _PLAN_ATTEMPTS_UNFINISHED_INDEX_SQL = """CREATE UNIQUE INDEX IF NOT EXISTS
   idx_plan_attempts_one_unfinished ON plan_step_attempts(step_id)
   WHERE dispatch_state IN ('prepared','dispatched')"""
+_PLAN_SOURCE_INDEX_SQL = """CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_source
+  ON plans(source_kind, source_id) WHERE source_id IS NOT NULL"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
@@ -272,10 +274,55 @@ def init_db():
             # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
             _ensure_columns(conn, "core_memories", {"pinned": "pinned INTEGER DEFAULT 0"})
             conn.commit()
+            _migrate_plan_source_uniqueness(conn)
             _migrate_plan_attempt_ownership(conn)
             _migrate_map_tags_cache(conn)
         finally:
             conn.close()
+
+
+def _migrate_plan_source_uniqueness(conn) -> None:
+    """Preserve legacy duplicate Plans while making their source link idempotent."""
+    duplicates = conn.execute(
+        """SELECT source_kind,source_id,MIN(id) AS kept_id
+           FROM plans WHERE source_id IS NOT NULL
+           GROUP BY source_kind,source_id HAVING COUNT(*) > 1
+           ORDER BY source_kind,source_id"""
+    ).fetchall()
+    migrated = []
+    conn.execute("BEGIN")
+    try:
+        for row in duplicates:
+            duplicate_ids = [
+                item["id"] for item in conn.execute(
+                    """SELECT id FROM plans
+                       WHERE source_kind=? AND source_id=? AND id<>? ORDER BY id""",
+                    (row["source_kind"], row["source_id"], row["kept_id"]),
+                ).fetchall()
+            ]
+            if duplicate_ids:
+                conn.execute(
+                    f"UPDATE plans SET source_id=NULL WHERE id IN "
+                    f"({','.join('?' for _ in duplicate_ids)})",
+                    duplicate_ids,
+                )
+                migrated.append((row, duplicate_ids))
+        conn.execute(_PLAN_SOURCE_INDEX_SQL)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    if not migrated:
+        return
+    try:
+        from ..core import log as audit
+        for row, duplicate_ids in migrated:
+            audit.log("plan", action="dedupe_source_migration",
+                      source_kind=row["source_kind"], source_id=row["source_id"],
+                      kept_plan_id=row["kept_id"], unlinked_plan_ids=duplicate_ids)
+    except Exception as exc:  # committed migration must not prevent startup
+        print(f"[WARN] Plan 来源去重已完成，但审计写入失败：{exc}")
 
 
 def _migrate_plan_attempt_ownership(conn) -> None:
@@ -1123,6 +1170,26 @@ def update_reminder(rid: int, **fields) -> None:
             conn.close()
 
 
+def transition_reminder(rid: int, expected_status: str, expected_last_trigger_date: str,
+                        **fields) -> bool:
+    """Atomically update a due reminder only if its scheduling snapshot is still current."""
+    fields["updated_at"] = now_iso()
+    keys = ", ".join(f"{key}=?" for key in fields)
+    values = list(fields.values()) + [rid, expected_status, expected_last_trigger_date or ""]
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE reminders SET {keys} WHERE id=? AND status=? "
+                "AND COALESCE(last_trigger_date,'')=?",
+                values,
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+
 def delete_reminder(rid: int) -> None:
     with _lock:
         conn = _conn()
@@ -1896,6 +1963,8 @@ def _get_plan_conn(conn, plan_id: int, *, include_steps=False,
 
 def create_plan(plan: dict, steps: list[dict]) -> dict:
     """Create a Plan and all of its steps atomically."""
+    if not steps:
+        raise ValueError("Plan must contain at least one step")
     now = now_iso()
     with _lock:
         conn = _conn()

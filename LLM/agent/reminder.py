@@ -14,7 +14,7 @@ from ..store import db
 from ..core import bus
 from ..core import log as audit
 from ..conf import REMINDER_STATUS
-from . import notify
+from . import notify, plan
 
 _tick = 15          # 扫描间隔（秒）
 _miss_window = 300  # 错过判定窗口：超过触发点 5 分钟后才触发 → 视为错过补报
@@ -74,6 +74,14 @@ def _escalate(rem, settings):
         audit.log("notify_ingest_failed", source="reminder", rid=rem["id"], error=str(e))
 
 
+def _create_plan(rem):
+    """Keep Plan failures isolated from the reminder state machine and later reminders."""
+    try:
+        plan.create_from_reminder(rem)
+    except Exception as e:  # noqa: BLE001
+        audit.log("reminder", action="plan_create_error", rid=rem.get("id"), error=str(e))
+
+
 def _tick_once(settings: dict):
     now = _now()
     today = now.strftime("%Y-%m-%d")
@@ -96,15 +104,23 @@ def _tick_once(settings: dict):
                     due = None
         if not due:
             continue
+        first_transition = rem["status"] == "pending"
         missed = (now - due).total_seconds() > _miss_window
         new_status = "missed" if missed else "triggered"
         if missed:
             rem["missed_count"] = (rem.get("missed_count") or 0) + 1
-        db.update_reminder(rem["id"], status=new_status, last_trigger_date=today,
-                           triggered_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-                           missed_count=rem["missed_count"])
+        transitioned = db.transition_reminder(
+            rem["id"], rem["status"], rem.get("last_trigger_date") or "",
+            status=new_status, last_trigger_date=today,
+            triggered_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            missed_count=rem["missed_count"],
+        )
+        if not transitioned:
+            continue
         rem = db.get_reminder(rem["id"])
         _broadcast(rem, settings, missed)
+        if first_transition:
+            _create_plan(rem)
 
     # 确认超时升级：triggered 且超过 confirm_timeout_min 未确认 → unconfirmed
     for rem in db.list_reminders():

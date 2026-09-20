@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 r"""Plan candidate validation, target compilation and tool boundary tests."""
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import pytest
 
 from LLM import conf
-from LLM.agent import plan, tools
+from LLM.agent import plan, reminder, tools
 from LLM.store import db
 
 
@@ -287,6 +289,161 @@ def test_omitted_owner_does_not_silently_become_creator(plan_db):
 
     made = db.get_plan(out["plan_id"])
     assert made["owner_uid"] is None
+
+
+def _due_once_reminder(plan_db, now, *, title="服药提醒", content="请服用晚间药物"):
+    rid = plan_db.add_reminder(
+        "elder_1", "medication", title, content, "once", now.strftime("%H:%M"),
+        trigger_date=now.strftime("%Y-%m-%d"), created_by="nurse_1",
+    )
+    return rid
+
+
+def test_reminder_trigger_transition_creates_exactly_one_plan(plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 8, 0, 10)
+    rid = _due_once_reminder(plan_db, now)
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+
+    reminder._tick_once({})
+    reminder._tick_once({})
+
+    made = plan_db.list_plans()
+    assert len(made) == 1
+    assert (made[0]["source_kind"], made[0]["source_id"]) == ("reminder", str(rid))
+    assert made[0]["kind"] == "reminder"
+    assert made[0]["priority"] == "P1"
+    assert made[0]["owner_uid"] == "elder_1"
+    detail = plan_db.get_plan(made[0]["id"], include_steps=True)
+    assert len(detail["steps"]) == 1
+    assert detail["steps"][0]["step_type"] == "manual"
+    assert plan_db.get_reminder(rid)["status"] == "triggered"
+
+
+def test_missed_reminder_transition_creates_exactly_one_plan(plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 9, 0, 10)
+    due = now - timedelta(minutes=10)
+    rid = _due_once_reminder(plan_db, due)
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+
+    reminder._tick_once({})
+    reminder._tick_once({})
+
+    made = plan_db.list_plans()
+    assert len(made) == 1
+    assert (made[0]["source_kind"], made[0]["source_id"]) == ("reminder", str(rid))
+    assert plan_db.get_reminder(rid)["status"] == "missed"
+
+
+def test_recurring_reminder_does_not_recreate_plan_after_first_transition(
+        plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 9, 0, 10)
+    rid = plan_db.add_reminder(
+        "elder_1", "medication", "每日服药", "请服药", "daily", "08:00")
+    plan_db.update_reminder(rid, status="triggered", last_trigger_date="2026-09-20")
+    calls = []
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+    monkeypatch.setattr(plan, "create_from_reminder", lambda rem: calls.append(rem["id"]))
+
+    reminder._tick_once({})
+
+    assert calls == []
+    assert plan_db.get_reminder(rid)["status"] == "missed"
+
+
+def test_reminder_plan_source_is_unique_in_database(plan_db):
+    source = {"title": "提醒任务", "kind": "reminder", "status": "queued",
+              "source_kind": "reminder", "source_id": "42"}
+    step = {"seq": 1, "step_type": "manual", "status": "pending"}
+
+    plan_db.create_plan(source, [step])
+    with pytest.raises(sqlite3.IntegrityError):
+        plan_db.create_plan(source, [step])
+
+
+def test_concurrent_reminder_plan_creation_is_idempotent(plan_db):
+    now = datetime(2026, 9, 21, 8, 0, 10)
+    rem = plan_db.get_reminder(_due_once_reminder(plan_db, now))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _index: plan.create_from_reminder(rem), range(8)))
+
+    assert len(plan_db.list_plans()) == 1
+    assert sum(result.get("created") is True for result in results) == 1
+    assert all(result["ok"] is True for result in results)
+
+
+def test_concurrent_ticks_only_one_wins_first_reminder_transition(plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 8, 0, 10)
+    rid = _due_once_reminder(plan_db, now)
+    barrier = threading.Barrier(2)
+    local = threading.local()
+    real_list = plan_db.list_reminders
+    calls = []
+    events = []
+
+    def synchronized_first_list(*args, **kwargs):
+        rows = real_list(*args, **kwargs)
+        if not getattr(local, "first_list_done", False):
+            local.first_list_done = True
+            barrier.wait(timeout=2)
+        return rows
+
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+    monkeypatch.setattr(plan_db, "list_reminders", synchronized_first_list)
+    monkeypatch.setattr(plan, "create_from_reminder", lambda rem: calls.append(rem["id"]))
+    monkeypatch.setattr(reminder.bus, "publish", lambda event, **fields: events.append(event))
+    monkeypatch.setattr(reminder.audit, "log", lambda *_args, **_kwargs: None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _index: reminder._tick_once({}), range(2)))
+
+    assert calls == [rid]
+    assert events.count("reminder") == 1
+
+
+def test_reminder_without_legal_step_only_broadcasts_and_audits_skipped(
+        plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 8, 0, 10)
+    rid = _due_once_reminder(plan_db, now, title="", content="")
+    events = []
+    records = []
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+    monkeypatch.setattr(reminder.bus, "publish", lambda event, **fields: events.append(
+        {"event": event, **fields}))
+    monkeypatch.setattr(plan.audit, "log", lambda event, **fields: records.append(
+        {"event": event, **fields}))
+
+    reminder._tick_once({})
+
+    assert plan_db.list_plans() == []
+    assert plan_db.get_reminder(rid)["status"] == "triggered"
+    assert [event["event"] for event in events] == ["reminder"]
+    skipped = [row for row in records if row.get("action") == "create_from_reminder_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reminder_id"] == rid
+
+
+def test_plan_creation_failure_does_not_block_reminder_tick(plan_db, monkeypatch):
+    now = datetime(2026, 9, 21, 8, 0, 10)
+    first = _due_once_reminder(plan_db, now, title="提醒一")
+    second = _due_once_reminder(plan_db, now, title="提醒二")
+    events = []
+    records = []
+    monkeypatch.setattr(reminder, "_now", lambda: now)
+    monkeypatch.setattr(reminder.bus, "publish", lambda event, **fields: events.append(
+        {"event": event, **fields}))
+    monkeypatch.setattr(reminder.audit, "log", lambda event, **fields: records.append(
+        {"event": event, **fields}))
+    monkeypatch.setattr(plan, "create_from_reminder", lambda _rem: (_ for _ in ()).throw(
+        RuntimeError("plan database unavailable")))
+
+    reminder._tick_once({})
+
+    assert plan_db.get_reminder(first)["status"] == "triggered"
+    assert plan_db.get_reminder(second)["status"] == "triggered"
+    assert [event["event"] for event in events] == ["reminder", "reminder"]
+    failed = [row for row in records if row.get("action") == "plan_create_error"]
+    assert {row["rid"] for row in failed} == {first, second}
 
 
 def test_local_tool_exception_still_resets_principal():
