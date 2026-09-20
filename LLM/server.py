@@ -18,6 +18,7 @@ AI 对话后端（FastAPI + SSE 流式）—— 大模型端"大脑与嘴"的 HT
 import asyncio
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -37,6 +38,8 @@ from .agent import chat, memory as rag, reminder, tools as tool_mod
 from .agent import notify          # 通知中心（护士台数据底座，模块 11）
 from .voice import voice_api
 from .agent import mcp_client   # MCP 桥（可选能力，内部降级，import 永远安全）
+from .agent import plan as plan_ops
+from .agent import plan_scheduler
 from .agent import session      # 分层用户体系：会话层（角色/主体/当前病房）——业务接口的角色唯一来源
 from .maps import locator, maptags   # 病房位置自动切换 / 记录病房区域要用（编辑器路由已搬走）
 from .maps import mapctl         # 地图编辑器服务（独立进程）的启停管理
@@ -98,6 +101,7 @@ async def lifespan(app: FastAPI):
     drain_task = bus.start_drain()   # 广播扇出任务
     voice_api.start_voice(client, MODEL, _post_chat_jobs)
     mcp_client.start(db.get_settings())   # MCP 外部工具（mcp_enabled 开启时拉起）
+    plan_scheduler.start()                # MCP 就绪后才允许 Plan 调度器派发动作
 
     # 分层用户体系：首启生成管理员口令（D12）+ 位置源自检 + 每秒 tick（TTL 降权 + 病房位置自动切换）
     pw = session.ensure_admin_password()
@@ -124,6 +128,7 @@ async def lifespan(app: FastAPI):
     tick_task = asyncio.create_task(_role_tick())
 
     yield
+    plan_scheduler.stop()    # 先收拢 Plan，避免退出时仍向 MCP 派发车控
     mapctl.stop()             # 编辑器服务是本进程拉起的：主后端退出不该留孤儿
     mcp_client.stop()
     voice_api.stop_voice()
@@ -320,6 +325,46 @@ class PasswordIn(BaseModel):
 
 class AdminAuthIn(BaseModel):
     required: bool
+
+
+class _PlanModel(BaseModel):
+    """请求体白名单：执行状态、创建者和完成判据只由后端生成。"""
+    model_config = {"extra": "forbid"}
+
+
+class PlanCreateIn(_PlanModel):
+    title: str
+    priority: str = "P2"
+    owner_uid: str = ""
+    steps: list[dict]
+    report: dict | None = None
+
+
+class PlanPriorityIn(_PlanModel):
+    version: int
+    priority: str
+
+
+class PlanCancelIn(_PlanModel):
+    version: int
+    reason: str
+
+
+class PlanConfirmIn(_PlanModel):
+    version: int
+    step_id: int
+    decision: str
+    note: str = ""
+
+
+class PlanRetryIn(_PlanModel):
+    version: int
+    step_id: int
+    note: str
+
+
+class NurseUnlockIn(_PlanModel):
+    pin: str
 
 
 class WardIn(BaseModel):
@@ -1146,6 +1191,118 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
     if role != "admin":
         return {role: _public_policy(POLICY_DEFAULTS.get(role, POLICY_DEFAULTS["ward"]))}
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
+
+
+# ---------------------------------------------------------------- Plan API / 护士台页面门
+_nurse_pin_fail: dict[str, float | int] = {"n": 0, "until": 0.0}
+_nurse_pin_lock = threading.Lock()
+_NURSE_PIN_COOLDOWN_S = 10.0
+
+
+def _plan_actor(request: Request) -> dict:
+    """记录人工来源元数据；这些字段不是认证凭据。"""
+    return {
+        "uid": "manual",
+        "role": "manual",
+        "slot": request.headers.get("x-surface", "")[:64],
+        "ip": request.client.host if request.client else "",
+        "user_agent": request.headers.get("user-agent", "")[:256],
+    }
+
+
+async def _plan_http(result: dict, plan_id: int | None = None):
+    if result.get("ok"):
+        return result
+    error = result.get("error", "conflict")
+    if error == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    if plan_id is not None and "plan" not in result:
+        latest = await asyncio.to_thread(db.get_plan, plan_id,
+                                         include_steps=True, include_attempts=True)
+        if latest is None:
+            return JSONResponse(status_code=404,
+                                content={"ok": False, "error": "not_found"})
+        result = {**result, "plan": latest}
+    return JSONResponse(status_code=409, content=result)
+
+
+@app.post("/api/nurse/page-unlock")
+async def nurse_page_unlock(body: NurseUnlockIn):
+    """页面门禁 only: verify the current admin password, issue no session."""
+    now = time.monotonic()
+    with _nurse_pin_lock:
+        if float(_nurse_pin_fail.get("until", 0.0)) > now:
+            return {"ok": False, "error": "护士台页面口令错误次数过多，请稍后再试"}
+    ok = await asyncio.to_thread(db.verify_admin_password, body.pin)
+    with _nurse_pin_lock:
+        if ok:
+            _nurse_pin_fail.update(n=0, until=0.0)
+        else:
+            failures = int(_nurse_pin_fail.get("n", 0)) + 1
+            _nurse_pin_fail["n"] = failures
+            if failures >= 3:
+                _nurse_pin_fail["until"] = time.monotonic() + _NURSE_PIN_COOLDOWN_S
+    return {"ok": bool(ok), **({} if ok else {"error": "护士台页面口令错误"})}
+
+
+@app.get("/api/plans")
+async def plans_list(state: str = Query(""), limit: int = Query(50, ge=1, le=200),
+                     before_id: int = Query(0, ge=0)):
+    states = tuple(item.strip() for item in state.split(",")
+                   if item.strip() and item.strip().lower() != "all")
+    rows, counts = await asyncio.gather(
+        asyncio.to_thread(db.list_plans, states, limit, before_id),
+        asyncio.to_thread(db.plan_counts),
+    )
+    return {"ok": True, "plans": rows, "counts": counts}
+
+
+@app.get("/api/plans/{plan_id}")
+async def plans_detail(plan_id: int):
+    plan = await asyncio.to_thread(db.get_plan, plan_id,
+                                   include_steps=True, include_attempts=True)
+    if plan is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    return {"ok": True, "plan": plan}
+
+
+@app.post("/api/plans")
+async def plans_create(body: PlanCreateIn, request: Request):
+    payload = body.model_dump(exclude_none=True)
+    try:
+        result = await asyncio.to_thread(plan_ops.create_candidate, payload, _plan_actor(request))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/plans/{plan_id}/priority")
+async def plans_priority(plan_id: int, body: PlanPriorityIn, request: Request):
+    result = await asyncio.to_thread(plan_ops.change_priority, plan_id, body.version,
+                                     body.priority, _plan_actor(request))
+    return await _plan_http(result, plan_id)
+
+
+@app.post("/api/plans/{plan_id}/cancel")
+async def plans_cancel(plan_id: int, body: PlanCancelIn, request: Request):
+    result = await asyncio.to_thread(plan_ops.cancel_plan, plan_id, body.version,
+                                     body.reason, _plan_actor(request))
+    return await _plan_http(result, plan_id)
+
+
+@app.post("/api/plans/{plan_id}/confirm")
+async def plans_confirm(plan_id: int, body: PlanConfirmIn, request: Request):
+    result = await asyncio.to_thread(plan_ops.confirm_step, plan_id, body.version,
+                                     body.step_id, body.decision, body.note,
+                                     _plan_actor(request))
+    return await _plan_http(result, plan_id)
+
+
+@app.post("/api/plans/{plan_id}/retry")
+async def plans_retry(plan_id: int, body: PlanRetryIn, request: Request):
+    result = await asyncio.to_thread(plan_ops.retry_step, plan_id, body.version,
+                                     body.step_id, body.note, _plan_actor(request))
+    return await _plan_http(result, plan_id)
 
 
 # ---------------------------------------------------------------- 通知中心（模块 11）
