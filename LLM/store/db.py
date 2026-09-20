@@ -36,6 +36,9 @@ _PLAN_ATTEMPTS_TABLE_SQL = """CREATE TABLE IF NOT EXISTS plan_step_attempts (
 )"""
 _PLAN_ATTEMPTS_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_plan_attempts_car_task_id
   ON plan_step_attempts(car_task_id)"""
+_PLAN_ATTEMPTS_UNFINISHED_INDEX_SQL = """CREATE UNIQUE INDEX IF NOT EXISTS
+  idx_plan_attempts_one_unfinished ON plan_step_attempts(step_id)
+  WHERE dispatch_state IN ('prepared','dispatched')"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
@@ -218,7 +221,8 @@ CREATE TABLE IF NOT EXISTS plan_steps (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_seq ON plan_steps(plan_id, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_id_id ON plan_steps(plan_id, id);
-""" + _PLAN_ATTEMPTS_TABLE_SQL + ";\n" + _PLAN_ATTEMPTS_INDEX_SQL + ";\n"
+""" + _PLAN_ATTEMPTS_TABLE_SQL + ";\n" + _PLAN_ATTEMPTS_INDEX_SQL + ";\n" + \
+    _PLAN_ATTEMPTS_UNFINISHED_INDEX_SQL + ";\n"
 
 
 def _conn():
@@ -272,6 +276,16 @@ def init_db():
 
 def _migrate_plan_attempt_ownership(conn) -> None:
     """Upgrade the initial independent attempt FKs to one composite ownership FK."""
+    bad_rows = conn.execute(
+        """SELECT a.id FROM plan_step_attempts AS a
+           LEFT JOIN plan_steps AS s ON s.id=a.step_id AND s.plan_id=a.plan_id
+           WHERE s.id IS NULL ORDER BY a.id"""
+    ).fetchall()
+    if bad_rows:
+        ids = ",".join(str(row["id"]) for row in bad_rows)
+        raise sqlite3.IntegrityError(
+            f"cross-owned plan step attempts require manual review; preserved ids: {ids}")
+
     rows = conn.execute("PRAGMA foreign_key_list(plan_step_attempts)").fetchall()
     groups = {}
     for row in rows:
@@ -288,8 +302,10 @@ def _migrate_plan_attempt_ownership(conn) -> None:
     try:
         conn.execute("ALTER TABLE plan_step_attempts RENAME TO plan_step_attempts__old")
         conn.execute("DROP INDEX IF EXISTS idx_plan_attempts_car_task_id")
+        conn.execute("DROP INDEX IF EXISTS idx_plan_attempts_one_unfinished")
         conn.execute(_PLAN_ATTEMPTS_TABLE_SQL)
         conn.execute(_PLAN_ATTEMPTS_INDEX_SQL)
+        conn.execute(_PLAN_ATTEMPTS_UNFINISHED_INDEX_SQL)
         conn.execute(
             f"""INSERT INTO plan_step_attempts ({columns})
                 SELECT {', '.join('a.' + name for name in columns.split(','))}
@@ -2052,16 +2068,23 @@ def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
             if step is None:
                 raise ValueError(f"plan step not found: {step_id}")
             plan_id = step["plan_id"]
-            if step["status"] == "pending":
-                cur = conn.execute(
-                    "UPDATE plan_steps SET status='dispatching' WHERE id=? AND status='pending'",
-                    (step_id,),
-                )
-                if cur.rowcount != 1:
-                    raise sqlite3.IntegrityError(f"plan step changed while dispatching: {step_id}")
-            elif step["status"] != "dispatching":
+            if step["status"] != "pending":
                 raise ValueError(
                     f"plan step cannot be dispatched from status {step['status']!r}: {step_id}")
+            unfinished = conn.execute(
+                """SELECT id FROM plan_step_attempts
+                   WHERE step_id=? AND dispatch_state IN ('prepared','dispatched') LIMIT 1""",
+                (step_id,),
+            ).fetchone()
+            if unfinished is not None:
+                raise ValueError(
+                    f"plan step already has an unfinished attempt: {step_id}")
+            changed = conn.execute(
+                "UPDATE plan_steps SET status='dispatching' WHERE id=? AND status='pending'",
+                (step_id,),
+            )
+            if changed.rowcount != 1:
+                raise sqlite3.IntegrityError(f"plan step changed while dispatching: {step_id}")
             cur = conn.execute(
                 """INSERT INTO plan_step_attempts
                    (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json,
@@ -2149,7 +2172,12 @@ def recover_running_plan_steps() -> int:
         try:
             conn.execute("BEGIN")
             rows = conn.execute(
-                f"SELECT id, plan_id FROM plan_steps WHERE status IN ({placeholders})",
+                f"""SELECT DISTINCT s.id, s.plan_id
+                    FROM plan_steps AS s
+                    LEFT JOIN plan_step_attempts AS a
+                      ON a.step_id=s.id AND a.plan_id=s.plan_id
+                    WHERE s.status IN ({placeholders})
+                       OR a.dispatch_state IN ('prepared','dispatched')""",
                 _ACTIVE_STEP_STATES,
             ).fetchall()
             if not rows:

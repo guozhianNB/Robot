@@ -101,6 +101,11 @@ def test_schema_contains_all_plan_fields_constraints_and_indexes(plan_db):
         assert ("status", "priority", "created_at") in plan_indexes
         assert ("plan_id", "seq") in step_indexes
         assert ("car_task_id",) in attempt_indexes
+        unfinished = next(
+            idx for idx in conn.execute("PRAGMA index_list(plan_step_attempts)")
+            if idx["name"] == "idx_plan_attempts_one_unfinished")
+        assert unfinished["unique"] == 1
+        assert unfinished["partial"] == 1
 
         step_foreign_keys = conn.execute("PRAGMA foreign_key_list(plan_steps)").fetchall()
         assert any(row["table"] == "plans" and row["on_delete"] == "CASCADE"
@@ -165,8 +170,53 @@ def test_attempt_number_and_idempotency_key_are_unique(plan_db):
 
     assert attempt["request_json"] == {"action": "robot_goto_point"}
     assert attempt["idempotency_key"] == f"{made['id']}:{step_id}:1"
-    with pytest.raises(sqlite3.IntegrityError):
+    version = plan_db.get_plan(made["id"])["version"]
+    with pytest.raises(ValueError):
         plan_db.prepare_plan_attempt(step_id, 1, {"action": "robot_goto_point"})
+    with pytest.raises(ValueError):
+        plan_db.prepare_plan_attempt(step_id, 2, {"action": "robot_goto_point"})
+    got = plan_db.get_plan(made["id"], include_attempts=True)
+    assert got["version"] == version
+    assert len(got["attempts"]) == 1
+
+
+def test_pending_step_with_unfinished_attempt_cannot_prepare_again(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    plan_db.prepare_plan_attempt(step["id"], 1, {})
+    conn = plan_db._conn()
+    try:
+        conn.execute("UPDATE plan_steps SET status='pending' WHERE id=?", (step["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    version = plan_db.get_plan(made["id"])["version"]
+
+    with pytest.raises(ValueError):
+        plan_db.prepare_plan_attempt(step["id"], 2, {})
+
+    got = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert got["version"] == version
+    assert got["steps"][0]["status"] == "pending"
+    assert len(got["attempts"]) == 1
+
+
+def test_partial_unique_index_rejects_two_unfinished_attempts(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    plan_db.prepare_plan_attempt(step["id"], 1, {})
+
+    conn = plan_db._conn()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO plan_step_attempts
+                   (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (made["id"], step["id"], 2, "second-unfinished", "dispatched", "{}"),
+            )
+    finally:
+        conn.close()
 
 
 def test_attempt_plan_and_step_must_belong_to_same_plan(plan_db):
@@ -202,6 +252,7 @@ def test_init_db_migrates_legacy_attempt_foreign_keys_without_losing_valid_rows(
     )
     conn = plan_db._conn()
     try:
+        conn.execute("UPDATE plan_steps SET status='pending' WHERE id=?", (step["id"],))
         conn.execute("ALTER TABLE plan_step_attempts RENAME TO plan_step_attempts__valid")
         conn.execute("DROP INDEX idx_plan_attempts_car_task_id")
         conn.execute(legacy_sql)
@@ -218,12 +269,61 @@ def test_init_db_migrates_legacy_attempt_foreign_keys_without_losing_valid_rows(
 
     got = plan_db.get_plan(made["id"], include_attempts=True)
     assert [row["id"] for row in got["attempts"]] == [attempt["id"]]
+    assert plan_db.recover_running_plan_steps() == 1
+    recovered = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert recovered["version"] == 3
+    assert recovered["status"] == "needs_review"
+    assert recovered["steps"][0]["status"] == "needs_review"
+    assert recovered["attempts"][0]["dispatch_state"] == "uncertain"
     conn = plan_db._conn()
     try:
         ownership = [row for row in conn.execute(
             "PRAGMA foreign_key_list(plan_step_attempts)") if row["table"] == "plan_steps"]
         assert {(row["from"], row["to"]) for row in ownership} == {
             ("plan_id", "plan_id"), ("step_id", "id")}
+    finally:
+        conn.close()
+
+
+def test_init_db_refuses_cross_owned_legacy_attempt_without_deleting_evidence(plan_db):
+    first = plan_db.create_plan(_plan(title="第一个"), [_step()])
+    second = plan_db.create_plan(_plan(title="第二个"), [_step()])
+    other_step = plan_db.get_plan(second["id"], include_steps=True)["steps"][0]
+    legacy_sql = plan_db._PLAN_ATTEMPTS_TABLE_SQL.replace(
+        "FOREIGN KEY(plan_id, step_id) REFERENCES plan_steps(plan_id, id) ON DELETE CASCADE",
+        "FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE,\n"
+        "  FOREIGN KEY(step_id) REFERENCES plan_steps(id) ON DELETE CASCADE",
+    )
+    conn = plan_db._conn()
+    try:
+        conn.execute("DROP TABLE plan_step_attempts")
+        conn.execute(legacy_sql)
+        conn.execute(
+            """INSERT INTO plan_step_attempts
+               (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json)
+               VALUES (?,?,?,?,?,?)""",
+            (first["id"], other_step["id"], 1, "cross-owned-legacy", "prepared", "{}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="cross-owned"):
+        plan_db.init_db()
+
+    conn = plan_db._conn()
+    try:
+        kept = conn.execute(
+            "SELECT * FROM plan_step_attempts WHERE idempotency_key='cross-owned-legacy'"
+        ).fetchone()
+        old_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='plan_step_attempts__old'"
+        ).fetchone()
+        assert kept is not None
+        assert kept["plan_id"] == first["id"]
+        assert kept["step_id"] == other_step["id"]
+        assert old_table is None
     finally:
         conn.close()
 
@@ -243,7 +343,9 @@ def test_prepare_attempt_dispatches_step_and_bumps_plan_once(plan_db):
 def test_prepare_attempt_rolls_back_step_and_version_if_insert_fails(plan_db):
     made = plan_db.create_plan(_plan(), [_step()])
     step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
-    plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    plan_db.update_plan_attempt(
+        attempt["id"], dispatch_state="finished", outcome="failed")
     plan_db.update_step(step["id"], status="pending")
     before = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
 
@@ -425,5 +527,30 @@ def test_recovery_marks_unfinished_attempt_uncertain(plan_db):
     assert plan_db.recover_running_plan_steps() == 1
 
     got = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert got["attempts"][0]["dispatch_state"] == "uncertain"
+    assert got["attempts"][0]["outcome"] == "uncertain"
+
+
+def test_recovery_finds_legacy_pending_step_from_unfinished_attempt(plan_db):
+    made = plan_db.create_plan(_plan(status="queued"), [_step(status="pending")])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    conn = plan_db._conn()
+    try:
+        conn.execute(
+            """INSERT INTO plan_step_attempts
+               (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json)
+               VALUES (?,?,?,?,?,?)""",
+            (made["id"], step["id"], 1, "legacy-half-state", "prepared", "{}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert plan_db.recover_running_plan_steps() == 1
+
+    got = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert got["version"] == 2
+    assert got["status"] == "needs_review"
+    assert got["steps"][0]["status"] == "needs_review"
     assert got["attempts"][0]["dispatch_state"] == "uncertain"
     assert got["attempts"][0]["outcome"] == "uncertain"
