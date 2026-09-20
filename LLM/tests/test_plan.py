@@ -388,7 +388,8 @@ def test_running_cancel_is_idempotent_and_stops_once(plan_db, monkeypatch):
                         retry_policy="safe_goto_only")
     calls = []
     monkeypatch.setattr(tools, "run_plan_tool",
-                        lambda name, args: calls.append(name) or {"ok": True})
+                        lambda name, args: calls.append(name) or {
+                            "ok": True, "result": '{"ok": true}'})
     first = plan.cancel_plan(made["id"], made["version"], "护士取消", {"uid": "nurse"})
     second = plan.cancel_plan(made["id"], first["plan"]["version"], "重复点击", {"uid": "nurse"})
     assert first["plan"]["status"] == "cancelling"
@@ -396,11 +397,61 @@ def test_running_cancel_is_idempotent_and_stops_once(plan_db, monkeypatch):
     assert calls == ["robot_stop"]
 
 
+def test_running_cancel_inner_stop_failure_marks_attempt_uncertain(plan_db, monkeypatch):
+    made = _stored_plan(plan_db, status="running", step_status="running",
+                        step_type="action", action="robot_goto_point",
+                        retry_policy="safe_goto_only")
+    step = made["steps"][0]
+    plan_db.update_step(step["id"], status="pending")
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    plan_db.transition_plan_execution(
+        made["id"], step_id=step["id"], attempt_id=attempt["id"],
+        step_changes={"status": "running"},
+        attempt_changes={"dispatch_state": "dispatched", "car_task_id": 9})
+    current = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    monkeypatch.setattr(tools, "run_plan_tool", lambda name, args: {
+        "ok": True, "result": '{"ok": false, "error": "底盘拒绝急停"}'})
+    out = plan.cancel_plan(made["id"], current["version"], "护士取消", {"uid": "n", "role": "ward"})
+    assert out["ok"] is False and out["plan"]["status"] == "needs_review"
+    assert out["plan"]["attempts"][0]["dispatch_state"] == "uncertain"
+    retry = plan.retry_step(out["plan"]["id"], out["plan"]["version"], step["id"],
+                            "重新执行", {"uid": "n", "role": "ward"})
+    assert retry["ok"] is True
+
+
+def test_queued_cancel_preserves_succeeded_steps_and_notifies(plan_db, monkeypatch):
+    made = plan_db.create_plan(
+        {"title": "部分完成", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "manual", "status": "succeeded"},
+         {"seq": 2, "step_type": "manual", "status": "pending"}],
+    )
+    events = []
+    monkeypatch.setattr(plan.notify, "ingest", lambda *args, **kwargs: events.append((args, kwargs)))
+    out = plan.cancel_plan(made["id"], made["version"], "不再需要", {"uid": "n", "role": "ward", "slot": "nurse"})
+    assert out["plan"]["steps"][0]["status"] == "succeeded"
+    assert out["plan"]["steps"][1]["status"] == "cancelled"
+    assert events and events[-1][0][:2] == ("plan", "plan_done")
+
+
 def test_version_conflict_does_not_mutate_plan(plan_db):
     made = _stored_plan(plan_db)
     out = plan.change_priority(made["id"], made["version"] - 1, "P1", {"uid": "nurse"})
     assert out["ok"] is False and out["error"] == "version_conflict"
     assert plan_db.get_plan(made["id"])["priority"] == "P2"
+
+
+def test_manual_audit_keeps_actor_context(plan_db, monkeypatch):
+    made = _stored_plan(plan_db)
+    records = []
+    monkeypatch.setattr(plan.audit, "log",
+                        lambda event, **fields: records.append({"event": event, **fields}))
+    out = plan.change_priority(
+        made["id"], made["version"], "P1",
+        {"uid": "nurse-1", "role": "ward", "slot": "nurse"})
+    assert out["ok"] is True
+    record = records[-1]
+    assert (record["actor_uid"], record["actor_role"], record["actor_surface"]) == (
+        "nurse-1", "ward", "nurse")
 
 
 def test_needs_review_retry_rejects_relative_action(plan_db):

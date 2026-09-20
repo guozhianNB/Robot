@@ -23,3 +23,16 @@ $env:OPENAI_API_KEY='test'; ..\..\.venv\Scripts\python.exe -m pytest --basetemp=
 ```
 
 `compileall` 和 `git diff --check` 通过。默认 pytest 临时目录在本机被权限策略拒绝，因此验证显式使用仓库内 `.pytest-local` basetemp；该目录为测试产物，不纳入提交。
+
+## 审查修复
+
+根据 `task-6-review.md` 的 Important 项完成二轮修复：
+
+- 急停严格解析 MCP 外层 envelope 与内层 JSON；内层 `ok:false`、非法 JSON 和错误状态均立即复核。
+- 急停失败在同一聚合事务将正在派发的 Attempt 改为 `uncertain`，后续允许显式安全重试创建新 Attempt。
+- 排队取消仅取消未完成步骤，保留 `succeeded/failed/skipped/interrupted` 历史，并发送 `plan_done` 取消终态通知。
+- scheduler 给步骤快照携带 Plan version；`_finish`、`_poll`、`_poll_cancel`、`_handle_wait` 和 review 迁移全部使用 `expected_version`，旧 tick 的结果不能覆盖人工迁移。
+- 人工操作审计分别保留 `actor_uid`、`actor_role`、`actor_surface`。
+- 取消宽限期在恰好 15.0 秒时进入复核（`>=`），并修正该异常分支调用不存在函数的问题。
+
+二轮回归：`test_plan.py + test_plan_scheduler.py + test_notify.py` 共 **94 passed**。

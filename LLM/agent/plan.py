@@ -275,6 +275,13 @@ def _actor_name(actor: dict | None) -> str:
     return str(actor.get("uid") or actor.get("role") or "unknown")[:128]
 
 
+def _actor_fields(actor: dict | None) -> dict:
+    actor = actor or {}
+    return {"actor_uid": str(actor.get("uid") or "")[:128],
+            "actor_role": str(actor.get("role") or "")[:64],
+            "actor_surface": str(actor.get("slot") or actor.get("surface") or "")[:64]}
+
+
 def _conflict(current: dict | None, reason: str = "conflict") -> dict:
     return {"ok": False, "error": reason, "plan": current} if current is not None else {
         "ok": False, "error": "not_found"}
@@ -282,6 +289,12 @@ def _conflict(current: dict | None, reason: str = "conflict") -> dict:
 
 def _read_plan(plan_id: int, *, attempts: bool = True) -> dict | None:
     return db.get_plan(plan_id, include_steps=True, include_attempts=attempts)
+
+
+def _attempt_for(step: dict) -> dict:
+    attempts = [item for item in (step.get("attempts") or []) if isinstance(item, dict)]
+    return max(attempts, key=lambda item: (int(item.get("attempt_no") or 0),
+                                            int(item.get("id") or 0)), default={})
 
 
 def _publish(plan: dict, *, step: dict | None = None, kind: str = "plan_updated") -> None:
@@ -311,7 +324,7 @@ def _committed(plan: dict, *, actor: dict | None, action: str,
                level: str = "info") -> dict:
     audit.log("plan", action=action, plan_id=plan.get("id"),
               step_id=(step or {}).get("id"), actor=_actor_name(actor),
-              version=plan.get("version"))
+              version=plan.get("version"), **_actor_fields(actor))
     _publish(plan, step=step)
     if notify_type:
         _notify(plan, notify_type, level=level)
@@ -355,10 +368,12 @@ def cancel_plan(plan_id: int, version: int, reason: str, actor: dict | None = No
     if active is None:
         updated = db.transition_plan_execution(
             plan_id, expected_version=version, all_step_changes={"status": "cancelled"},
+            all_step_exclude_statuses=("succeeded", "failed", "skipped", "cancelled", "interrupted"),
             plan_changes={"status": "cancelled"})
         if updated is None:
             return _conflict(_read_plan(plan_id), "version_conflict")
-        return _committed(updated, actor=actor, action="cancel")
+        return _committed(updated, actor=actor, action="cancel",
+                          notify_type="plan_done", level="warning")
 
     # Reserve the cancellation atomically before touching the car.  A duplicate
     # request now observes cancelling and cannot issue a second stop command.
@@ -373,15 +388,22 @@ def cancel_plan(plan_id: int, version: int, reason: str, actor: dict | None = No
     try:
         from . import tools
         stop = tools.run_plan_tool("robot_stop", {})
-        if not isinstance(stop, dict) or stop.get("ok") is not True:
-            raise RuntimeError(str((stop or {}).get("error") if isinstance(stop, dict) else stop))
+        from .plan_scheduler import parse_stop_result
+        ok, message = parse_stop_result(stop)
+        if not ok:
+            raise RuntimeError(message)
     except Exception as exc:
         latest = _read_plan(plan_id)
         if latest:
             step = next((s for s in latest.get("steps", []) if s.get("id") == active["id"]), active)
+            attempt = _attempt_for(step)
             reviewed = db.transition_plan_execution(
                 plan_id, expected_version=latest.get("version"), step_id=step["id"],
                 step_changes={"status": "needs_review", "last_error": f"急停失败：{exc}"},
+                attempt_id=attempt.get("id"),
+                attempt_changes=({"dispatch_state": "uncertain", "outcome": "uncertain",
+                                  "result_json": {"reason": str(exc)},
+                                  "last_checked_at": db.now_iso()} if attempt.get("id") else None),
                 plan_changes={"status": "needs_review"})
             latest = reviewed or _read_plan(plan_id)
             if latest:

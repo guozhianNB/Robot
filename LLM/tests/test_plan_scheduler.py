@@ -346,3 +346,52 @@ def test_cancel_poll_requires_fresh_idle_status_before_cancelled(monkeypatch, tm
     got = db.get_plan(made["id"], include_steps=True)
     assert got["status"] == "cancelled"
     assert got["steps"][0]["status"] == "interrupted"
+
+
+def test_cancel_poll_marks_review_at_exact_grace_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "取消超时", "priority": "P2", "status": "cancelling"},
+        [{"seq": 1, "step_type": "action", "action": "robot_goto_point",
+          "status": "interrupting", "args_json": {"x": 1, "y": 2}}],
+    )
+    step = db.get_plan(made["id"], include_steps=True, include_attempts=True)["steps"][0]
+    monkeypatch.setattr(plan_scheduler.conf, "PLAN_STATUS_GRACE_S", 15.0)
+    monkeypatch.setattr(tools, "run_plan_tool", lambda name, args: {
+        "ok": True, "result": json.dumps({"ok": True, "status": "unavailable"})})
+    plan_scheduler._cancel_started.clear()
+    plan_scheduler._poll_cancel(step, 0.0)
+    plan_scheduler._poll_cancel(step, 15.0)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["status"] == "needs_review"
+    assert got["steps"][0]["status"] == "needs_review"
+
+
+def test_finish_cannot_overwrite_newer_manual_transition(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "CAS", "priority": "P2", "status": "queued"},
+        [{"seq": 1, "step_type": "action", "action": "robot_move",
+          "status": "pending", "args_json": {"direction": "forward", "distance_m": .2}}],
+    )
+    step = made["steps"][0]
+    attempt = db.prepare_plan_attempt(step["id"], 1, {"action": "robot_move"})
+    running = db.transition_plan_execution(
+        made["id"], step_id=step["id"], attempt_id=attempt["id"],
+        step_changes={"status": "running"},
+        attempt_changes={"dispatch_state": "dispatched", "car_task_id": 7},
+        plan_changes={"status": "running"})
+    stale_step = running["steps"][0]
+    stale_step["_plan_version"] = running["version"]
+    stale_attempt = running["attempts"][0]
+    status, newer = db.update_plan_versioned(made["id"], running["version"], priority="P1")
+    assert status == "updated"
+    plan_scheduler._finish(stale_step, stale_attempt, "succeeded", {"ok": True})
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["version"] == newer["version"]
+    assert got["status"] == "running"
+    assert got["steps"][0]["status"] == "running"

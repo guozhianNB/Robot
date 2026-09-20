@@ -52,6 +52,24 @@ class ToolResult:
         return value if type(value) is int and value > 0 else None
 
 
+def parse_stop_result(raw: dict) -> tuple[bool, str]:
+    """Validate robot_stop's MCP envelope and inner car response."""
+    if not isinstance(raw, dict) or raw.get("ok") is not True:
+        return False, str((raw or {}).get("error") or (raw or {}).get("message") or "MCP 急停调用失败")
+    body = raw.get("result")
+    if not isinstance(body, str):
+        return False, "急停结果不是 JSON 字符串"
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return False, "急停结果不是合法 JSON"
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return False, str((payload or {}).get("error") or (payload or {}).get("message") or "车控急停失败")
+    if payload.get("status") in {"error", "rejected", "uncertain", "unavailable", "stale"}:
+        return False, str(payload.get("error") or payload.get("status"))
+    return True, ""
+
+
 def parse_tool_result(raw: dict) -> ToolResult:
     """Validate the transport envelope and the car server's JSON payload."""
     if not isinstance(raw, dict) or raw.get("ok") is not True:
@@ -165,16 +183,20 @@ def _all_plans() -> list[dict]:
     for row in db.list_plans(limit=None):
         full = db.get_plan(row["id"], include_steps=True, include_attempts=True)
         if full is not None:
+            for step in full.get("steps", []):
+                step["_plan_version"] = full.get("version")
             plans.append(full)
     return plans
 
 
-def _set_plan_status(plan_id: int, status: str) -> None:
+def _set_plan_status(plan_id: int, status: str, expected_version: int | None = None) -> bool:
     current = db.get_plan(plan_id)
     if current is None or current.get("status") == status:
-        return
-    if db.transition_plan_execution(plan_id, plan_changes={"status": status}) is None:
-        raise RuntimeError(f"Plan {plan_id} 状态更新失败")
+        return current is not None
+    if db.transition_plan_execution(plan_id, expected_version=expected_version,
+                                    plan_changes={"status": status}) is None:
+        return False
+    return True
 
 
 def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
@@ -187,7 +209,7 @@ def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
             "result_json": {"reason": reason}, "last_checked_at": db.now_iso(),
         }
     updated = db.transition_plan_execution(
-        step["plan_id"], step_id=step["id"],
+        step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
         step_changes={"status": "needs_review", "last_error": reason},
         attempt_id=attempt_id, attempt_changes=attempt_changes,
         plan_changes={"status": "needs_review"},
@@ -210,7 +232,7 @@ def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
                     for item in plan.get("steps", [])]
         plan_status = "succeeded" if all(item == "succeeded" for item in statuses) else "running"
     updated = db.transition_plan_execution(
-        step["plan_id"], step_id=step["id"],
+        step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
         step_changes={"status": final_step, "finished_at": now_iso,
                       "last_progress_at": now_iso,
                       "last_error": "" if outcome == "succeeded" else str(
@@ -269,7 +291,7 @@ def _poll(step: dict, now: float) -> None:
         if matching:
             changes["result_json"] = payload
         db.transition_plan_execution(
-            step["plan_id"], step_id=step["id"],
+            step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
             step_changes={"last_progress_at": checked_at} if decision == "running" else None,
             attempt_id=attempt["id"], attempt_changes=changes,
         )
@@ -296,17 +318,17 @@ def _poll_cancel(step: dict, now: float) -> None:
     payload = parsed.payload if isinstance(parsed.payload, dict) else {}
     fresh = parsed.kind == "status" and payload.get("state_fresh") is True
     if parsed.kind == "unavailable" or not fresh:
-        if now - started > conf.PLAN_STATUS_GRACE_S:
+        if now - started >= conf.PLAN_STATUS_GRACE_S:
             attempt = _attempt_for(step)
-            plan_ops._mark_review(step, "急停后 15 秒未获得新鲜车况", attempt or None)
+            _mark_review(step, "急停后 15 秒未获得新鲜车况", attempt or None)
             _cancel_started.pop(step["id"], None)
         return
     current = payload.get("current")
     exec_state = str(payload.get("exec_state") or payload.get("state") or "").lower()
     active = isinstance(current, dict) and current.get("task_id") not in (None, "", 0)
     if active or exec_state in {"moving", "running", "executing", "busy"}:
-        if now - started > conf.PLAN_STATUS_GRACE_S:
-            plan_ops._mark_review(step, "急停后仍检测到活动车控任务", _attempt_for(step) or None)
+        if now - started >= conf.PLAN_STATUS_GRACE_S:
+            _mark_review(step, "急停后仍检测到活动车控任务", _attempt_for(step) or None)
             _cancel_started.pop(step["id"], None)
         return
     plan = db.get_plan(step["plan_id"], include_steps=True, include_attempts=True)
@@ -316,7 +338,7 @@ def _poll_cancel(step: dict, now: float) -> None:
     attempt = _attempt_for(step)
     now_iso = db.now_iso()
     updated = db.transition_plan_execution(
-        step["plan_id"], step_id=step["id"],
+        step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
         step_changes={"status": "interrupted", "finished_at": now_iso,
                       "last_progress_at": now_iso},
         attempt_id=attempt.get("id"),
@@ -346,13 +368,20 @@ def _dispatch(step: dict, now: float) -> None:
                          if item.get("dispatch_state") == "prepared"), None)
         attempt = prepared or db.prepare_plan_attempt(step["id"], attempt_no, request)
         _attempt_started[step["id"]] = now
-        _set_plan_status(step["plan_id"], "running")
+        prepared_plan = db.get_plan(step["plan_id"])
+        if prepared_plan is None or not _set_plan_status(
+                step["plan_id"], "running", prepared_plan.get("version")):
+            return
+        dispatch_plan = db.get_plan(step["plan_id"])
+        if dispatch_plan is None:
+            return
+        dispatch_version = dispatch_plan.get("version")
         parsed = parse_tool_result(tools.run_plan_tool(step["action"], request["args"]))
         if parsed.kind == "started":
             accepted = parsed.payload or {}
             started_at = db.now_iso()
             db.transition_plan_execution(
-                step["plan_id"], step_id=step["id"],
+                step["plan_id"], expected_version=dispatch_version, step_id=step["id"],
                 step_changes={"status": "running", "started_at": started_at,
                               "last_progress_at": started_at},
                 attempt_id=attempt["id"], attempt_changes={
@@ -365,7 +394,7 @@ def _dispatch(step: dict, now: float) -> None:
         if parsed.kind == "action_error":
             finished_at = db.now_iso()
             updated = db.transition_plan_execution(
-                step["plan_id"], step_id=step["id"],
+                step["plan_id"], expected_version=dispatch_version, step_id=step["id"],
                 step_changes={"status": "failed", "finished_at": finished_at,
                               "last_error": parsed.message},
                 attempt_id=attempt["id"], attempt_changes={
@@ -385,6 +414,7 @@ def _dispatch(step: dict, now: float) -> None:
         current = next((item for item in (latest or {}).get("steps", [])
                         if item.get("id") == step.get("id")), None)
         if current is not None:
+            current["_plan_version"] = latest.get("version")
             # Includes the legacy half-state (pending + prepared attempt).  It
             # is evidence of an ambiguous dispatch and must not spin/retry.
             _mark_review(current, f"派发状态冲突: {exc}", _attempt_for(current) or None)
@@ -396,7 +426,7 @@ def _handle_wait(step: dict, wall_now: float) -> None:
     if step.get("wait_kind") != "time":
         if step.get("status") != "waiting":
             db.transition_plan_execution(
-                step["plan_id"], step_id=step["id"],
+                step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
                 step_changes={"status": "waiting"},
                 plan_changes={"status": "waiting"},
             )
@@ -409,7 +439,7 @@ def _handle_wait(step: dict, wall_now: float) -> None:
     if wall_now < wake:
         if step.get("status") != "waiting":
             db.transition_plan_execution(
-                step["plan_id"], step_id=step["id"],
+                step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
                 step_changes={"status": "waiting"},
                 plan_changes={"status": "waiting"},
             )
@@ -421,7 +451,7 @@ def _handle_wait(step: dict, wall_now: float) -> None:
                 for item in plan.get("steps", [])]
     plan_status = "succeeded" if all(status == "succeeded" for status in statuses) else "running"
     updated = db.transition_plan_execution(
-        step["plan_id"], step_id=step["id"],
+        step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
         step_changes={"status": "succeeded", "finished_at": db.now_iso()},
         plan_changes={"status": plan_status},
     )

@@ -2158,6 +2158,7 @@ def transition_plan_execution(plan_id: int, *, expected_version: int | None = No
                               step_id: int | None = None,
                               step_changes: dict | None = None,
                               all_step_changes: dict | None = None,
+                              all_step_exclude_statuses: tuple[str, ...] = (),
                               new_attempt: dict | None = None,
                               attempt_id: int | None = None,
                               attempt_changes: dict | None = None,
@@ -2211,9 +2212,14 @@ def transition_plan_execution(plan_id: int, *, expected_version: int | None = No
                 raise ValueError("step_id is required for step changes")
             if all_step_values:
                 assignments = ",".join(f"{field}=?" for field in all_step_values)
+                where = "plan_id=?"
+                args = [*all_step_values.values(), plan_id]
+                if all_step_exclude_statuses:
+                    placeholders = ",".join("?" for _ in all_step_exclude_statuses)
+                    where += f" AND status NOT IN ({placeholders})"
+                    args.extend(all_step_exclude_statuses)
                 conn.execute(
-                    f"UPDATE plan_steps SET {assignments} WHERE plan_id=?",
-                    (*all_step_values.values(), plan_id),
+                    f"UPDATE plan_steps SET {assignments} WHERE {where}", args,
                 )
             if new_attempt is not None:
                 if not isinstance(new_attempt, dict):
