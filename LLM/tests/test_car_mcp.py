@@ -163,10 +163,17 @@ def test_goto_requires_navigation_before_task_registration(server_rig):
     assert not link.tasks and not executor.jobs
 
 
+def test_started_action_returns_registered_task_id(server_rig):
+    module, link, _nav, executor = server_rig
+    out = load_json(module._move(link, executor, "forward", 0.5))
+    assert out["status"] == "started"
+    assert out["task_id"] == link.tasks[0]["task_id"]
+
+
 def test_started_returns_immediately_and_worker_sends_exact_ros_request(server_rig):
     module, link, nav, executor = server_rig
     out = load_json(module._goto_point(link, nav, executor, 4, 5, 90))
-    assert out == {"ok": True, "status": "started", "action": "goto_point",
+    assert out == {"ok": True, "status": "started", "task_id": 1, "action": "goto_point",
                    "summary": "前往 point", "exec_state": "navigating",
                    "target": {"x": 1.0, "y": 2.0, "yaw_deg": 30.0, "goal_source": "point"},
                    "warnings": ["地图标记较旧"]}
