@@ -17,6 +17,7 @@ from .. import conf
 from ..core import log as audit
 from ..store import db
 from . import action_gate, tools
+from . import plan as plan_ops
 
 
 _ACTIVE_STATES = frozenset({"dispatching", "running", "interrupting"})
@@ -34,6 +35,7 @@ _thread: threading.Thread | None = None
 # all unfinished attempts to needs_review before this state can be consulted.
 _attempt_started: dict[int, float] = {}
 _unavailable_since: dict[int, float] = {}
+_cancel_started: dict[int, float] = {}
 
 
 @dataclass(frozen=True)
@@ -184,7 +186,7 @@ def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
             "dispatch_state": "uncertain", "outcome": "uncertain",
             "result_json": {"reason": reason}, "last_checked_at": db.now_iso(),
         }
-    db.transition_plan_execution(
+    updated = db.transition_plan_execution(
         step["plan_id"], step_id=step["id"],
         step_changes={"status": "needs_review", "last_error": reason},
         attempt_id=attempt_id, attempt_changes=attempt_changes,
@@ -192,6 +194,8 @@ def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
     )
     audit.log("plan", action="needs_review", plan_id=step["plan_id"],
               step_id=step["id"], reason=reason)
+    if updated:
+        plan_ops._notify(updated, "plan_needs_review", level="critical")
 
 
 def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
@@ -205,7 +209,7 @@ def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
         statuses = ["succeeded" if item.get("id") == step["id"] else item.get("status")
                     for item in plan.get("steps", [])]
         plan_status = "succeeded" if all(item == "succeeded" for item in statuses) else "running"
-    db.transition_plan_execution(
+    updated = db.transition_plan_execution(
         step["plan_id"], step_id=step["id"],
         step_changes={"status": final_step, "finished_at": now_iso,
                       "last_progress_at": now_iso,
@@ -220,6 +224,9 @@ def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
     )
     _attempt_started.pop(step["id"], None)
     _unavailable_since.pop(step["id"], None)
+    if updated:
+        plan_ops._notify(updated, "plan_done" if plan_status == "succeeded" else "plan_failed",
+                         level="info" if plan_status == "succeeded" else "warning")
 
 
 def _poll(step: dict, now: float) -> None:
@@ -277,6 +284,53 @@ def _poll(step: dict, now: float) -> None:
     _finish(step, attempt, decision, payload)
 
 
+def _poll_cancel(step: dict, now: float) -> None:
+    """Confirm a cancellation without claiming that robot_stop stopped the car.
+
+    The stop command only writes a websocket message.  Cancellation is final
+    only after a fresh status snapshot shows no active task; unavailable or
+    stale status is held for the configured grace period and then reviewed.
+    """
+    started = _cancel_started.setdefault(step["id"], now)
+    parsed = parse_tool_result(tools.run_plan_tool("robot_status", {}))
+    payload = parsed.payload if isinstance(parsed.payload, dict) else {}
+    fresh = parsed.kind == "status" and payload.get("state_fresh") is True
+    if parsed.kind == "unavailable" or not fresh:
+        if now - started > conf.PLAN_STATUS_GRACE_S:
+            attempt = _attempt_for(step)
+            plan_ops._mark_review(step, "急停后 15 秒未获得新鲜车况", attempt or None)
+            _cancel_started.pop(step["id"], None)
+        return
+    current = payload.get("current")
+    exec_state = str(payload.get("exec_state") or payload.get("state") or "").lower()
+    active = isinstance(current, dict) and current.get("task_id") not in (None, "", 0)
+    if active or exec_state in {"moving", "running", "executing", "busy"}:
+        if now - started > conf.PLAN_STATUS_GRACE_S:
+            plan_ops._mark_review(step, "急停后仍检测到活动车控任务", _attempt_for(step) or None)
+            _cancel_started.pop(step["id"], None)
+        return
+    plan = db.get_plan(step["plan_id"], include_steps=True, include_attempts=True)
+    if plan is None or plan.get("status") != "cancelling":
+        _cancel_started.pop(step["id"], None)
+        return
+    attempt = _attempt_for(step)
+    now_iso = db.now_iso()
+    updated = db.transition_plan_execution(
+        step["plan_id"], step_id=step["id"],
+        step_changes={"status": "interrupted", "finished_at": now_iso,
+                      "last_progress_at": now_iso},
+        attempt_id=attempt.get("id"),
+        attempt_changes=({"dispatch_state": "finished", "outcome": "uncertain",
+                          "result_json": payload, "finished_at": now_iso,
+                          "last_checked_at": now_iso} if attempt.get("id") else None),
+        plan_changes={"status": "cancelled"},
+    )
+    if updated:
+        plan_ops._publish(updated, step=step)
+        plan_ops._notify(updated, "plan_done", level="info")
+    _cancel_started.pop(step["id"], None)
+
+
 def _dispatch(step: dict, now: float) -> None:
     if step.get("action") not in _ACTION_NAMES:
         _mark_review(step, f"动作不在自动调度清单: {step.get('action')}")
@@ -288,7 +342,9 @@ def _dispatch(step: dict, now: float) -> None:
         attempts = [item for item in step.get("attempts", []) if isinstance(item, dict)]
         attempt_no = max((int(item.get("attempt_no") or 0) for item in attempts), default=0) + 1
         request = {"action": step["action"], "args": dict(step.get("args_json") or {})}
-        attempt = db.prepare_plan_attempt(step["id"], attempt_no, request)
+        prepared = next((item for item in attempts
+                         if item.get("dispatch_state") == "prepared"), None)
+        attempt = prepared or db.prepare_plan_attempt(step["id"], attempt_no, request)
         _attempt_started[step["id"]] = now
         _set_plan_status(step["plan_id"], "running")
         parsed = parse_tool_result(tools.run_plan_tool(step["action"], request["args"]))
@@ -308,7 +364,7 @@ def _dispatch(step: dict, now: float) -> None:
             return
         if parsed.kind == "action_error":
             finished_at = db.now_iso()
-            db.transition_plan_execution(
+            updated = db.transition_plan_execution(
                 step["plan_id"], step_id=step["id"],
                 step_changes={"status": "failed", "finished_at": finished_at,
                               "last_error": parsed.message},
@@ -319,6 +375,8 @@ def _dispatch(step: dict, now: float) -> None:
                 },
                 plan_changes={"status": "failed"},
             )
+            if updated:
+                plan_ops._notify(updated, "plan_failed", level="warning")
             return
         _mark_review(step, parsed.message or f"动作受理结果不确定: {parsed.kind}", attempt)
     except (ValueError, RuntimeError) as exc:
@@ -362,11 +420,13 @@ def _handle_wait(step: dict, wall_now: float) -> None:
     statuses = ["succeeded" if item.get("id") == step["id"] else item.get("status")
                 for item in plan.get("steps", [])]
     plan_status = "succeeded" if all(status == "succeeded" for status in statuses) else "running"
-    db.transition_plan_execution(
+    updated = db.transition_plan_execution(
         step["plan_id"], step_id=step["id"],
         step_changes={"status": "succeeded", "finished_at": db.now_iso()},
         plan_changes={"status": plan_status},
     )
+    if updated and plan_status == "succeeded":
+        plan_ops._notify(updated, "plan_done", level="info")
 
 
 def _choose_pending(plans: list[dict]) -> dict | None:
@@ -405,6 +465,8 @@ def tick_once(now: float | None = None) -> None:
             step = active[0]
             if step.get("status") == "running":
                 _poll(step, mono_now)
+            elif step.get("status") == "interrupting":
+                _poll_cancel(step, mono_now)
             else:
                 _mark_review(step, f"无法自动恢复 {step.get('status')} 步骤",
                              _attempt_for(step) or None)

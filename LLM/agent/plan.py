@@ -9,6 +9,7 @@ from datetime import datetime
 from .. import conf
 from ..core import log as audit
 from ..store import db
+from . import notify
 
 
 PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
@@ -263,3 +264,217 @@ def create_from_tool(title, steps, priority="P2", owner_uid="", report=None) -> 
     made = out["plan"]
     return {"ok": True, "plan_id": made["id"], "display_no": made["display_no"],
             "status": made["status"], "summary": out["summary"]}
+
+
+# ---------------------------------------------------------------- 人工状态迁移
+_PLAN_TERMINAL = frozenset({"succeeded", "failed", "cancelled", "expired"})
+
+
+def _actor_name(actor: dict | None) -> str:
+    actor = actor or {}
+    return str(actor.get("uid") or actor.get("role") or "unknown")[:128]
+
+
+def _conflict(current: dict | None, reason: str = "conflict") -> dict:
+    return {"ok": False, "error": reason, "plan": current} if current is not None else {
+        "ok": False, "error": "not_found"}
+
+
+def _read_plan(plan_id: int, *, attempts: bool = True) -> dict | None:
+    return db.get_plan(plan_id, include_steps=True, include_attempts=attempts)
+
+
+def _publish(plan: dict, *, step: dict | None = None, kind: str = "plan_updated") -> None:
+    try:
+        from ..core import bus
+        bus.publish(kind, plan_id=plan.get("id"), version=plan.get("version"),
+                    plan={"id": plan.get("id"), "display_no": plan.get("display_no"),
+                          "status": plan.get("status"), "priority": plan.get("priority")},
+                    step=(step or {}).copy() if step else None)
+    except Exception as exc:
+        audit.log("plan", action="publish_failed", plan_id=plan.get("id"), error=str(exc))
+
+
+def _notify(plan: dict, event_type: str, *, level: str = "info") -> None:
+    """Notifications are best effort and never undo a committed transition."""
+    try:
+        notify.ingest("plan", event_type, level=level, uid=plan.get("owner_uid") or "",
+                      body=f"{plan.get('display_no', 'Plan')}：{plan.get('title', '')}",
+                      ref=f"plan:{plan.get('id')}")
+    except Exception as exc:
+        audit.log("plan", action="notify_failed", plan_id=plan.get("id"),
+                  type=event_type, error=str(exc))
+
+
+def _committed(plan: dict, *, actor: dict | None, action: str,
+               step: dict | None = None, notify_type: str | None = None,
+               level: str = "info") -> dict:
+    audit.log("plan", action=action, plan_id=plan.get("id"),
+              step_id=(step or {}).get("id"), actor=_actor_name(actor),
+              version=plan.get("version"))
+    _publish(plan, step=step)
+    if notify_type:
+        _notify(plan, notify_type, level=level)
+    return {"ok": True, "plan": plan}
+
+
+def change_priority(plan_id: int, version: int, priority: str, actor: dict | None = None) -> dict:
+    if priority not in PRIORITIES:
+        return {"ok": False, "error": "invalid_priority"}
+    current = _read_plan(plan_id)
+    if current is None:
+        return _conflict(None, "not_found")
+    if current.get("version") != version:
+        return _conflict(current, "version_conflict")
+    if current.get("status") in _PLAN_TERMINAL or current.get("status") == "cancelling":
+        return _conflict(current, "invalid_state")
+    updated = db.transition_plan_execution(plan_id, expected_version=version,
+                                           plan_changes={"priority": priority})
+    if updated is None:
+        return _conflict(_read_plan(plan_id), "version_conflict")
+    return _committed(updated, actor=actor, action="priority", level="info")
+
+
+def cancel_plan(plan_id: int, version: int, reason: str, actor: dict | None = None) -> dict:
+    reason = str(reason or "").strip()
+    if not reason:
+        return {"ok": False, "error": "reason_required"}
+    current = _read_plan(plan_id)
+    if current is None:
+        return _conflict(None, "not_found")
+    if current.get("version") != version:
+        return _conflict(current, "version_conflict")
+    status = current.get("status")
+    if status in {"cancelled", "cancelling"}:
+        # Cancellation is idempotent.  In particular, never emit robot_stop twice.
+        return {"ok": True, "plan": current}
+    if status in _PLAN_TERMINAL:
+        return _conflict(current, "invalid_state")
+    steps = current.get("steps") or []
+    active = next((s for s in steps if s.get("status") in {"dispatching", "running", "interrupting"}), None)
+    if active is None:
+        updated = db.transition_plan_execution(
+            plan_id, expected_version=version, all_step_changes={"status": "cancelled"},
+            plan_changes={"status": "cancelled"})
+        if updated is None:
+            return _conflict(_read_plan(plan_id), "version_conflict")
+        return _committed(updated, actor=actor, action="cancel")
+
+    # Reserve the cancellation atomically before touching the car.  A duplicate
+    # request now observes cancelling and cannot issue a second stop command.
+    now = db.now_iso()
+    updated = db.transition_plan_execution(
+        plan_id, expected_version=version, step_id=active["id"],
+        step_changes={"status": "interrupting", "last_error": reason,
+                      "last_progress_at": now},
+        plan_changes={"status": "cancelling"})
+    if updated is None:
+        return _conflict(_read_plan(plan_id), "version_conflict")
+    try:
+        from . import tools
+        stop = tools.run_plan_tool("robot_stop", {})
+        if not isinstance(stop, dict) or stop.get("ok") is not True:
+            raise RuntimeError(str((stop or {}).get("error") if isinstance(stop, dict) else stop))
+    except Exception as exc:
+        latest = _read_plan(plan_id)
+        if latest:
+            step = next((s for s in latest.get("steps", []) if s.get("id") == active["id"]), active)
+            reviewed = db.transition_plan_execution(
+                plan_id, expected_version=latest.get("version"), step_id=step["id"],
+                step_changes={"status": "needs_review", "last_error": f"急停失败：{exc}"},
+                plan_changes={"status": "needs_review"})
+            latest = reviewed or _read_plan(plan_id)
+            if latest:
+                _committed(latest, actor=actor, action="cancel_stop_failed",
+                           step=step, notify_type="plan_needs_review", level="critical")
+                return {"ok": False, "error": "stop_failed", "plan": latest}
+    latest = _read_plan(plan_id)
+    return _committed(latest or updated, actor=actor, action="cancel",
+                      step=active) if latest else {"ok": True, "plan": updated}
+
+
+def _plan_status_after_step(plan: dict, step_id: int, terminal: str) -> str:
+    statuses = [terminal if s.get("id") == step_id else s.get("status")
+                for s in plan.get("steps", [])]
+    if terminal == "failed":
+        return "failed"
+    if any(status == "needs_review" for status in statuses):
+        return "needs_review"
+    if all(s == "succeeded" for s in statuses):
+        return "succeeded"
+    return "running"
+
+
+def confirm_step(plan_id: int, version: int, step_id: int, decision: str,
+                 note: str, actor: dict | None = None) -> dict:
+    note = str(note or "").strip()
+    current = _read_plan(plan_id)
+    if current is None:
+        return _conflict(None, "not_found")
+    if current.get("version") != version:
+        return _conflict(current, "version_conflict")
+    step = next((s for s in current.get("steps", []) if s.get("id") == step_id), None)
+    if step is None:
+        return _conflict(current, "step_not_found")
+    if step.get("status") in {"running", "dispatching", "interrupting"}:
+        return _conflict(current, "invalid_state")
+    status = step.get("status")
+    if status == "needs_review":
+        if decision not in {"mark_succeeded", "mark_failed", "retry"} or not note:
+            return {"ok": False, "error": "needs_review_decision_requires_note", "plan": current}
+        if decision == "retry":
+            return retry_step(plan_id, version, step_id, note, actor)
+        terminal = "succeeded" if decision == "mark_succeeded" else "failed"
+    else:
+        if decision != "complete" or step.get("step_type") not in {"manual", "wait"}:
+            return {"ok": False, "error": "invalid_decision", "plan": current}
+        if step.get("step_type") == "wait" and step.get("wait_kind") != "manual":
+            return {"ok": False, "error": "time_wait_cannot_be_confirmed", "plan": current}
+        if status not in {"pending", "waiting", "paused"}:
+            return _conflict(current, "invalid_state")
+        terminal = "succeeded"
+    now = db.now_iso()
+    plan_status = _plan_status_after_step(current, step_id, terminal)
+    updated = db.transition_plan_execution(
+        plan_id, expected_version=version, step_id=step_id,
+        step_changes={"status": terminal, "finished_at": now,
+                      "last_error": "" if terminal == "succeeded" else note},
+        plan_changes={"status": plan_status})
+    if updated is None:
+        return _conflict(_read_plan(plan_id), "version_conflict")
+    return _committed(updated, actor=actor, action=f"confirm_{decision}", step=step,
+                      notify_type=("plan_failed" if terminal == "failed" else
+                                   "plan_done" if plan_status == "succeeded" else None),
+                      level="warning" if terminal == "failed" else "info")
+
+
+def retry_step(plan_id: int, version: int, step_id: int, note: str,
+               actor: dict | None = None) -> dict:
+    note = str(note or "").strip()
+    current = _read_plan(plan_id)
+    if current is None:
+        return _conflict(None, "not_found")
+    if current.get("version") != version:
+        return _conflict(current, "version_conflict")
+    step = next((s for s in current.get("steps", []) if s.get("id") == step_id), None)
+    if step is None:
+        return _conflict(current, "step_not_found")
+    if step.get("status") != "needs_review" or not note:
+        return {"ok": False, "error": "retry_requires_needs_review_and_note", "plan": current}
+    if step.get("step_type") != "action" or step.get("retry_policy") != "safe_goto_only":
+        return {"ok": False, "error": "retry_not_allowed", "plan": current}
+    # Relative actions (move/turn) never retry after an uncertain outcome.
+    if step.get("action") != "robot_goto_point":
+        return {"ok": False, "error": "retry_not_allowed", "plan": current}
+    attempts = [a for a in (step.get("attempts") or []) if isinstance(a, dict)]
+    attempt_no = max((int(a.get("attempt_no") or 0) for a in attempts), default=0) + 1
+    request = {"action": step.get("action"), "args": dict(step.get("args_json") or {})}
+    updated = db.transition_plan_execution(
+        plan_id, expected_version=version, step_id=step_id,
+        step_changes={"status": "pending", "last_error": note,
+                      "finished_at": None},
+        new_attempt={"attempt_no": attempt_no, "request": request},
+        plan_changes={"status": "queued"})
+    if updated is None:
+        return _conflict(_read_plan(plan_id), "version_conflict")
+    return _committed(updated, actor=actor, action="retry", step=step)

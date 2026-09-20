@@ -4,7 +4,7 @@
 import pytest
 import json
 
-from LLM.agent import action_gate, plan_scheduler, tools
+from LLM.agent import action_gate, plan_scheduler, tools, plan
 
 
 @pytest.mark.parametrize("raw,kind", [
@@ -326,3 +326,23 @@ def test_run_plan_tool_requires_mcp_enabled_and_car_server(monkeypatch):
         "robot_move": {"server": "other", "schema": {}}
     })
     assert tools.run_plan_tool("robot_move", {})["ok"] is False
+
+
+def test_cancel_poll_requires_fresh_idle_status_before_cancelled(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = db.create_plan(
+        {"title": "取消", "priority": "P2", "status": "cancelling"},
+        [{"seq": 1, "step_type": "action", "action": "robot_goto_point",
+          "status": "interrupting", "args_json": {"x": 1, "y": 2}}],
+    )
+    step = db.get_plan(made["id"], include_steps=True, include_attempts=True)["steps"][0]
+    monkeypatch.setattr(tools, "run_plan_tool", lambda name, args: {
+        "ok": True, "result": json.dumps({"ok": True, "exec_state": "idle",
+                                             "state_fresh": True})})
+    plan_scheduler._cancel_started.clear()
+    plan_scheduler._poll_cancel(step, 10.0)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["status"] == "cancelled"
+    assert got["steps"][0]["status"] == "interrupted"

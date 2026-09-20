@@ -356,6 +356,72 @@ def test_nested_exception_restores_outer_principal():
             tools.TOOL_DEFAULTS.pop(f"{name}_enabled", None)
 
 
+def _stored_plan(plan_db, *, status="queued", step_status="pending", step_type="manual",
+                 wait_kind="manual", action=None, retry_policy="none"):
+    return plan_db.create_plan(
+        {"title": "人工操作", "priority": "P2", "status": status},
+        [{"seq": 1, "step_type": step_type, "action": action,
+          "wait_kind": wait_kind, "status": step_status,
+          "retry_policy": retry_policy, "max_attempts": 1}],
+    )
+
+
+def test_manual_confirm_uses_versioned_aggregate_transaction(plan_db):
+    made = _stored_plan(plan_db)
+    out = plan.confirm_step(made["id"], made["version"], made["steps"][0]["id"],
+                            "complete", "护士确认", {"uid": "nurse"})
+    assert out["ok"] is True
+    assert out["plan"]["status"] == "succeeded"
+    assert out["plan"]["steps"][0]["status"] == "succeeded"
+
+
+def test_time_wait_cannot_be_manually_confirmed(plan_db):
+    made = _stored_plan(plan_db, step_type="wait", wait_kind="time")
+    out = plan.confirm_step(made["id"], made["version"], made["steps"][0]["id"],
+                            "complete", "强制完成", {"uid": "nurse"})
+    assert out["ok"] is False and out["error"] == "time_wait_cannot_be_confirmed"
+
+
+def test_running_cancel_is_idempotent_and_stops_once(plan_db, monkeypatch):
+    made = _stored_plan(plan_db, status="running", step_status="running",
+                        step_type="action", action="robot_goto_point",
+                        retry_policy="safe_goto_only")
+    calls = []
+    monkeypatch.setattr(tools, "run_plan_tool",
+                        lambda name, args: calls.append(name) or {"ok": True})
+    first = plan.cancel_plan(made["id"], made["version"], "护士取消", {"uid": "nurse"})
+    second = plan.cancel_plan(made["id"], first["plan"]["version"], "重复点击", {"uid": "nurse"})
+    assert first["plan"]["status"] == "cancelling"
+    assert second["plan"]["status"] == "cancelling"
+    assert calls == ["robot_stop"]
+
+
+def test_version_conflict_does_not_mutate_plan(plan_db):
+    made = _stored_plan(plan_db)
+    out = plan.change_priority(made["id"], made["version"] - 1, "P1", {"uid": "nurse"})
+    assert out["ok"] is False and out["error"] == "version_conflict"
+    assert plan_db.get_plan(made["id"])["priority"] == "P2"
+
+
+def test_needs_review_retry_rejects_relative_action(plan_db):
+    made = _stored_plan(plan_db, status="needs_review", step_status="needs_review",
+                        step_type="action", action="robot_move", retry_policy="none")
+    out = plan.retry_step(made["id"], made["version"], made["steps"][0]["id"],
+                          "不确定，人工复核", {"uid": "nurse"})
+    assert out["ok"] is False and out["error"] == "retry_not_allowed"
+
+
+def test_needs_review_retry_creates_prepared_new_attempt(plan_db):
+    made = _stored_plan(plan_db, status="needs_review", step_status="needs_review",
+                        step_type="action", action="robot_goto_point",
+                        retry_policy="safe_goto_only")
+    out = plan.retry_step(made["id"], made["version"], made["steps"][0]["id"],
+                          "重新校验后执行", {"uid": "nurse"})
+    assert out["ok"] is True
+    assert out["plan"]["steps"][0]["status"] == "pending"
+    assert out["plan"]["attempts"][-1]["dispatch_state"] == "prepared"
+
+
 def test_principal_context_is_isolated_between_threads():
     name = "__principal_thread_probe__"
     barrier = threading.Barrier(2)

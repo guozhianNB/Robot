@@ -2154,8 +2154,11 @@ def update_plan_attempt(attempt_id: int, **changes) -> dict | None:
             conn.close()
 
 
-def transition_plan_execution(plan_id: int, *, step_id: int | None = None,
+def transition_plan_execution(plan_id: int, *, expected_version: int | None = None,
+                              step_id: int | None = None,
                               step_changes: dict | None = None,
+                              all_step_changes: dict | None = None,
+                              new_attempt: dict | None = None,
                               attempt_id: int | None = None,
                               attempt_changes: dict | None = None,
                               plan_changes: dict | None = None) -> dict | None:
@@ -2169,21 +2172,29 @@ def transition_plan_execution(plan_id: int, *, step_id: int | None = None,
     """
     step_values = _checked_changes(
         step_changes or {}, _STEP_MUTABLE_FIELDS, json_fields=("args_json", "target_json"))
+    all_step_values = _checked_changes(
+        all_step_changes or {}, _STEP_MUTABLE_FIELDS,
+        json_fields=("args_json", "target_json"))
     attempt_values = _checked_changes(
         attempt_changes or {}, _ATTEMPT_MUTABLE_FIELDS,
         json_fields=("request_json", "accept_json", "result_json"))
     plan_values = _checked_changes(plan_changes or {}, _PLAN_MUTABLE_FIELDS)
+    if new_attempt is not None and step_id is None:
+        raise ValueError("step_id is required for a new attempt")
     if plan_values:
         plan_values["updated_at"] = now_iso()
-    if not step_values and not attempt_values and not plan_values:
+    if not step_values and not all_step_values and not attempt_values and not plan_values:
         return get_plan(plan_id, include_steps=True, include_attempts=True)
     with _lock:
         conn = _conn()
         try:
             conn.execute("BEGIN")
-            plan = conn.execute("SELECT id FROM plans WHERE id=?", (plan_id,)).fetchone()
+            plan = conn.execute("SELECT id, version FROM plans WHERE id=?", (plan_id,)).fetchone()
             if plan is None:
                 conn.commit()
+                return None
+            if expected_version is not None and int(plan["version"]) != int(expected_version):
+                conn.rollback()
                 return None
             if step_id is not None:
                 step = conn.execute(
@@ -2198,6 +2209,32 @@ def transition_plan_execution(plan_id: int, *, step_id: int | None = None,
                     )
             elif step_values:
                 raise ValueError("step_id is required for step changes")
+            if all_step_values:
+                assignments = ",".join(f"{field}=?" for field in all_step_values)
+                conn.execute(
+                    f"UPDATE plan_steps SET {assignments} WHERE plan_id=?",
+                    (*all_step_values.values(), plan_id),
+                )
+            if new_attempt is not None:
+                if not isinstance(new_attempt, dict):
+                    raise TypeError("new_attempt must be an object")
+                attempt_no = int(new_attempt.get("attempt_no") or 0)
+                request = new_attempt.get("request") or {}
+                if attempt_no <= 0 or not isinstance(request, dict):
+                    raise ValueError("new attempt requires attempt_no and request")
+                unfinished = conn.execute(
+                    "SELECT id FROM plan_step_attempts WHERE step_id=? "
+                    "AND dispatch_state IN ('prepared','dispatched') LIMIT 1", (step_id,)
+                ).fetchone()
+                if unfinished is not None:
+                    raise ValueError("plan step already has an unfinished attempt")
+                conn.execute(
+                    """INSERT INTO plan_step_attempts
+                       (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,
+                        request_json,started_at) VALUES (?,?,?,?,?,?,?)""",
+                    (plan_id, step_id, attempt_no, f"{plan_id}:{step_id}:{attempt_no}",
+                     "prepared", _json_text(request, {}), now_iso()),
+                )
             if attempt_id is not None:
                 attempt = conn.execute(
                     "SELECT plan_id, step_id FROM plan_step_attempts WHERE id=?",
