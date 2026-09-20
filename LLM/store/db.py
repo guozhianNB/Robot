@@ -2069,7 +2069,8 @@ def update_step(step_id: int, **changes) -> dict | None:
             conn.close()
 
 
-def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
+def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict,
+                         expected_version: int | None = None) -> dict:
     with _lock:
         conn = _conn()
         try:
@@ -2079,6 +2080,10 @@ def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
             if step is None:
                 raise ValueError(f"plan step not found: {step_id}")
             plan_id = step["plan_id"]
+            if expected_version is not None:
+                plan = conn.execute("SELECT version FROM plans WHERE id=?", (plan_id,)).fetchone()
+                if plan is None or int(plan["version"]) != int(expected_version):
+                    raise RuntimeError("plan version changed while preparing attempt")
             if step["status"] != "pending":
                 raise ValueError(
                     f"plan step cannot be dispatched from status {step['status']!r}: {step_id}")

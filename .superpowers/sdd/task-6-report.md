@@ -36,3 +36,7 @@ $env:OPENAI_API_KEY='test'; ..\..\.venv\Scripts\python.exe -m pytest --basetemp=
 - 取消宽限期在恰好 15.0 秒时进入复核（`>=`），并修正该异常分支调用不存在函数的问题。
 
 二轮回归：`test_plan.py + test_plan_scheduler.py + test_notify.py` 共 **94 passed**。
+
+随后又收紧了 Attempt 准备与 Plan 取消之间的竞态：`prepare_plan_attempt()` 支持
+`expected_version`，调度器若在准备前后观察到 `cancelling/cancelled/needs_review` 会放弃派发，
+不会把人工终态改回 `running`。上述 94 个回归测试仍全部通过。

@@ -193,6 +193,8 @@ def _set_plan_status(plan_id: int, status: str, expected_version: int | None = N
     current = db.get_plan(plan_id)
     if current is None or current.get("status") == status:
         return current is not None
+    if current.get("status") in {"cancelling", "cancelled", "needs_review"}:
+        return False
     if db.transition_plan_execution(plan_id, expected_version=expected_version,
                                     plan_changes={"status": status}) is None:
         return False
@@ -366,7 +368,8 @@ def _dispatch(step: dict, now: float) -> None:
         request = {"action": step["action"], "args": dict(step.get("args_json") or {})}
         prepared = next((item for item in attempts
                          if item.get("dispatch_state") == "prepared"), None)
-        attempt = prepared or db.prepare_plan_attempt(step["id"], attempt_no, request)
+        attempt = prepared or db.prepare_plan_attempt(
+            step["id"], attempt_no, request, expected_version=step.get("_plan_version"))
         _attempt_started[step["id"]] = now
         prepared_plan = db.get_plan(step["plan_id"])
         if prepared_plan is None or not _set_plan_status(
@@ -415,6 +418,8 @@ def _dispatch(step: dict, now: float) -> None:
                         if item.get("id") == step.get("id")), None)
         if current is not None:
             current["_plan_version"] = latest.get("version")
+            if latest.get("status") in {"cancelling", "cancelled", "needs_review"}:
+                return
             # Includes the legacy half-state (pending + prepared attempt).  It
             # is evidence of an ambiguous dispatch and must not spin/retry.
             _mark_review(current, f"派发状态冲突: {exc}", _attempt_for(current) or None)
