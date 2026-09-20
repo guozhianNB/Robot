@@ -247,4 +247,17 @@ describe("管理台 Plan 页面源码契约", () => {
     expect(source).toContain("ApiError");
     expect(source).toContain("body?.plan");
   });
+
+  it("按后端状态矩阵展示人工确认和重试入口", () => {
+    for (const status of ["pending", "waiting", "paused", "needs_review", "cancelling", "cancelled", "expired"])
+      expect(source).toContain(status);
+    expect(source).toContain('"complete"');
+    expect(source).toContain("safe_goto_only");
+    expect(source).not.toContain("step.status === 'failed' || step.status === 'canceled'");
+  });
+
+  it("创建步骤校验动作数值范围和定时等待", () => {
+    for (const token of ["Number.isFinite", "distance_m", "5", "360", "wakeAt", "isNaN"])
+      expect(source).toContain(token);
+  });
 });

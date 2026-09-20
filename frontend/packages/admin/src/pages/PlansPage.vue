@@ -19,6 +19,8 @@ import {
 } from "shared";
 
 const priorityRank: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+const COORDINATE_LIMIT = 1000;
+const TERMINAL_PLAN_STATES = new Set(["succeeded", "failed", "cancelled", "expired"]);
 const plans = ref<PlanSummary[]>([]);
 const currentPlan = ref<PlanDetail | null>(null);
 const selectedStatus = ref("all");
@@ -43,8 +45,8 @@ const orderedPlans = computed(() => [...plans.value].sort((a, b) =>
   || Date.parse(b.updated_at || b.created_at) - Date.parse(a.updated_at || a.created_at)));
 
 function statusLabel(status: string) {
-  return ({ queued: "排队", running: "执行中", paused: "暂停", needs_review: "待复核",
-    succeeded: "已完成", failed: "失败", canceled: "已取消" } as Record<string, string>)[status] ?? status;
+  return ({ queued: "排队", running: "执行中", waiting: "等待中", paused: "暂停", needs_review: "待复核",
+    cancelling: "取消中", succeeded: "已完成", failed: "失败", cancelled: "已取消", expired: "已过期" } as Record<string, string>)[status] ?? status;
 }
 
 function priorityLabel(priority: string) { return priority; }
@@ -138,7 +140,8 @@ async function cancel(id: number) {
 async function confirmStep(step: PlanStep) {
   const detail = planFor(step.plan_id);
   if (!detail || !window.confirm(`确认步骤“${step.label}”已完成？`)) return;
-  await runMutation(() => confirmPlanStep(detail.id, step.id, "mark_succeeded", "管理员确认", detail.version));
+  const decision = step.status === "needs_review" ? "mark_succeeded" : "complete";
+  await runMutation(() => confirmPlanStep(detail.id, step.id, decision, "管理员确认", detail.version));
 }
 
 async function retryStep(step: PlanStep) {
@@ -161,15 +164,32 @@ function buildStep(): PlanCreateStep {
   return { type: "action", action: f.action, args: { [f.action === "robot_goto_place" ? "place" : "zone"]: f.target.trim() }, label } as PlanActionStep;
 }
 
+function validateStepForm(): string | null {
+  const f = stepForm.value;
+  if (f.type === "wait" && f.waitKind === "time") {
+    if (!f.wakeAt.trim() || Number.isNaN(Date.parse(f.wakeAt))) return "定时等待需要填写合法的唤醒时间";
+  }
+  if (f.type !== "action") return null;
+  if (f.action === "robot_move") {
+    const distance = Number(f.distance);
+    if (!Number.isFinite(distance) || !(distance > 0 && distance <= 5)) return "移动距离必须是 0 到 5 米之间的有限数字";
+  }
+  if (f.action === "robot_turn") {
+    const angle = Number(f.angle);
+    if (!Number.isFinite(angle) || !(Math.abs(angle) > 0 && Math.abs(angle) <= 360)) return "转向角度必须是 0 到 360 度之间的有限数字";
+  }
+  if (f.action === "robot_goto_point") {
+    const coordinates = [Number(f.x), Number(f.y), Number(f.yaw)];
+    if (!coordinates.every(Number.isFinite) || coordinates.slice(0, 2).some((value) => Math.abs(value) > COORDINATE_LIMIT)
+        || Math.abs(coordinates[2]) > 360) return `坐标必须是有限数字，范围不超过 ±${COORDINATE_LIMIT}，朝向不超过 ±360 度`;
+  }
+  if (["robot_goto_place", "robot_goto_zone"].includes(f.action) && !f.target.trim()) return "目标地点或区域不能为空";
+  return null;
+}
+
 function addStep() {
-  if (stepForm.value.type === "wait" && stepForm.value.waitKind === "time" && !stepForm.value.wakeAt) {
-    errorText.value = "定时等待需要填写唤醒时间";
-    return;
-  }
-  if (stepForm.value.type === "action" && ["robot_goto_place", "robot_goto_zone"].includes(stepForm.value.action) && !stepForm.value.target.trim()) {
-    errorText.value = "目标地点或区域不能为空";
-    return;
-  }
+  const validationError = validateStepForm();
+  if (validationError) { errorText.value = validationError; return; }
   createSteps.value.push(buildStep());
   stepForm.value.label = "";
   errorText.value = "";
@@ -180,6 +200,8 @@ function removeStep(index: number) { createSteps.value.splice(index, 1); }
 async function submitCreate() {
   if (!createForm.value.title.trim()) { errorText.value = "请填写计划标题"; return; }
   if (!createSteps.value.length) { errorText.value = "请至少添加一个结构化步骤"; return; }
+  const validationError = validateStepForm();
+  if (validationError) { errorText.value = validationError; return; }
   saving.value = true;
   try {
     await createPlan({ title: createForm.value.title.trim(), priority: createForm.value.priority,
@@ -231,7 +253,8 @@ onUnmounted(() => {
       <label class="filter">状态
         <select v-model="selectedStatus" @change="load">
           <option value="all">全部</option><option value="queued">排队</option><option value="running">执行中</option>
-          <option value="needs_review">待复核</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="canceled">已取消</option>
+          <option value="waiting">等待中</option><option value="paused">暂停</option><option value="needs_review">待复核</option><option value="cancelling">取消中</option>
+          <option value="succeeded">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="expired">已过期</option>
         </select>
       </label>
     </div>
@@ -251,16 +274,16 @@ onUnmounted(() => {
           <span class="status">{{ statusLabel(plan.status) }}</span><span class="priority">{{ plan.priority }}</span>
           <small>{{ formatTime(plan.updated_at) }}</small>
         </button>
-        <select class="priority-select" :value="plan.priority" title="调整优先级" aria-label="调整优先级" :disabled="saving || plan.status === 'canceled'" @change="updatePriority(plan, $event)">
+        <select class="priority-select" :value="plan.priority" title="调整优先级" aria-label="调整优先级" :disabled="saving || TERMINAL_PLAN_STATES.has(plan.status) || plan.status === 'cancelling'" @change="updatePriority(plan, $event)">
           <option value="P0">P0</option><option value="P1">P1</option><option value="P2">P2</option><option value="P3">P3</option>
         </select>
-        <button v-if="plan.status !== 'succeeded' && plan.status !== 'canceled'" class="icon-button danger" type="button" title="取消计划" aria-label="取消计划" :disabled="saving" @click="cancel(plan.id)">×</button>
+        <button v-if="!TERMINAL_PLAN_STATES.has(plan.status) && plan.status !== 'cancelling'" class="icon-button danger" type="button" title="取消计划" aria-label="取消计划" :disabled="saving" @click="cancel(plan.id)">×</button>
         <div v-if="expandedId === plan.id && currentPlan?.id === plan.id" class="details">
           <div v-for="step in currentPlan.steps" :key="step.id" class="step-row">
             <div><b>{{ step.seq }}. {{ step.label }}</b><span class="muted">{{ step.action || step.step_type }} · {{ statusLabel(step.status) }}</span></div>
             <div class="step-actions">
-              <button v-if="step.status === 'needs_review' || step.status === 'failed'" class="icon-button" type="button" title="确认步骤" aria-label="确认步骤" :disabled="saving" @click="confirmStep(step)">✓</button>
-              <button v-if="step.status === 'failed' || step.status === 'canceled'" class="icon-button" type="button" title="重试步骤" aria-label="重试步骤" :disabled="saving" @click="retryStep(step)">↻</button>
+              <button v-if="(step.status === 'needs_review' || ((step.step_type === 'manual' || step.wait_kind === 'manual') && ['pending', 'waiting', 'paused'].includes(step.status)))" class="icon-button" type="button" title="确认步骤" aria-label="确认步骤" :disabled="saving" @click="confirmStep(step)">✓</button>
+              <button v-if="step.status === 'needs_review' && step.step_type === 'action' && step.action === 'robot_goto_point' && step.retry_policy === 'safe_goto_only'" class="icon-button" type="button" title="重试步骤" aria-label="重试步骤" :disabled="saving" @click="retryStep(step)">↻</button>
             </div>
             <div v-if="step.attempts.length" class="attempts">
               <span v-for="attempt in step.attempts" :key="attempt.id">尝试 #{{ attempt.attempt_no }} · {{ attempt.outcome || attempt.dispatch_state }}</span>
@@ -278,9 +301,9 @@ onUnmounted(() => {
         <fieldset><legend>结构化步骤</legend>
           <div class="form-grid"><label>类型<select v-model="stepForm.type"><option value="action">车控动作</option><option value="wait">等待</option><option value="manual">人工确认</option></select></label><label>步骤名称<input v-model="stepForm.label" placeholder="例如：前往护士站" /></label></div>
           <template v-if="stepForm.type === 'action'"><div class="form-grid"><label>动作<select v-model="stepForm.action"><option value="robot_move">直行/倒车</option><option value="robot_turn">转向</option><option value="robot_goto_point">前往坐标</option><option value="robot_goto_place">前往地点</option><option value="robot_goto_zone">前往区域</option></select></label><label v-if="stepForm.action === 'robot_move'">方向<select v-model="stepForm.direction"><option value="forward">前进</option><option value="back">后退</option><option value="left">左移</option><option value="right">右移</option></select></label></div>
-            <div v-if="stepForm.action === 'robot_move'" class="form-grid"><label>距离（米）<input v-model.number="stepForm.distance" type="number" min="0.1" step="0.1" /></label></div>
-            <div v-else-if="stepForm.action === 'robot_turn'" class="form-grid"><label>角度（度）<input v-model.number="stepForm.angle" type="number" step="1" /></label></div>
-            <div v-else-if="stepForm.action === 'robot_goto_point'" class="form-grid three"><label>X<input v-model.number="stepForm.x" type="number" step="0.01" /></label><label>Y<input v-model.number="stepForm.y" type="number" step="0.01" /></label><label>朝向<input v-model.number="stepForm.yaw" type="number" step="1" /></label></div>
+             <div v-if="stepForm.action === 'robot_move'" class="form-grid"><label>距离（米）<input v-model.number="stepForm.distance" type="number" min="0.1" max="5" step="0.1" /></label></div>
+             <div v-else-if="stepForm.action === 'robot_turn'" class="form-grid"><label>角度（度）<input v-model.number="stepForm.angle" type="number" min="-360" max="360" step="1" /></label></div>
+             <div v-else-if="stepForm.action === 'robot_goto_point'" class="form-grid three"><label>X<input v-model.number="stepForm.x" type="number" min="-1000" max="1000" step="0.01" /></label><label>Y<input v-model.number="stepForm.y" type="number" min="-1000" max="1000" step="0.01" /></label><label>朝向<input v-model.number="stepForm.yaw" type="number" min="-360" max="360" step="1" /></label></div>
             <div v-else class="form-grid"><label>目标地点/区域<input v-model="stepForm.target" required /></label></div>
           </template>
           <template v-else-if="stepForm.type === 'wait'"><div class="form-grid"><label>等待方式<select v-model="stepForm.waitKind"><option value="time">指定时间</option><option value="device">设备信号</option><option value="external">外部信号</option></select></label><label v-if="stepForm.waitKind === 'time'">唤醒时间<input v-model="stepForm.wakeAt" type="datetime-local" /></label></div></template>
