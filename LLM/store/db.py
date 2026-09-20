@@ -16,6 +16,27 @@ from ..conf import DB_PATH, HISTORY_WINDOW
 
 _lock = threading.RLock()
 
+_PLAN_ATTEMPTS_TABLE_SQL = """CREATE TABLE IF NOT EXISTS plan_step_attempts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id          INTEGER NOT NULL,
+  step_id          INTEGER NOT NULL,
+  attempt_no       INTEGER NOT NULL,
+  idempotency_key  TEXT NOT NULL UNIQUE,
+  dispatch_state   TEXT NOT NULL DEFAULT 'prepared',
+  car_task_id      TEXT,
+  request_json     TEXT NOT NULL DEFAULT '{}',
+  accept_json      TEXT,
+  result_json      TEXT,
+  started_at       TEXT,
+  last_checked_at  TEXT,
+  finished_at      TEXT,
+  outcome          TEXT,
+  UNIQUE(step_id, attempt_no),
+  FOREIGN KEY(plan_id, step_id) REFERENCES plan_steps(plan_id, id) ON DELETE CASCADE
+)"""
+_PLAN_ATTEMPTS_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_plan_attempts_car_task_id
+  ON plan_step_attempts(car_task_id)"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
   uid TEXT PRIMARY KEY,
@@ -193,33 +214,11 @@ CREATE TABLE IF NOT EXISTS plan_steps (
   finished_at      TEXT,
   last_progress_at TEXT,
   last_error       TEXT NOT NULL DEFAULT '',
-  UNIQUE(plan_id, seq),
   FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_seq ON plan_steps(plan_id, seq);
-
-CREATE TABLE IF NOT EXISTS plan_step_attempts (
-  id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  plan_id          INTEGER NOT NULL,
-  step_id          INTEGER NOT NULL,
-  attempt_no       INTEGER NOT NULL,
-  idempotency_key  TEXT NOT NULL UNIQUE,
-  dispatch_state   TEXT NOT NULL DEFAULT 'prepared',
-  car_task_id      TEXT,
-  request_json     TEXT NOT NULL DEFAULT '{}',
-  accept_json      TEXT,
-  result_json      TEXT,
-  started_at       TEXT,
-  last_checked_at  TEXT,
-  finished_at      TEXT,
-  outcome          TEXT,
-  UNIQUE(step_id, attempt_no),
-  FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE,
-  FOREIGN KEY(step_id) REFERENCES plan_steps(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_plan_attempts_car_task_id
-  ON plan_step_attempts(car_task_id);
-"""
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_id_id ON plan_steps(plan_id, id);
+""" + _PLAN_ATTEMPTS_TABLE_SQL + ";\n" + _PLAN_ATTEMPTS_INDEX_SQL + ";\n"
 
 
 def _conn():
@@ -265,9 +264,43 @@ def init_db():
             # P3 保护/强化：core_memories pinned=护士永久保护(不被自动清理/画像覆盖)
             _ensure_columns(conn, "core_memories", {"pinned": "pinned INTEGER DEFAULT 0"})
             conn.commit()
+            _migrate_plan_attempt_ownership(conn)
             _migrate_map_tags_cache(conn)
         finally:
             conn.close()
+
+
+def _migrate_plan_attempt_ownership(conn) -> None:
+    """Upgrade the initial independent attempt FKs to one composite ownership FK."""
+    rows = conn.execute("PRAGMA foreign_key_list(plan_step_attempts)").fetchall()
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["id"], set()).add((row["from"], row["to"]))
+    if any(pairs == {("plan_id", "plan_id"), ("step_id", "id")}
+           for pairs in groups.values()):
+        return
+
+    columns = (
+        "id,plan_id,step_id,attempt_no,idempotency_key,dispatch_state,car_task_id,"
+        "request_json,accept_json,result_json,started_at,last_checked_at,finished_at,outcome"
+    )
+    conn.execute("BEGIN")
+    try:
+        conn.execute("ALTER TABLE plan_step_attempts RENAME TO plan_step_attempts__old")
+        conn.execute("DROP INDEX IF EXISTS idx_plan_attempts_car_task_id")
+        conn.execute(_PLAN_ATTEMPTS_TABLE_SQL)
+        conn.execute(_PLAN_ATTEMPTS_INDEX_SQL)
+        conn.execute(
+            f"""INSERT INTO plan_step_attempts ({columns})
+                SELECT {', '.join('a.' + name for name in columns.split(','))}
+                FROM plan_step_attempts__old AS a
+                JOIN plan_steps AS s ON s.id=a.step_id AND s.plan_id=a.plan_id"""
+        )
+        conn.execute("DROP TABLE plan_step_attempts__old")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migrate_map_tags_cache(conn) -> None:
@@ -1767,6 +1800,8 @@ _PLAN_LIST_MAX = 200
 def _json_text(value, default):
     if value is None:
         value = default
+    if value is not None and not isinstance(value, dict):
+        raise TypeError("Plan JSON fields must be objects or null")
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -1776,13 +1811,18 @@ def _decode_json_fields(row, fields) -> dict | None:
     item = dict(row)
     for field, default in fields.items():
         raw = item.get(field)
-        if raw in (None, ""):
-            item[field] = default
+        if raw is None and default is None:
+            item[field] = None
             continue
         try:
-            item[field] = json.loads(raw)
-        except (TypeError, ValueError):
-            item[field] = default
+            value = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DataError(f"invalid JSON in {field}") from exc
+        if value is not None and not isinstance(value, dict):
+            raise sqlite3.DataError(f"{field} must contain a JSON object or null")
+        if value is None and default is not None:
+            raise sqlite3.DataError(f"{field} must contain a JSON object")
+        item[field] = value
     return item
 
 
@@ -1940,6 +1980,15 @@ def _checked_changes(changes: dict, allowed: set[str], json_fields=()) -> dict:
     return values
 
 
+def _bump_plan_version(conn, plan_id: int) -> None:
+    cur = conn.execute(
+        "UPDATE plans SET version=version+1, updated_at=? WHERE id=?",
+        (now_iso(), plan_id),
+    )
+    if cur.rowcount != 1:
+        raise sqlite3.IntegrityError(f"plan not found for aggregate update: {plan_id}")
+
+
 def update_plan_versioned(plan_id: int, version: int, **changes) -> tuple[str, dict | None]:
     values = _checked_changes(changes, _PLAN_MUTABLE_FIELDS)
     values["updated_at"] = now_iso()
@@ -1974,13 +2023,21 @@ def update_step(step_id: int, **changes) -> dict | None:
     with _lock:
         conn = _conn()
         try:
-            cur = conn.execute(
-                f"UPDATE plan_steps SET {assignments} WHERE id=?", (*values.values(), step_id))
-            conn.commit()
-            if not cur.rowcount:
+            conn.execute("BEGIN")
+            step = conn.execute(
+                "SELECT plan_id FROM plan_steps WHERE id=?", (step_id,)).fetchone()
+            if step is None:
+                conn.commit()
                 return None
+            conn.execute(
+                f"UPDATE plan_steps SET {assignments} WHERE id=?", (*values.values(), step_id))
+            _bump_plan_version(conn, step["plan_id"])
+            conn.commit()
             return _step_row(
                 conn.execute("SELECT * FROM plan_steps WHERE id=?", (step_id,)).fetchone())
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1990,10 +2047,21 @@ def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
         conn = _conn()
         try:
             conn.execute("BEGIN")
-            step = conn.execute("SELECT plan_id FROM plan_steps WHERE id=?", (step_id,)).fetchone()
+            step = conn.execute(
+                "SELECT plan_id, status FROM plan_steps WHERE id=?", (step_id,)).fetchone()
             if step is None:
                 raise ValueError(f"plan step not found: {step_id}")
             plan_id = step["plan_id"]
+            if step["status"] == "pending":
+                cur = conn.execute(
+                    "UPDATE plan_steps SET status='dispatching' WHERE id=? AND status='pending'",
+                    (step_id,),
+                )
+                if cur.rowcount != 1:
+                    raise sqlite3.IntegrityError(f"plan step changed while dispatching: {step_id}")
+            elif step["status"] != "dispatching":
+                raise ValueError(
+                    f"plan step cannot be dispatched from status {step['status']!r}: {step_id}")
             cur = conn.execute(
                 """INSERT INTO plan_step_attempts
                    (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json,
@@ -2004,6 +2072,7 @@ def prepare_plan_attempt(step_id: int, attempt_no: int, request: dict) -> dict:
                     _json_text(request, {}), now_iso(),
                 ),
             )
+            _bump_plan_version(conn, plan_id)
             conn.commit()
             return _attempt_row(conn.execute(
                 "SELECT * FROM plan_step_attempts WHERE id=?", (cur.lastrowid,)).fetchone())
@@ -2030,15 +2099,23 @@ def update_plan_attempt(attempt_id: int, **changes) -> dict | None:
     with _lock:
         conn = _conn()
         try:
-            cur = conn.execute(
+            conn.execute("BEGIN")
+            attempt = conn.execute(
+                "SELECT plan_id FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                conn.commit()
+                return None
+            conn.execute(
                 f"UPDATE plan_step_attempts SET {assignments} WHERE id=?",
                 (*values.values(), attempt_id),
             )
+            _bump_plan_version(conn, attempt["plan_id"])
             conn.commit()
-            if not cur.rowcount:
-                return None
             return _attempt_row(conn.execute(
                 "SELECT * FROM plan_step_attempts WHERE id=?", (attempt_id,)).fetchone())
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

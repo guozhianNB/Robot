@@ -102,9 +102,16 @@ def test_schema_contains_all_plan_fields_constraints_and_indexes(plan_db):
         assert ("plan_id", "seq") in step_indexes
         assert ("car_task_id",) in attempt_indexes
 
-        foreign_keys = conn.execute("PRAGMA foreign_key_list(plan_steps)").fetchall()
+        step_foreign_keys = conn.execute("PRAGMA foreign_key_list(plan_steps)").fetchall()
         assert any(row["table"] == "plans" and row["on_delete"] == "CASCADE"
-                   for row in foreign_keys)
+                   for row in step_foreign_keys)
+        attempt_foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(plan_step_attempts)").fetchall()
+        ownership = [row for row in attempt_foreign_keys if row["table"] == "plan_steps"]
+        assert {(row["from"], row["to"]) for row in ownership} == {
+            ("plan_id", "plan_id"), ("step_id", "id")}
+        assert {row["id"] for row in ownership} == {ownership[0]["id"]}
+        assert all(row["on_delete"] == "CASCADE" for row in ownership)
     finally:
         conn.close()
 
@@ -162,6 +169,93 @@ def test_attempt_number_and_idempotency_key_are_unique(plan_db):
         plan_db.prepare_plan_attempt(step_id, 1, {"action": "robot_goto_point"})
 
 
+def test_attempt_plan_and_step_must_belong_to_same_plan(plan_db):
+    first = plan_db.create_plan(_plan(title="第一个"), [_step()])
+    second = plan_db.create_plan(_plan(title="第二个"), [_step()])
+    other_step = plan_db.get_plan(second["id"], include_steps=True)["steps"][0]
+
+    conn = plan_db._conn()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO plan_step_attempts
+                   (plan_id,step_id,attempt_no,idempotency_key,dispatch_state,request_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (first["id"], other_step["id"], 1, "cross-plan", "prepared", "{}"),
+            )
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_legacy_attempt_foreign_keys_without_losing_valid_rows(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    legacy_sql = plan_db._PLAN_ATTEMPTS_TABLE_SQL.replace(
+        "FOREIGN KEY(plan_id, step_id) REFERENCES plan_steps(plan_id, id) ON DELETE CASCADE",
+        "FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE,\n"
+        "  FOREIGN KEY(step_id) REFERENCES plan_steps(id) ON DELETE CASCADE",
+    )
+    columns = (
+        "id,plan_id,step_id,attempt_no,idempotency_key,dispatch_state,car_task_id,"
+        "request_json,accept_json,result_json,started_at,last_checked_at,finished_at,outcome"
+    )
+    conn = plan_db._conn()
+    try:
+        conn.execute("ALTER TABLE plan_step_attempts RENAME TO plan_step_attempts__valid")
+        conn.execute("DROP INDEX idx_plan_attempts_car_task_id")
+        conn.execute(legacy_sql)
+        conn.execute(
+            f"INSERT INTO plan_step_attempts ({columns}) "
+            f"SELECT {columns} FROM plan_step_attempts__valid"
+        )
+        conn.execute("DROP TABLE plan_step_attempts__valid")
+        conn.commit()
+    finally:
+        conn.close()
+
+    plan_db.init_db()
+
+    got = plan_db.get_plan(made["id"], include_attempts=True)
+    assert [row["id"] for row in got["attempts"]] == [attempt["id"]]
+    conn = plan_db._conn()
+    try:
+        ownership = [row for row in conn.execute(
+            "PRAGMA foreign_key_list(plan_step_attempts)") if row["table"] == "plan_steps"]
+        assert {(row["from"], row["to"]) for row in ownership} == {
+            ("plan_id", "plan_id"), ("step_id", "id")}
+    finally:
+        conn.close()
+
+
+def test_prepare_attempt_dispatches_step_and_bumps_plan_once(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+
+    plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+
+    got = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert got["version"] == 2
+    assert got["steps"][0]["status"] == "dispatching"
+    assert len(got["attempts"]) == 1
+
+
+def test_prepare_attempt_rolls_back_step_and_version_if_insert_fails(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    plan_db.update_step(step["id"], status="pending")
+    before = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        plan_db.prepare_plan_attempt(step["id"], 1, {"action": "duplicate"})
+
+    after = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert after["version"] == before["version"]
+    assert after["steps"][0]["status"] == "pending"
+    assert len(after["attempts"]) == 1
+
+
 def test_plan_delete_cascades_to_steps_and_attempts(plan_db):
     made = plan_db.create_plan(_plan(), [_step()])
     step_id = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]["id"]
@@ -200,6 +294,63 @@ def test_step_and_attempt_updates_keep_json_inside_db_layer(plan_db):
     assert plan_db.update_plan_attempt(999_999, outcome="failed") is None
 
 
+def test_step_and_attempt_changes_invalidate_stale_plan_version(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+
+    plan_db.update_step(step["id"], label="调度器已修改")
+    stale_state, stale = plan_db.update_plan_versioned(
+        made["id"], made["version"], title="护士台旧快照写入")
+    after_step = plan_db.get_plan(made["id"])
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    before_attempt_update = plan_db.get_plan(made["id"])
+    plan_db.update_plan_attempt(attempt["id"], dispatch_state="dispatched")
+    after_attempt_update = plan_db.get_plan(made["id"])
+
+    assert stale_state == "conflict"
+    assert stale["version"] == 2
+    assert after_step["version"] == 2
+    assert before_attempt_update["version"] == 3
+    assert after_attempt_update["version"] == 4
+
+
+def test_json_fields_fail_closed_on_invalid_values(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+
+    with pytest.raises((TypeError, ValueError)):
+        plan_db.update_step(step["id"], args_json=[])
+    conn = plan_db._conn()
+    try:
+        conn.execute("UPDATE plan_steps SET args_json='not-json' WHERE id=?", (step["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.DataError):
+        plan_db.get_plan(made["id"], include_steps=True)
+    conn = plan_db._conn()
+    try:
+        conn.execute("UPDATE plan_steps SET args_json='[]' WHERE id=?", (step["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.DataError):
+        plan_db.get_plan(made["id"], include_steps=True)
+
+
+def test_update_field_whitelists_reject_ownership_and_identity_changes(plan_db):
+    made = plan_db.create_plan(_plan(), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {})
+
+    with pytest.raises(ValueError):
+        plan_db.update_plan_versioned(made["id"], 2, id=77)
+    with pytest.raises(ValueError):
+        plan_db.update_step(step["id"], plan_id=77)
+    with pytest.raises(ValueError):
+        plan_db.update_plan_attempt(attempt["id"], step_id=77)
+
+
 def test_list_counts_and_before_id(plan_db):
     first = plan_db.create_plan(_plan(title="第一个", status="queued"), [_step()])
     second = plan_db.create_plan(_plan(title="第二个", status="waiting"), [_step()])
@@ -210,14 +361,27 @@ def test_list_counts_and_before_id(plan_db):
     assert plan_db.plan_counts() == {"queued": 2, "waiting": 1}
 
 
-def test_concurrent_versioned_updates_allow_one_writer(plan_db):
+def test_concurrent_versioned_updates_allow_one_writer(plan_db, monkeypatch):
     made = plan_db.create_plan(_plan(), [_step()])
     barrier = threading.Barrier(3)
     results = []
+    errors = []
+
+    class NoopLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(plan_db, "_lock", NoopLock())
 
     def write(status):
         barrier.wait()
-        results.append(plan_db.update_plan_versioned(made["id"], 1, status=status)[0])
+        try:
+            results.append(plan_db.update_plan_versioned(made["id"], 1, status=status)[0])
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
 
     threads = [
         threading.Thread(target=write, args=("running",)),
@@ -229,6 +393,7 @@ def test_concurrent_versioned_updates_allow_one_writer(plan_db):
     for thread in threads:
         thread.join()
 
+    assert errors == []
     assert sorted(results) == ["conflict", "updated"]
     assert plan_db.get_plan(made["id"])["version"] == 2
 
@@ -249,3 +414,16 @@ def test_active_step_and_recovery_move_uncertain_work_to_review(plan_db):
     assert got["version"] == 3
     assert got["steps"][0]["status"] == "needs_review"
     assert plan_db.active_plan_step() is None
+
+
+def test_recovery_marks_unfinished_attempt_uncertain(plan_db):
+    made = plan_db.create_plan(_plan(status="running"), [_step()])
+    step = plan_db.get_plan(made["id"], include_steps=True)["steps"][0]
+    attempt = plan_db.prepare_plan_attempt(step["id"], 1, {"action": "robot_goto_point"})
+    plan_db.update_plan_attempt(attempt["id"], dispatch_state="dispatched")
+
+    assert plan_db.recover_running_plan_steps() == 1
+
+    got = plan_db.get_plan(made["id"], include_steps=True, include_attempts=True)
+    assert got["attempts"][0]["dispatch_state"] == "uncertain"
+    assert got["attempts"][0]["outcome"] == "uncertain"
