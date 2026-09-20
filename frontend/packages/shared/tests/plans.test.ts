@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   cancelPlan,
   changePlanPriority,
@@ -212,5 +214,37 @@ describe("Plan SSE 契约", () => {
 
   it("业务分类不能覆盖总线 type", () => {
     expect(parseBusPayload('{"type":"manual","plan_id":7}')).toBeNull();
+  });
+});
+
+describe("管理台 Plan 页面源码契约", () => {
+  const source = readFileSync(resolve(__dirname, "../../admin/src/pages/PlansPage.vue"), "utf8");
+
+  it("通过 shared Plan API 提供创建、调级、取消、确认和重试入口", () => {
+    for (const symbol of [
+      "listPlans", "createPlan", "changePlanPriority", "cancelPlan",
+      "confirmPlanStep", "retryPlanStep",
+    ]) expect(source).toContain(symbol);
+    expect(source).not.toContain('fetch("/api/plans');
+  });
+
+  it("人工创建只暴露结构化动作和字段，不接收原始 JSON", () => {
+    for (const field of ["robot_move", "robot_turn", "robot_goto_point", "robot_goto_place", "robot_goto_zone", "wait", "manual"])
+      expect(source).toContain(field);
+    expect(source).not.toMatch(/textarea[\\s\\S]*json|v-model[^\\n]*json/i);
+  });
+
+  it("包含四类 Plan SSE 事件、断线重连和卸载关闭", () => {
+    for (const type of ["plan_created", "plan_updated", "plan_step_changed", "plan_needs_review"])
+      expect(source).toContain(type);
+    expect(source).toContain("parseBusPayload");
+    expect(source).toContain("3000");
+    expect(source).toContain("onUnmounted");
+    expect(source).toContain("close");
+  });
+
+  it("冲突错误读取 ApiError.body.plan", () => {
+    expect(source).toContain("ApiError");
+    expect(source).toContain("body?.plan");
   });
 });
