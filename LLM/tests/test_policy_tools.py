@@ -40,16 +40,18 @@ def probe():
 
 
 def test_ward_gets_only_safety_tools(probe):
-    """集体层（含未识别说话人的兜底）只拿安全工具：急停 + 状态只读（R3 + 规格 §3.3 矩阵）。"""
+    """集体层只新增提交候选 Plan 的入口，不获得普通车控动作。"""
     names = set(_names({}, _p("ward")))
     assert "__probe__" not in names
-    assert names <= {"robot_status", "robot_stop"}
+    assert "create_plan" in names
+    assert not names & {"robot_move", "robot_turn", "robot_goto_point",
+                        "robot_goto_zone", "robot_goto_place"}
 
 
 def test_elder_only_gets_whitelisted_tools(probe):
     names = set(_names({}, _p("elder")))
     assert "__probe__" not in names
-    assert names <= {"robot_status", "robot_stop"}
+    assert "create_plan" in names
 
 
 def test_admin_sees_registered_tool(probe):
@@ -308,8 +310,11 @@ def test_car_mcp_visibility_and_direct_call_are_role_symmetric(monkeypatch):
     monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
 
-    assert set(_names({"mcp_enabled": True}, _p("ward"))) == {"robot_status", "robot_stop"}
+    assert set(_names({"mcp_enabled": True}, _p("ward"))) == {
+        "robot_status", "robot_stop", "create_plan"}
     assert set(car_tools) <= set(_names({"mcp_enabled": True}, _p("elder")))
+    assert "create_plan" in _names({"mcp_enabled": True}, _p("elder"))
+    assert "create_plan" in _names({"mcp_enabled": True}, _p("admin"))
     assert set(car_tools) <= set(_names({"mcp_enabled": True}, _p("admin")))
     denied = tools.run_tool("robot_move", {"direction": "forward", "distance_m": 1}, _p("ward"))
     assert denied["ok"] is False and calls == []

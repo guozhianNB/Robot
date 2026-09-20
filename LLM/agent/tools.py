@@ -20,12 +20,20 @@ r"""
 import importlib
 import inspect
 import pkgutil
+from contextvars import ContextVar
 
 from . import mcp_client   # MCP 桥（可选能力，内部自行降级，import 永远安全）
 
 # ---------------------------------------------------------------- 注册表
 # name -> {"schema": OpenAI function-calling 声明, "fn": 实现函数, "enabled": 默认开关}
 _TOOL_REGISTRY: dict[str, dict] = {}
+_CURRENT_PRINCIPAL: ContextVar[dict | None] = ContextVar(
+    "tool_current_principal", default=None)
+
+
+def current_principal() -> dict:
+    """Return a copy of the principal bound to the current local-tool call."""
+    return dict(_CURRENT_PRINCIPAL.get() or {})
 
 
 def tool(name: str, description: str, parameters: dict, enabled: bool = True,
@@ -220,7 +228,10 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not is_local:
         return mcp_client.call_tool(name, args or {})
+    token = _CURRENT_PRINCIPAL.set(dict(p))
     try:
         return _run_fn(reg["fn"], args or {})
     except Exception as e:
         return {"ok": False, "message": f"工具执行失败: {e}"}
+    finally:
+        _CURRENT_PRINCIPAL.reset(token)
