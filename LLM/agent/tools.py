@@ -20,9 +20,12 @@ r"""
 import importlib
 import inspect
 import pkgutil
+import threading
+import time
 from contextvars import ContextVar
 
 from . import mcp_client   # MCP 桥（可选能力，内部自行降级，import 永远安全）
+from . import action_gate
 
 # ---------------------------------------------------------------- 注册表
 # name -> {"schema": OpenAI function-calling 声明, "fn": 实现函数, "enabled": 默认开关}
@@ -202,6 +205,29 @@ def tools_with_state(settings: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- 调度入口
+_PLAN_ACTIONS = frozenset({
+    "robot_goto_point", "robot_move", "robot_turn", "robot_status", "robot_stop",
+})
+_CAR_GATE_BYPASS = frozenset({"robot_status", "robot_stop"})
+
+
+def run_plan_tool(name: str, args: dict | None = None) -> dict:
+    """Plan 调度器专用车控入口。"""
+    from ..store import db
+
+    if name not in _PLAN_ACTIONS:
+        return {"ok": False, "error": f"Plan 不允许调用工具 {name}"}
+    if not db.get_settings().get("mcp_enabled"):
+        return {"ok": False, "error": "MCP 工具总开关已关闭，不允许 Plan 调用车控"}
+    entry = mcp_client.tools().get(name)
+    if not entry or entry.get("server") != "car":
+        return {"ok": False, "error": f"车控工具未注册: {name}"}
+    try:
+        return mcp_client.call_tool(name, args or {})
+    except Exception as exc:
+        return {"ok": False, "error": f"车控工具调用失败: {exc}"}
+
+
 def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     """统一分发。**执行前再校验一次角色白名单**（闸门 2 第二道）。"""
     from .policy import POLICY_DEFAULTS, role_policy
@@ -243,7 +269,17 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
                   reason="out_of_role_whitelist" if not allow_ok else "tool_roles_mismatch")
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not is_local:
-        return mcp_client.call_tool(name, args or {})
+        gate_token = None
+        if entry.get("server") == "car" and name not in _CAR_GATE_BYPASS:
+            ref = f"dialog:{threading.get_ident()}:{time.monotonic_ns()}"
+            gate_token = action_gate.claim("dialog", ref)
+            if gate_token is None:
+                return {"ok": False, "status": "busy", "error": "车控正由另一个任务占用"}
+        try:
+            return mcp_client.call_tool(name, args or {})
+        finally:
+            if gate_token is not None:
+                action_gate.release(gate_token)
     args_error = _local_args_error(reg, args)
     if args_error:
         return {"ok": False, "error": f"工具参数不符合 schema：{args_error}"}
