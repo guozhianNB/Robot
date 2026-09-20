@@ -3,7 +3,6 @@
 
 import pytest
 import json
-import threading
 
 from LLM.agent import action_gate, plan_scheduler, tools
 
@@ -144,6 +143,16 @@ def test_stop_joins_previous_scheduler_thread(monkeypatch):
     monkeypatch.setattr(plan_scheduler, "_thread", fake)
     plan_scheduler.stop()
     assert fake.joined is True
+
+
+def test_invalid_plan_config_enters_lifespan_warning_queue(monkeypatch):
+    monkeypatch.setenv("PLAN_TICK_S", "nan")
+    warning_name = "PLAN_TICK_S"
+    before = len(plan_scheduler.conf.CONFIG_WARNINGS)
+    value = plan_scheduler.conf._positive_finite_env(warning_name, 1.0)
+    assert value == 1.0
+    assert any(item.get("name") == warning_name
+               for item in plan_scheduler.conf.CONFIG_WARNINGS[before:])
 
 
 def test_dialog_action_is_busy_while_plan_owns_slot(monkeypatch):

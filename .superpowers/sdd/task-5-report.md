@@ -52,11 +52,15 @@ pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
 
 ```
 pytest LLM/tests/test_plan_scheduler.py -q
-18 passed
+19 passed
 
 pytest LLM/tests/test_plan_scheduler.py LLM/tests/test_plan_db.py \
   LLM/tests/test_car_mcp.py LLM/tests/test_plan.py LLM/tests/test_policy_tools.py -q
-200 passed
+201 passed
 ```
 
 新增红灯测试覆盖完整扫描、聚合 API、wall-clock wait 和 stop join；测试仍使用假 MCP，不访问 rosbridge。
+
+配置告警链补充验证：非法 `PLAN_TICK_S=nan` 会进入 `conf.CONFIG_WARNINGS`，由现有
+`server.lifespan()` 的 `_audit_config_warnings()` 统一写入 `config_warning` 审计；相关测试与
+Plan 配置回退测试均通过（2 passed）。
