@@ -46,6 +46,40 @@ def test_nurse_unlock_has_independent_three_failure_cooldown(client):
     assert server._login_fail == {}
 
 
+def test_nurse_pin_cooldown_expiry_resets_consecutive_failures(client, monkeypatch):
+    import LLM.server as server
+
+    clock = iter([100.0, 100.0, 100.0, 111.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(clock))
+    for _ in range(3):
+        server._verify_nurse_pin("bad")
+    result = server._verify_nurse_pin("bad")
+    assert result["ok"] is False
+    assert server._nurse_pin_fail == {"n": 1, "until": 0.0}
+
+
+def test_nurse_pin_verification_is_serialized(client, monkeypatch):
+    import concurrent.futures
+    import time
+    import LLM.server as server
+
+    active = 0
+    peak = 0
+
+    def verify(_pin):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        time.sleep(0.02)
+        active -= 1
+        return False
+
+    monkeypatch.setattr(server.db, "verify_admin_password", verify)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(server._verify_nurse_pin, ["bad"] * 4))
+    assert peak == 1
+
+
 def test_plan_api_is_public_and_strict(client):
     created = client.post("/api/plans", json=_manual_plan()).json()
     assert created["ok"] is True

@@ -73,6 +73,35 @@ def _audit_config_warnings() -> None:
             print(f"[WARN] 配置回退审计写入失败：{exc}")
 
 
+def _stop_runtime(*, hard_map: bool = False, stop_background: bool = False
+                  ) -> list[tuple[str, str]]:
+    """按固定顺序停止运行组件，并在全部尝试后统一记录错误。"""
+    steps = [
+        ("plan_scheduler", plan_scheduler.stop),
+        ("mapctl", (lambda: mapctl.stop(hard=True)) if hard_map else mapctl.stop),
+        ("mcp_client", mcp_client.stop),
+        ("reminder", reminder.stop),
+        ("voice", voice_api.stop_voice),
+        ("bus", bus.stop),
+    ]
+    if stop_background:
+        steps.append(("background", lambda: _bg.shutdown(wait=False)))
+    errors: list[tuple[str, str]] = []
+    for name, stop in steps:
+        try:
+            stop()
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            errors.append((name, str(exc)))
+    if errors:
+        try:
+            audit.log("system", action="shutdown_degraded",
+                      errors=[{"component": name, "error": error}
+                              for name, error in errors])
+        except Exception as exc:  # audit failure must not abort remaining shutdown
+            print(f"[WARN] 运行组件停止异常且审计失败：{errors}; audit={exc}")
+    return errors
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from .core import log as audit
@@ -101,7 +130,14 @@ async def lifespan(app: FastAPI):
     drain_task = bus.start_drain()   # 广播扇出任务
     voice_api.start_voice(client, MODEL, _post_chat_jobs)
     mcp_client.start(db.get_settings())   # MCP 外部工具（mcp_enabled 开启时拉起）
-    plan_scheduler.start()                # MCP 就绪后才允许 Plan 调度器派发动作
+    try:
+        plan_scheduler.start()            # MCP 就绪后才允许 Plan 调度器派发动作
+    except Exception as exc:              # 恢复/数据库异常只降级，不阻断主后端
+        try:
+            audit.log("plan", action="scheduler_start_failed", error=str(exc))
+        except Exception:
+            pass
+        print(f"[WARN] Plan 调度器启动失败，已降级：{exc}")
 
     # 分层用户体系：首启生成管理员口令（D12）+ 位置源自检 + 每秒 tick（TTL 降权 + 病房位置自动切换）
     pw = session.ensure_admin_password()
@@ -127,13 +163,15 @@ async def lifespan(app: FastAPI):
 
     tick_task = asyncio.create_task(_role_tick())
 
-    yield
-    plan_scheduler.stop()    # 先收拢 Plan，避免退出时仍向 MCP 派发车控
-    mapctl.stop()             # 编辑器服务是本进程拉起的：主后端退出不该留孤儿
-    mcp_client.stop()
-    voice_api.stop_voice()
-    drain_task.cancel()
-    tick_task.cancel()
+    try:
+        yield
+    finally:
+        # 聚合式清理保证 scheduler/mapctl 即使抛错，MCP 仍会被关闭。
+        _stop_runtime(hard_map=False)
+        try:
+            drain_task.cancel()
+        finally:
+            tick_task.cancel()
 
 
 app = FastAPI(title="AI 陪护机器人后端", lifespan=lifespan)
@@ -1199,6 +1237,27 @@ _nurse_pin_lock = threading.Lock()
 _NURSE_PIN_COOLDOWN_S = 10.0
 
 
+def _verify_nurse_pin(pin: str) -> dict:
+    """串行完成冷却判定、口令校验和计数更新。"""
+    with _nurse_pin_lock:
+        now = time.monotonic()
+        until = float(_nurse_pin_fail.get("until", 0.0))
+        if until > now:
+            return {"ok": False, "error": "护士台页面口令错误次数过多，请稍后再试"}
+        if until:
+            # 冷却窗口结束后重新计算“连续三次”；不能让历史失败永久累积。
+            _nurse_pin_fail.update(n=0, until=0.0)
+        ok = db.verify_admin_password(pin)
+        if ok:
+            _nurse_pin_fail.update(n=0, until=0.0)
+        else:
+            failures = int(_nurse_pin_fail.get("n", 0)) + 1
+            _nurse_pin_fail["n"] = failures
+            if failures >= 3:
+                _nurse_pin_fail["until"] = now + _NURSE_PIN_COOLDOWN_S
+        return {"ok": bool(ok), **({} if ok else {"error": "护士台页面口令错误"})}
+
+
 def _plan_actor(request: Request) -> dict:
     """记录人工来源元数据；这些字段不是认证凭据。"""
     return {
@@ -1229,20 +1288,7 @@ async def _plan_http(result: dict, plan_id: int | None = None):
 @app.post("/api/nurse/page-unlock")
 async def nurse_page_unlock(body: NurseUnlockIn):
     """页面门禁 only: verify the current admin password, issue no session."""
-    now = time.monotonic()
-    with _nurse_pin_lock:
-        if float(_nurse_pin_fail.get("until", 0.0)) > now:
-            return {"ok": False, "error": "护士台页面口令错误次数过多，请稍后再试"}
-    ok = await asyncio.to_thread(db.verify_admin_password, body.pin)
-    with _nurse_pin_lock:
-        if ok:
-            _nurse_pin_fail.update(n=0, until=0.0)
-        else:
-            failures = int(_nurse_pin_fail.get("n", 0)) + 1
-            _nurse_pin_fail["n"] = failures
-            if failures >= 3:
-                _nurse_pin_fail["until"] = time.monotonic() + _NURSE_PIN_COOLDOWN_S
-    return {"ok": bool(ok), **({} if ok else {"error": "护士台页面口令错误"})}
+    return await asyncio.to_thread(_verify_nurse_pin, body.pin)
 
 
 @app.get("/api/plans")
@@ -1555,7 +1601,7 @@ async def events_stream():
 # ---------------------------------------------------------------- 系统
 @app.post("/api/system/shutdown")
 async def system_shutdown():
-    """系统退出：停提醒线程 → 停语音（释放音频设备）→ 停广播 → 停线程池，
+    """系统退出：先停 Plan，再停 MCP/提醒/语音/广播/线程池，
     返回响应后延迟 1 秒 os._exit(0)，保证前端先收到 200 再杀进程。
     幂等：重复调用直接返回；任何 stop 步骤抛异常也保证退出任务被调度。"""
     global _shutting_down
@@ -1565,15 +1611,17 @@ async def system_shutdown():
     from .core import log as audit
     audit.log("system", action="shutdown", by="nurse")
     try:
-        mapctl.stop(hard=True)               # 编辑器服务（独立进程）一起带走；马上 os._exit，
-                                             # 只留 1 秒，等不起 POSIX 上的 SIGTERM 优雅期（会留孤儿）
-        reminder.stop()                      # 1. 提醒调度线程（不再触发新提醒）
-        voice_api.stop_voice()               # 2. 语音 worker（释放麦克风/扬声器）
-        bus.stop()                           # 3. 事件总线扇出
-        _bg.shutdown(wait=False)             # 4. 后台任务线程池（不等待，进程将退出）
+        # 和 lifespan 共用同一停止序列。hard_map=True 因为 1 秒后会 os._exit，
+        # 没有时间等待编辑器子进程的常规优雅退出。
+        _stop_runtime(hard_map=True, stop_background=True)
     finally:
-        asyncio.create_task(_delayed_exit()) # 5. 无论上述步骤是否抛异常，1 秒后真正退出
+        _schedule_delayed_exit()             # 无论停止阶段如何，1 秒后真正退出
     return {"ok": True, "message": "系统正在退出…"}
+
+
+def _schedule_delayed_exit() -> None:
+    """独立封装便于 shutdown 测试替换，避免测试进程被 os._exit 杀死。"""
+    asyncio.create_task(_delayed_exit())
 
 
 async def _delayed_exit():

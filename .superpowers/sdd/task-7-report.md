@@ -29,3 +29,13 @@ D:\_project\Robot\.venv\Scripts\python.exe -m pytest --basetemp=D:\_project\Robo
 结果：`96 passed`。
 
 未连接真实车辆或 MCP；生命周期测试全部使用可控替身。
+
+## Review 修复
+
+根据 `task-7-review.md` 的 3 项 Important 完成补强：
+
+1. PIN 校验收敛到同步 `_verify_nurse_pin()`，由 `asyncio.to_thread` 调用；冷却判断、PBKDF2 校验、失败计数更新在同一把锁内。冷却到期先清零，重新满足“连续 3 次”的语义。
+2. lifespan 与 `/api/system/shutdown` 共用 `_stop_runtime()`，固定先停止 Plan scheduler，再停止 mapeditor 和 MCP；延迟退出调度独立封装，测试可 monkeypatch，不会触发真实 `os._exit`。
+3. scheduler 启动/恢复异常写 `scheduler_start_failed` 审计并降级；停止阶段逐组件捕获并继续，最终以 `shutdown_degraded` 聚合审计。lifespan 使用 `try/finally`，确保请求阶段异常也执行清理。
+
+新增红灯测试覆盖冷却重置、并发串行、启动降级、停止异常聚合和系统退出顺序。API/shutdown 专项结果：`13 passed`。
