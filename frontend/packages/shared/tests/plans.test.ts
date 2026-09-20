@@ -11,10 +11,11 @@ import {
 } from "../src/api/plans";
 import type {
   PlanCreateInput,
+  PlanCreateResponse,
+  PlanConflictResponse,
   PlanDetail,
-  PlanResponse,
-  PlanStep,
 } from "../src/api/plans";
+import { ApiError } from "../src/api/client";
 import { parseBusPayload } from "../src/events";
 import type { PlanUpdatedEvent } from "../src/events";
 import { listPlans as listPlansFromBarrel } from "../src";
@@ -35,12 +36,17 @@ describe("Plan REST 客户端", () => {
   });
 
   it("类型覆盖创建接口尚无 attempt 的 Plan 快照与 summary", () => {
-    type CreatedSnapshot = Omit<PlanDetail, "attempts" | "steps"> & {
-      steps: Array<Omit<PlanStep, "attempts">>;
-    };
-    const created = {} as CreatedSnapshot;
-    const response: PlanResponse = { ok: true, plan: created, summary: "PL-0007 去护士站" };
-    expect(response.summary).toBe("PL-0007 去护士站");
+    type CreatedHasAttempts = "attempts" extends keyof PlanCreateResponse["plan"] ? true : false;
+    type CreatedStepHasAttempts = "attempts" extends keyof PlanCreateResponse["plan"]["steps"][number]
+      ? true
+      : false;
+    type DetailAttemptsRequired = undefined extends PlanDetail["attempts"] ? false : true;
+    const createdHasAttempts: CreatedHasAttempts = false;
+    const createdStepHasAttempts: CreatedStepHasAttempts = false;
+    const detailAttemptsRequired: DetailAttemptsRequired = true;
+    expect(createdHasAttempts).toBe(false);
+    expect(createdStepHasAttempts).toBe(false);
+    expect(detailAttemptsRequired).toBe(true);
   });
 
   it("创建输入类型拒绝 P0、执行字段和非法 report", () => {
@@ -145,13 +151,28 @@ describe("Plan REST 客户端", () => {
     expect(init.headers["X-Surface"]).toBeUndefined();
   });
 
-  it("非 2xx 沿用 shared client 的错误模式", async () => {
+  it("409 仍 reject 且暴露 latest Plan", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: false, status: 409, json: async () => ({ ok: false, error: "version_conflict" }),
+      ok: false,
+      status: 409,
+      json: async () => ({
+        ok: false,
+        error: "version_conflict",
+        plan: { id: 7, version: 4, status: "queued", steps: [], attempts: [] },
+      }),
     }));
-    await expect(changePlanPriority(7, "P1", 1)).rejects.toThrow(
-      "API 409: /api/plans/7/priority",
-    );
+
+    try {
+      await changePlanPriority(7, "P1", 1);
+      throw new Error("expected changePlanPriority to reject");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      const apiError = error as ApiError<PlanConflictResponse>;
+      expect(apiError.message).toBe("API 409: /api/plans/7/priority");
+      expect(apiError.status).toBe(409);
+      expect(apiError.body?.error).toBe("version_conflict");
+      expect(apiError.body?.plan.version).toBe(4);
+    }
   });
 });
 

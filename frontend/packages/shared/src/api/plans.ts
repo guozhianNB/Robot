@@ -43,7 +43,7 @@ export interface PlanStep {
   finished_at: string | null;
   last_progress_at: string | null;
   last_error: string;
-  attempts?: PlanAttempt[];
+  attempts: PlanAttempt[];
 }
 
 export interface PlanSummary {
@@ -71,7 +71,13 @@ export interface PlanSummary {
 
 export interface PlanDetail extends PlanSummary {
   steps: PlanStep[];
-  attempts?: PlanAttempt[];
+  attempts: PlanAttempt[];
+}
+
+export type PlanCreatedStep = Omit<PlanStep, "attempts">;
+
+export interface PlanCreated extends PlanSummary {
+  steps: PlanCreatedStep[];
 }
 
 export interface PlanCounts {
@@ -93,8 +99,18 @@ export interface PlanListResponse {
 export interface PlanResponse {
   ok: boolean;
   plan: PlanDetail;
-  /** 仅创建接口返回的人类可读摘要。 */
-  summary?: string;
+}
+
+export interface PlanCreateResponse {
+  ok: boolean;
+  plan: PlanCreated;
+  summary: string;
+}
+
+export interface PlanConflictResponse {
+  ok: false;
+  error: string;
+  plan: PlanDetail;
 }
 
 export interface PlanCreateInput {
@@ -161,8 +177,8 @@ export function getPlan(id: number): Promise<PlanResponse> {
   return apiGet<PlanResponse>(`/api/plans/${id}`);
 }
 
-export function createPlan(input: PlanCreateInput): Promise<PlanResponse> {
-  return apiPost<PlanResponse>("/api/plans", input);
+export function createPlan(input: PlanCreateInput): Promise<PlanCreateResponse> {
+  return apiPost<PlanCreateResponse>("/api/plans", input);
 }
 
 export function changePlanPriority(

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { apiDelete, apiGet, apiPost } from "../src/api/client";
+import { ApiError, apiDelete, apiGet, apiPost } from "../src/api/client";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -42,5 +42,25 @@ describe("REST client", () => {
       ok: false, status: 500, json: async () => ({}),
     }));
     await expect(apiGet("/api/xxx")).rejects.toThrow();
+  });
+
+  it("非 ok 响应保留状态、地址和 JSON body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ ok: false, error: "version_conflict", plan: { version: 4 } }),
+    }));
+
+    try {
+      await apiPost("/api/plans/7/priority", { priority: "P1", version: 3 });
+      throw new Error("expected apiPost to reject");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      expect(error).toMatchObject({
+        status: 409,
+        url: "/api/plans/7/priority",
+        body: { ok: false, error: "version_conflict", plan: { version: 4 } },
+      });
+    }
   });
 });

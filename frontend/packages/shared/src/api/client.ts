@@ -3,9 +3,31 @@
 // 后端据此返回**该槽位的角色**——role 绝不由前端指定（后端红线 R1）。
 export type Surface = "kiosk" | "admin";
 
+export class ApiError<TBody = unknown> extends Error {
+  readonly status: number;
+  readonly url: string;
+  readonly body: TBody | undefined;
+
+  constructor(status: number, url: string, body?: TBody) {
+    super(`API ${status}: ${url}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.url = url;
+    this.body = body;
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
-  if (!res.ok) throw new Error(`API ${res.status}: ${url}`);
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      // HTTP 状态仍是主错误；空响应或非 JSON 错误页不应掩盖它。
+    }
+    throw new ApiError(res.status, url, body);
+  }
   return (await res.json()) as T;
 }
 
