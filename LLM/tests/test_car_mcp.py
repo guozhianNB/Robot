@@ -3,6 +3,7 @@ r"""车控连接层测试：仅替换 websocket 边界，不访问板卡。"""
 import importlib
 import importlib.util
 import asyncio
+import hashlib
 import json
 import math
 import queue
@@ -163,10 +164,17 @@ def test_goto_requires_navigation_before_task_registration(server_rig):
     assert not link.tasks and not executor.jobs
 
 
+def test_started_action_returns_registered_task_id(server_rig):
+    module, link, _nav, executor = server_rig
+    out = load_json(module._move(link, executor, "forward", 0.5))
+    assert out["status"] == "started"
+    assert out["task_id"] == link.tasks[0]["task_id"]
+
+
 def test_started_returns_immediately_and_worker_sends_exact_ros_request(server_rig):
     module, link, nav, executor = server_rig
     out = load_json(module._goto_point(link, nav, executor, 4, 5, 90))
-    assert out == {"ok": True, "status": "started", "action": "goto_point",
+    assert out == {"ok": True, "status": "started", "task_id": 1, "action": "goto_point",
                    "summary": "前往 point", "exec_state": "navigating",
                    "target": {"x": 1.0, "y": 2.0, "yaw_deg": 30.0, "goal_source": "point"},
                    "warnings": ["地图标记较旧"]}
@@ -1100,6 +1108,32 @@ def test_nav_old_tags_fingerprint_warning_and_changed_rejection(nav_deps):
     assert out["ok"] and any("无指纹" in w for w in out["warnings"])
     deps["fingerprint_check"] = lambda tags, info: {"ok": False, "changed": False, "reasons": ["yaml 元数据不可用"]}
     assert importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps).resolve_point(1, 2)["ok"] is False
+
+
+def test_nav_returns_fingerprint_from_the_same_tags_snapshot(nav_deps):
+    calls = []
+    tags = {
+        "map": "ward", "resolution": 0.05, "origin": [0, 0, 0],
+        "destinations": [{"name": "护士站", "aliases": [], "x": 1, "y": 2,
+                          "yaw_deg": 30}],
+        "zones": [],
+    }
+
+    def resolve(name):
+        calls.append(name)
+        return {"ok": True, "exists": True, "stale": False, "tags": tags,
+                "warnings": [], "fingerprint": {"ok": True, "changed": False}}
+
+    deps = dict(nav_deps)
+    deps["resolve"] = resolve
+    nav = importlib.import_module("LLM.car_mcp.car_nav").CarNav(**deps)
+
+    out = nav.resolve_place("护士站")
+
+    assert out["ok"] is True
+    raw = json.dumps(tags, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    assert out["tags_fingerprint"] == "sha1:" + hashlib.sha1(raw).hexdigest()  # noqa: S324
+    assert calls == ["demo"]
 
 
 def test_nav_zone_fallback_selects_nearest_destination_and_reports_it(nav_deps):

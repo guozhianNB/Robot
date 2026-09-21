@@ -159,7 +159,7 @@ def _start(link, executor, action: str, target: dict, request: dict, expected_st
         except Exception:
             pass
         return _error(f"后台执行器不可用: {exc}", status="error")
-    return _json({"ok": True, "status": "started", "action": action, "summary": summary,
+    return _json({"ok": True, "status": "started", "task_id": task_id, "action": action, "summary": summary,
                   "exec_state": expected_state, "target": target, "warnings": list(warnings or [])})
 
 

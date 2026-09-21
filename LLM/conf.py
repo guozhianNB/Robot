@@ -20,6 +20,66 @@ PROMPT_DIR = Path(__file__).resolve().parent / "agent" / "prompt"
 PROMPT_FILE = PROMPT_DIR / "base.md"  # System Prompt 模板（人设+红线，外置便于查看/修改）
 REACT_PROMPT_FILE = PROMPT_DIR / "react.md"  # ReAct 工具决策规则（每次请求实时读取）
 FACTORY_PASSWORD = os.environ.get("PASSWORD", "").strip()  # 管理员出厂口令；仅用于显式恢复，不覆盖当前口令
+CONFIG_WARNINGS: list[dict[str, object]] = []
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive integer environment setting without breaking imports."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (AttributeError, TypeError, ValueError):
+        value = 0
+    if value > 0:
+        return value
+    warning = {"name": name, "value": raw, "fallback": default}
+    CONFIG_WARNINGS.append(warning)
+    print(f"[WARN] 配置 {name}={raw!r} 非法，回退默认值 {default}")
+    return default
+
+
+def _positive_finite_env(name: str, default: float) -> float:
+    """Parse a positive finite Plan runtime setting without breaking import."""
+    import math
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = 0.0
+    if math.isfinite(value) and value > 0:
+        # Preserve integer-looking values for backwards-compatible config
+        # diagnostics while still accepting fractional tick/grace settings.
+        return int(value) if value.is_integer() else value
+    warning = {"name": name, "value": raw, "fallback": default}
+    CONFIG_WARNINGS.append(warning)
+    print(f"[WARN] 配置 {name}={raw!r} 非法，回退默认值 {default}")
+    return default
+
+
+PLAN_TICK_S = _positive_finite_env("PLAN_TICK_S", 1.0)
+PLAN_STATUS_GRACE_S = _positive_finite_env("PLAN_STATUS_GRACE_S", 15.0)
+PLAN_GOTO_TIMEOUT_S = _positive_finite_env("PLAN_GOTO_TIMEOUT_S", 200)
+PLAN_MOVE_TIMEOUT_S = _positive_finite_env("PLAN_MOVE_TIMEOUT_S", 45)
+PLAN_TURN_TIMEOUT_S = _positive_finite_env("PLAN_TURN_TIMEOUT_S", 45)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    CONFIG_WARNINGS.append({"name": name, "value": raw, "fallback": default})
+    print(f"[WARN] 配置 {name}={raw!r} 非法，回退默认值 {default}")
+    return default
+
+
+PLAN_EXECUTOR_ENABLED = _bool_env("PLAN_EXECUTOR_ENABLED", True)
 
 # ---- 默认设置（与前端"设置页"一一对应，可持久化覆盖）----
 DEFAULT_SETTINGS = {

@@ -2068,3 +2068,69 @@ zone 本身有风险 —— 这正是上面加 `zone_from_stale_pose` 的原因�
   （可考虑把 `pose.suspect` 接进 goto 的前置校验，即"位姿可疑时先拒绝发车并提示先定位"）。
 - 板卡配置仍是 `resolution: 0.05`（`106d07b` 的 0.025 未上板），要生效需 pull + `colcon build`
   `robot_bringup` + 重启 base/slam + **重新扫图**。
+
+---
+
+## 2026-09-21 · Plan 表第一期落地（确定性线性执行）
+
+**设计与边界：** 权威设计为 `docs/参考资料/plan表设计-初版.md`，实施计划为
+`docs/superpowers/plans/2026-09-21-plan-table.md`。LLM 只通过 `create_plan` 提交候选；后端状态机是
+执行状态的唯一事实来源，不能把 `started` 当成功、不能凭 `idle`/`arrived` 谎报到达。第一期支持
+P0-P3 排序、线性 action/wait/manual 步骤和人工操作，**不实现运行中自动抢占**；动态重规划留后续。
+
+**后端：**
+
+- `store/db.py` 增加 plans / plan_steps / plan_step_attempts、聚合事务、版本乐观锁、来源幂等索引和
+  旧数据迁移；重启遗留 `dispatching/running/interrupting` 一律转人工复核，不自动重发车。
+- `agent/plan.py` 负责编译、创建和人工迁移；地点/区域在创建时解析为 `robot_goto_point` 并固化地图、
+  坐标和 tags 指纹。`agent/plan_scheduler.py` 用独立线程逐层解析 MCP envelope/JSON/车况，以匹配的
+  `car_task_id` 明确终态推进；相对动作结果不确定时不重试。
+- `agent/action_gate.py` 统一仲裁对话与 Plan 的单车动作槽；`tools.run_plan_tool()` 仅放行 car MCP
+  白名单，执行不继承 creator 的 ward/elder/admin 权限；`robot_status`/`robot_stop` 始终放行。
+- `server.py` 新增七组免鉴权 Plan API 与 `POST /api/nurse/page-unlock`。写操作带 `version`，冲突回
+  409 + 最新快照；PIN 直接校验当前管理员口令，连续 3 次错误冷却 10 秒，不建会话、不签 token。
+  lifespan 固定 MCP 后启动 scheduler，退出时先停 scheduler 再停 MCP，任一组件失败只降级并审计。
+- reminder 只在首次 `pending -> triggered/missed` 时按 `(source_kind, source_id)` 幂等创建一个 manual
+  Plan；Plan 的复核/失败/完成继续走通知中心 `notify.ingest(source="plan", ...)`。
+
+**前端：**
+
+- shared 新增 `api/plans.ts`、四类 Plan SSE 事件，以及 admin/nurse 共用的 `planUi.ts` 状态矩阵、
+  严格数值校验和结构化步骤编译；Plan 请求不附加 `X-Surface`。
+- admin 增加“计划”页签；护士台增加当前管理员口令页面门和“通知/计划”页签。护士台解锁标志仅存
+  当前 tab 的 `sessionStorage[nurse-page-unlocked-v1]`，刷新保持、关 tab 失效、无 TTL；未解锁时
+  不拉通知/Plan、不建立 SSE。页面 PIN 不是 API 权限边界，通知读/确认与 Plan API 仍免鉴权。
+- 两端都支持结构化创建、详情/attempt、调级、取消、人工确认和 safe goto 重试；409 使用后端返回的
+  最新 Plan 提示刷新。SSE 断线重连后立即重拉，异步 generation 防止旧响应覆盖新状态。
+
+**规格覆盖：** `2026-09-18-nurse-console-design.md` 的 D1-D8 和通知契约继续有效；原 D9-D11
+作为历史保留，现行口径由 2026-09-21 Plan 设计覆盖。护士台不新增角色，也不修改
+`session.derive_role()` / `policy.POLICY_DEFAULTS` / `X-Surface` 取值域。
+
+**Task 12 最终验证（2026-09-21）：**
+
+- 后端聚焦：`241 passed`（`test_car_mcp`/Plan DB/Plan/调度/API/策略/shutdown），fake MCP 与
+  monkeypatch 隔离，无真实 rosbridge。
+- 后端 `LLM/tests` 全量：`656 passed, 1 failed`。唯一失败是既有 `LLM/tests/test_server_voice_routes.py::test_face_status_route`
+  引用未导入的 `face_api`（与 Plan 无关，未修改）。根目录全量在收集阶段另有 3 个已知旧分包导入错误
+  （`tests/test_bus.py`、`tests/test_face_api.py`、`tests/test_unlock_switch.py`）；排除这三项后运行
+  根测试为 `387 passed, 5 failed, 5 errors, 8 skipped`，失败/错误均为同一批旧 `LLM` 根模块导入、
+  `update_elder` 旧导入或隐私测试读取测试临时样本，未发现 Plan 回归。测试临时目录随后已清理。
+- 前端：`pnpm --dir frontend test` = shared `7 files / 77 passed`；`pnpm --dir frontend build`
+  的 admin、kiosk、nurse、mapeditor 四包均成功。
+- 隐私：`scripts/check_privacy.py` exit 0；索引、未跟踪和历史三条通道的人脸/指纹均干净。输出中的
+  声纹/wav/模型权重属于仓库既知遗留警告，不是本次新增。
+- `git diff --check` 通过。reuse-first 三层记录：
+  `Name layer: PLAN_TICK_S / nurse-page-unlocked-v1 / plan_needs_review -> conf.py、NursePinGate、events.ts 唯一生产定义；`
+  `Behavior layer: Plan compile/schedule/queue/version/PIN -> plan.py、plan_scheduler.py、planUi.ts 与既有测试；`
+  `Reference layer: 参考资料/plan表设计-初版.md -> server.py、shared plans.ts、admin PlansPage、nurse PlanPanel。`
+  `jscpd@5` 扫描 shared/admin/nurse 发现 8 个小段重复（0.47% 行 / 0.97% token），主要是 admin/nurse
+  两套 Vue 表单展示和测试源码契约；可漂移的状态矩阵、数值校验已抽到 shared `planUi.ts`，没有 `*2/New/V2` 副本。
+- 浏览器：使用真实 FastAPI 静态托管构建产物（独立临时 SQLite，MCP/voice/reminder/定位显式禁用）和
+  Edge headless。初始页只显示 PIN 门且不加载通知/Plan/SSE；`2468` 成功后显示“通知/计划” tabs，
+  `sessionStorage[nurse-page-unlocked-v1]` 写入；刷新保持解锁，新 tab 重新显示 PIN 门。1280×720 与
+  390×844 的 `body.scrollWidth` 分别为 1280/390，顶栏、tabs、filters、内容区边界无重叠；截图保存于
+  `%TEMP%/robot-task12-nurse-1280.png` 与 `%TEMP%/robot-task12-nurse-390.png` 并已人工查看。
+
+所有车控验收使用 fake MCP，不连接真实 rosbridge、不下发真车；真实底盘串行执行、途中急停、AMCL
+定位精度和现场网络访问仍属未验项。浏览器临时服务和 Edge 会话仅用于本次验收，未写入运行库。

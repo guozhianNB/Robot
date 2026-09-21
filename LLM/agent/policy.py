@@ -20,12 +20,13 @@ POLICY_DEFAULTS: dict[str, dict] = {
     # ---- 集体层：一屋子人。读得到本病房公开对话，读不到任何个人档案 ----
     "ward": {
         "prompt_file": PROMPT_DIR / "ward.md",
-        # 只接"安全 + 只读"两类：状态播报与急停。
+        # 只接"安全 + 只读"能力及候选 Plan 提交入口：状态播报、急停、呼救和 create_plan。
         # 依据规格 §3.3 能力矩阵：`车·状态查询（位姿/电量）✅ 只读播报`、`车·急停/呼救 ✅ 永远允许（R3）`。
         # 未识别的说话人也会回落到这一层 —— 急停必须可用（空列表 = 连急停都做不了，违反 R3）。
         # notify_nurse 同属"呼救"一族：声纹识别失败时老人仍要能把话传到护士台（规格
         # 2026-09-18-llm-notify-nurse-mcp-design.md D5；代价=未识别说话人可刷护士台，有 60s 去重兜底）。
-        "allowed_tools": ["robot_status", "robot_stop", "notify_nurse"],
+        # create_plan 只提交全量校验后的候选，不授予普通车控动作权限。
+        "allowed_tools": ["robot_status", "robot_stop", "notify_nurse", "create_plan"],
         "data_scope": "none",
         "ward_context": True,
     },
@@ -36,7 +37,7 @@ POLICY_DEFAULTS: dict[str, dict] = {
         "allowed_tools": [
             "robot_status", "robot_stop", "robot_move", "robot_turn",
             "robot_goto_point", "robot_goto_zone", "robot_goto_place",
-            "see_what", "notify_nurse",
+            "see_what", "notify_nurse", "create_plan",
         ],
         "data_scope": "self",
         "ward_context": True,

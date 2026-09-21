@@ -22,6 +22,7 @@ import inspect
 import pkgutil
 import threading
 import time
+from contextvars import ContextVar
 
 from . import mcp_client   # MCP 桥（可选能力，内部自行降级，import 永远安全）
 from . import action_gate
@@ -29,6 +30,13 @@ from . import action_gate
 # ---------------------------------------------------------------- 注册表
 # name -> {"schema": OpenAI function-calling 声明, "fn": 实现函数, "enabled": 默认开关}
 _TOOL_REGISTRY: dict[str, dict] = {}
+_CURRENT_PRINCIPAL: ContextVar[dict | None] = ContextVar(
+    "tool_current_principal", default=None)
+
+
+def current_principal() -> dict:
+    """Return a copy of the principal bound to the current local-tool call."""
+    return dict(_CURRENT_PRINCIPAL.get() or {})
 
 
 def tool(name: str, description: str, parameters: dict, enabled: bool = True,
@@ -61,6 +69,22 @@ def _run_fn(fn, args: dict):
     allowed = {p for p in sig.parameters if p not in ("self", "cls")}
     kwargs = {k: v for k, v in args.items() if k in allowed}
     return fn(**kwargs)
+
+
+def _local_args_error(reg: dict, args) -> str:
+    """Validate the top-level object contract needed before signature filtering."""
+    if not isinstance(args, dict):
+        return "工具参数必须是对象"
+    parameters = reg.get("schema", {}).get("function", {}).get("parameters", {})
+    required = set(parameters.get("required") or [])
+    missing = required - set(args)
+    if missing:
+        return f"缺少必填字段：{', '.join(sorted(missing))}"
+    if parameters.get("additionalProperties") is False:
+        unknown = set(args) - set(parameters.get("properties") or {})
+        if unknown:
+            return f"不允许字段：{', '.join(sorted(unknown))}"
+    return ""
 
 
 def _audit_args(name: str, args: dict | None):
@@ -188,11 +212,7 @@ _CAR_GATE_BYPASS = frozenset({"robot_status", "robot_stop"})
 
 
 def run_plan_tool(name: str, args: dict | None = None) -> dict:
-    """Plan 调度器专用车控入口。
-
-    Plan 已由调度器完成角色校验与动作所有权仲裁，因此这里不读取 principal；仍保留
-    MCP 总开关、工具注册和 ``server=car`` 三道边界，避免绕过配置调用任意外部工具。
-    """
+    """Plan 调度器专用车控入口。"""
     from ..store import db
 
     if name not in _PLAN_ACTIONS:
@@ -260,7 +280,13 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
         finally:
             if gate_token is not None:
                 action_gate.release(gate_token)
+    args_error = _local_args_error(reg, args)
+    if args_error:
+        return {"ok": False, "error": f"工具参数不符合 schema：{args_error}"}
+    token = _CURRENT_PRINCIPAL.set(dict(p))
     try:
         return _run_fn(reg["fn"], args or {})
     except Exception as e:
         return {"ok": False, "message": f"工具执行失败: {e}"}
+    finally:
+        _CURRENT_PRINCIPAL.reset(token)

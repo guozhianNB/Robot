@@ -18,6 +18,7 @@ import SettingsPage from "./pages/SettingsPage.vue";
 import VoiceStatusPage from "./pages/VoiceStatusPage.vue";
 import RolesPage from "./pages/RolesPage.vue";
 import MapEditorPage from "./pages/MapEditorPage.vue";
+import PlansPage from "./pages/PlansPage.vue";
 
 const tabs = [
   { id: "overview", label: "监控总览" },
@@ -25,6 +26,7 @@ const tabs = [
   { id: "chat", label: "对话" },
   { id: "memories", label: "记忆" },
   { id: "reminders", label: "提醒" },
+  { id: "plans", label: "计划" },
   { id: "wards", label: "病房管理" },
   { id: "mapeditor", label: "地图编辑器" },
   { id: "tools", label: "工具日志" },
@@ -166,6 +168,7 @@ onUnmounted(() => {
       <ChatPage v-else-if="active === 'chat'" />
       <MemoriesPage v-else-if="active === 'memories'" />
       <RemindersPage v-else-if="active === 'reminders'" />
+      <PlansPage v-else-if="active === 'plans'" />
       <WardsPage v-else-if="active === 'wards'" @goto-mapeditor="active = 'mapeditor'" />
       <ToolLogPage v-else-if="active === 'tools'" />
       <VoiceStatusPage v-else-if="active === 'voice'" />

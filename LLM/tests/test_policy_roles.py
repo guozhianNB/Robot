@@ -5,10 +5,11 @@ from LLM import conf
 # 集体层白名单的唯一真相（用例里三处复用，改策略只改这里）。
 # notify_nurse = "把话传到护士台"：与 robot_stop 同属**呼救**一族，未识别的说话人落到这层时
 # 也必须有求援手段（规格 docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md D5）。
-WARD_TOOLS = ["robot_status", "robot_stop", "notify_nurse"]
+WARD_TOOLS = ["robot_status", "robot_stop", "notify_nurse", "create_plan"]
 CAR_ACTION_TOOLS = [
     "robot_move", "robot_turn", "robot_goto_point", "robot_goto_zone", "robot_goto_place",
 ]
+ELDER_TOOLS = set(WARD_TOOLS + CAR_ACTION_TOOLS + ["see_what"])
 
 
 def test_policy_keys_cover_three_roles():
@@ -20,7 +21,7 @@ def test_ward_has_only_safety_tools_and_no_personal_scope():
     assert p["data_scope"] == "none"        # 不注入任何老人档案/私人记忆
     assert p["ward_context"] is True        # 但读得到本病房的集体上下文
     # 集体层只接"安全 + 只读"：急停（R3 永远允许）+ 状态只读播报（规格 §3.3 矩阵）
-    # + 喊护士（notify_nurse，R3 的呼救一族）。
+    # + 喊护士（notify_nurse，R3 的呼救一族）+ 只提交候选计划的 create_plan。
     # 未识别的说话人会回落到这一层，所以这里**不能**是空列表。
     assert p["allowed_tools"] == WARD_TOOLS
 
@@ -37,8 +38,7 @@ def test_elder_reads_self_plus_ward_context():
     p = policy.POLICY_DEFAULTS["elder"]
     assert p["data_scope"] == "self"
     assert p["ward_context"] is True
-    assert "robot_stop" in p["allowed_tools"]     # R3：安全动作永远在列
-    assert all(name in p["allowed_tools"] for name in CAR_ACTION_TOOLS)
+    assert set(p["allowed_tools"]) == ELDER_TOOLS
     assert not any(name in policy.POLICY_DEFAULTS["ward"]["allowed_tools"] for name in CAR_ACTION_TOOLS)
 
 
