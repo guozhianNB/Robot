@@ -300,13 +300,13 @@ def _poll(step: dict, now: float) -> None:
         changes = {"last_checked_at": checked_at}
         if matching:
             changes["result_json"] = payload
-        db.transition_plan_execution(
+        updated = db.transition_plan_execution(
             step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
             step_changes={"last_progress_at": checked_at} if decision == "running" else None,
             attempt_id=attempt["id"], attempt_changes=changes,
         )
-        if decision == "running":
-            pass
+        if updated:
+            plan_ops._publish(updated, step=step)
         return
     if decision == "needs_review":
         reason = ("车控状态不可用超过恢复宽限期" if parsed.kind == "unavailable"
@@ -481,9 +481,10 @@ def _handle_wait(step: dict, wall_now: float) -> None:
         step_changes={"status": "succeeded", "finished_at": db.now_iso()},
         plan_changes={"status": plan_status},
     )
-    if updated and plan_status == "succeeded":
+    if updated:
         plan_ops._publish(updated, step=step)
-        plan_ops._notify(updated, "plan_done", level="info")
+        if plan_status == "succeeded":
+            plan_ops._notify(updated, "plan_done", level="info")
 
 
 def _choose_pending(plans: list[dict]) -> dict | None:
