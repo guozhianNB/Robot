@@ -6,3 +6,4 @@ export * from "./api/alarm";
 export * from "./api/notifications";
 export * from "./api/mapService";
 export * from "./api/plans";
+export * from "./planUi";

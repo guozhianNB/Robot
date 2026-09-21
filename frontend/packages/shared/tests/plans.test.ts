@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   cancelPlan,
@@ -20,6 +20,16 @@ import type {
 import { ApiError } from "../src/api/client";
 import { parseBusPayload } from "../src/events";
 import type { PlanUpdatedEvent } from "../src/events";
+import {
+  buildPlanCreateStep,
+  canCancelPlan,
+  canChangePlanPriority,
+  canRetryPlanStep,
+  planStepConfirmDecision,
+  validatePlanStepDraft,
+  type PlanStepDraft,
+} from "../src/planUi";
+import type { PlanStep } from "../src/api/plans";
 import { listPlans as listPlansFromBarrel } from "../src";
 
 function stub(body: unknown = { ok: true }) {
@@ -217,6 +227,57 @@ describe("Plan SSE 契约", () => {
   });
 });
 
+describe("Plan 页面共享业务规则", () => {
+  const step = (patch: Partial<PlanStep>): PlanStep => ({
+    id: 11, plan_id: 7, seq: 1, step_type: "action", action: "robot_move",
+    label: "步骤", args_json: {}, status: "pending", wait_kind: null, wake_at: null,
+    map_name: null, target_json: null, tags_fingerprint: null, timeout_sec: 30,
+    retry_policy: "none", max_attempts: 1, started_at: null, finished_at: null,
+    last_progress_at: null, last_error: "", attempts: [], ...patch,
+  });
+  const draft = (patch: Partial<PlanStepDraft> = {}): PlanStepDraft => ({
+    type: "action", label: "移动", action: "robot_move", direction: "forward",
+    distance: 1, angle: 90, x: 0, y: 0, yaw: 0, target: "",
+    waitKind: "device", wakeAt: "", ...patch,
+  });
+
+  it("终态与取消中禁止调级和取消", () => {
+    for (const status of ["succeeded", "failed", "cancelled", "expired", "cancelling"]) {
+      expect(canChangePlanPriority(status)).toBe(false);
+      expect(canCancelPlan(status)).toBe(false);
+    }
+    expect(canChangePlanPriority("queued")).toBe(true);
+    expect(canCancelPlan("running")).toBe(true);
+  });
+
+  it("确认入口严格匹配人工步骤与待复核状态", () => {
+    expect(planStepConfirmDecision(step({ step_type: "manual", status: "pending" }))).toBe("complete");
+    expect(planStepConfirmDecision(step({ step_type: "wait", wait_kind: "manual", status: "paused" }))).toBe("complete");
+    expect(planStepConfirmDecision(step({ status: "needs_review" }))).toBe("mark_succeeded");
+    expect(planStepConfirmDecision(step({ step_type: "wait", wait_kind: "time", status: "waiting" }))).toBeNull();
+    expect(planStepConfirmDecision(step({ step_type: "action", status: "running" }))).toBeNull();
+  });
+
+  it("重试只放行待复核的 safe goto point", () => {
+    const retryable = step({ status: "needs_review", action: "robot_goto_point", retry_policy: "safe_goto_only" });
+    expect(canRetryPlanStep(retryable)).toBe(true);
+    expect(canRetryPlanStep({ ...retryable, status: "failed" })).toBe(false);
+    expect(canRetryPlanStep({ ...retryable, action: "robot_move" })).toBe(false);
+  });
+
+  it("结构化步骤构建与 admin 数值边界一致", () => {
+    expect(validatePlanStepDraft(draft())).toBeNull();
+    expect(buildPlanCreateStep(draft())).toEqual({
+      type: "action", action: "robot_move", args: { direction: "forward", distance_m: 1 }, label: "移动",
+    });
+    expect(validatePlanStepDraft(draft({ distance: Number.NaN }))).toContain("0 到 5");
+    expect(validatePlanStepDraft(draft({ action: "robot_turn", angle: 0 }))).toContain("0 到 360");
+    expect(validatePlanStepDraft(draft({ action: "robot_goto_point", x: 1001 }))).toContain("1000");
+    expect(validatePlanStepDraft(draft({ action: "robot_goto_place", target: " " }))).toContain("不能为空");
+    expect(validatePlanStepDraft(draft({ type: "wait", waitKind: "time", wakeAt: "bad" }))).toContain("唤醒时间");
+  });
+});
+
 describe("管理台 Plan 页面源码契约", () => {
   const source = readFileSync(resolve(__dirname, "../../admin/src/pages/PlansPage.vue"), "utf8");
 
@@ -251,13 +312,80 @@ describe("管理台 Plan 页面源码契约", () => {
   it("按后端状态矩阵展示人工确认和重试入口", () => {
     for (const status of ["pending", "waiting", "paused", "needs_review", "cancelling", "cancelled", "expired"])
       expect(source).toContain(status);
-    expect(source).toContain('"complete"');
-    expect(source).toContain("safe_goto_only");
+    expect(source).toContain("planStepConfirmDecision");
+    expect(source).toContain("canRetryPlanStep");
     expect(source).not.toContain("step.status === 'failed' || step.status === 'canceled'");
   });
 
   it("创建步骤校验动作数值范围和定时等待", () => {
-    for (const token of ["Number.isFinite", "distance_m", "5", "360", "wakeAt", "isNaN"])
-      expect(source).toContain(token);
+    expect(source).toContain("validatePlanStepDraft");
+    expect(source).toContain("buildPlanCreateStep");
+  });
+});
+
+describe("护士台 PIN 门与 Plan 面板源码契约", () => {
+  const nurseRoot = resolve(__dirname, "../../nurse/src");
+  const pinPath = resolve(nurseRoot, "components/NursePinGate.vue");
+  const panelPath = resolve(nurseRoot, "components/PlanPanel.vue");
+  const appPath = resolve(nurseRoot, "App.vue");
+  const sourceOf = (path: string) => existsSync(path) ? readFileSync(path, "utf8") : "";
+
+  it("提供独立 PIN 门并只用当前 tab 的固定解锁标记", () => {
+    expect(existsSync(pinPath)).toBe(true);
+    const source = sourceOf(pinPath);
+    expect(source).toContain("unlockNursePage");
+    expect(source).toContain("nurse-page-unlocked-v1");
+    expect(source).toContain("sessionStorage.setItem");
+    expect(source).not.toContain("localStorage");
+    expect(source).not.toMatch(/ttl|expires|expiry|setTimeout/i);
+    expect(source.match(/sessionStorage\.setItem/g)).toHaveLength(1);
+    expect(source).toMatch(/if \(!result\.ok\)[\s\S]*return;[\s\S]*sessionStorage\.setItem/);
+    expect(source.indexOf("sessionStorage.setItem")).toBeGreaterThan(source.indexOf("result.ok"));
+  });
+
+  it("PlanPanel 通过 shared API 提供完整人工操作且不裸调接口", () => {
+    expect(existsSync(panelPath)).toBe(true);
+    const source = sourceOf(panelPath);
+    for (const symbol of [
+      "listPlans", "createPlan", "changePlanPriority", "cancelPlan",
+      "confirmPlanStep", "retryPlanStep",
+    ]) expect(source).toContain(symbol);
+    expect(source).not.toContain('fetch("/api/plans');
+    expect(source).not.toContain("X-Surface");
+    expect(source).not.toContain("EventSource");
+    expect(source).toContain("loadGeneration");
+    expect(source).toContain("openGeneration");
+    expect(source).toMatch(/requestId !== loadGeneration/);
+    expect(source).toMatch(/requestId !== openGeneration/);
+    expect(source).toMatch(/async function openPlan[\s\S]*loadGeneration \+= 1[\s\S]*loading\.value = false/);
+  });
+
+  it("两端共用人工状态矩阵和结构化步骤校验规则", () => {
+    const admin = sourceOf(resolve(__dirname, "../../admin/src/pages/PlansPage.vue"));
+    const nurse = sourceOf(panelPath);
+    for (const symbol of [
+      "buildPlanCreateStep", "planStepConfirmDecision", "canRetryPlanStep",
+      "canCancelPlan", "canChangePlanPriority",
+    ]) {
+      expect(admin).toContain(symbol);
+      expect(nurse).toContain(symbol);
+    }
+  });
+
+  it("App 在 PIN 门之后才挂载工作台、通知加载和唯一 SSE 连接", () => {
+    const source = sourceOf(appPath);
+    expect(source).toContain("NursePinGate");
+    expect(source).toContain("PlanPanel");
+    expect(source).toContain('v-if="!unlocked"');
+    expect(source).toContain("startUnlockedWorkspace");
+    expect(source).toMatch(/if \(!unlocked\.value\) return/);
+    expect(source).toContain("loadNotices");
+    expect(source).toContain("connect");
+    expect(source).toContain("plan_created");
+    expect(source).toContain("plan_needs_review");
+    expect(source.match(/new EventSource/g)).toHaveLength(1);
+    expect(source).toMatch(/function connect\(\)[\s\S]*!unlocked\.value[\s\S]*new EventSource/);
+    expect(source).toContain("workspaceActive");
+    expect(source).toMatch(/await loadNotices\(\);[\s\S]*if \(workspaceActive\) schedulePoll\(\)/);
   });
 });

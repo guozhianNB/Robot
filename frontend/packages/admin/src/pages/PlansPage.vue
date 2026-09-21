@@ -2,6 +2,10 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   ApiError,
+  buildPlanCreateStep,
+  canCancelPlan,
+  canChangePlanPriority,
+  canRetryPlanStep,
   cancelPlan,
   changePlanPriority,
   confirmPlanStep,
@@ -9,18 +13,19 @@ import {
   getPlan,
   listPlans,
   parseBusPayload,
+  planStatusLabel,
+  planStepConfirmDecision,
+  PLAN_PRIORITY_RANK,
   retryPlanStep,
-  type PlanActionStep,
   type PlanCreateStep,
   type PlanDetail,
   type PlanPriority,
   type PlanStep,
+  type PlanStepDraft,
   type PlanSummary,
+  validatePlanStepDraft,
 } from "shared";
 
-const priorityRank: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
-const COORDINATE_LIMIT = 1000;
-const TERMINAL_PLAN_STATES = new Set(["succeeded", "failed", "cancelled", "expired"]);
 const plans = ref<PlanSummary[]>([]);
 const currentPlan = ref<PlanDetail | null>(null);
 const selectedStatus = ref("all");
@@ -32,8 +37,8 @@ const showCreate = ref(false);
 
 const createForm = ref({ title: "", priority: "P1" as Exclude<PlanPriority, "P0">,
   ownerUid: "", notify: true, speak: false });
-const stepForm = ref({ type: "action" as PlanCreateStep["type"], label: "",
-  action: "robot_move" as PlanActionStep["action"], direction: "forward" as "forward" | "back" | "left" | "right",
+const stepForm = ref<PlanStepDraft>({ type: "action", label: "",
+  action: "robot_move", direction: "forward",
   distance: 1, angle: 90, x: 0, y: 0, yaw: 0, target: "", waitKind: "device" as "time" | "device" | "external", wakeAt: "" });
 const createSteps = ref<PlanCreateStep[]>([]);
 
@@ -41,13 +46,8 @@ let eventSource: EventSource | null = null;
 let reconnectTimer: number | null = null;
 
 const orderedPlans = computed(() => [...plans.value].sort((a, b) =>
-  (priorityRank[a.priority] ?? 9) - (priorityRank[b.priority] ?? 9)
+  (PLAN_PRIORITY_RANK[a.priority] ?? 9) - (PLAN_PRIORITY_RANK[b.priority] ?? 9)
   || Date.parse(b.updated_at || b.created_at) - Date.parse(a.updated_at || a.created_at)));
-
-function statusLabel(status: string) {
-  return ({ queued: "排队", running: "执行中", waiting: "等待中", paused: "暂停", needs_review: "待复核",
-    cancelling: "取消中", succeeded: "已完成", failed: "失败", cancelled: "已取消", expired: "已过期" } as Record<string, string>)[status] ?? status;
-}
 
 function priorityLabel(priority: string) { return priority; }
 
@@ -140,7 +140,8 @@ async function cancel(id: number) {
 async function confirmStep(step: PlanStep) {
   const detail = planFor(step.plan_id);
   if (!detail || !window.confirm(`确认步骤“${step.label}”已完成？`)) return;
-  const decision = step.status === "needs_review" ? "mark_succeeded" : "complete";
+  const decision = planStepConfirmDecision(step);
+  if (!decision) return;
   await runMutation(() => confirmPlanStep(detail.id, step.id, decision, "管理员确认", detail.version));
 }
 
@@ -150,47 +151,10 @@ async function retryStep(step: PlanStep) {
   await runMutation(() => retryPlanStep(detail.id, step.id, "管理员重试", detail.version));
 }
 
-function buildStep(): PlanCreateStep {
-  const label = stepForm.value.label.trim() || "计划步骤";
-  if (stepForm.value.type === "manual") return { type: "manual", label };
-  if (stepForm.value.type === "wait") {
-    if (stepForm.value.waitKind === "time") return { type: "wait", wait_kind: "time", wake_at: stepForm.value.wakeAt, label };
-    return { type: "wait", wait_kind: stepForm.value.waitKind, label };
-  }
-  const f = stepForm.value;
-  if (f.action === "robot_move") return { type: "action", action: f.action, args: { direction: f.direction, distance_m: Number(f.distance) }, label };
-  if (f.action === "robot_turn") return { type: "action", action: f.action, args: { angle_deg: Number(f.angle) }, label };
-  if (f.action === "robot_goto_point") return { type: "action", action: f.action, args: { x: Number(f.x), y: Number(f.y), yaw_deg: Number(f.yaw) }, label };
-  return { type: "action", action: f.action, args: { [f.action === "robot_goto_place" ? "place" : "zone"]: f.target.trim() }, label } as PlanActionStep;
-}
-
-function validateStepForm(): string | null {
-  const f = stepForm.value;
-  if (f.type === "wait" && f.waitKind === "time") {
-    if (!f.wakeAt.trim() || Number.isNaN(Date.parse(f.wakeAt))) return "定时等待需要填写合法的唤醒时间";
-  }
-  if (f.type !== "action") return null;
-  if (f.action === "robot_move") {
-    const distance = Number(f.distance);
-    if (!Number.isFinite(distance) || !(distance > 0 && distance <= 5)) return "移动距离必须是 0 到 5 米之间的有限数字";
-  }
-  if (f.action === "robot_turn") {
-    const angle = Number(f.angle);
-    if (!Number.isFinite(angle) || !(Math.abs(angle) > 0 && Math.abs(angle) <= 360)) return "转向角度必须是 0 到 360 度之间的有限数字";
-  }
-  if (f.action === "robot_goto_point") {
-    const coordinates = [Number(f.x), Number(f.y), Number(f.yaw)];
-    if (!coordinates.every(Number.isFinite) || coordinates.slice(0, 2).some((value) => Math.abs(value) > COORDINATE_LIMIT)
-        || Math.abs(coordinates[2]) > 360) return `坐标必须是有限数字，范围不超过 ±${COORDINATE_LIMIT}，朝向不超过 ±360 度`;
-  }
-  if (["robot_goto_place", "robot_goto_zone"].includes(f.action) && !f.target.trim()) return "目标地点或区域不能为空";
-  return null;
-}
-
 function addStep() {
-  const validationError = validateStepForm();
+  const validationError = validatePlanStepDraft(stepForm.value);
   if (validationError) { errorText.value = validationError; return; }
-  createSteps.value.push(buildStep());
+  createSteps.value.push(buildPlanCreateStep(stepForm.value));
   stepForm.value.label = "";
   errorText.value = "";
 }
@@ -200,7 +164,7 @@ function removeStep(index: number) { createSteps.value.splice(index, 1); }
 async function submitCreate() {
   if (!createForm.value.title.trim()) { errorText.value = "请填写计划标题"; return; }
   if (!createSteps.value.length) { errorText.value = "请至少添加一个结构化步骤"; return; }
-  const validationError = validateStepForm();
+  const validationError = validatePlanStepDraft(stepForm.value);
   if (validationError) { errorText.value = validationError; return; }
   saving.value = true;
   try {
@@ -262,7 +226,7 @@ onUnmounted(() => {
     <p v-if="errorText" class="error" role="alert">{{ errorText }}</p>
     <div v-if="currentPlan" class="current-plan">
       <div class="section-heading"><span>当前计划</span><span class="muted">v{{ currentPlan.version }} · {{ formatTime(currentPlan.updated_at) }}</span></div>
-      <div class="current-line"><strong>{{ currentPlan.display_no }} · {{ currentPlan.title }}</strong><span class="status">{{ statusLabel(currentPlan.status) }}</span><span class="priority">{{ priorityLabel(currentPlan.priority) }}</span></div>
+      <div class="current-line"><strong>{{ currentPlan.display_no }} · {{ currentPlan.title }}</strong><span class="status">{{ planStatusLabel(currentPlan.status) }}</span><span class="priority">{{ priorityLabel(currentPlan.priority) }}</span></div>
       <div class="current-meta">负责人：{{ currentPlan.owner_uid || "未指定" }}　来源：{{ currentPlan.source_kind || "人工" }}</div>
     </div>
 
@@ -271,19 +235,19 @@ onUnmounted(() => {
       <article v-for="plan in orderedPlans" :key="plan.id" class="plan-row" :class="{ selected: currentPlan?.id === plan.id }">
         <button class="plan-main" type="button" @click="openPlan(plan.id)">
           <span class="plan-no">{{ plan.display_no }}</span><span class="plan-title">{{ plan.title }}</span>
-          <span class="status">{{ statusLabel(plan.status) }}</span><span class="priority">{{ plan.priority }}</span>
+          <span class="status">{{ planStatusLabel(plan.status) }}</span><span class="priority">{{ plan.priority }}</span>
           <small>{{ formatTime(plan.updated_at) }}</small>
         </button>
-        <select class="priority-select" :value="plan.priority" title="调整优先级" aria-label="调整优先级" :disabled="saving || TERMINAL_PLAN_STATES.has(plan.status) || plan.status === 'cancelling'" @change="updatePriority(plan, $event)">
+        <select class="priority-select" :value="plan.priority" title="调整优先级" aria-label="调整优先级" :disabled="saving || !canChangePlanPriority(plan.status)" @change="updatePriority(plan, $event)">
           <option value="P0">P0</option><option value="P1">P1</option><option value="P2">P2</option><option value="P3">P3</option>
         </select>
-        <button v-if="!TERMINAL_PLAN_STATES.has(plan.status) && plan.status !== 'cancelling'" class="icon-button danger" type="button" title="取消计划" aria-label="取消计划" :disabled="saving" @click="cancel(plan.id)">×</button>
+        <button v-if="canCancelPlan(plan.status)" class="icon-button danger" type="button" title="取消计划" aria-label="取消计划" :disabled="saving" @click="cancel(plan.id)">×</button>
         <div v-if="expandedId === plan.id && currentPlan?.id === plan.id" class="details">
           <div v-for="step in currentPlan.steps" :key="step.id" class="step-row">
-            <div><b>{{ step.seq }}. {{ step.label }}</b><span class="muted">{{ step.action || step.step_type }} · {{ statusLabel(step.status) }}</span></div>
+            <div><b>{{ step.seq }}. {{ step.label }}</b><span class="muted">{{ step.action || step.step_type }} · {{ planStatusLabel(step.status) }}</span></div>
             <div class="step-actions">
-              <button v-if="(step.status === 'needs_review' || ((step.step_type === 'manual' || step.wait_kind === 'manual') && ['pending', 'waiting', 'paused'].includes(step.status)))" class="icon-button" type="button" title="确认步骤" aria-label="确认步骤" :disabled="saving" @click="confirmStep(step)">✓</button>
-              <button v-if="step.status === 'needs_review' && step.step_type === 'action' && step.action === 'robot_goto_point' && step.retry_policy === 'safe_goto_only'" class="icon-button" type="button" title="重试步骤" aria-label="重试步骤" :disabled="saving" @click="retryStep(step)">↻</button>
+              <button v-if="planStepConfirmDecision(step)" class="icon-button" type="button" title="确认步骤" aria-label="确认步骤" :disabled="saving" @click="confirmStep(step)">✓</button>
+              <button v-if="canRetryPlanStep(step)" class="icon-button" type="button" title="重试步骤" aria-label="重试步骤" :disabled="saving" @click="retryStep(step)">↻</button>
             </div>
             <div v-if="step.attempts.length" class="attempts">
               <span v-for="attempt in step.attempts" :key="attempt.id">尝试 #{{ attempt.attempt_no }} · {{ attempt.outcome || attempt.dispatch_state }}</span>
