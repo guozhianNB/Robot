@@ -39,6 +39,7 @@ LLM/
   core/                log(审计) bus(SSE) vectors(轻量向量) zonegeo(几何)     零业务、零外部依赖
   store/               db(SQLite) ragstore(Chroma) graph(Kuzu) embed migrate  持久化
   agent/               chat memory tools mcp_client reminder session policy   智能体
+                       plan plan_scheduler action_gate                         Plan 编排/调度/车控仲裁
                        prompt/  base.md(共用人设+红线) + ward/elder/admin.md(角色片段)
   maps/                mapstore mapsources maptags mapserver locator roslink  地图域
                        mapapi(编辑器路由，仅 :8010 进程 import) mapctl(编辑器进程管理)
@@ -60,6 +61,9 @@ LLM/
 - `agent/prompt/` — **角色提示词片段**：`ward.md`/`elder.md`/`admin.md` 三层各一份，由 `chat._load_role_prompt()` 按 `role_policy(role)["prompt_file"]` 装载、叠加在 `base.md` 之上（`base.md` **是共用 base**，管"怎么说"；角色片段管"现在跟谁说话"）；缺文件 → 空串 + 审计 `prompt_role_missing`，不阻断对话。
 - `agent/memory.py` — RAG 记忆 + 半自动沉淀：`recall()`、`note_turn()`、`consolidate()`、`suggest_from_chat()`。**红线：`MEDICAL_KEYWORDS` 命中拒绝写入**。（MaiBot 对标增强：核心记忆定稿/保护、回收站、纠错、画像防退化等，见 `docs/log.md` 2026-09 条目）
 - `agent/reminder.py` — 独立线程定时调度（15s tick），状态机 `pending→triggered→confirmed/unconfirmed/missed`。
+- `agent/plan.py` — **Plan 领域层**：候选计划编译、地点/区域固化为坐标、创建与人工迁移；LLM 只通过本地工具 `create_plan` 提候选，执行状态只由后端状态机推进。Plan/Step/Attempt 持久化在 `brain.db`，提醒首次 `triggered/missed` 时按来源幂等建 Plan。
+- `agent/plan_scheduler.py` — **确定性 Plan 调度线程**：逐层解析 MCP 返回、按 `car_task_id` 对账，只有明确终态才推进；重启遗留移动步骤进入 `needs_review`，绝不自动重发车。`start()` 在 MCP 后启动，退出时先于 MCP 停止；`PLAN_EXECUTOR_ENABLED` 可整体关闭。
+- `agent/action_gate.py` — 对话与 Plan 共用的单车动作槽；Plan 占用时普通车控返回 busy，`robot_status`/`robot_stop` 始终放行。Plan 专用入口 `tools.run_plan_tool()` 只允许 car MCP 白名单，不继承创建者角色，也不伪装 admin。
 - `agent/notify.py` — **通知中心（模块 11）的唯一写入口**：`ingest()`（归一化 → 去重合并 → 落库 → 审计 → 广播）/ `list_notices()` / `counts()` / `ack()` / `ack_all()` / `remove()` / `prune()`；护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。**合并键 = `(source,type,uid,正文)`，且合并时级别只升不降、广播与库里那一行对齐**（2026-09-18 修订：少了正文，同一分钟内的不同事会互相吞掉、critical 被静默降级）。LLM 侧上报出口 = MCP 子进程 `LLM/notice_mcp/`（工具 `notify_nurse`，投递到免鉴权投递口），规格 `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md`。
 - `core/bus.py` — SSE 事件总线，`publish()`（任意线程）→ asyncio 扇出订阅者。
 - `agent/tools.py` — 工具注册中心 + 分发：本地工具（`LLM/tool/` 下 `@tool` 装饰器注册，自动加载）+ MCP 工具（`conf.MCP_SERVERS` 配置），`run_tool()` 统一分发，per-tool 开关自动生效。
@@ -88,7 +92,8 @@ LLM/
 - 记忆：`/api/memories` 一族 —— `GET|POST`、`/{mid}/confirm|reject|delete`、`/recycle`(+restore/purge)、`/correct`、`/import`、`/portrait`(护士手动画像)、`/suggest`、`/health`；`/api/memories/core`(+confirm/unconfirm/pin/unpin/{mid}delete)、`/rag`(+delete)、`/graph`、`/expressions`(+approve/reject)
 - 语音（可选，依赖缺失时降级，见「系统稳健性」）：`GET /api/voice/status` ｜ `POST /api/voice/enroll` ｜ `GET /api/voice/speakers` ｜ `DELETE /api/voice/speakers/{uid}` ｜ `POST /api/voice/record`(+`/{id}/audio`) ｜ `GET /api/face/status`
 - 告警/系统：`POST /api/alarm`（kiosk SOS）｜ `POST /api/system/shutdown`
-- 通知中心（模块 11，护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`）：`POST /api/notifications`（**免鉴权**投递口，任何模块/小车都能上报）｜ `GET /api/notifications`（`?state=all|unread&limit&before_id`，返回 `{items, counts}`）｜ `POST /api/notifications/{nid}/ack` ｜ `POST /api/notifications/ack-all`（**读/确认这三条免鉴权**——规格 D11「护士台免登录」；D11 明确"只放护士台"）｜ `DELETE /api/notifications/{nid}`（**仅管理员**，删记录是数据损失，不放宽）；广播总线事件 `notification`（新通知/去重合并，**通知类型在 `kind` 键里**）与 `notification_ack`
+- 通知中心（模块 11，护士台数据面，规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`）：`POST /api/notifications`（**免鉴权**投递口，任何模块/小车都能上报）｜ `GET /api/notifications`（`?state=all|unread&limit&before_id`，返回 `{items, counts}`）｜ `POST /api/notifications/{nid}/ack` ｜ `POST /api/notifications/ack-all`（读/确认三条免鉴权）｜ `DELETE /api/notifications/{nid}`（**仅管理员**，删记录是数据损失，不放宽）；广播总线事件 `notification`（新通知/去重合并，**通知类型在 `kind` 键里**）与 `notification_ack`
+- Plan（2026-09-21 第一期，权威设计 `docs/参考资料/plan表设计-初版.md`）：`POST /api/nurse/page-unlock`（用当前管理员口令校验页面门，不建会话/不签 token）｜ `GET|POST /api/plans` ｜ `GET /api/plans/{id}` ｜ `POST /api/plans/{id}/priority|cancel|confirm|retry`。Plan API **全部免鉴权**，写操作使用 `version` 乐观锁，冲突返回 409 + 最新 Plan；事件为 `plan_created` / `plan_updated` / `plan_step_changed` / `plan_needs_review`。第一期 P0-P3 只排序，不做运行中自动抢占；测试必须用 fake MCP，禁止借验收真发车。
 - 工具/设置：`GET /api/tools` ｜ `GET /api/tools/log` ｜ `GET|POST /api/settings`
 - 广播：`GET /api/events`（SSE）
 - **地图编辑器**（第三个前端 `/mapeditor`，规格见 `docs/superpowers/specs/2026-09-14-map-editor-design.md`）—— ⚠️ **以下路由 2026-09-15 起已搬到 `LLM/maps/mapapi.py`，只在独立进程 `LLM.mapeditor_server`（`conf.MAP_EDITOR_PORT`=8010）上挂载，主后端（8000）不再暴露它们**（主后端只留 3 条仅管理员的 `GET|POST /api/mapeditor/service{,/start,/stop}` 做进程启停）：
@@ -132,10 +137,10 @@ LLM/
 ## 前端（frontend/）
 
 - pnpm workspace（Vue3 + Vite + TS），四个端包 + `shared` 共享层：
-  - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/工具日志/语音状态/设置；dev :5173。
+  - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/计划/工具日志/语音状态/设置；Plan 页支持结构化创建、查看步骤/attempt、调级、取消、确认和安全重试；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
-  - `packages/nurse` — **护士台**（PC 浏览器，模块 11 告警面板）：只做三件事 = 看通知 / 点「处理了」/ 一眼看清未处理条数（不做对话、设置、记忆、地图、身份权限）；**免登录、打开即用**（规格 D11：用户原话"护士台不再需要登录、也不会被弹"；管理台 `/admin` 的口令门不受影响）；dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。规格 `docs/superpowers/specs/2026-09-18-nurse-console-design.md`。
-  - `packages/shared` — 共享层：REST client（`src/api/`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 思考档位工具 `src/thinking.ts`（五档 `ThinkingMode` / `THINKING_MODE_ORDER` / `normalizeThinkingMode`（含 on/off 兼容）/ `thinkingModeLabel`），admin/kiosk 都从它引入。
+  - `packages/nurse` — **护士台**（PC 浏览器，通知 + Plan 工作台）：进入页面先用**当前管理员口令**解锁；只在当前 tab 的 `sessionStorage` 保存解锁标志，刷新保持、关 tab 失效、页面内无超时。解锁前不拉数据、不连 SSE；解锁后可处理通知，以及查看/创建/调级/取消/确认/安全重试 Plan。页面 PIN 不建立 admin 会话，通知读/确认与 Plan API 仍免鉴权；不提供自由车控、对话、设置、记忆、地图或身份管理。dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。
+  - `packages/shared` — 共享层：REST client（`src/api/`，Plan 契约在 `plans.ts`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 两端共用的 Plan 状态/操作/结构化步骤规则 `src/planUi.ts` + 思考档位工具 `src/thinking.ts`。
   - `packages/mapeditor` — **地图编辑器**（PC 浏览器，看图 / 标地点 / 划区域 / 管地图文件）：dev `:5175`、生产由编辑器自己的进程挂 `/mapeditor`（主后端 8000 不再挂载，见「快速上手 → 前端」）；`src/` 是 Vue3 应用（App.vue + pages/{MapCanvas,PlacePanel,ZonePanel,MapFiles}.vue + lib/{coords,colorize,api,types}.ts），**另含不经打包的原生静态页** `public/pixel-editor.html`（上游 `ROS-SLAM-Map-Editor/editor.html` 的 LF 副本，相对上游 git blob 只改 6 处）、接线层 `public/pixel-netio.js` 与自托管资源 `public/vendor/`（5 个原 CDN 资源 + 上游 MIT LICENSE）。
 - 工程细节：vite `base` 与后端挂载路径一致（admin→`/admin/`、kiosk→`/kiosk/`，见 vite.config 注释 C-1）；`shared` 包 alias 到 TS 源码（monorepo 已知坑）。
 - **功能齐平是渐进迁移**：个别旧功能尚未搬入 Vue admin——典型如**老人注册向导**（旧入口在 `UI(old)/index.html`「➕ 注册老人」4 步向导，规格 `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md`，后端 `/api/profiles` + `/api/voice/enroll` 一直可用）。要动此类功能先看旧实现 + 规格，别从零重造。
@@ -151,7 +156,8 @@ LLM/
 - `docs/superpowers/specs/2026-08-24-elder-registration-flow-design.md` — 老人注册向导设计（尚未迁入 Vue admin，见「前端（frontend/）」节）。
 - `docs/superpowers/specs/2026-09-14-map-editor-design.md` — **地图编辑器设计（A 篇：看图/标地点/划区域/管地图文件；B 篇：像素修图）**，**2026-09-14 已落地**（实现台账与偏差见文末「实现台账与偏差（2026-09-14 落地）」一节）。改地图相关代码前必读。
 - `docs/superpowers/specs/2026-09-17-thinking-mode-switch-design.md` — **思考档位手动切换（五档：自动/不思考/轻/中/重度）+ 思维链上屏**（2026-09-17 落地，含 D5「`reasoning_effort` 必须是顶层参数、塞 extra_body 会被静默忽略」这条实测坑）：`none` 关不掉敏感词安全网、档位落 `settings.thinking_mode`、思维链只上屏绝不进 TTS。改 `chat_stream`/`voice/worker.py` 前必读。
-- `docs/superpowers/specs/2026-09-18-nurse-console-design.md` — **护士台 + 后端通知中心设计**（模块 11 落地：`notifications` 表 + 5 条路由 + 总线 `notification`/`notification_ack` + 第四个前端包 `packages/nurse`）：含 D6「payload 里通知类型用 `kind`、绝不能用 `type`」与 D7 视觉尺度（不做大按钮/大字号）、D8（`server.host: true` + `--host 0.0.0.0` 保证局域网可达）；**D5/§4.2 于 2026-09-18 修订**（合并键加正文、级别只升不降、广播与库对齐）。改通知链路前必读。
+- `docs/superpowers/specs/2026-09-18-nurse-console-design.md` — **护士台 + 后端通知中心设计**：D1-D8 与通知契约继续有效；D9-D11 的 2026-09-18 文字保留为历史，已由 2026-09-21 Plan 设计覆盖为“页面 PIN + 通知/Plan 工作台”。
+- `docs/参考资料/plan表设计-初版.md` — **Plan 系统现行权威设计**（文件名虽含“初版”，正文状态为“设计定稿”）：Plan/Step/Attempt、执行白名单、调度/对账、API、事件、护士台页面门和分期边界；实施计划见 `docs/superpowers/plans/2026-09-21-plan-table.md`。
 - `docs/superpowers/specs/2026-09-18-llm-notify-nurse-mcp-design.md` — **小车 LLM 向护士后台传达信息的 MCP 工具**（`LLM/notice_mcp/` + 工具 `notify_nurse`）：投递到免鉴权投递口走 `notify.ingest()` 唯一写入口（去重/审计/SSE 实时广播全在）；含 D3「子进程回调后端」的自环裁定与 D5（ward 层也给，声纹识别失败时不能堵死求助）。改 MCP 工具接线/角色白名单前必读。
 - 历史档案：`docs/superpowers/specs/2026-08-18-ai-chat-frontend-design.md` 等 8 月旧规格描述的是单文件 `UI/index.html` 时代的实现，仅作过程参考（其 `/api/chat` 请求体已过时，实际为 `{uid, message, thinking}`）。
 
