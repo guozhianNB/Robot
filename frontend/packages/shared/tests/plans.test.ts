@@ -276,6 +276,27 @@ describe("Plan 页面共享业务规则", () => {
     expect(validatePlanStepDraft(draft({ action: "robot_goto_place", target: " " }))).toContain("不能为空");
     expect(validatePlanStepDraft(draft({ type: "wait", waitKind: "time", wakeAt: "bad" }))).toContain("唤醒时间");
   });
+
+  it.each([
+    ["移动距离", { action: "robot_move", distance: "" }],
+    ["移动距离空白", { action: "robot_move", distance: "   " }],
+    ["移动距离数字字符串", { action: "robot_move", distance: "1" }],
+    ["转向角度", { action: "robot_turn", angle: "" }],
+    ["X 坐标", { action: "robot_goto_point", x: "" }],
+    ["Y 坐标", { action: "robot_goto_point", y: "   " }],
+    ["朝向", { action: "robot_goto_point", yaw: "0" }],
+  ] as const)("%s 拒绝空值、空白或非 number 输入", (_label, patch) => {
+    expect(validatePlanStepDraft(draft(patch))).not.toBeNull();
+  });
+
+  it("所有数字字段拒绝非有限 number，构建阶段也 fail closed", () => {
+    expect(validatePlanStepDraft(draft({ action: "robot_move", distance: Infinity }))).not.toBeNull();
+    expect(validatePlanStepDraft(draft({ action: "robot_turn", angle: Number.NaN }))).not.toBeNull();
+    expect(validatePlanStepDraft(draft({ action: "robot_goto_point", x: -Infinity }))).not.toBeNull();
+    expect(validatePlanStepDraft(draft({ action: "robot_goto_point", y: Number.NaN }))).not.toBeNull();
+    expect(validatePlanStepDraft(draft({ action: "robot_goto_point", yaw: Infinity }))).not.toBeNull();
+    expect(() => buildPlanCreateStep(draft({ action: "robot_goto_point", x: "" }))).toThrow();
+  });
 });
 
 describe("管理台 Plan 页面源码契约", () => {
@@ -320,6 +341,18 @@ describe("管理台 Plan 页面源码契约", () => {
   it("创建步骤校验动作数值范围和定时等待", () => {
     expect(source).toContain("validatePlanStepDraft");
     expect(source).toContain("buildPlanCreateStep");
+  });
+
+  it("添加步骤先显式校验，失败时不追加步骤也不调用 API", () => {
+    const body = source.slice(source.indexOf("function addStep"), source.indexOf("function removeStep"));
+    expect(body.indexOf("validatePlanStepDraft")).toBeGreaterThan(-1);
+    expect(body.indexOf("return")).toBeGreaterThan(body.indexOf("validatePlanStepDraft"));
+    expect(body.indexOf("createSteps.value.push")).toBeGreaterThan(body.indexOf("return"));
+    expect(body).not.toContain("createPlan(");
+  });
+
+  it("窄屏当前计划长标题可收缩换行", () => {
+    expect(source).toMatch(/\.current-line strong\s*\{[^}]*min-width:\s*0[^}]*overflow-wrap:\s*anywhere/);
   });
 });
 
@@ -370,6 +403,20 @@ describe("护士台 PIN 门与 Plan 面板源码契约", () => {
       expect(admin).toContain(symbol);
       expect(nurse).toContain(symbol);
     }
+  });
+
+  it("添加步骤先显式校验，失败时不追加步骤也不调用 API", () => {
+    const source = sourceOf(panelPath);
+    const body = source.slice(source.indexOf("function addStep"), source.indexOf("async function submitCreate"));
+    expect(body.indexOf("validatePlanStepDraft")).toBeGreaterThan(-1);
+    expect(body.indexOf("return")).toBeGreaterThan(body.indexOf("validatePlanStepDraft"));
+    expect(body.indexOf("createSteps.value.push")).toBeGreaterThan(body.indexOf("return"));
+    expect(body).not.toContain("createPlan(");
+  });
+
+  it("窄屏当前计划长标题可收缩换行", () => {
+    const source = sourceOf(panelPath);
+    expect(source).toMatch(/\.current strong\s*\{[^}]*min-width:\s*0[^}]*overflow-wrap:\s*anywhere/);
   });
 
   it("App 在 PIN 门之后才挂载工作台、通知加载和唯一 SSE 连接", () => {

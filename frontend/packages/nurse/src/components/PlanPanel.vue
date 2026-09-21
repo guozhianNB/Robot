@@ -266,7 +266,7 @@ button, input, select { font: inherit; }.primary, .secondary, .icon, select, inp
 .icon { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; cursor: pointer; }.icon:disabled, button:disabled { opacity: .5; cursor: not-allowed; }.danger { color: #b91c1c; border-color: #fecaca; }
 .toolbar label { display: flex; align-items: center; gap: 5px; color: #64748b; font-size: 12px; }.toolbar select, .plan-row > select { height: 30px; padding: 0 7px; }
 .error { margin: 8px 0; padding: 7px 10px; border-left: 3px solid #dc2626; background: #fef2f2; color: #991b1b; font-size: 13px; }
-.current { flex-wrap: wrap; padding: 9px 11px; margin-bottom: 10px; background: #eaf2f8; border-left: 3px solid #2878a5; }.current strong { margin-right: auto; }.current small { width: 100%; color: #526475; }
+.current { flex-wrap: wrap; padding: 9px 11px; margin-bottom: 10px; background: #eaf2f8; border-left: 3px solid #2878a5; }.current strong { min-width: 0; margin-right: auto; overflow-wrap: anywhere; }.current small { width: 100%; color: #526475; }
 .state, .priority { padding: 2px 6px; border-radius: 3px; background: #e2e8f0; font-size: 11px; white-space: nowrap; }.priority { color: #854d0e; background: #fef9c3; }
 .plan-list { display: grid; gap: 5px; }.plan-row { flex-wrap: wrap; padding: 7px 8px; background: #fff; border: 1px solid #dde5ed; border-left: 3px solid #8fa4b8; }
 .plan-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }.plan-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.number { color: #64748b; font-size: 12px; }.plan-main small { margin-left: auto; color: #64748b; }

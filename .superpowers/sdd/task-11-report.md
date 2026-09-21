@@ -44,3 +44,10 @@ D:\_project\Robot\.venv\Scripts\python.exe -m pytest \
 - 两轮独立审查发现的后端路由缺失、轮询泄漏、Plan 请求乱序均已修复；复审后无已知 Critical/Important 遗留。
 - `jscpd@5` 扫描 shared/admin/nurse：73 files，重复率 1.24%。命中主要是两端不同主题下的 Plan 列表加载与结构化表单模板；易漂移的业务规则已抽到 `planUi.ts`。继续抽取 Vue 页面状态会让无 Vue 依赖的 shared 包承担 UI 运行时依赖，因此本任务不扩大重构。
 - literal/type 扫描确认 session key 只有 PIN 门一处；Plan 类型仍以 `api/plans.ts` 为事实来源，状态矩阵与表单校验以 `planUi.ts` 为事实来源。
+
+## Review 修复（增量）
+
+- `PlanStepDraft` 的 move/turn/x/y/yaw 输入改为覆盖浏览器真实形态的 `number | string`，统一 strict finite parser；空串、纯空白、数字字符串、NaN 和 Infinity 均拒绝，不再被 `Number("")` 静默转为 0。
+- `buildPlanCreateStep` 同样使用 strict parser，调用方即使绕过显式校验也会 fail closed；admin 与 nurse 的“添加步骤”均先显式校验，错误路径不 push、不调用 API。
+- admin/nurse 当前计划标题增加 `min-width: 0` 与 `overflow-wrap: anywhere`，窄屏长连续字符不会把状态控件推出视口。
+- shared 源码契约与边界测试增至 45 项；shared 全量 `77 passed`，nurse/admin 生产构建通过。
