@@ -248,6 +248,8 @@ def create_candidate(payload: dict, creator: dict, resolver=None) -> dict:
                   creator_uid=plan_row["creator_uid"], creator_role=plan_row["creator_role"])
     except Exception as exc:  # committed state must not be reported as a failed tool call
         print(f"[WARN] Plan {stored['display_no']} 已创建，但审计写入失败：{exc}")
+    # Broadcast only after the database commit; an SSE failure must never undo it.
+    _publish(stored, kind="plan_created")
     return {"ok": True, "plan": stored, "summary": summary}
 
 
@@ -295,6 +297,7 @@ def create_from_reminder(reminder: dict) -> dict:
         return {"ok": True, "created": False, "duplicate": True}
     audit.log("plan", action="create_from_reminder", reminder_id=rid,
               plan_id=made["id"], display_no=made["display_no"])
+    _publish(made, kind="plan_created")
     return {"ok": True, "created": True, "plan": made}
 
 
@@ -330,6 +333,11 @@ def _attempt_for(step: dict) -> dict:
 
 
 def _publish(plan: dict, *, step: dict | None = None, kind: str = "plan_updated") -> None:
+    if kind == "plan_updated":
+        if plan.get("status") == "needs_review":
+            kind = "plan_needs_review"
+        elif step is not None:
+            kind = "plan_step_changed"
     try:
         from ..core import bus
         bus.publish(kind, plan_id=plan.get("id"), version=plan.get("version"),

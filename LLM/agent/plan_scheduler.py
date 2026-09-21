@@ -199,9 +199,11 @@ def _set_plan_status(plan_id: int, status: str, expected_version: int | None = N
         return current is not None
     if current.get("status") in {"cancelling", "cancelled", "needs_review"}:
         return False
-    if db.transition_plan_execution(plan_id, expected_version=expected_version,
-                                    plan_changes={"status": status}) is None:
+    updated = db.transition_plan_execution(plan_id, expected_version=expected_version,
+                                    plan_changes={"status": status})
+    if updated is None:
         return False
+    plan_ops._publish(updated)
     return True
 
 
@@ -223,6 +225,7 @@ def _mark_review(step: dict, reason: str, attempt: dict | None = None) -> None:
     audit.log("plan", action="needs_review", plan_id=step["plan_id"],
               step_id=step["id"], reason=reason)
     if updated:
+        plan_ops._publish(updated, step=step)
         plan_ops._notify(updated, "plan_needs_review", level="critical")
 
 
@@ -253,6 +256,7 @@ def _finish(step: dict, attempt: dict, outcome: str, payload: dict) -> None:
     _attempt_started.pop(step["id"], None)
     _unavailable_since.pop(step["id"], None)
     if updated:
+        plan_ops._publish(updated, step=step)
         plan_ops._notify(updated, "plan_done" if plan_status == "succeeded" else "plan_failed",
                          level="info" if plan_status == "succeeded" else "warning")
 
@@ -387,7 +391,7 @@ def _dispatch(step: dict, now: float) -> None:
         if parsed.kind == "started":
             accepted = parsed.payload or {}
             started_at = db.now_iso()
-            db.transition_plan_execution(
+            updated = db.transition_plan_execution(
                 step["plan_id"], expected_version=dispatch_version, step_id=step["id"],
                 step_changes={"status": "running", "started_at": started_at,
                               "last_progress_at": started_at},
@@ -397,6 +401,8 @@ def _dispatch(step: dict, now: float) -> None:
                 },
                 plan_changes={"status": "running"},
             )
+            if updated:
+                plan_ops._publish(updated, step=step)
             return
         if parsed.kind == "action_error":
             finished_at = db.now_iso()
@@ -412,6 +418,7 @@ def _dispatch(step: dict, now: float) -> None:
                 plan_changes={"status": "failed"},
             )
             if updated:
+                plan_ops._publish(updated, step=step)
                 plan_ops._notify(updated, "plan_failed", level="warning")
             return
         _mark_review(step, parsed.message or f"动作受理结果不确定: {parsed.kind}", attempt)
@@ -440,11 +447,13 @@ def _dispatch(step: dict, now: float) -> None:
 def _handle_wait(step: dict, wall_now: float) -> None:
     if step.get("wait_kind") != "time":
         if step.get("status") != "waiting":
-            db.transition_plan_execution(
+            updated = db.transition_plan_execution(
                 step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
                 step_changes={"status": "waiting"},
                 plan_changes={"status": "waiting"},
             )
+            if updated:
+                plan_ops._publish(updated, step=step)
         return
     try:
         wake = datetime.fromisoformat(str(step.get("wake_at"))).timestamp()
@@ -453,11 +462,13 @@ def _handle_wait(step: dict, wall_now: float) -> None:
         return
     if wall_now < wake:
         if step.get("status") != "waiting":
-            db.transition_plan_execution(
+            updated = db.transition_plan_execution(
                 step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
                 step_changes={"status": "waiting"},
                 plan_changes={"status": "waiting"},
             )
+            if updated:
+                plan_ops._publish(updated, step=step)
         return
     plan = db.get_plan(step["plan_id"], include_steps=True)
     if plan is None:
@@ -471,6 +482,7 @@ def _handle_wait(step: dict, wall_now: float) -> None:
         plan_changes={"status": plan_status},
     )
     if updated and plan_status == "succeeded":
+        plan_ops._publish(updated, step=step)
         plan_ops._notify(updated, "plan_done", level="info")
 
 
