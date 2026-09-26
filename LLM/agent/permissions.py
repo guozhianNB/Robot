@@ -121,3 +121,112 @@ def decide(principal: dict | None, tool: str, *, server: str = "", local: bool =
     if not tool_roles_ok(role, tool, server=server, local=local):
         return {"allow": False, "reason": "tool_roles_mismatch", "source": "tool_roles"}
     return {"allow": True, "reason": "", "source": "factory"}
+
+
+# ---------------------------------------------------------------- 矩阵快照与写入口
+def _registry_rows() -> list[dict]:
+    """矩阵的行 = 注册表里**现在存在**的工具（本地 + 已在线的 MCP）。
+
+    MCP 工具只有在后端拉起子进程后才出现在 `mcp_client.tools()` 里 —— 后端没在线/子进程没起时
+    矩阵页会少这几行，这是如实反映"现在有什么"，不是 bug。
+    """
+    from . import mcp_client, tools
+    rows = []
+    for name, reg in tools._TOOL_REGISTRY.items():
+        rows.append({"name": name, "server": "local", "local": True,
+                     "switch_key": f"{name}_enabled",
+                     "switch_default": bool(reg.get("enabled", True))})
+    for name, entry in mcp_client.tools().items():
+        if name in tools._TOOL_REGISTRY:
+            continue                        # 与本地重名时本地优先（沿用旧口径）
+        rows.append({"name": name, "server": entry.get("server", ""), "local": False,
+                     "switch_key": "mcp_enabled", "switch_default": True})
+    return sorted(rows, key=lambda r: (r["server"], r["name"]))
+
+
+def matrix_snapshot(settings: dict | None = None) -> dict:
+    """矩阵页数据源：行=工具、列=三层，每格给「出厂 / 实际 / 是否人工改过 / 是否红锁」。
+
+    `allowed` 用 `ignore_switch=True` 算 —— 回答"**若整机开关打开**，这一层允许吗"，
+    整机开关状态另用 `switch_on` 单列提示，免得管理员把"开关关着"误判成"矩阵没生效"。
+    """
+    st = settings if settings is not None else db.get_settings()
+    grants = load_grants()
+    rows = _registry_rows()
+    known = {r["name"] for r in rows}
+    for (role, tool), allowed in sorted(grants.items()):     # 已下线工具的遗留行
+        if tool not in known:
+            rows.append({"name": tool, "server": "(已下线)", "local": True,
+                         "switch_key": "", "switch_default": True, "orphan": True})
+            known.add(tool)
+    tools_out = []
+    for r in rows:
+        orphan = bool(r.get("orphan"))
+        factory, allowed, overridden, locked = {}, {}, {}, {}
+        for role in ROLES:
+            if orphan:
+                factory[role] = allowed[role] = overridden[role] = False
+                locked[role] = False
+                continue
+            factory[role] = factory_allows(role, r["name"], server=r["server"],
+                                           local=r["local"])
+            overridden[role] = (role, r["name"]) in grants
+            locked[role] = is_locked(role, r["name"])
+            allowed[role] = decide({"role": role}, r["name"], server=r["server"],
+                                   local=r["local"], settings=st, grants=grants,
+                                   ignore_switch=True)["allow"]
+        switch_on = True if orphan else bool(
+            st.get(r["switch_key"], r["switch_default"]) if r["switch_key"] else True)
+        tools_out.append({"name": r["name"], "server": r["server"], "local": r["local"],
+                          "orphan": orphan, "switch_on": switch_on,
+                          "factory": factory, "allowed": allowed,
+                          "overridden": overridden, "locked": locked})
+    return {"roles": list(ROLES), "tools": tools_out,
+            "grants": [{"role": gr, "tool": gt, "allowed": bool(ga)}
+                       for (gr, gt), ga in sorted(grants.items())]}
+
+
+def set_grants(changes: list[dict], actor: dict | None = None) -> dict:
+    """逐格写入（**只有 admin 的路由才该调用**）。
+
+    规则：角色非法 / 工具名为空 → 拒绝；命中 LOCKED → 拒绝（R3）；
+    写回出厂值 → 删行（D2：只存差额），本来就是出厂值 → noop；否则 upsert。
+    **逐格独立提交、不回滚已成功的格**；返回 `ok` = 所有格都成功。
+    """
+    actor = actor or {}
+    by = str(actor.get("uid") or actor.get("slot") or "")
+    existing = load_grants()
+    results = []
+    for ch in changes:
+        role = str(ch.get("role") or "")
+        tool = str(ch.get("tool") or "")
+        want = bool(ch.get("allowed"))
+        if role not in ROLES:
+            results.append({"role": role, "tool": tool, "ok": False,
+                            "action": "rejected", "reason": "unknown_role"})
+            continue
+        if not tool:
+            results.append({"role": role, "tool": tool, "ok": False,
+                            "action": "rejected", "reason": "empty_tool"})
+            continue
+        if is_locked(role, tool):
+            audit.log("policy_deny", action="permissions_locked", role=role, tool=tool,
+                      decision="deny", reason="r3_locked", by=by)
+            results.append({"role": role, "tool": tool, "ok": False,
+                            "action": "rejected", "reason": "locked"})
+            continue
+        before = existing.get((role, tool))
+        base = factory_allows(role, tool)          # 与出厂一致 → 不留冗余行
+        if want == base:
+            removed = db.delete_role_grant(role, tool)
+            action = "cleared" if removed else "noop"
+        else:
+            db.set_role_grant(role, tool, want, by=by)
+            action = "set"
+        if action == "set" or (action == "cleared" and before is not None):
+            audit.log("policy_change", role=role, tool=tool, **{"from": before}, to=want,
+                      action=action, by=by, slot=actor.get("slot", ""), via="api")
+        existing[(role, tool)] = want
+        results.append({"role": role, "tool": tool, "ok": True, "action": action,
+                        "allowed": want})
+    return {"ok": all(r["ok"] for r in results), "results": results}

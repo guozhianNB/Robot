@@ -187,3 +187,89 @@ def test_run_tool_audits_matrix_source(d, monkeypatch):
     tools.run_tool("robot_move", {}, {"role": "admin", "slot": "admin"})
     assert seen[-1][1]["reason"] == "matrix_deny"
     assert seen[-1][1]["source"] == "matrix"
+
+
+# ---------------------------------------------------------------- 快照与写入口
+def test_snapshot_matches_factory_when_table_empty(d):
+    """对账：空表时 allowed 必须逐格等于 factory（防"改了默认忘了矩阵"）。"""
+    from LLM.agent import permissions
+    snap = permissions.matrix_snapshot(settings={"mcp_enabled": True})
+    assert snap["roles"] == ["ward", "elder", "admin"]
+    assert snap["grants"] == []
+    assert snap["tools"], "注册表里至少有 create_plan，工具行不该为空"
+    for t in snap["tools"]:
+        for role in snap["roles"]:
+            assert t["allowed"][role] == t["factory"][role]
+            assert t["overridden"][role] is False
+
+
+def test_snapshot_marks_locked_and_override(d, monkeypatch):
+    from LLM.agent import permissions, tools
+    monkeypatch.setattr(tools.mcp_client, "tools",
+                        lambda: {**_mcp("tavily-search", "tavily"), **_mcp("robot_stop", "car")})
+    d.set_role_grant("elder", "tavily-search", True, by="admin")
+    snap = permissions.matrix_snapshot(settings={"mcp_enabled": True})
+    by_name = {t["name"]: t for t in snap["tools"]}
+
+    assert by_name["robot_stop"]["locked"]["ward"] is True       # R3 红锁
+    assert by_name["robot_stop"]["locked"]["admin"] is False
+    tavily = by_name["tavily-search"]
+    assert tavily["factory"]["elder"] is False                   # 出厂只给 admin
+    assert tavily["overridden"]["elder"] is True
+    assert tavily["allowed"]["elder"] is True                    # 覆盖生效
+    assert [g for g in snap["grants"] if g["tool"] == "tavily-search"] == [
+        {"role": "elder", "tool": "tavily-search", "allowed": True}]
+
+
+def test_snapshot_marks_orphan_grant(d):
+    """库里留着已下线工具的行 → 标 orphan，让人知道它不生效。"""
+    from LLM.agent import permissions
+    d.set_role_grant("elder", "早就没了的工具", True, by="admin")
+    snap = permissions.matrix_snapshot(settings={})
+    orph = [t for t in snap["tools"] if t["orphan"]]
+    assert [t["name"] for t in orph] == ["早就没了的工具"]
+    assert orph[0]["allowed"] == {"ward": False, "elder": False, "admin": False}
+
+
+def test_set_grants_rejects_locked_and_unknown_role(d):
+    from LLM.agent import permissions
+    out = permissions.set_grants([
+        {"role": "ward", "tool": "robot_stop", "allowed": False},      # R3 锁
+        {"role": "nope", "tool": "robot_move", "allowed": True},       # 非法角色
+        {"role": "elder", "tool": "tavily-search", "allowed": True},   # 合法
+    ], actor={"uid": "admin", "slot": "admin"})
+    assert out["ok"] is False                              # 有格被拒 → 整体 ok False
+    by_key = {(r["role"], r["tool"]): r for r in out["results"]}
+    assert by_key[("ward", "robot_stop")]["action"] == "rejected"
+    assert by_key[("ward", "robot_stop")]["reason"] == "locked"
+    assert by_key[("nope", "robot_move")]["action"] == "rejected"
+    assert by_key[("elder", "tavily-search")]["action"] == "set"
+    assert d.get_role_grants() == {("elder", "tavily-search"): True}   # 合法那格照常落库
+
+
+def test_set_grants_clears_row_equal_to_factory(d):
+    """写回出厂值 = 删行（D2：只存差额，别留冗余）。"""
+    from LLM.agent import permissions
+    d.set_role_grant("admin", "robot_move", False, by="admin")
+    out = permissions.set_grants([{"role": "admin", "tool": "robot_move", "allowed": True}],
+                                 actor={"uid": "admin", "slot": "admin"})
+    assert out["results"][0]["action"] == "cleared"
+    assert d.get_role_grants() == {}
+    # 本来就是出厂值再写一次 = noop（不留行、不报错）
+    out = permissions.set_grants([{"role": "admin", "tool": "robot_move", "allowed": True}],
+                                 actor={"uid": "admin", "slot": "admin"})
+    assert out["results"][0]["action"] == "noop"
+    assert d.get_role_grants() == {}
+
+
+def test_set_grants_writes_audit(d, monkeypatch):
+    from LLM.agent import permissions
+    seen = []
+    monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    d.set_role_grant("admin", "robot_move", False, by="admin")
+    permissions.set_grants([{"role": "admin", "tool": "robot_move", "allowed": True}],
+                           actor={"uid": "admin", "slot": "admin"})
+    assert seen[-1][0] == "policy_change"
+    assert seen[-1][1]["role"] == "admin" and seen[-1][1]["tool"] == "robot_move"
+    assert seen[-1][1]["from"] is False and seen[-1][1]["to"] is True
+    assert seen[-1][1]["by"] == "admin" and seen[-1][1]["via"] == "api"
