@@ -236,6 +236,20 @@ def route_scan() -> list[dict]:
     return out
 
 
+def matrix_grants() -> dict:
+    """权限矩阵的**运行期覆盖行**（`role_tool_grants`）。
+
+    老库/后端还没重启时该表可能不存在（`init_db()` 会在后端启动时建）——此时如实报告"读不到"，
+    而不是假装"没有覆盖"（两者的运维含义完全不同）。
+    """
+    from LLM.store import db
+    try:
+        rows = db.list_role_grants()
+        return {"available": True, "rows": rows}
+    except Exception as e:                          # noqa: BLE001
+        return {"available": False, "error": str(e), "rows": []}
+
+
 def recent_audit(n: int) -> list[dict]:
     """审计里最近 N 条权限相关事件（audit.jsonl 可能混有测试写入，看 ts 分辨）。"""
     path = ROOT / "LLM" / "data" / "audit.jsonl"
@@ -338,8 +352,21 @@ def render(data: dict) -> None:
           "**派生的风险**：任何能访问 8000 端口的人都能创建/调级/取消 Plan，"
           "护士台 PIN 只护页面、不护 API。")
 
+    title("[7] 权限矩阵覆盖行（role_tool_grants：只存与出厂默认不同的格子）")
+    mg = data["matrix"]
+    if not mg["available"]:
+        print("  ⚠️ 读不到覆盖表（老库还没建表 / 后端未重启）：" + str(mg["error"]))
+        print("     后端启动时 `db.init_db()` 会建表；重启后本节即有内容。")
+    elif not mg["rows"]:
+        print("  （无覆盖行：三层权限全部等于出厂默认）")
+    else:
+        for r in mg["rows"]:
+            print(f"  {r['role']:<6} {r['tool']:<20} "
+                  f"{'允许' if r['allowed'] else '拒绝'}   by {r['updated_by'] or '-'} "
+                  f"@ {r['updated_at']}")
+
     if data["audit"]:
-        title("[7] 最近权限相关审计（含测试写入，看 ts 分辨）")
+        title("[8] 最近权限相关审计（含测试写入，看 ts 分辨）")
         for row in data["audit"]:
             extra = {k: v for k, v in row.items() if k not in ("ts", "event")}
             print(f"  {row.get('ts')}  {row.get('event'):<24} {json.dumps(extra, ensure_ascii=False)}")
@@ -370,6 +397,7 @@ def main() -> int:
         "effective": effective_by_role(matrix, reg, settings),
         "roles": role_map(),
         "admin_gate": admin_gate(),
+        "matrix": matrix_grants(),
         "routes": route_scan(),
         "audit": recent_audit(args.audit) if args.audit > 0 else [],
     }
