@@ -65,8 +65,16 @@ function cellValue(role: string, t: MatrixTool) {
   const k = cellKey(role, t.name);
   return draft.value[k] !== undefined ? draft.value[k] : t.allowed[role];
 }
-function toggle(role: string, t: MatrixTool, next: boolean) {
-  if (t.locked[role] || t.orphan) return;         // R3 红锁 / 已下线：不可勾
+function toggle(role: string, t: MatrixTool, ev: Event) {
+  const el = ev.target as HTMLInputElement;
+  if (t.locked[role] || t.orphan) { el.checked = cellValue(role, t); return; }  // R3 红锁 / 已下线
+  const next = el.checked;
+  // 高危二次确认：出厂对该层是关的，现在要放开（典型：把联网/抓取工具给老人层）
+  if (next && !t.factory[role] &&
+      !confirm(`「${t.name}」（${t.server}）出厂对 ${role} 层是关闭的。\n确认放开这一格？`)) {
+    el.checked = cellValue(role, t);        // 用户取消 → 把 DOM 勾选态还原（:checked 是单向绑定）
+    return;
+  }
   const k = cellKey(role, t.name);
   if (next === t.allowed[role]) delete draft.value[k];   // 改回原值 = 不再是 diff
   else draft.value[k] = next;
@@ -216,7 +224,7 @@ onMounted(load);
               <input type="checkbox" :checked="cellValue(r, t)" :disabled="t.locked[r] || t.orphan"
                      :title="t.locked[r] ? 'R3：急停/呼救不受权限限制，不可取消'
                              : (t.overridden[r] ? '已人工修改（勾=已落库的覆盖）' : '出厂默认')"
-                     @change="toggle(r, t, ($event.target as HTMLInputElement).checked)" />
+                     @change="toggle(r, t, $event)" />
               <span v-if="t.locked[r]" class="lock">🔒</span>
               <span v-else-if="isDirty(r, t.name)" class="dirty">●</span>
               <span v-else-if="t.overridden[r]" class="over">已改</span>
