@@ -131,6 +131,11 @@ Principal = {
 | 地点白名单管理 | ❌ | ❌ | ✅（暂缓，D16） |
 | 层级切换 / 登录登出 | ❌ | ❌ | ✅ |
 
+> **2026-09-26 补充（权限矩阵 P1）**：上表是**出厂默认**（代码里的 `policy.py` 白名单 ∩ 工具自身 roles）。
+> 运行期可由管理员在管理端「身份与权限」页逐格勾选覆盖（`brain.db.role_tool_grants`，即时生效），
+> 判定统一走 `agent/permissions.py::decide()`；急停/呼救（`robot_stop`/`notify_nurse`）是不可取消的红锁。
+> 见 `docs/superpowers/specs/2026-09-26-permission-matrix-design.md`。
+
 ## 4. 会话与认证
 
 ### 4.1 新模块 `LLM/session.py`

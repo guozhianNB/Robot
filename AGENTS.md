@@ -57,6 +57,7 @@ LLM/
 - `store/db.py` — SQLite 数据层（`LLM/data/brain.db`，WAL + 线程锁）。函数命名 `get_*`/`add_*`/`set_*`/`update_*`/`delete_*`/`upsert_*`，协程侧用 `asyncio.to_thread`。
 - `agent/session.py` — **分层用户体系的会话层**（双槽会话主体 + 角色推导 + 口令 + 病房自动切换）：`derive_role()`（uid→role 的唯一权威，按 `profiles.kind`，**不靠 uid 前缀**）、`get_principal(slot)`、`set_subject()`、`login_admin()/logout()`、`change_admin_password()/set_admin_auth()/ensure_admin_password()`、`current_ward()/manual_set_ward()/running_map_name()/autoswitch_state()`、`tick()`（每秒：admin TTL 降权 + 病房位置判定）。**角色只在这里推导，业务代码一律读 `get_principal()`（R1）**。
 - `agent/policy.py` — **三角色策略包**：`POLICY_DEFAULTS`（ward/elder/admin 三层的 `prompt_file`/`allowed_tools`/`data_scope`/`ward_context`）+ `role_policy()`（未知角色 fail-closed 落集体层，返回浅拷贝防全局白名单被污染）。**纯数据 + 纯函数、不做任何 IO**；P1 的 `check_action()` 动作分级不在此留空壳。
+- `agent/permissions.py` — **权限判定的唯一入口**（2026-09-26 权限矩阵 P1，规格 `docs/superpowers/specs/2026-09-26-permission-matrix-design.md`）：`decide()` 按 `switch → lock → matrix → factory → tool_roles` 判定并如实上报第一因（`source`/`reason`）；出厂默认 = `policy.py` 白名单 ∩ 工具自身 roles，运行期覆盖 = `brain.db.role_tool_grants`（管理端「身份与权限」页可勾选，**即时生效、无需重启**）；`LOCKED`（`robot_stop`/`notify_nurse`）是 R3 红线，写入口硬拒、UI 只读，**但不越过整机开关**（`mcp_enabled=false` 是运维拔能力，不是权限）。`tools.effective_tools()`/`run_tool()` 只调它，**不得再写第二份白名单/roles 判定**。
 - `core/zonegeo.py` — **点是否在区域内**（纯几何、纯 stdlib、约 30 行）：`point_in_polygon()`（射线法）+ `zone_hit()`（吃缓存行，`shape='rect'` 用外接矩形，点数 <3 一律 `False`，**坏入参绝不抛异常**）。口径与前端 `packages/mapeditor/src/lib/coords.ts` 一致。
 - `agent/prompt/` — **角色提示词片段**：`ward.md`/`elder.md`/`admin.md` 三层各一份，由 `chat._load_role_prompt()` 按 `role_policy(role)["prompt_file"]` 装载、叠加在 `base.md` 之上（`base.md` **是共用 base**，管"怎么说"；角色片段管"现在跟谁说话"）；缺文件 → 空串 + 审计 `prompt_role_missing`，不阻断对话。
 - `agent/memory.py` — RAG 记忆 + 半自动沉淀：`recall()`、`note_turn()`、`consolidate()`、`suggest_from_chat()`。**红线：`MEDICAL_KEYWORDS` 命中拒绝写入**。（MaiBot 对标增强：核心记忆定稿/保护、回收站、纠错、画像防退化等，见 `docs/log.md` 2026-09 条目）
@@ -121,6 +122,12 @@ LLM/
    `POST /api/session/user` 带 `uid="admin"` 或 `role` 一律 400。**病房区域几何的唯一真相是地图文件夹的
    `<图名>.tags.json`**（`brain.db.zones` 只是只读缓存），`profiles` 只记 `ward_map`+`ward_zone`。
    详细规格：`docs/superpowers/specs/2026-09-14-layered-user-roles-design.md`（§14 是复审结论）。
+8. **权限判定只有一个入口（2026-09-26）**：任何"某层能不能用某工具"的判断**只能**走
+   `agent/permissions.py::decide()`（顺序 `switch → lock → matrix → factory → tool_roles`）；
+   `tools.effective_tools()` 与 `tools.run_tool()` 都只是它的调用方，**不得再写第二份白名单/roles 判定**。
+   改某一层的权限优先走管理端「身份与权限」页（写 `role_tool_grants`，即时生效）；只有要改**出厂默认**才动
+   `agent/policy.py` 的白名单或 `conf.MCP_SERVERS[server]["roles"]`。`robot_stop`/`notify_nurse` 是 R3 红锁，
+   写入口硬拒、UI 只读。
 
 ## 系统稳健性（降级运行，重点）
 
@@ -137,7 +144,7 @@ LLM/
 ## 前端（frontend/）
 
 - pnpm workspace（Vue3 + Vite + TS），四个端包 + `shared` 共享层：
-  - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/计划/工具日志/语音状态/设置；Plan 页支持结构化创建、查看步骤/attempt、调级、取消、确认和安全重试；dev :5173。
+  - `packages/admin` — 管理端（PC 浏览器）：页签 = 监控总览/对话/记忆/提醒/计划/工具日志/语音状态/**身份与权限**/设置；「身份与权限」页含**可编辑权限矩阵**（勾选即改设备上某层的工具权限，见 `agent/permissions.py`）；Plan 页支持结构化创建、查看步骤/attempt、调级、取消、确认和安全重试；dev :5173。
   - `packages/kiosk` — 车载交互端（老人面前屏幕，无屏也能跑，语音主交互在后端闭环）：状态条/对话区/切换用户(锁定)/提醒/SOS/设置弹层；dev :5174。
   - `packages/nurse` — **护士台**（PC 浏览器，通知 + Plan 工作台）：进入页面先用**当前管理员口令**解锁；只在当前 tab 的 `sessionStorage` 保存解锁标志，刷新保持、关 tab 失效、页面内无超时。解锁前不拉数据、不连 SSE；解锁后可处理通知，以及查看/创建/调级/取消/确认/安全重试 Plan。页面 PIN 不建立 admin 会话，通知读/确认与 Plan API 仍免鉴权；不提供自由车控、对话、设置、记忆、地图或身份管理。dev `:5176`（`server.host: true`）、生产由主后端挂 `/nurse`。
   - `packages/shared` — 共享层：REST client（`src/api/`，Plan 契约在 `plans.ts`）+ SSE 事件唯一定义 `src/events.ts`（类型枚举 + `parseBusPayload`）+ 两端共用的 Plan 状态/操作/结构化步骤规则 `src/planUi.ts` + 思考档位工具 `src/thinking.ts`。
