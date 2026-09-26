@@ -9,6 +9,21 @@ from LLM import server
 from LLM.voice import voice_api
 
 
+@pytest.fixture(autouse=True)
+def _isolate_session():
+    """会话状态是模块级全局：别的用例文件会遗留 kiosk 主体，把本文件的断言带偏。
+
+    2026-09-26（权限矩阵 P1 验证时发现）：`test_ward_autoswitch.py` / `test_worker_roles.py`
+    先跑时，`test_chat_submits_completed_turn_when_body_closes_after_done` 的
+    `args[1] == "elder_done"` 会变成上一位遗留主体 —— 基线 f0dcb17 同样复现（与本轮改动无关），
+    故这里补一个自动隔离夹具，而不是改断言。
+    """
+    from LLM.agent import session
+    session.reset_for_test()
+    yield
+    session.reset_for_test()
+
+
 def _patch_request_side_effects(monkeypatch):
     monkeypatch.setattr(server.db, "get_settings", lambda: {})
     monkeypatch.setattr(server._bg, "submit", lambda *args, **kwargs: None)

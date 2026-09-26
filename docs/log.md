@@ -2134,3 +2134,37 @@ P0-P3 排序、线性 action/wait/manual 步骤和人工操作，**不实现运�
 
 所有车控验收使用 fake MCP，不连接真实 rosbridge、不下发真车；真实底盘串行执行、途中急停、AMCL
 定位精度和现场网络访问仍属未验项。浏览器临时服务和 Edge 会话仅用于本次验收，未写入运行库。
+
+## 2026-09-26 · 权限矩阵 P1：把"谁能用什么工具"从代码常量变成可编辑矩阵
+
+动机：三层权限原本是三处**代码常量**的交集（`agent/policy.py` 的角色白名单、`conf.MCP_SERVERS[*].roles`、
+`settings` 的整机开关），运行期只读 —— 想给老人层开个联网搜索，得同时改两个文件再重启，还没有"谁改的"记录。
+用户要求做成"分配器 + 人工勾选"。设计：`docs/superpowers/specs/2026-09-26-permission-matrix-design.md`，
+计划：`docs/superpowers/plans/2026-09-26-permission-matrix.md`（8 任务 TDD，分支 `feature/permission-matrix`）。
+
+- **单一判定入口 `agent/permissions.py::decide()`**：顺序 `switch → lock → matrix → factory → tool_roles`，
+  返回 `{allow, reason, source}` 并如实上报第一因。`tools.effective_tools()` / `run_tool()` 里的两份重复判定
+  改为调它（删掉 `_mcp_tools_for`），`policy_deny` 审计**保留原有 reason 字符串**、新增 `source`。
+- **覆盖层表 `role_tool_grants`**（`store/db.py`，只存与出厂默认不同的格子，删行 = 回默认）：因此矩阵天然三态
+  （出厂允许/出厂拒绝/人工改过），且不会把"忘了写"变成"拒绝"。写回出厂值即删行（`action=cleared`）。
+- **三条 API**：`GET /api/permissions/matrix`（admin 三列全量，其他角色只回自己那列）、
+  `POST /api/permissions/matrix`（**仅 admin**；逐格独立提交、部分成功即部分生效；红锁格 403 带逐格结果）、
+  `POST /api/permissions/reset`。每一格改动落 `policy_change` 审计（from/to/by/slot/via）。
+- **管理端「身份与权限」页改成可编辑矩阵**（改造既有 `RolesPage.vue`，不新增页）：行=工具（按 server 分组）、
+  列=三层勾选；● = 未保存、已改 = 已落库、灰 = 出厂；开关关着的行淡色、已下线工具灰显；
+  勾开启"出厂对本层拒绝"的格子有二次确认。**勾选即生效、无需重启**（判定每次读一次库，无缓存）。
+- **R3 红锁**：`robot_stop` / `notify_nurse` 在 ward/elder 两列硬编码为不可取消（写入口 `rejected`、UI 只读）。
+  实测踩到的边界：红锁**不能越过整机开关** —— 否则急停会穿过 `mcp_enabled=false`（那时车控/通知子进程根本
+  没起，语义上也说不通），故顺序定为 `switch` 先于 `lock`；连带把 `test_policy_tools.py` 里拿 `robot_stop`
+  当"可被服务器 roles 拒掉"的探针改成 `see_what`，`test_notice_mcp.py` 里那条改为断言"红锁不可被 roles 收窄"。
+- **顺手修掉一处既有的测试顺序依赖**：`test_chat_text_tts.py` 会因 `test_ward_autoswitch.py` /
+  `test_worker_roles.py` 遗留 kiosk 会话主体而失败；已在基线 worktree（`f0dcb17`）复现确认与本次改动无关，
+  补 `session.reset_for_test()` 的 autouse 夹具隔离。
+- 新增 `scripts/show_permissions.py`（只读体检）：三层策略矩阵、每层"现在真正能用"的工具（白名单 ∩ 工具 roles
+  ∩ 开关，含"为什么被挡"）、uid→角色、口令门、活体会话、免鉴权路由面、最近权限审计。用法
+  `.venv\Scripts\python.exe scripts/show_permissions.py --url http://127.0.0.1:8000`。
+- 测试：`test_permissions.py` 19 条 + `test_permissions_api.py` 6 条；连同权限相关回归共 229 passed
+  （`test_permissions/_policy_roles/_policy_tools/_server_roles_routes/_settings_roles/_worker_roles/
+  _session_roles/_ward_autoswitch/_notice_mcp/_prompt_layers/_react_agent/_chat_text_tts`）。
+- 未验项：真实车控链路下的可见性（用 fake MCP 验的）；`fetch`/`tavily` 放开给老人层后的实际检索效果与滥用面；
+  矩阵页的多标签并发编辑（逐格幂等，无乐观锁，最后一次勾选生效）。

@@ -168,26 +168,31 @@ def test_run_tool_denies_whitelisted_tool_excluded_by_server_roles(monkeypatch):
 
     与 `test_run_tool_denies_mcp_outside_server_roles` 的差别：那条用的 `mcp_probe` 不在任何
     角色白名单里，拒因落在**白名单**（`allow_ok=False`）而非服务器 roles，判别力弱。
-    这里用 **elder 白名单内**的 `robot_stop`，只有"服务器 roles 也参与判定"才会被拒。
+    这里用 **elder 白名单内**的 `see_what`，只有"服务器 roles 也参与判定"才会被拒。
+
+    为什么探针从 `robot_stop` 换成 `see_what`（2026-09-26，权限矩阵 P1）：`robot_stop` 与
+    `notify_nurse` 现在是 R3 红锁（`permissions.LOCKED`），**任何闸门都拦不住**——急停对老人层
+    必须永远可用（规格 2026-09-26-permission-matrix-design.md D8/§7）。拿它当"可被服务器 roles
+    挡掉"的样本会与 R3 直接冲突，故改用同样在 elder 白名单内的 `see_what`。
     """
     from LLM.agent import policy
     called = []
     seen = []
     monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
-        "robot_stop": {"server": "srv", "schema": {"type": "function",
-                       "function": {"name": "robot_stop", "description": "", "parameters": {}}}}})
+        "see_what": {"server": "srv", "schema": {"type": "function",
+                     "function": {"name": "see_what", "description": "", "parameters": {}}}}})
     monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
     monkeypatch.setattr(tools.mcp_client, "call_tool",
                         lambda name, args: called.append(name) or {"ok": True})
     monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
     monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
-    assert "robot_stop" in policy.role_policy("elder")["allowed_tools"]   # 前提：白名单内
-    assert "robot_stop" not in _names({"mcp_enabled": True}, _p("elder"))  # 看不见
-    res = tools.run_tool("robot_stop", {}, _p("elder"))                   # 也调不到
+    assert "see_what" in policy.role_policy("elder")["allowed_tools"]   # 前提：白名单内
+    assert "see_what" not in _names({"mcp_enabled": True}, _p("elder"))  # 看不见
+    res = tools.run_tool("see_what", {}, _p("elder"))                   # 也调不到
     assert res["ok"] is False and called == []
     assert seen[-1][1]["reason"] == "tool_roles_mismatch"                 # 拒因 = 服务器 roles
-    assert tools.run_tool("robot_stop", {}, _p("admin"))["ok"] is True
-    assert called == ["robot_stop"]
+    assert tools.run_tool("see_what", {}, _p("admin"))["ok"] is True
+    assert called == ["see_what"]
 
 
 def test_unknown_tool_is_not_counted_as_denied(monkeypatch):

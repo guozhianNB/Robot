@@ -144,41 +144,27 @@ def _mcp_roles(server: str) -> set[str]:
     return {"admin"} if declared is None else set(declared)
 
 
-def _mcp_tools_for(settings: dict, resolved_role: str, allow) -> list[dict]:
-    """MCP 工具按「角色白名单 ∩ 服务器 roles」过滤 —— 与本地工具同一把尺子。
-
-    `allow` 是 `role_policy(role)["allowed_tools"]`（None=不裁剪）。**白名单是天花板**：
-    服务器声明 `roles=["elder"]` 也不能让一个不在 elder 白名单里的 MCP 工具对 elder 可见。
-    """
-    out = []
-    for name, entry in mcp_client.tools().items():
-        if name in _TOOL_REGISTRY:
-            continue                        # 与本地重名时本地优先（沿用旧口径）
-        if allow is not None and name not in allow:
-            continue
-        if resolved_role not in _mcp_roles(entry.get("server", "")):
-            continue
-        out.append(entry["schema"])
-    return out
-
-
 def effective_tools(settings: dict, principal: dict | None = None) -> list[dict]:
-    """闸门 2：per-tool 开关 ∩ 角色白名单 ∩ 工具自身 roles。`principal` 缺省 → 集体层（R2）。"""
-    from .policy import POLICY_DEFAULTS, role_policy
-    role = (principal or {}).get("role")
-    resolved = role if role in POLICY_DEFAULTS else "ward"     # 解析一次，白名单与 roles 用同一个
-    allow = role_policy(role)["allowed_tools"]                 # None = 不裁剪；[] = 一个都不给
+    """闸门 2：整机开关 ∩ 角色白名单 ∩ 工具自身 roles —— **统一经 `permissions.decide()`**。
+
+    出厂默认来自 `policy.py` 白名单与工具自身 roles，运行期覆盖来自 `role_tool_grants`
+    （规格 docs/superpowers/specs/2026-09-26-permission-matrix-design.md §4）。
+    `grants` 在入口**只查一次**（§4.2 热路径约束），逐个工具判定时透传。
+    """
+    from . import permissions
+    grants = permissions.load_grants()
     out = []
     for name, reg in _TOOL_REGISTRY.items():
-        if not settings.get(f"{name}_enabled", reg["enabled"]):
-            continue
-        if allow is not None and name not in allow:
-            continue
-        if reg.get("roles") is not None and resolved not in reg["roles"]:
-            continue
-        out.append(reg["schema"])
+        if permissions.decide(principal, name, local=True, settings=settings,
+                              grants=grants)["allow"]:
+            out.append(reg["schema"])
     if settings.get("mcp_enabled"):
-        out += _mcp_tools_for(settings, resolved, allow)
+        for name, entry in mcp_client.tools().items():
+            if name in _TOOL_REGISTRY:
+                continue                    # 与本地重名时本地优先（沿用旧口径）
+            if permissions.decide(principal, name, server=entry.get("server", ""), local=False,
+                                  settings=settings, grants=grants)["allow"]:
+                out.append(entry["schema"])
     return out
 
 
@@ -229,13 +215,13 @@ def run_plan_tool(name: str, args: dict | None = None) -> dict:
 
 
 def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
-    """统一分发。**执行前再校验一次角色白名单**（闸门 2 第二道）。"""
-    from .policy import POLICY_DEFAULTS, role_policy
+    """统一分发。**执行前再校验一次**（闸门 2 第二道，与 `effective_tools` 同一个入口）。"""
+    from . import permissions
     from ..core import log as audit
+    from .policy import POLICY_DEFAULTS
     p = principal or {}
     role = p.get("role")
     resolved = role if role in POLICY_DEFAULTS else "ward"
-    allow = role_policy(role)["allowed_tools"]
     reg = _TOOL_REGISTRY.get(name)
     is_local = reg is not None
     # MCP 侧取**一次快照**：`mcp_client.tools()` 会拷贝注册表，两次查表之间工具若消失
@@ -245,28 +231,22 @@ def run_tool(name: str, args: dict, principal: dict | None = None) -> dict:
     if not is_local and entry is None:
         # 未知工具（模型幻觉/拼错）：走未知分支，**不落越权审计**（别污染越权统计）
         return {"ok": False, "message": f"未知工具 {name}"}
-    if not is_local:
-        # 总开关：`effective_tools()` 看不见的 MCP 工具，这里同样不许被直调
-        # （模型可能凭上一轮/缓存里的 schema 点名调用）。
-        from ..store import db
-        if not db.get_settings().get("mcp_enabled"):
-            audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
-                      uid=p.get("uid"), slot=p.get("slot"),
-                      decision="deny", args=_audit_args(name, args), reason="mcp_disabled")
-            return {"ok": False, "error": f"MCP 工具总开关已关闭，不允许调用工具 {name}"}
-    allow_ok = allow is None or name in allow
-    if is_local:
-        roles_ok = reg.get("roles") is None or resolved in reg["roles"]
-    else:
-        roles_ok = resolved in _mcp_roles(entry.get("server", ""))
-    if not (allow_ok and roles_ok):
+
+    verdict = permissions.decide(p, name, server=(entry or {}).get("server", ""),
+                                 local=is_local, grants=permissions.load_grants())
+    if not verdict["allow"]:
         # 同时记 `role`（原始，可能缺省/未知/带大小写）与 `resolved_role`（归一后真正参与判定的
         # 那个角色）：只记原始值时，`role=None`/`"??"` 的拒绝记录与 `"ward"` 混在一起，按 role
         # 聚合的越权统计会把 fail-closed 的兜底算成"集体层越权"。
+        # `source` 是新增的第一因（lock/switch/matrix/factory/tool_roles），便于排查是哪道闸门拦的。
         audit.log("policy_deny", tool=name, role=role, resolved_role=resolved,
                   uid=p.get("uid"), slot=p.get("slot"),
                   decision="deny", args=_audit_args(name, args),
-                  reason="out_of_role_whitelist" if not allow_ok else "tool_roles_mismatch")
+                  reason=verdict["reason"], source=verdict["source"])
+        if verdict["reason"] == "mcp_disabled":
+            return {"ok": False, "error": f"MCP 工具总开关已关闭，不允许调用工具 {name}"}
+        if verdict["source"] == "switch":
+            return {"ok": False, "error": f"工具已关闭，不允许调用工具 {name}"}
         return {"ok": False, "error": f"当前身份不允许调用工具 {name}"}
     if not is_local:
         gate_token = None

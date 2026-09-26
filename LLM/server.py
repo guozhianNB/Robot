@@ -1231,6 +1231,82 @@ async def policy_roles(x_surface: str = Header(default="kiosk")):
     return {k: _public_policy(v) for k, v in POLICY_DEFAULTS.items()}
 
 
+# ---------------------------------------------------------------- 权限矩阵（规格 2026-09-26）
+# 判定与快照的真相在 `agent/permissions.py`；这里只做 HTTP 形状、鉴权与审计。
+# 写入口**只认 admin**（R1：角色由 X-Surface → get_principal 推导，请求体里的 role 只是"改哪一列"）。
+class PermissionChangeIn(BaseModel):
+    role: str
+    tool: str
+    allowed: bool
+
+
+class PermissionChangesIn(BaseModel):
+    changes: list[PermissionChangeIn] = []
+
+
+class PermissionResetIn(BaseModel):
+    role: str = ""
+    tool: str = ""
+
+
+@app.get("/api/permissions/matrix")
+async def permissions_matrix(x_surface: str = Header(default="kiosk")):
+    """矩阵：admin 得三列全量；其他角色只拿自己那一列（写一律 403，见 POST）。"""
+    from .agent import permissions
+    role = session.get_principal(_surface(x_surface))["role"]
+    snap = await asyncio.to_thread(permissions.matrix_snapshot)
+    if role == "admin":
+        return {"ok": True, "scope": "all", **snap}
+    keep = [role] if role in snap["roles"] else ["ward"]
+    return {"ok": True, "scope": "self", "roles": keep,
+            "tools": [{**t,
+                       "factory": {r: t["factory"][r] for r in keep},
+                       "allowed": {r: t["allowed"][r] for r in keep},
+                       "overridden": {r: t["overridden"][r] for r in keep},
+                       "locked": {r: t["locked"][r] for r in keep}}
+                      for t in snap["tools"]]}
+
+
+@app.post("/api/permissions/matrix")
+async def permissions_set(body: PermissionChangesIn, x_surface: str = Header(default="kiosk")):
+    """改矩阵（**仅管理员**）。逐格独立提交，部分成功即部分生效；R3 红锁格一律拒绝（403 带逐格结果）。"""
+    from .agent import permissions
+    slot = _surface(x_surface)
+    principal = session.get_principal(slot)
+    if principal["role"] != "admin":
+        audit.log("policy_deny", action="permissions_matrix", slot=slot,
+                  decision="deny", reason="admin_only")
+        raise HTTPException(status_code=403, detail="仅管理员可修改权限矩阵")
+    if not body.changes:
+        raise HTTPException(status_code=400, detail="changes 不能为空")
+    if len(body.changes) > 200:
+        raise HTTPException(status_code=400, detail="一次最多改 200 格")
+    payload = [c.model_dump() for c in body.changes]
+    for ch in payload:
+        if ch["role"] not in permissions.ROLES:
+            raise HTTPException(status_code=422, detail=f"未知角色：{ch['role']!r}")
+    result = await asyncio.to_thread(permissions.set_grants, payload, principal)
+    if not result["ok"]:
+        # 用 403 表达"有格被规则（R3 红锁 / 非法角色）拒绝"，body 带逐格结果供前端标红
+        return JSONResponse(status_code=403, content=result)
+    return result
+
+
+@app.post("/api/permissions/reset")
+async def permissions_reset(body: PermissionResetIn, x_surface: str = Header(default="kiosk")):
+    """恢复出厂（**仅管理员**）：删覆盖行即回到 policy.py 白名单 + conf 的 MCP roles。"""
+    slot = _surface(x_surface)
+    principal = session.get_principal(slot)
+    if principal["role"] != "admin":
+        audit.log("policy_deny", action="permissions_reset", slot=slot,
+                  decision="deny", reason="admin_only")
+        raise HTTPException(status_code=403, detail="仅管理员可恢复出厂权限")
+    removed = await asyncio.to_thread(db.clear_role_grants, body.role or "")
+    audit.log("policy_change", action="reset", role=body.role or "*", tool=body.tool or "*",
+              count=removed, by=principal["uid"], slot=slot, via="api")
+    return {"ok": True, "removed": removed}
+
+
 # ---------------------------------------------------------------- Plan API / 护士台页面门
 _nurse_pin_fail: dict[str, float | int] = {"n": 0, "until": 0.0}
 _nurse_pin_lock = threading.Lock()

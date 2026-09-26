@@ -1,12 +1,13 @@
 <script setup lang="ts">
-// 身份与权限（admin 页签）：策略矩阵只读 + 口令设置 + 会话/病房上下文可调项。
-// 规格：docs/superpowers/specs/2026-09-14-layered-user-roles-design.md（D12 口令可改、D13 口令门可关）
+// 身份与权限（admin 页签）：**可编辑权限矩阵** + 口令设置 + 会话/病房上下文可调项。
+// 规格：docs/superpowers/specs/2026-09-26-permission-matrix-design.md（矩阵：D11 矩阵全可编辑，仅 R3 红锁不可勾）
+//      docs/superpowers/specs/2026-09-14-layered-user-roles-design.md（D12 口令可改、D13 口令门可关）
 //
-// 为什么口令/策略走裸 fetch 而不是 shared：shared 的 apiGet/apiPost 在非 2xx 时直接抛
-// `API <status>: <url>`，会**丢掉响应体里的 error/detail**（该文件不在本次改动范围）。
-// 这两个接口的失败语义（403 非管理员 / 400 口令太短 / 口令门冷却）恰恰都靠响应体表达，
+// 为什么口令/矩阵走裸 fetch 而不是 shared：shared 的 apiGet/apiPost 在非 2xx 时直接抛
+// `API <status>: <url>`，会**丢掉响应体里的 error/detail/results**。本页的失败语义
+// （403 非管理员 / 403 红锁逐格结果 / 400 口令太短 / 口令门冷却）恰恰都靠响应体表达，
 // 所以这里自带一层 `req()` 把 X-Surface 头和响应体错误一起处理。
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { changePassword, getAdminAuth, restoreFactoryPassword, setAdminAuth } from "shared";
 
 interface RolePolicy {
@@ -14,6 +15,21 @@ interface RolePolicy {
   allowed_tools?: string[] | null;
   data_scope?: string;
   ward_context?: boolean;
+}
+
+/** 矩阵一行（后端 GET /api/permissions/matrix → tools[]）。 */
+interface MatrixTool {
+  name: string;
+  server: string;
+  local: boolean;
+  /** 注册表里已不存在（工具下线/改名），但库里还留着覆盖行 */
+  orphan: boolean;
+  /** 整机开关（本地 <名>_enabled / MCP mcp_enabled）当前是否打开 */
+  switch_on: boolean;
+  factory: Record<string, boolean>;
+  allowed: Record<string, boolean>;
+  overridden: Record<string, boolean>;
+  locked: Record<string, boolean>;
 }
 
 const roles = ref<Record<string, RolePolicy>>({});
@@ -26,7 +42,46 @@ const ttl = ref(300);
 const wardWindow = ref(10);
 const loaded = ref(false);
 
-/** 带 X-Surface: admin 的请求；失败时把后端 `error`/`detail` 原样带回，绝不吞成状态码。 */
+// ---- 权限矩阵状态 ----
+const matrix = ref<MatrixTool[]>([]);
+const matrixRoles = ref<string[]>([]);
+const draft = ref<Record<string, boolean>>({});   // key = `${role}|${tool}`，只放"改动过的格"
+const saving = ref(false);
+
+const grouped = computed(() => {
+  const out: { server: string; tools: MatrixTool[] }[] = [];
+  for (const t of matrix.value) {
+    const last = out[out.length - 1];
+    if (last && last.server === t.server) last.tools.push(t);
+    else out.push({ server: t.server, tools: [t] });
+  }
+  return out;
+});
+const dirtyCount = computed(() => Object.keys(draft.value).length);
+
+function cellKey(role: string, tool: string) { return `${role}|${tool}`; }
+function isDirty(role: string, tool: string) { return draft.value[cellKey(role, tool)] !== undefined; }
+function cellValue(role: string, t: MatrixTool) {
+  const k = cellKey(role, t.name);
+  return draft.value[k] !== undefined ? draft.value[k] : t.allowed[role];
+}
+function toggle(role: string, t: MatrixTool, ev: Event) {
+  const el = ev.target as HTMLInputElement;
+  if (t.locked[role] || t.orphan) { el.checked = cellValue(role, t); return; }  // R3 红锁 / 已下线
+  const next = el.checked;
+  // 高危二次确认：出厂对该层是关的，现在要放开（典型：把联网/抓取工具给老人层）
+  if (next && !t.factory[role] &&
+      !confirm(`「${t.name}」（${t.server}）出厂对 ${role} 层是关闭的。\n确认放开这一格？`)) {
+    el.checked = cellValue(role, t);        // 用户取消 → 把 DOM 勾选态还原（:checked 是单向绑定）
+    return;
+  }
+  const k = cellKey(role, t.name);
+  if (next === t.allowed[role]) delete draft.value[k];   // 改回原值 = 不再是 diff
+  else draft.value[k] = next;
+  draft.value = { ...draft.value };
+}
+
+/** 带 X-Surface: admin 的请求；失败时把后端 `error`/`detail` 与**响应体**一起带回。 */
 async function req<T = any>(path: string, body?: unknown): Promise<{ ok: boolean; data?: T;
                                                                    error?: string }> {
   try {
@@ -36,7 +91,7 @@ async function req<T = any>(path: string, body?: unknown): Promise<{ ok: boolean
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const b = await res.json().catch(() => null);
-    if (!res.ok) return { ok: false, error: b?.error ?? b?.detail ?? `HTTP ${res.status}` };
+    if (!res.ok) return { ok: false, error: b?.error ?? b?.detail ?? `HTTP ${res.status}`, data: b };
     return { ok: true, data: b as T };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -44,6 +99,15 @@ async function req<T = any>(path: string, body?: unknown): Promise<{ ok: boolean
 }
 
 function say(text: string, ok = true) { msg.value = text; msgOk.value = ok; }
+
+async function loadMatrix() {
+  const r = await req<{ ok: boolean; scope: string; roles: string[]; tools: MatrixTool[] }>(
+    "/api/permissions/matrix");
+  if (!r.ok || !r.data) { say(`❌ 读权限矩阵失败：${r.error}`, false); return; }
+  matrix.value = r.data.tools;
+  matrixRoles.value = r.data.roles;
+  draft.value = {};
+}
 
 async function load() {
   const [p, a, s] = await Promise.all([
@@ -57,7 +121,36 @@ async function load() {
   const st = s.data?.settings ?? {};
   if (typeof st.admin_session_ttl_s === "number") ttl.value = st.admin_session_ttl_s;
   if (typeof st.ward_context_window === "number") wardWindow.value = st.ward_context_window;
+  await loadMatrix();
   loaded.value = true;
+}
+
+async function saveMatrix() {
+  const changes = Object.entries(draft.value).map(([k, allowed]) => {
+    const idx = k.indexOf("|");
+    return { role: k.slice(0, idx), tool: k.slice(idx + 1), allowed };
+  });
+  if (!changes.length) { say("没有改动"); return; }
+  saving.value = true;
+  try {
+    const r = await req<{ ok: boolean; results: any[] }>("/api/permissions/matrix", { changes });
+    if (r.ok) {
+      say(`✅ 已保存 ${changes.length} 处改动（即时生效，无需重启）`);
+    } else {
+      const bad = (r.data?.results ?? []).filter((x: any) => !x.ok)
+        .map((x: any) => `${x.role}/${x.tool}（${x.reason === "locked" ? "R3 红锁，不可取消" : x.reason}）`)
+        .join("、");
+      say(`❌ 有格子被拒：${bad || r.error}`, false);
+    }
+    await loadMatrix();
+  } finally { saving.value = false; }
+}
+
+async function resetMatrix() {
+  if (!confirm("把全部人工改动恢复为出厂默认？（policy.py 的工具白名单 + conf 的 MCP roles）")) return;
+  const r = await req("/api/permissions/reset", {});
+  if (r.ok) { say("✅ 已恢复出厂默认"); await loadMatrix(); }
+  else say(`❌ ${r.error}`, false);
 }
 
 async function savePw() {
@@ -104,26 +197,62 @@ onMounted(load);
   <section class="page">
     <h3>身份与权限</h3>
     <p class="hint">
-      三层能力由后端策略包（<code>LLM/agent/policy.py</code>）决定，角色由后端按主体推导 —— 管理台只能看，不能改。
-      改后端的提示词片段/工具白名单要动代码，不是本页。
+      角色由后端按主体推导（前端传的 role 一律不可信，R1）。下表是**可编辑的权限矩阵**：
+      出厂默认来自 <code>LLM/agent/policy.py</code> 的工具白名单与 <code>LLM/conf.py</code> 里
+      MCP 服务器的 <code>roles</code>，勾选写入运行期覆盖层（<code>brain.db.role_tool_grants</code>），
+      <b>即时生效、无需重启</b>。
     </p>
 
+    <h4>权限矩阵（可编辑）</h4>
     <table>
       <thead>
-        <tr><th>角色</th><th>提示词片段</th><th>工具白名单</th><th>数据范围</th><th>读病房上下文</th></tr>
+        <tr>
+          <th>工具</th>
+          <th>来源</th>
+          <th v-for="r in matrixRoles" :key="r">{{ r }}</th>
+        </tr>
       </thead>
       <tbody>
-        <tr v-for="(pol, role) in roles" :key="role">
-          <td class="mono">{{ role }}</td>
-          <td class="mono">{{ pol.prompt_file }}</td>
-          <td class="mono">{{ pol.allowed_tools === null || pol.allowed_tools === undefined
-            ? "全部（不按角色裁剪）" : (pol.allowed_tools.join(", ") || "无（空列表）") }}</td>
-          <td class="mono">{{ pol.data_scope }}</td>
-          <td>{{ pol.ward_context ? "是" : "否" }}</td>
-        </tr>
-        <tr v-if="loaded && !Object.keys(roles).length"><td colspan="5">读不到策略矩阵</td></tr>
+        <template v-for="g in grouped" :key="g.server">
+          <tr class="group"><td :colspan="2 + matrixRoles.length">{{ g.server }}</td></tr>
+          <tr v-for="t in g.tools" :key="t.name" :class="{ off: !t.switch_on, dead: t.orphan }">
+            <td class="mono">
+              {{ t.name }}<span v-if="t.orphan" class="tag">已下线</span>
+            </td>
+            <td class="mono">{{ t.local ? t.server : (t.switch_on ? "" : "开关已关") }}</td>
+            <td v-for="r in matrixRoles" :key="r">
+              <input type="checkbox" :checked="cellValue(r, t)" :disabled="t.locked[r] || t.orphan"
+                     :title="t.locked[r] ? 'R3：急停/呼救不受权限限制，不可取消'
+                             : (t.overridden[r] ? '已人工修改（勾=已落库的覆盖）' : '出厂默认')"
+                     @change="toggle(r, t, $event)" />
+              <span v-if="t.locked[r]" class="lock">🔒</span>
+              <span v-else-if="isDirty(r, t.name)" class="dirty">●</span>
+              <span v-else-if="t.overridden[r]" class="over">已改</span>
+            </td>
+          </tr>
+        </template>
+        <tr v-if="loaded && !matrix.length"><td :colspan="2 + matrixRoles.length">读不到矩阵</td></tr>
       </tbody>
     </table>
+    <div class="row">
+      <button :disabled="saving || !dirtyCount" @click="saveMatrix">
+        保存改动{{ dirtyCount ? `（${dirtyCount}）` : "" }}
+      </button>
+      <button class="danger" @click="resetMatrix">全部恢复出厂</button>
+    </div>
+    <p class="hint">
+      <b>●</b> = 本次未保存；<b>已改</b> = 已落库的覆盖；灰勾/灰空 = 出厂默认。
+      淡色行 = 整机开关关着（去「设置」页打开，勾了也不生效）；<b>已下线</b> = 库里留着覆盖但工具
+      已不在注册表（可「恢复出厂」清掉）。🔒 是红线 R3：急停/呼救任何层都不可取消。
+    </p>
+
+    <h4>出厂策略参考</h4>
+    <p class="hint">
+      <span v-for="(pol, role) in roles" :key="role" class="policy">
+        <b>{{ role }}</b>：数据范围 <code>{{ pol.data_scope }}</code>、
+        病房上下文 {{ pol.ward_context ? "读" : "不读" }}；
+      </span>
+    </p>
 
     <h4>口令设置</h4>
     <p v-if="!authRequired" class="warn">
@@ -166,8 +295,18 @@ h4 { margin: 22px 0 8px; font-size: 15px; color: #cbd5e1; }
 table { width: 100%; border-collapse: collapse; margin-top: 10px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1f2937; font-size: 13px; }
 th { color: #94a3b8; font-weight: normal; }
+tr.group td { color: #64748b; font-size: 11px; text-transform: uppercase;
+  background: #0f172a; padding: 4px 10px; }
+tr.off { opacity: .55; }
+tr.dead td { color: #64748b; }
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 code { background: #1e293b; padding: 1px 5px; border-radius: 4px; }
+.tag, .over { font-size: 11px; color: #94a3b8; margin-left: 6px; }
+.dirty { color: #fbbf24; margin-left: 6px; }
+.lock { margin-left: 4px; }
+.policy { margin-right: 14px; }
+input[type="checkbox"] { transform: scale(1.15); cursor: pointer; }
+input[type="checkbox"]:disabled { cursor: not-allowed; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row input { padding: 8px 12px; border-radius: 8px; border: 1px solid #334155;
   background: #1e293b; color: #e2e8f0; font-size: 14px; }
@@ -175,5 +314,6 @@ code { background: #1e293b; padding: 1px 5px; border-radius: 4px; }
 .row label { color: #94a3b8; font-size: 13px; display: flex; gap: 6px; align-items: center; }
 .row button { padding: 8px 16px; border-radius: 8px; border: none; background: #1e3a5f;
   color: #e2e8f0; cursor: pointer; font-size: 14px; }
+.row button:disabled { opacity: .5; cursor: not-allowed; }
 .row button.danger { background: #7f1d1d; }
 </style>

@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS chat_history (
   uid TEXT, role TEXT, content TEXT, ts TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+-- 权限矩阵覆盖层（规格 docs/superpowers/specs/2026-09-26-permission-matrix-design.md）：
+-- **只存与出厂默认不同的格子**；删行 = 回到出厂默认（D2）。出厂默认见 agent/policy.py
+-- 的白名单与 conf.MCP_SERVERS 的 roles；本表是运行期可编辑的那一层。
+CREATE TABLE IF NOT EXISTS role_tool_grants (
+  role       TEXT NOT NULL,          -- ward | elder | admin
+  tool       TEXT NOT NULL,          -- 工具名（本地与 MCP 同一命名空间）
+  allowed    INTEGER NOT NULL,       -- 1=允许，0=显式拒绝（显式拒绝必须能盖掉"出厂允许"）
+  updated_at TEXT NOT NULL,
+  updated_by TEXT NOT NULL,          -- 写入者（uid/slot），审计追溯
+  PRIMARY KEY (role, tool)
+);
 CREATE TABLE IF NOT EXISTS summaries (uid TEXT PRIMARY KEY, summary TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS portraits (uid TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS core_memories (
@@ -1498,6 +1509,79 @@ def verify_admin_password(pw: str) -> bool:
 def set_admin_auth_required(required: bool) -> None:
     """开关口令门（D13）。关掉之后任何人点「管理层」都能进，UI 必须显示警示。"""
     _set_setting_raw("admin_auth_required", "1" if required else "0")
+
+
+# ---------------------------------------------------------------- 权限矩阵（role_tool_grants）
+# 规格：docs/superpowers/specs/2026-09-26-permission-matrix-design.md §3
+# 本组函数是覆盖层的**唯一持久化出口**；判定逻辑在 agent/permissions.py，不在这里。
+def list_role_grants() -> list[dict]:
+    """矩阵里的全部覆盖行（矩阵页与审计用）。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT role,tool,allowed,updated_at,updated_by FROM role_tool_grants "
+            "ORDER BY role,tool").fetchall()
+        return [{**dict(r), "allowed": bool(r["allowed"])} for r in rows]
+    finally:
+        conn.close()
+
+
+def get_role_grants() -> dict[tuple[str, str], bool]:
+    """判定热路径用：`{(role, tool): allowed}`。空表 = 全走出厂默认。
+
+    **每轮对话只查一次**（在 effective_tools 入口），不要放进逐工具的循环里。
+    """
+    conn = _conn()
+    try:
+        return {(r["role"], r["tool"]): bool(r["allowed"])
+                for r in conn.execute("SELECT role,tool,allowed FROM role_tool_grants")}
+    finally:
+        conn.close()
+
+
+def set_role_grant(role: str, tool: str, allowed: bool, by: str = "") -> None:
+    """写一格（逐格 upsert，天然幂等，故不需要乐观锁——规格 D9）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                """INSERT INTO role_tool_grants(role,tool,allowed,updated_at,updated_by)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(role,tool) DO UPDATE SET
+                     allowed=excluded.allowed, updated_at=excluded.updated_at,
+                     updated_by=excluded.updated_by""",
+                (role, tool, 1 if allowed else 0, now_iso(), by or ""))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def delete_role_grant(role: str, tool: str) -> int:
+    """删一格 → 回到出厂默认。返回删除行数（0 = 本来就是默认）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("DELETE FROM role_tool_grants WHERE role=? AND tool=?",
+                               (role, tool))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def clear_role_grants(role: str = "") -> int:
+    """恢复出厂：`role=""` 清全部，否则只清该列。返回删除行数。"""
+    with _lock:
+        conn = _conn()
+        try:
+            if role:
+                cur = conn.execute("DELETE FROM role_tool_grants WHERE role=?", (role,))
+            else:
+                cur = conn.execute("DELETE FROM role_tool_grants")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------- 地图标记索引缓存

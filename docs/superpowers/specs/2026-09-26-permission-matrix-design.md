@@ -70,9 +70,9 @@
 | D5 | `conf.MCP_SERVERS.roles` 的地位 | **降级为"出厂默认"**，可被矩阵覆盖（即管理员能把 `fetch`/`tavily` 勾给别的层） | 用户诉求就是"人工勾选改权限"；保留未声明=`admin` 作为出厂值 |
 | D6 | 生效时机 | **不缓存**：每次判定读一次库（整表一次查询） | 勾选即生效、零一致性逻辑；SQLite/WAL 本机查询微秒级 |
 | D7 | 读库异常 | **回落出厂政策** + 审计 `policy_deny(reason=matrix_unavailable)` | 绝不因读库失败而放行（fail-closed） |
-| D8 | R3 锁 | `robot_stop`（急停）与 `notify_nurse`（呼救）在 `ward`/`elder` 两列**不可写、UI 只读** | 规格 R3「安全动作永远放行」不能被一次误勾破坏 |
+| D8 | R3 锁 | `robot_stop`（急停）与 `notify_nurse`（呼救）在 `ward`/`elder` 两列**不可写、UI 只读**；红锁**不越过整机开关**（见 §4.1） | 规格 R3「安全动作永远放行」不能被一次误勾破坏；但运维把能力拔掉（`mcp_enabled=false`）是另一回事，不是权限分歧 |
 | D9 | 并发控制 | **不做乐观锁**（`version`） | 逐格 upsert 天然幂等；冲突语义只是"最后一次勾选生效" |
-| D10 | 页面归属 | 只做在 `frontend/packages/admin`（新增「权限」页签），kiosk/nurse 不做 | 权限 = 管理动作，与既有「设置/工具」页同端 |
+| D10 | 页面归属 | 只做在 `frontend/packages/admin`；**改造既有的「身份与权限」页（`RolesPage.vue`）**，不新增页签 | 权限 = 管理动作，与既有「设置/工具」页同端；该页原本就是这张只读矩阵，复用优先（见 §12 实现台账偏差 1） |
 | D11 | 可编辑性 | **矩阵全可编辑**（admin 端手动勾选并保存），唯一例外是 D8 的 R3 红锁 | 用户 2026-09-26 明确要求"admin 页面可以手动编辑"，并确认保留急停/呼救红锁（§1.4） |
 
 ## 3. 数据模型（`LLM/store/db.py`）
@@ -100,7 +100,7 @@ def delete_role_grant(role, tool) -> int                  # 返回删除行数�
 def clear_role_grants(role: str = "") -> int              # 恢复出厂（role="" = 全部）
 ```
 
-**遗留行（orphan）语义**：工具下线/改名后，矩阵里那一行仍存在，但 `decide()` 永远不会查到它。`matrix_snapshot()` 必须把这些行标成 `orphan: true` 显示出来，并允许一键清理 —— 否则矩阵页会长期展示一个不存在的工具，让人以为它还生效。
+**遗留行（orphan）语义**：工具下线/改名后，矩阵里那一行仍存在，但 `decide()` 永远不会查到它。`matrix_snapshot()` 必须把这些行标成 `orphan: true` 显示出来，**并如实显示库里存了什么**（`allowed`/`overridden` 照实取覆盖表），以便一键清理 —— 否则矩阵页会长期展示一个不存在的工具、且管理员看不到自己留下的那条覆盖。
 
 ## 4. 判定入口（新增 `LLM/agent/permissions.py`）
 
@@ -134,13 +134,17 @@ def decide(principal: dict | None, tool: str, *, server: str = "", local: bool =
 
 | 序 | 环节 | 条件 | `source` | `reason` |
 |---|---|---|---|---|
-| 1 | **lock** | `(role, tool)` 命中 `LOCKED` | `lock` | —（直接 allow） |
-| 2 | **switch** | 本地 `settings["<名>_enabled"]` 为假 / MCP `settings["mcp_enabled"]` 为假 | `switch` | `tool_disabled` / `mcp_disabled` |
+| 1 | **switch** | 本地 `settings["<名>_enabled"]` 为假 / MCP `settings["mcp_enabled"]` 为假 | `switch` | `tool_disabled` / `mcp_disabled` |
+| 2 | **lock** | `(role, tool)` 命中 `LOCKED` | `lock` | —（直接 allow） |
 | 3 | **matrix** | 表里有 `(role, tool)` 行 | `matrix` | `matrix_deny`（`allowed=0`） |
-| 4 | **tool_roles** | 工具自身 roles 不含该角色（本地 `@tool(roles=…)` / MCP 服务器 `roles`） | `tool_roles` | `tool_roles_mismatch` |
-| 5 | **factory** | `policy.py` 白名单不含该工具 | `factory` | `out_of_role_whitelist` |
+| 4 | **factory** | `policy.py` 白名单不含该工具 | `factory` | `out_of_role_whitelist` |
+| 5 | **tool_roles** | 工具自身 roles 不含该角色（本地 `@tool(roles=…)` / MCP 服务器 `roles`） | `tool_roles` | `tool_roles_mismatch` |
 
-**注意顺序与今天不同**：矩阵（3）**先于**出厂闸门（4/5）—— 这正是"可覆盖"的含义。而 `switch` 仍在矩阵之前：整机开关关掉时，任何勾选都不生效（与今天一致，避免"我明明勾了却还是不亮"的困惑由管理员误判为 bug）。
+**三条顺序都是刻意的**（2026-09-26 实现期订正，见 §12 实现台账）：
+
+1. **矩阵（3）先于出厂闸门（4/5）** —— 这正是"可覆盖"的含义；
+2. **`switch`（1）先于 `lock`（2）与矩阵** —— 整机开关（`mcp_enabled` / `<工具>_enabled`）是**运维把能力拔掉**的开关，不是权限。R3 保护的是"身份/权限不能挡住急停与呼救"，不是"绕过全局 kill switch"；把开关放在最前，也让"开关关着 → 勾了不生效"有唯一解释（否则管理员会把开关问题误判成矩阵 bug）；
+3. **`factory`（4）先于 `tool_roles`（5）** —— 兼容性决定：`tools.py` 旧实现的审计 reason 优先级就是"白名单先"（`out_of_role_whitelist if not allow_ok else tool_roles_mismatch`），换顺序会改动审计口径并让按 reason 聚合的既有用例回归；**允许/拒绝的结论完全相同**。
 
 ### 4.2 热路径性能口径（必须遵守）
 
@@ -206,17 +210,19 @@ def set_grants(changes: list[dict], actor: dict) -> dict:
 
 ## 6. 前端（`frontend/packages/admin`）
 
-**「权限」页是一张可编辑表**（不是只读报表）：勾选 → 只提交 diff → 后端逐格落库 → 即时生效；刷新后能看到自己改过的格子（实心）与出厂默认（灰）的差别。
+**「身份与权限」页里的矩阵是一张可编辑表**（不是只读报表）：勾选 → 只提交 diff → 后端逐格落库 → 即时生效；刷新后能看到自己改过的格子（「已改」）与出厂默认（灰）的差别。
 
-- 新增页签「权限」：`packages/admin/src/pages/Permissions.vue`；共享契约 `packages/shared/src/api/permissions.ts`（类型 + `getPermissionMatrix()` / `postPermissionChanges()` / `resetPermissions()`）。
+> **实现偏差（2026-09-26）**：仓库里已有 `packages/admin/src/pages/RolesPage.vue`（页签「身份与权限」），它原本就是这张只读矩阵（且页内文案写着"管理台只能看，不能改"）。故**改造该页**，不新增 `Permissions.vue`、也不新增 `shared/src/api/permissions.ts` —— 该页已经有一套裸 `fetch`（`req()`）来处理"非 2xx 时保留响应体 error/detail"的需求，矩阵的 403（红锁逐格结果）正好吃这套，复用即可。
+
 - 布局：表格，**行 = 工具**（按 `server` 分组：本地 / 车 / 通知 / 视觉 / 联网 / 抓取），**列 = ward / elder / admin** 三个勾选框。
 - 三态渲染：
-  - 灰勾 = 出厂允许；灰空 = 出厂拒绝；**实心** = 人工改过（该格附「恢复默认」小按钮）；
-  - 开关关闭（`switch_on: false`）的整行加淡色 + 行首提示"整机开关已关，勾选暂不生效"。
-- 🔒 锁：`locked` 为真的格子渲染为只读勾选 + tooltip「R3：急停/呼救不受权限限制，不可取消」。
-- ⚠️ 高危标记：出厂只给 admin 的 MCP 工具（`fetch_*` / `tavily-*`）加 ⚠️；勾给 `elder`/`ward` 时二次确认（文案指出"这是抓取任意网址/联网检索的能力"）。
-- 保存：只提交 diff（改动的格子）；成功后重拉矩阵并弹提示；失败按 `results` 标红对应格。
-- `AGENTS.md` 的管理端页签列表加「权限」。
+  - 灰勾 = 出厂允许；灰空 = 出厂拒绝；**实心 + 「已改」** = 人工改过；**●** = 本次未保存的 diff；
+  - 开关关闭（`switch_on: false`）的整行淡色；已下线（`orphan`）的行灰显且不可勾。
+- 🔒 锁：`locked` 为真的格子 `disabled` + tooltip「R3：急停/呼救不受权限限制，不可取消」。
+- ⚠️ 高危二次确认：勾**开启**出厂对本层拒绝的格子时 `confirm()` 提示（典型场景：把 `fetch_*` / `tavily-*` 这类联网/抓取工具放开给老人层）。
+- 保存：只提交 diff（改动的格子）；成功后重拉矩阵并提示；失败时按 `results` 把被拒的格子写进提示（含"R3 红锁"文案）。
+- 「全部恢复出厂」= `POST /api/permissions/reset`。
+- `AGENTS.md` 的管理端页签列表注明该页含可编辑矩阵。
 
 ## 7. 红线与安全
 
@@ -224,7 +230,7 @@ def set_grants(changes: list[dict], actor: dict) -> dict:
 |---|---|
 | R1 前端 role 不可信 | 矩阵读写都只从 `X-Surface` → `get_principal()` 取角色；请求体里的 role 只作"要改哪一列"的数据，**改哪一列由 admin 身份决定**（非 admin 只能读自己那列、一律不能写） |
 | R2 fail-closed | 未知角色/未知工具/表里没记录 → 落出厂政策（最保守）；读库异常 → 出厂政策 + 审计 |
-| R3 急停/呼救 | `LOCKED` 硬编码 + 写入口硬拒 + UI 只读；不因矩阵数据而失效 |
+| R3 急停/呼救 | `LOCKED` 硬编码 + 写入口硬拒 + UI 只读；不因矩阵/白名单/服务器 roles 而失效；**但服从整机开关**（`mcp_enabled=false` 时车控/通知子进程根本没起，那是运维开关不是权限，见 §4.1） |
 | R4 医疗红线 | 不在本设计范围（`memory.MEDICAL_KEYWORDS` 不变） |
 | R5 上下文单向 | 不在本设计范围（`data_scope` 属 P2） |
 | 审计 | 每一格改动 = 一条 `policy_change`；每一次越权 = 既有 `policy_deny`（新增 `source`） |
@@ -236,13 +242,13 @@ def set_grants(changes: list[dict], actor: dict) -> dict:
 1. **对账**：空表时 `matrix_snapshot()["allowed"]` 逐格等于 `decide()` 等于今天的 `effective_tools` 行为（防"改了默认忘了矩阵"）。
 2. **覆盖放行**：给 `elder` 写 `tavily-search=1`（同时 `conf` 不动）→ `effective_tools` 可见 + `run_tool` 放行。
 3. **显式拒绝盖掉出厂允许**：给 `admin` 写 `robot_move=0` → `effective_tools` 不含它、`run_tool` 拒绝（reason 落 `matrix_deny`）。
-4. **R3 锁**：`set_grants` 对 `ward/elder × robot_stop|notify_nurse` 逐格 `ok:false` 且 `action=rejected`；`decide()` 仍 allow。
+4. **R3 锁**：`set_grants` 对 `ward/elder × robot_stop|notify_nurse` 逐格 `ok:false` 且 `action=rejected`；`decide()` 在整机开关打开时仍 allow（开关关闭时由 `switch` 拦下，这是 D8 的边界）。
 5. **fail-closed**：未知角色（`"??"`）、未知工具 → 拒；`db.get_role_grants` 抛异常 → 回落出厂 + 审计。
 6. **鉴权**：非 admin `POST /api/permissions/matrix` → 403 + `policy_deny`；admin → 200 + `policy_change`（含 from/to）。
 7. **即时生效**：写完立刻 `effective_tools` 生效（无缓存断言）。
 8. **幂等与清理**：写 `allowed == 出厂值` → 行被删除（`action=cleared`）；`reset` 后回到对账态。
 9. **orphan**：库里塞一个注册表不存在的工具名 → `matrix_snapshot` 标 `orphan: true`。
-10. **回归**：`test_policy_roles.py` / `test_policy_tools.py` 全绿（出厂默认仍是唯一真相；未 monkeypatch 矩阵时行为与今天一致）。
+10. **回归**：`test_policy_roles.py` / `test_policy_tools.py` 全绿（出厂默认仍是唯一真相；未 monkeypatch 矩阵时行为与今天一致）。**一处有意的语义调整**：`test_policy_tools.py::test_run_tool_denies_whitelisted_tool_excluded_by_server_roles` 与 `test_notice_mcp.py` 里两条以 `robot_stop` / `notify_nurse` 当"可被服务器 roles 拒掉"样本的用例，因两者进入 `LOCKED` 而改为用 `see_what` 做探针、或断言"红锁不可被 roles 收窄"（见 §12 实现台账偏差 2）。
 
 ## 9. 分期
 
@@ -258,12 +264,13 @@ def set_grants(changes: list[dict], actor: dict) -> dict:
 | `LLM/store/db.py` | 新表 + 5 个 `*_role_grant*` 函数（§3） |
 | `LLM/agent/permissions.py` | **新增**：`ROLES` / `LOCKED` / `decide()` / `matrix_snapshot()` / `set_grants()` / `normalize_role()` / `factory_allows()`（§4） |
 | `LLM/agent/tools.py` | `effective_tools()` / `run_tool()` 改调 `decide()`（入口查一次 `grants`）；审计加 `source`；**签名与既有 reason 字符串不变** |
-| `LLM/server.py` | 新增 §5 三条路由（矩阵 GET/POST、reset），PUT 到「会话 / 角色」段落之后 |
-| `frontend/packages/shared/src/api/permissions.ts` | **新增**契约与调用 |
-| `frontend/packages/admin/src/pages/Permissions.vue` + 路由/页签 | **新增**页面 |
-| `LLM/tests/test_permissions.py` | **新增**（§8 十条） |
-| `AGENTS.md` | `policy.py` 段 + 管理端页签列表 + 「关键约定」补一条"权限判定只有 `permissions.decide()` 一个入口" |
+| `LLM/server.py` | 新增 §5 三条路由（矩阵 GET/POST、reset），插在 `GET /api/policy/roles` 之后 |
+| `frontend/packages/admin/src/pages/RolesPage.vue` | **改造**：只读矩阵表 → 可编辑矩阵（不新增页面、不新增 shared 契约，见 §6 偏差说明） |
+| `LLM/tests/test_permissions.py` | **新增**（§8 十条，19 条用例） |
+| `LLM/tests/test_permissions_api.py` | **新增**（路由：鉴权 / 逐格结果 / 重置，6 条用例） |
+| `AGENTS.md` | `permissions.py` 条目 + 管理端页签列表 + 「关键约定」补一条"权限判定只有 `permissions.decide()` 一个入口" |
 | `docs/superpowers/specs/2026-09-14-layered-user-roles-design.md` §3.3 | 加一句：能力矩阵的**出厂默认**见 `policy.py`，运行期可由 admin 通过权限矩阵覆盖（本设计） |
+| `docs/log.md` | 追加 2026-09-26 实现记录 |
 
 ## 11. 边界与未决
 
@@ -272,3 +279,17 @@ def set_grants(changes: list[dict], actor: dict) -> dict:
 3. **工具新增**：新工具无需任何矩阵操作，自动按出厂默认出现在矩阵页（`matrix_snapshot` 从注册表拉行）。
 4. **MCP 服务器整台下线**：其工具从注册表消失 → 矩阵行变 `orphan`，页面提示可清理，不自动删除（保留管理员意图，重新上线即恢复）。
 5. **矩阵与"整机开关"的优先级**：开关关 > 矩阵勾（§4.1 顺序），页面必须有文案说明，否则会被当成 bug。
+
+## 12. 实现台账与偏差（2026-09-26 P1 落地）
+
+实现计划：`docs/superpowers/plans/2026-09-26-permission-matrix.md`（8 任务 TDD）。分支 `feature/permission-matrix`，逐任务 commit。
+
+| # | 偏差 / 决定 | 说明 |
+|---|---|---|
+| 1 | **前端改造 `RolesPage.vue`，不新建页** | 规格 §6/§10 原写"新增 `Permissions.vue` + `shared/src/api/permissions.ts`"；实际仓库里已有同样内容的只读页。复用它的裸 `fetch`（`req()`）恰好满足"403 要拿到逐格 results"的需求，省一个页签、少一份重复代码。 |
+| 2 | **判定顺序订正为 `switch → lock → matrix → factory → tool_roles`** | 原设计把 `lock` 放第一位。实现期发现两条后果：① 红锁会让"急停"穿过 `mcp_enabled=false`（全局 kill switch），而 `mcp_enabled=false` 时车控/通知子进程根本没起，语义上说不通；② `factory` 与 `tool_roles` 的顺序会改变 `policy_deny` 的 `reason`（旧实现是"白名单先"），影响按 reason 聚合的既有用例。故按 §4.1 现在的顺序定稿。 |
+| 3 | **`notify_nurse` 纳入 R3 红锁的连带影响** | 它原本可被"服务器 roles 收窄"拒掉。进红锁后，`test_notice_mcp.py` 里那条用例改为断言"红锁不可被 roles 收窄"；`test_policy_tools.py` 里用 `robot_stop` 当"可被服务器 roles 拒"的探针改为 `see_what`（它同样在 elder 白名单内且不在红锁里）。**生产配置不变**（`notice` 声明了三层 roles）。 |
+| 4 | **orphan 行如实显示覆盖** | 已下线工具的遗留行不仅标 `orphan`，还照实回显 `allowed`/`overridden`，否则管理员看不到自己留下的那条覆盖、也无从清理。 |
+| 5 | **顺手修掉一处既有的测试顺序依赖** | `test_chat_text_tts.py` 会因 `test_ward_autoswitch.py` / `test_worker_roles.py` 遗留的 kiosk 会话状态而失败；已在基线 worktree（`f0dcb17`）复现，与本设计无关。补一个 `session.reset_for_test()` 的 autouse 隔离夹具。 |
+| 6 | **`switches` 未纳入矩阵** | 整机开关仍在设置页（`<工具名>_enabled` / `mcp_enabled`），矩阵只管"层 × 工具"。两者优先级在 §4.1 与页面文案里写明。 |
+

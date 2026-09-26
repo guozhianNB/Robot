@@ -356,23 +356,29 @@ def test_notify_nurse_hidden_when_mcp_disabled(monkeypatch):
     assert "notify_nurse" not in _names({"mcp_enabled": False}, _principal("elder"))
 
 
-def test_notify_nurse_denied_when_server_roles_exclude_caller(monkeypatch):
-    """服务器级 roles 是第二道闸门：把 notice 收窄到 admin，elder 就必须被拒。"""
+def test_notify_nurse_locked_against_server_roles_narrowing(monkeypatch):
+    """R3 红锁：呼救不可被"服务器把 notice 收窄到 admin"挡掉（红锁优先于 roles/矩阵/白名单）。
+
+    2026-09-26 变更（权限矩阵 P1，规格 D8/§7）：`notify_nurse` 与 `robot_stop` 同列
+    `permissions.LOCKED`——"老人求助喊不出来"比"未识别说话人能刷护士台"严重得多
+    （依据 2026-09-18-llm-notify-nurse-mcp-design.md D5）。故本用例从"必须被拒"改为
+    "必须仍可用"。
+
+    **红锁不越过整机开关**：`mcp_enabled` 关掉时照样拒（见 `test_notify_nurse_hidden_when_mcp_disabled`
+    与 `test_policy_deny_audit_has_no_message_text`）——那是运维拔能力的开关，不是权限。
+    """
     seen = []
     monkeypatch.setattr(tools.mcp_client, "tools", _mcp_snapshot)
-    # `run_tool` 会读 settings 查总开关：这里打桩，别让用例依赖真库（跨文件跑时 DB_PATH 可能被
-    # 别的用例改到不可写目录 —— 那是沙箱/隔离问题，与本用例的判别力无关）。
     monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda name, args: {"ok": True})
     monkeypatch.setattr("LLM.core.log.log", lambda event, **fields: seen.append((event, fields)))
     patched = dict(conf.MCP_SERVERS)
     patched["notice"] = {**conf.MCP_SERVERS["notice"], "roles": ["admin"]}
     monkeypatch.setattr(conf, "MCP_SERVERS", patched)
 
     r = tools.run_tool("notify_nurse", {"message": "测试", "level": "info"}, _principal("elder"))
-    # 精确文案 + 审计 reason：总开关关闭分支的文案里也有"不允许"，只断言子串会因**错误原因**变绿。
-    assert r["ok"] is False
-    assert r["error"] == "当前身份不允许调用工具 notify_nurse"
-    assert seen[-1][1]["reason"] == "tool_roles_mismatch"
+    assert r["ok"] is True                     # 服务器 roles 收窄也挡不住呼救
+    assert [e for e, _ in seen if e == "policy_deny"] == []
 
 
 def test_audit_args_redact_notify_nurse_message():
