@@ -222,13 +222,14 @@ def test_snapshot_marks_locked_and_override(d, monkeypatch):
 
 
 def test_snapshot_marks_orphan_grant(d):
-    """库里留着已下线工具的行 → 标 orphan，让人知道它不生效。"""
+    """库里留着已下线工具的行 → 标 orphan，并**如实显示存了什么**（页面才好清理）。"""
     from LLM.agent import permissions
     d.set_role_grant("elder", "早就没了的工具", True, by="admin")
     snap = permissions.matrix_snapshot(settings={})
     orph = [t for t in snap["tools"] if t["orphan"]]
     assert [t["name"] for t in orph] == ["早就没了的工具"]
-    assert orph[0]["allowed"] == {"ward": False, "elder": False, "admin": False}
+    assert orph[0]["overridden"] == {"ward": False, "elder": True, "admin": False}
+    assert orph[0]["allowed"] == {"ward": False, "elder": True, "admin": False}
 
 
 def test_set_grants_rejects_locked_and_unknown_role(d):

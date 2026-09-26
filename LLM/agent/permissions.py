@@ -165,8 +165,11 @@ def matrix_snapshot(settings: dict | None = None) -> dict:
         factory, allowed, overridden, locked = {}, {}, {}, {}
         for role in ROLES:
             if orphan:
-                factory[role] = allowed[role] = overridden[role] = False
-                locked[role] = False
+                # 已下线的工具：没有出厂默认可算，但**要如实显示库里存了什么**，
+                # 否则管理员看不到自己留下的一条覆盖、也无从清理（页面按 orphan 灰显）。
+                factory[role] = locked[role] = False
+                overridden[role] = (role, r["name"]) in grants
+                allowed[role] = bool(grants.get((role, r["name"]), False))
                 continue
             factory[role] = factory_allows(role, r["name"], server=r["server"],
                                            local=r["local"])
