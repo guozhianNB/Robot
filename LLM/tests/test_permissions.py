@@ -44,14 +44,22 @@ def test_set_grant_overwrites_and_delete_removes(d):
 
 # ---------------------------------------------------------------- 判定入口
 def test_decide_lock_allows_safety_tools(d):
-    """R3：急停/呼救不受任何权限影响，即便整机开关关着也放行。"""
+    """R3：急停/呼救不受**权限**影响（白名单/矩阵/服务器 roles 都挡不住）。
+
+    两者都是 MCP 工具（car / notice），故开关是 `mcp_enabled`；**红锁不越过整机开关**——
+    那是运维拔能力的开关，不是权限（规格 §4.1 顺序说明）。
+    """
     from LLM.agent import permissions
     for role in ("ward", "elder"):
         for tool in ("robot_stop", "notify_nurse"):
-            out = permissions.decide({"role": role}, tool,
-                                     settings={"robot_stop_enabled": False,
-                                               "notify_nurse_enabled": False}, grants={})
+            out = permissions.decide({"role": role}, tool, server="car", local=False,
+                                     settings={"mcp_enabled": True},
+                                     grants={}, ignore_switch=False)
             assert out["allow"] is True and out["source"] == "lock"
+            out = permissions.decide({"role": role}, tool, server="car", local=False,
+                                     settings={"mcp_enabled": False},
+                                     grants={(role, tool): False})
+            assert out["allow"] is False and out["source"] == "switch"
 
 
 def test_decide_switch_denies_before_matrix(d):
@@ -105,9 +113,11 @@ def test_decide_reason_priority_matches_legacy(d, monkeypatch):
     out = permissions.decide({"role": "elder"}, "see_what", server="srv", local=False,
                              settings={"mcp_enabled": True}, grants={})
     assert out["reason"] == "tool_roles_mismatch"
-    # R3 优先于一切：即便服务器只声明 admin、开关也关着，急停对老人层仍放行
+    # R3 优先于 matrix/factory/tool_roles：即便服务器只声明 admin、矩阵也写了拒绝，
+    # 急停对老人层仍放行（整机开关关掉才会被 switch 拦下，见上一条用例）
     out = permissions.decide({"role": "elder"}, "robot_stop", server="srv", local=False,
-                             settings={"mcp_enabled": False}, grants={})
+                             settings={"mcp_enabled": True},
+                             grants={("elder", "robot_stop"): False})
     assert out["allow"] is True and out["source"] == "lock"
 
 
@@ -123,3 +133,57 @@ def test_decide_falls_back_to_factory_when_db_raises(d, monkeypatch):
     assert grants == {}
     assert seen and seen[-1][0] == "policy_deny"
     assert seen[-1][1]["action"] == "matrix_unavailable"
+
+
+# ---------------------------------------------------------------- 接入 tools.py
+def _mcp(schema_name: str, server: str) -> dict:
+    return {schema_name: {"server": server, "schema": {
+        "type": "function",
+        "function": {"name": schema_name, "description": "", "parameters": {}}}}}
+
+
+def test_effective_tools_matrix_grants_mcp_tool(d, monkeypatch):
+    """矩阵放行后，老人层**看得见也调得到** tavily-search（出厂只给 admin，见 D5）。"""
+    from LLM.agent import tools
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: _mcp("tavily-search", "tavily"))
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda n, a: {"ok": True})
+    d.set_settings({"mcp_enabled": True})          # run_tool 读真实 settings，总开关必须打开
+    settings = {"mcp_enabled": True}
+    p = {"uid": "elder_101_1", "role": "elder", "slot": "kiosk"}
+
+    names = lambda: [t["function"]["name"] for t in tools.effective_tools(settings, p)]
+    assert "tavily-search" not in names()                       # 出厂：只有 admin
+    d.set_role_grant("elder", "tavily-search", True, by="admin")
+    assert "tavily-search" in names()                           # 勾上即生效（无缓存）
+    assert tools.run_tool("tavily-search", {}, p)["ok"] is True
+
+
+def test_effective_tools_matrix_denies_admin_tool(d, monkeypatch):
+    """反向：矩阵显式拒绝能盖掉 admin 的"全部"出厂默认。"""
+    from LLM.agent import tools
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: _mcp("robot_move", "car"))
+    monkeypatch.setattr(tools, "_mcp_roles", lambda server: {"admin"})
+    monkeypatch.setattr(tools.mcp_client, "call_tool", lambda n, a: {"ok": True})
+    d.set_settings({"mcp_enabled": True})
+    settings = {"mcp_enabled": True}
+    admin = {"uid": "admin", "role": "admin", "slot": "admin"}
+
+    names = lambda: [t["function"]["name"] for t in tools.effective_tools(settings, admin)]
+    assert "robot_move" in names()
+    d.set_role_grant("admin", "robot_move", False, by="admin")
+    assert "robot_move" not in names()
+    res = tools.run_tool("robot_move", {}, admin)
+    assert res["ok"] is False and "不允许" in res["error"]
+
+
+def test_run_tool_audits_matrix_source(d, monkeypatch):
+    """越权审计要带上第一因（source=matrix），否则排查时分不清是哪道闸门拦的。"""
+    from LLM.agent import tools
+    d.set_settings({"mcp_enabled": True})
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: _mcp("robot_move", "car"))
+    seen = []
+    monkeypatch.setattr("LLM.core.log.log", lambda ev, **kw: seen.append((ev, kw)))
+    d.set_role_grant("admin", "robot_move", False, by="admin")
+    tools.run_tool("robot_move", {}, {"role": "admin", "slot": "admin"})
+    assert seen[-1][1]["reason"] == "matrix_deny"
+    assert seen[-1][1]["source"] == "matrix"

@@ -12,10 +12,13 @@ r"""权限矩阵：三层 × 每工具的**唯一判定入口**。
   R2 fail-closed —— 未知角色 / 未知工具 / 无记录 → 最保守那一侧（出厂政策）；
   R3 急停与呼救**永不**被权限挡住（`LOCKED`，写入口硬拒，见规格 §7）。
 
-判定顺序（规格 §4.1）：``lock → switch → matrix → factory(白名单) → tool_roles``。
-`factory` 排在 `tool_roles` 之前是**兼容性决定**：tools.py 旧实现的审计 reason 优先级就是
-"白名单先"（`out_of_role_whitelist if not allow_ok else tool_roles_mismatch`），换顺序会改动
-审计口径、并让按 reason 聚合的既有用例回归；允许/拒绝的结论完全相同。
+判定顺序（规格 §4.1）：``switch → lock → matrix → factory(白名单) → tool_roles``。
+两条顺序都是**故意的**：
+  * `switch` 在 `lock` 之前 —— 整机开关（`mcp_enabled` / `<工具>_enabled`）是**运维把能力拔掉**
+    的开关，不是权限；R3 保护的是"身份/权限不能挡住急停与呼救"，不是"绕过全局 kill switch"；
+  * `factory` 在 `tool_roles` 之前 —— tools.py 旧实现的审计 reason 优先级就是"白名单先"
+    （`out_of_role_whitelist if not allow_ok else tool_roles_mismatch`），换顺序会改动审计口径、
+    并让按 reason 聚合的既有用例回归；允许/拒绝的结论完全相同。
 """
 import time
 
@@ -25,8 +28,10 @@ from .policy import role_policy
 
 ROLES = ("ward", "elder", "admin")
 
-# R3：急停（robot_stop）与呼救（notify_nurse）在任何层都不可取消。
+# R3：急停（robot_stop）与呼救（notify_nurse）在**权限层面**任何层都不可取消。
 # **故意不进 DB** —— 否则"能改这一格的人"就等于"能绕过 R3 的人"。
+# 它们仍然服从整机开关（见上面的顺序说明）：`mcp_enabled` 关掉时车控/通知子进程根本没起，
+# 红锁也无从调用——那条路是运维开关，不是权限分歧。
 LOCKED: dict[str, frozenset[str]] = {
     "ward": frozenset({"robot_stop", "notify_nurse"}),
     "elder": frozenset({"robot_stop", "notify_nurse"}),
@@ -91,9 +96,6 @@ def decide(principal: dict | None, tool: str, *, server: str = "", local: bool =
     """
     role = normalize_role((principal or {}).get("role"))
 
-    if is_locked(role, tool):
-        return {"allow": True, "reason": "", "source": "lock"}
-
     if not ignore_switch:
         st = settings if settings is not None else db.get_settings()
         if local:
@@ -103,6 +105,9 @@ def decide(principal: dict | None, tool: str, *, server: str = "", local: bool =
                 return {"allow": False, "reason": "tool_disabled", "source": "switch"}
         elif not st.get("mcp_enabled"):
             return {"allow": False, "reason": "mcp_disabled", "source": "switch"}
+
+    if is_locked(role, tool):
+        return {"allow": True, "reason": "", "source": "lock"}
 
     g = grants if grants is not None else load_grants()
     if (role, tool) in g:
