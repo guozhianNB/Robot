@@ -51,3 +51,31 @@ export function apiDelete<T = any>(url: string, surface?: Surface): Promise<T> {
     headers: { Accept: "application/json", ...(surface ? { "X-Surface": surface } : {}) },
   });
 }
+
+/** FastAPI 校验错误的单条结构（`{"detail":[{"msg":"...","loc":[...]}]}`）。 */
+interface ValidationIssue {
+  msg?: string;
+}
+
+/**
+ * 后端错误正文里能给人看的那句话。
+ *
+ * `ApiError.message` 只有 `API 422: /api/plans` 这种定位信息，真正的原因在 body 里：
+ * FastAPI 校验失败是 `{"detail":[{...}]}`，路由自己抛 `HTTPException(422, detail="...")`
+ * 是 `{"detail":"当前地图未知"}`。业务代码统一用这个函数取原因——否则用户只能看到
+ * 一个没有任何解释的状态码（2026-09-27 用户实测踩过）。
+ */
+export function apiErrorMessage(error: unknown, fallback = "请求失败"): string {
+  if (!(error instanceof ApiError)) {
+    return error instanceof Error && error.message ? error.message : fallback;
+  }
+  const detail = (error.body as { detail?: unknown } | undefined)?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => (item as ValidationIssue | null)?.msg)
+      .filter((msg): msg is string => typeof msg === "string" && !!msg.trim());
+    if (messages.length) return `参数不合法：${messages.join("；")}`;
+  }
+  return error.message;
+}

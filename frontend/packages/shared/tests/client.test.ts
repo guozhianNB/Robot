@@ -1,7 +1,29 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { ApiError, apiDelete, apiGet, apiPost } from "../src/api/client";
+import { ApiError, apiDelete, apiErrorMessage, apiGet, apiPost } from "../src/api/client";
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("apiErrorMessage 取后端原因", () => {
+  it("优先取 FastAPI HTTPException 的字符串 detail", () => {
+    const error = new ApiError(422, "/api/plans", { detail: "robot_goto_place 目标解析失败：当前地图未知" });
+    expect(apiErrorMessage(error)).toBe("robot_goto_place 目标解析失败：当前地图未知");
+  });
+
+  it("把校验错误数组拼成一句话", () => {
+    const error = new ApiError(422, "/api/plans", {
+      detail: [{ msg: "Field required", loc: ["body", "title"] }, { msg: "Input should be a valid array" }],
+    });
+    expect(apiErrorMessage(error)).toContain("Field required");
+    expect(apiErrorMessage(error)).toContain("Input should be a valid array");
+    expect(apiErrorMessage(error)).toContain("参数不合法");
+  });
+
+  it("没有可用 detail 时退回 ApiError.message，非 ApiError 退回传入兜底", () => {
+    expect(apiErrorMessage(new ApiError(500, "/api/plans", {}))).toBe("API 500: /api/plans");
+    expect(apiErrorMessage(new Error("炸了"))).toBe("炸了");
+    expect(apiErrorMessage(null, "未知错误")).toBe("未知错误");
+  });
+});
 
 describe("REST client", () => {
   it("apiGet 解析 JSON", async () => {

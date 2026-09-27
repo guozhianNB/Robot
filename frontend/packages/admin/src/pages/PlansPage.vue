@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   ApiError,
+  apiErrorMessage,
   buildPlanCreateStep,
   canCancelPlan,
   canChangePlanPriority,
@@ -84,7 +85,7 @@ async function load() {
     } else currentPlan.value = null;
     errorText.value = "";
   } catch (error) {
-    errorText.value = `读取计划失败：${error instanceof Error ? error.message : String(error)}`;
+    errorText.value = `读取计划失败：${apiErrorMessage(error)}`;
   } finally {
     loading.value = false;
   }
@@ -97,7 +98,7 @@ async function openPlan(id: number) {
     const result = await getPlan(id);
     if (result.plan) setLatest(result.plan);
   } catch (error) {
-    errorText.value = `读取计划详情失败：${error instanceof Error ? error.message : String(error)}`;
+    errorText.value = `读取计划详情失败：${apiErrorMessage(error)}`;
   }
 }
 
@@ -113,7 +114,7 @@ async function runMutation(action: () => Promise<{ plan: PlanDetail }>) {
       setLatest(latest);
       errorText.value = "计划已被其他窗口修改，已刷新最新版本。请重新操作。";
     } else {
-      errorText.value = `操作失败：${error instanceof Error ? error.message : String(error)}`;
+      errorText.value = `操作失败：${apiErrorMessage(error)}`;
     }
   } finally {
     saving.value = false;
@@ -176,7 +177,7 @@ async function submitCreate() {
     createSteps.value = [];
     await load();
   } catch (error) {
-    errorText.value = `创建失败：${error instanceof Error ? error.message : String(error)}`;
+    errorText.value = `创建失败：${apiErrorMessage(error)}`;
   } finally { saving.value = false; }
 }
 
@@ -244,7 +245,9 @@ onUnmounted(() => {
         <button v-if="canCancelPlan(plan.status)" class="icon-button danger" type="button" title="取消计划" aria-label="取消计划" :disabled="saving" @click="cancel(plan.id)">×</button>
         <div v-if="expandedId === plan.id && currentPlan?.id === plan.id" class="details">
           <div v-for="step in currentPlan.steps" :key="step.id" class="step-row">
-            <div><b>{{ step.seq }}. {{ step.label }}</b><span class="muted">{{ step.action || step.step_type }} · {{ planStatusLabel(step.status) }}</span></div>
+            <div><b>{{ step.seq }}. {{ step.label }}</b><span class="muted">{{ step.action || step.step_type }} · {{ planStatusLabel(step.status) }}</span>
+              <p v-if="step.last_error" class="step-error">{{ step.last_error }}</p>
+            </div>
             <div class="step-actions">
               <button v-if="planStepConfirmDecision(step)" class="icon-button" type="button" title="确认步骤" aria-label="确认步骤" :disabled="saving" @click="confirmStep(step)">✓</button>
               <button v-if="canRetryPlanStep(step)" class="icon-button" type="button" title="重试步骤" aria-label="重试步骤" :disabled="saving" @click="retryStep(step)">↻</button>
@@ -272,6 +275,7 @@ onUnmounted(() => {
           </template>
           <template v-else-if="stepForm.type === 'wait'"><div class="form-grid"><label>等待方式<select v-model="stepForm.waitKind"><option value="time">指定时间</option><option value="device">设备信号</option><option value="external">外部信号</option></select></label><label v-if="stepForm.waitKind === 'time'">唤醒时间<input v-model="stepForm.wakeAt" type="datetime-local" /></label></div></template>
           <button class="secondary" type="button" @click="addStep">添加步骤</button>
+          <p class="hint">前往坐标/地点/区域的步骤在「当前地图未知」时会先挂起（等待目标解析），导航恢复后由后端自动解析并执行。</p>
           <ul v-if="createSteps.length" class="pending-steps"><li v-for="(step, index) in createSteps" :key="index"><span>{{ index + 1 }}. {{ step.label || step.type }}</span><button class="icon-button" type="button" title="移除步骤" aria-label="移除步骤" @click="removeStep(index)">×</button></li></ul>
         </fieldset>
         <div class="checks"><label><input v-model="createForm.notify" type="checkbox" /> 通知护士台</label><label><input v-model="createForm.speak" type="checkbox" /> 在场时播报</label></div>
@@ -290,7 +294,7 @@ button, select, input { font: inherit; }.toolbar button, .dialog button { cursor
 .primary, .secondary { padding: 6px 11px; }.primary { background: #2563eb; border-color: #2563eb; }.icon-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; cursor: pointer; }.icon-button:disabled, button:disabled { opacity: .5; cursor: not-allowed; }.danger { color: #fecaca; border-color: #7f1d1d; }
 .filter { display: flex; align-items: center; gap: 5px; color: #94a3b8; font-size: 12px; }.filter select, .priority-select { padding: 5px 7px; }
 .error { margin: 8px 0; padding: 8px 10px; color: #fecaca; background: #451a1a; border-left: 3px solid #ef4444; font-size: 13px; }.current-plan { border-left: 3px solid #38bdf8; background: #172554; padding: 10px 12px; margin-bottom: 12px; }.section-heading { justify-content: space-between; color: #bae6fd; font-size: 12px; }.current-line { margin-top: 6px; }.current-line strong { min-width: 0; margin-right: auto; overflow-wrap: anywhere; }.current-meta { color: #bfdbfe; font-size: 12px; margin-top: 6px; }
-.status, .priority { display: inline-block; padding: 2px 6px; border-radius: 3px; background: #334155; font-size: 11px; white-space: nowrap; }.priority { color: #fcd34d; }.plan-list { display: grid; gap: 5px; }.plan-row { flex-wrap: wrap; padding: 7px 8px; background: #1e293b; border: 1px solid transparent; }.plan-row.selected { border-color: #2563eb; }.plan-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }.plan-no { color: #94a3b8; font-size: 12px; }.plan-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.plan-main small { margin-left: auto; }.priority-select { width: 60px; }.details { width: 100%; border-top: 1px solid #334155; margin-top: 4px; padding: 7px 0 0 40px; }.step-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 6px 0; border-bottom: 1px solid #273449; }.step-row b { display: block; font-size: 13px; }.step-row .muted { margin-left: 8px; }.step-actions { display: flex; gap: 4px; }.attempts { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 5px; color: #94a3b8; font-size: 11px; }.attempts span { background: #0f172a; padding: 3px 5px; border-radius: 3px; }.empty { color: #94a3b8; text-align: center; padding: 32px; }
+.status, .priority { display: inline-block; padding: 2px 6px; border-radius: 3px; background: #334155; font-size: 11px; white-space: nowrap; }.priority { color: #fcd34d; }.plan-list { display: grid; gap: 5px; }.plan-row { flex-wrap: wrap; padding: 7px 8px; background: #1e293b; border: 1px solid transparent; }.plan-row.selected { border-color: #2563eb; }.plan-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }.plan-no { color: #94a3b8; font-size: 12px; }.plan-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.plan-main small { margin-left: auto; }.priority-select { width: 60px; }.details { width: 100%; border-top: 1px solid #334155; margin-top: 4px; padding: 7px 0 0 40px; }.step-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 6px 0; border-bottom: 1px solid #273449; }.step-row b { display: block; font-size: 13px; }.step-row .muted { margin-left: 8px; }.step-error { margin: 4px 0 0; color: #fecaca; font-size: 12px; overflow-wrap: anywhere; }.hint { margin: 6px 0 0; color: #94a3b8; font-size: 11px; }.step-actions { display: flex; gap: 4px; }.attempts { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 5px; color: #94a3b8; font-size: 11px; }.attempts span { background: #0f172a; padding: 3px 5px; border-radius: 3px; }.empty { color: #94a3b8; text-align: center; padding: 32px; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; background: rgb(2 6 23 / .72); display: grid; place-items: center; padding: 16px; }.dialog { width: min(620px, 100%); max-height: 92vh; overflow-y: auto; padding: 16px; background: #0f172a; border: 1px solid #475569; box-shadow: 0 10px 30px rgb(0 0 0 / .35); }.dialog-heading { justify-content: space-between; border-bottom: 1px solid #334155; padding-bottom: 8px; margin-bottom: 10px; }.dialog h3 { margin: 0; font-size: 17px; }.dialog label { display: flex; flex-direction: column; gap: 4px; color: #cbd5e1; font-size: 12px; margin-bottom: 8px; }.dialog input, .dialog select { padding: 7px 8px; width: 100%; box-sizing: border-box; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }.form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }.dialog fieldset { border: 1px solid #334155; padding: 10px; margin: 10px 0; }.dialog legend { color: #94a3b8; padding: 0 5px; font-size: 12px; }.secondary { background: #1e293b; color: #e2e8f0; }.pending-steps { list-style: none; padding: 0; margin: 8px 0; border-top: 1px solid #334155; }.pending-steps li { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #273449; font-size: 12px; }.checks { display: flex; gap: 14px; color: #cbd5e1; font-size: 12px; }.checks label { flex-direction: row; align-items: center; }.dialog-actions { justify-content: flex-end; margin-top: 14px; }
 @media (max-width: 680px) { .plan-main small { display: none; }.form-grid, .form-grid.three { grid-template-columns: 1fr; }.toolbar { flex-wrap: wrap; padding-bottom: 8px; }.toolbar-title { width: 100%; }.details { padding-left: 10px; } }
 </style>

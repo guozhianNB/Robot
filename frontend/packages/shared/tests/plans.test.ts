@@ -354,6 +354,18 @@ describe("管理台 Plan 页面源码契约", () => {
   it("窄屏当前计划长标题可收缩换行", () => {
     expect(source).toMatch(/\.current-line strong\s*\{[^}]*min-width:\s*0[^}]*overflow-wrap:\s*anywhere/);
   });
+
+  it("创建失败显示后端原因（detail），不再只报 API 422 状态码", () => {
+    expect(source).toContain("apiErrorMessage");
+    const body = source.slice(source.indexOf("async function submitCreate"),
+                              source.indexOf("function connectEvents"));
+    expect(body).toContain("apiErrorMessage(error)");
+    expect(body).not.toContain("error.message");
+  });
+
+  it("等待目标解析的步骤把后端原因显示出来", () => {
+    expect(source).toContain("step.last_error");
+  });
 });
 
 describe("护士台 PIN 门与 Plan 面板源码契约", () => {
@@ -417,6 +429,16 @@ describe("护士台 PIN 门与 Plan 面板源码契约", () => {
   it("窄屏当前计划长标题可收缩换行", () => {
     const source = sourceOf(panelPath);
     expect(source).toMatch(/\.current strong\s*\{[^}]*min-width:\s*0[^}]*overflow-wrap:\s*anywhere/);
+  });
+
+  it("护士台创建失败同样显示后端原因，并显示等待解析的步骤原因", () => {
+    const source = sourceOf(panelPath);
+    expect(source).toContain("apiErrorMessage");
+    const body = source.slice(source.indexOf("async function submitCreate"),
+                              source.indexOf("watch("));
+    expect(body).toContain("apiErrorMessage(error)");
+    expect(body).not.toContain("error.message");
+    expect(source).toContain("step.last_error");
   });
 
   it("App 在 PIN 门之后才挂载工作台、通知加载和唯一 SSE 连接", () => {

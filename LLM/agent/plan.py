@@ -19,6 +19,12 @@ PLAN_ACTIONS = frozenset({
     "robot_move", "robot_turn", "robot_goto_point",
     "robot_goto_place", "robot_goto_zone",
 })
+# 需要把「地点/区域/坐标」解析成绝对目标、因而可能暂时解析不了的动作。
+# 创建期解析不了时按设计 §4.2 挂 waiting（保留原动作与参数），
+# 由 `plan_scheduler` 定期重解析后才编译成 `robot_goto_point`。
+DEFERRED_NAV_ACTIONS = frozenset({
+    "robot_goto_point", "robot_goto_place", "robot_goto_zone",
+})
 
 _TOP_LEVEL_FIELDS = frozenset({"title", "priority", "owner_uid", "steps", "report"})
 _STEP_FIELDS = {
@@ -138,6 +144,26 @@ def _compile_target(action: str, args: dict, resolver) -> tuple[dict, dict]:
     }
 
 
+def _compile_target_result(action: str, args: dict, resolver) -> dict:
+    """Resolve one navigation action into a frozen point, never fabricating coordinates.
+
+    Returns ``{"ok": True, "point": ..., "fields": ...}`` or, when the target simply
+    cannot be resolved right now (导航没跑、地点没标、缓存过期…),
+    ``{"ok": False, "error": ...}``.  Malformed arguments are rejected earlier by
+    ``_normalize_action_args`` and therefore never reach this deferrable path.
+    """
+    try:
+        point, fields = _compile_target(action, args, resolver)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "point": point, "fields": fields}
+
+
+def defer_reason(action: str, error: str) -> str:
+    """The audit/UI-facing reason stored on a step whose target is not frozen yet."""
+    return f"目标尚未解析（{action}）：{error or '未知错误'}"
+
+
 def _base_step(seq: int, step_type: str, label: str) -> dict:
     return {
         "seq": seq, "step_type": step_type, "action": None, "label": label,
@@ -174,10 +200,16 @@ def compile_steps(raw_steps: list[dict], resolver) -> list[dict]:
             timeout, retry, attempts = _action_defaults(action)
             out.update({"action": action, "args_json": args, "timeout_sec": timeout,
                         "retry_policy": retry, "max_attempts": attempts})
-            if action.startswith("robot_goto_"):
-                point, target_fields = _compile_target(action, args, resolver)
-                out.update(target_fields)
-                out.update({"action": "robot_goto_point", "args_json": point})
+            if action in DEFERRED_NAV_ACTIONS:
+                built = _compile_target_result(action, args, resolver)
+                if not built["ok"]:
+                    # 设计 §4.2：暂时无法解析时步骤进入 waiting，禁止编造坐标。
+                    # 原动作与原参数原样留在行里，调度器据此重解析。
+                    out.update({"status": "waiting",
+                                "last_error": defer_reason(action, built["error"])})
+                else:
+                    out.update(built["fields"])
+                    out.update({"action": "robot_goto_point", "args_json": built["point"]})
         elif step_type == "wait":
             wait_kind = raw.get("wait_kind")
             if wait_kind not in _WAIT_KINDS:
@@ -228,10 +260,13 @@ def create_candidate(payload: dict, creator: dict, resolver=None) -> dict:
         normalized_report.update(report)
 
     steps = compile_steps(payload.get("steps"), resolver)
+    deferred = [step for step in steps if step.get("status") == "waiting"]
     principal = dict(creator or {})
     plan_row = {
         "kind": "care", "title": title.strip(), "priority": priority,
-        "preemption": "queue", "status": "queued",
+        "preemption": "queue",
+        # 首步就要等目标解析时 Plan 也如实标 waiting（与 _handle_wait 口径一致）。
+        "status": "waiting" if deferred else "queued",
         "owner_uid": owner_uid.strip() or None,
         "source_kind": "chat", "source_id": None,
         "creator_uid": principal.get("uid") or None,
@@ -242,15 +277,34 @@ def create_candidate(payload: dict, creator: dict, resolver=None) -> dict:
     made = db.create_plan(plan_row, steps)
     stored = made
     summary = f"{stored['display_no']} {stored['title']}（{len(steps)} 步）"
+    if deferred:
+        summary += f"，其中 {len(deferred)} 步等待目标解析"
     try:
         audit.log("plan", action="create", plan_id=stored["id"],
                   display_no=stored["display_no"], priority=priority,
-                  creator_uid=plan_row["creator_uid"], creator_role=plan_row["creator_role"])
+                  creator_uid=plan_row["creator_uid"], creator_role=plan_row["creator_role"],
+                  deferred_targets=len(deferred))
     except Exception as exc:  # committed state must not be reported as a failed tool call
         print(f"[WARN] Plan {stored['display_no']} 已创建，但审计写入失败：{exc}")
     # Broadcast only after the database commit; an SSE failure must never undo it.
     _publish(stored, kind="plan_created")
     return {"ok": True, "plan": stored, "summary": summary}
+
+
+def resolve_step_target(step: dict, resolver=None) -> dict:
+    """Re-resolve a navigation step that creation had to defer (design §4.2).
+
+    Pure: no database writes, no dispatch.  Returns ``{"ok": True, "point", "fields"}``
+    when the target is finally resolvable, or ``{"ok": False, "error"}`` while it is
+    still not (navigation down, tags missing, fingerprint stale…).  Stored arguments
+    that do not even validate raise ``ValueError``: that is corrupted persisted data,
+    not a temporary map condition, and the caller must fail closed.
+    """
+    action = step.get("action")
+    if action not in DEFERRED_NAV_ACTIONS:
+        raise ValueError(f"动作 {action!r} 不需要重解析导航目标")
+    args = _normalize_action_args(action, dict(step.get("args_json") or {}))
+    return _compile_target_result(action, args, resolver)
 
 
 def create_from_tool(title, steps, priority="P2", owner_uid="", report=None) -> dict:

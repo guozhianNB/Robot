@@ -112,3 +112,42 @@ def test_plan_requests_cannot_inject_execution_fields(client):
                          ("creator_uid", "admin")):
         response = client.post("/api/plans", json={**_manual_plan(), field: value})
         assert response.status_code == 422
+
+
+def test_navigation_plan_without_readable_map_is_created_as_waiting(client, monkeypatch):
+    """回归：导航没跑时创建带 goto 步骤的 Plan 不再 422（设计 §4.2）。
+
+    旧行为把「当前地图未知」当成请求错误返回 422，前端只看到 `API 422: /api/plans`
+    而没有任何原因；现在该步骤进入 waiting，保留原动作等待调度器重解析。
+    """
+    from LLM.agent import plan as plan_ops
+
+    class Unavailable:
+        def resolve_place(self, _place):
+            return {"ok": False, "status": "rejected", "error": "当前地图未知",
+                    "hint": "请确认导航正在运行并重试"}
+
+    monkeypatch.setattr(plan_ops, "_resolver_or_default", lambda _resolver: Unavailable())
+    created = client.post("/api/plans", json={
+        "title": "去护士站", "priority": "P1",
+        "steps": [{"type": "action", "action": "robot_goto_place",
+                   "args": {"place": "护士站"}, "label": "去护士站"}],
+        "report": {"notify": True, "speak_if_present": False},
+    })
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["ok"] is True
+    assert body["plan"]["status"] == "waiting"
+    step = body["plan"]["steps"][0]
+    assert step["status"] == "waiting"
+    assert step["action"] == "robot_goto_place"
+    assert step["target_json"] is None
+    assert "当前地图未知" in step["last_error"]
+
+    # 参数本身不合法仍然是请求错误，不许降级成 waiting。
+    malformed = client.post("/api/plans", json={
+        "title": "缺参数",
+        "steps": [{"type": "action", "action": "robot_goto_place", "args": {}}],
+    })
+    assert malformed.status_code == 422

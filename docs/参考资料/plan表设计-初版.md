@@ -264,7 +264,9 @@ Plan 调度器使用独立 daemon 线程，不能挂进 `session.tick()` 的 1 �
 - `PLAN_STATUS_GRACE_S=15.0`：`unavailable`、急停后的重新探测及短暂 readiness 忙的恢复宽限期；
 - `PLAN_GOTO_TIMEOUT_S=200`；
 - `PLAN_MOVE_TIMEOUT_S=45`；
-- `PLAN_TURN_TIMEOUT_S=45`。
+- `PLAN_TURN_TIMEOUT_S=45`；
+- `PLAN_RESOLVE_RETRY_S=15.0`：`waiting` 中的导航步骤重解析目标的间隔（§4.2 的「暂时无法解析」；
+  太小会每个 tick 都打一次地图/rosbridge）。
 
 这些常量放在 `LLM/conf.py`，环境变量可覆盖，解析非法值时回退默认值并审计。上一轮 tick 仍在执行
 时跳过，不允许并发 tick。所有慢调用均在调度线程内，不阻塞 FastAPI 事件循环。步骤超过动作超时

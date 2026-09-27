@@ -77,6 +77,112 @@ def test_tick_dispatches_once_then_advances_on_matching_last(monkeypatch, tmp_pa
     assert finished["steps"][0]["status"] == "succeeded"
 
 
+class _FakeNav:
+    """只能解析「护士站」的假 CarNav；其余目标一律报当前地图未知。"""
+
+    def __init__(self, available=True):
+        self.available = available
+        self.calls = 0
+
+    def resolve_place(self, place):
+        self.calls += 1
+        if not self.available:
+            return {"ok": False, "status": "rejected", "error": "当前地图未知"}
+        return {"ok": True, "map": "ward-map",
+                "target": {"x": 1, "y": 2, "yaw_deg": 30, "goal_source": "destination"},
+                "tags_fingerprint": "sha1:" + "a" * 40}
+
+
+def _deferred_goto_place_plan(db):
+    return db.create_plan(
+        {"title": "去护士站", "priority": "P2", "status": "waiting"},
+        [{"seq": 1, "step_type": "action", "action": "robot_goto_place",
+          "args_json": {"place": "护士站"}, "status": "waiting",
+          "timeout_sec": 200, "retry_policy": "safe_goto_only", "max_attempts": 2,
+          "last_error": "目标尚未解析：当前地图未知"}],
+    )
+
+
+def _stub_car_mcp(monkeypatch, calls):
+    monkeypatch.setattr("LLM.store.db.get_settings", lambda: {"mcp_enabled": True})
+    monkeypatch.setattr(tools.mcp_client, "tools", lambda: {
+        name: {"server": "car", "schema": {}}
+        for name in ("robot_goto_point", "robot_status")
+    })
+
+    def call(name, args):
+        calls.append((name, args))
+        if name == "robot_goto_point":
+            return {"ok": True, "result": json.dumps(
+                {"ok": True, "status": "started", "task_id": 9})}
+        return {"ok": True, "result": json.dumps(
+            {"ok": True, "last": {"task_id": 9, "ok": True}})}
+
+    monkeypatch.setattr(tools.mcp_client, "call_tool", call)
+
+
+def test_deferred_navigation_step_is_resolved_then_dispatched(monkeypatch, tmp_path):
+    """设计 §4.2：创建期解析不了的目标由调度器重解析，成功后才派发。"""
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = _deferred_goto_place_plan(db)
+    calls = []
+    _stub_car_mcp(monkeypatch, calls)
+    nav = _FakeNav()
+    monkeypatch.setattr("LLM.car_mcp.car_nav.CarNav", lambda: nav)
+    plan_scheduler._resolve_checked.clear()
+
+    plan_scheduler.tick_once(100)
+    resolved = db.get_plan(made["id"], include_steps=True)
+    step = resolved["steps"][0]
+    assert step["status"] == "pending"
+    assert step["action"] == "robot_goto_point"
+    assert step["args_json"] == {"x": 1.0, "y": 2.0, "yaw_deg": 30.0}
+    assert step["map_name"] == "ward-map"
+    assert step["target_json"]["source_action"] == "robot_goto_place"
+    assert step["tags_fingerprint"] == "sha1:" + "a" * 40
+    assert step["last_error"] == ""
+    assert step["retry_policy"] == "safe_goto_only"
+    assert calls == []                      # 解析成功那一 tick 只改状态，不派发
+
+    plan_scheduler.tick_once(101)
+    assert [name for name, _args in calls] == ["robot_goto_point"]
+    assert calls[0][1] == {"x": 1.0, "y": 2.0, "yaw_deg": 30.0}
+    running = db.get_plan(made["id"], include_steps=True)
+    assert running["steps"][0]["status"] == "running"
+    assert running["status"] == "running"
+
+
+def test_unresolved_navigation_retry_is_throttled_and_never_dispatches(monkeypatch, tmp_path):
+    monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
+    from LLM.store import db
+    db.init_db()
+    made = _deferred_goto_place_plan(db)
+    calls = []
+    _stub_car_mcp(monkeypatch, calls)
+    nav = _FakeNav(available=False)
+    monkeypatch.setattr("LLM.car_mcp.car_nav.CarNav", lambda: nav)
+    plan_scheduler._resolve_checked.clear()
+
+    plan_scheduler.tick_once(100)
+    got = db.get_plan(made["id"], include_steps=True)
+    assert got["steps"][0]["status"] == "waiting"
+    assert got["steps"][0]["action"] == "robot_goto_place"
+    assert "当前地图未知" in got["steps"][0]["last_error"]
+    assert calls == []
+    assert nav.calls == 1
+
+    version = got["version"]
+    plan_scheduler.tick_once(101)           # 节流窗口内：不重试、不写库
+    assert nav.calls == 1
+    assert db.get_plan(made["id"], include_steps=True)["version"] == version
+
+    plan_scheduler.tick_once(100 + plan_scheduler.conf.PLAN_RESOLVE_RETRY_S + 0.1)
+    assert nav.calls == 2
+    assert calls == []
+
+
 def test_move_timeout_never_retries(monkeypatch, tmp_path):
     monkeypatch.setattr("LLM.store.db.DB_PATH", tmp_path / "plan.db")
     from LLM.store import db

@@ -171,7 +171,36 @@ def test_real_tool_entry_rejects_unknown_top_level_fields(plan_db):
     assert db.list_plans() == []
 
 
-def test_navigation_snapshot_requires_map_and_valid_sha1(plan_db):
+def _goto_place_payload():
+    return {"title": "去护士站", "steps": [{
+        "type": "action", "action": "robot_goto_place", "args": {"place": "护士站"}}]}
+
+
+def test_unresolvable_navigation_target_is_deferred_not_rejected(plan_db):
+    """设计 §4.2：暂时无法解析时步骤进入 waiting，绝不编造坐标、也不拒绝建 Plan。"""
+    class Unavailable:
+        def resolve_place(self, _place):
+            return {"ok": False, "status": "rejected", "error": "当前地图未知",
+                    "hint": "请确认导航正在运行并重试"}
+
+    out = plan.create_candidate(_goto_place_payload(), _creator(), resolver=Unavailable())
+
+    assert out["ok"] is True
+    stored = db.get_plan(out["plan"]["id"], include_steps=True)
+    assert stored["status"] == "waiting"
+    step = stored["steps"][0]
+    assert step["status"] == "waiting"
+    # 原动作与原参数必须原样保留，调度器才有机会重解析。
+    assert step["action"] == "robot_goto_place"
+    assert step["args_json"] == {"place": "护士站"}
+    assert step["map_name"] is None
+    assert step["target_json"] is None
+    assert step["tags_fingerprint"] is None
+    assert "当前地图未知" in step["last_error"]
+    assert "等待目标解析" in out["summary"]
+
+
+def test_invalid_resolution_snapshot_is_deferred_without_coordinates(plan_db):
     class MissingSnapshot:
         def resolve_place(self, _place):
             return {"ok": True, "map": "", "target": {"x": 1, "y": 2, "yaw_deg": 0}}
@@ -182,12 +211,67 @@ def test_navigation_snapshot_requires_map_and_valid_sha1(plan_db):
                     "target": {"x": 1, "y": 2, "yaw_deg": 0},
                     "tags_fingerprint": "sha1:not-a-digest"}
 
-    payload = {"title": "去护士站", "steps": [{
-        "type": "action", "action": "robot_goto_place", "args": {"place": "护士站"}}]}
-    with pytest.raises(ValueError, match="地图"):
-        plan.create_candidate(payload, _creator(), resolver=MissingSnapshot())
-    with pytest.raises(ValueError, match="指纹"):
-        plan.create_candidate(payload, _creator(), resolver=BadFingerprint())
+    for resolver, fragment in ((MissingSnapshot(), "地图名"), (BadFingerprint(), "指纹")):
+        out = plan.create_candidate(_goto_place_payload(), _creator(), resolver=resolver)
+        step = db.get_plan(out["plan"]["id"], include_steps=True)["steps"][0]
+        assert step["status"] == "waiting"
+        assert fragment in step["last_error"]
+        assert step["target_json"] is None
+
+
+def test_malformed_navigation_arguments_are_still_rejected(plan_db):
+    """参数缺失/类型不符是请求错误，仍然 fail-closed 拒绝，不降级成 waiting。"""
+    with pytest.raises(ValueError, match="place"):
+        plan.create_candidate({
+            "title": "缺参数",
+            "steps": [{"type": "action", "action": "robot_goto_place", "args": {}}],
+        }, creator=_creator())
+    with pytest.raises(ValueError, match="白名单|动作"):
+        plan.compile_steps([{"type": "action", "action": "robot_fly", "args": {}}], None)
+
+
+def test_deferred_step_keeps_non_navigation_steps_running_normally(plan_db, fake_resolver):
+    """同一次创建里，能解析的步骤照常固化，不能解析的只挂自己那一步。"""
+    class SplitResolver:
+        def resolve_place(self, place):
+            if place == "护士站":
+                return fake_resolver.resolve_place(place)
+            return {"ok": False, "error": "当前地图未知"}
+
+    out = plan.create_candidate({
+        "title": "混合计划",
+        "steps": [
+            {"type": "manual", "label": "护士确认"},
+            {"type": "action", "action": "robot_goto_place", "args": {"place": "护士站"}},
+            {"type": "action", "action": "robot_goto_place", "args": {"place": "活动区"}},
+        ],
+    }, creator=_creator(), resolver=SplitResolver())
+
+    steps = db.get_plan(out["plan"]["id"], include_steps=True)["steps"]
+    assert [step["status"] for step in steps] == ["pending", "pending", "waiting"]
+    assert steps[1]["action"] == "robot_goto_point"
+    assert steps[1]["target_json"]["name"] == "护士站"
+    assert steps[2]["action"] == "robot_goto_place"
+    assert steps[2]["target_json"] is None
+
+
+def test_resolve_step_target_reruns_the_same_compile_rules(plan_db, fake_resolver):
+    step = {"action": "robot_goto_place", "args_json": {"place": "护士站"}}
+    out = plan.resolve_step_target(step, resolver=fake_resolver)
+    assert out["ok"] is True
+    assert out["point"] == {"x": 1.0, "y": 2.0, "yaw_deg": 30.0}
+    assert out["fields"]["map_name"] == "ward-map"
+
+    class Unavailable:
+        def resolve_place(self, _place):
+            return {"ok": False, "error": "当前地图未知"}
+
+    still = plan.resolve_step_target(step, resolver=Unavailable())
+    assert still == {"ok": False, "error": "robot_goto_place 目标解析失败：当前地图未知"}
+    with pytest.raises(ValueError, match="重解析"):
+        plan.resolve_step_target(
+            {"action": "robot_move", "args_json": {"direction": "forward", "distance_m": 1}},
+            resolver=fake_resolver)
 
 
 def test_report_is_persisted_as_structured_plan_data(plan_db):

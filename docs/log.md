@@ -2168,3 +2168,45 @@ P0-P3 排序、线性 action/wait/manual 步骤和人工操作，**不实现运�
   _session_roles/_ward_autoswitch/_notice_mcp/_prompt_layers/_react_agent/_chat_text_tts`）。
 - 未验项：真实车控链路下的可见性（用 fake MCP 验的）；`fetch`/`tavily` 放开给老人层后的实际检索效果与滥用面；
   矩阵页的多标签并发编辑（逐格幂等，无乐观锁，最后一次勾选生效）。
+
+## 2026-09-27 · Plan 创建 422：导航目标解析不了时改为步骤 waiting，不再拒绝建 Plan
+
+现象：用户在 Plan 列表里创建计划，报 `API 422: /api/plans`，页面上没有任何原因说明。
+
+- **复现**（用与前端完全相同的请求体打 `POST /api/plans`）：`manual` / `wait(device|time)` / `robot_move` /
+  `robot_turn` 全部 200；`robot_goto_point` / `robot_goto_place` / `robot_goto_zone` 一律 422，
+  body 是 `{"detail":"robot_goto_place 目标解析失败：当前地图未知"}`。
+- **根因**：`server.py::plans_create` → `agent/plan.py::create_candidate` → `compile_steps` → `_compile_target`
+  → `CarNav._context()`；后者要求「导航在跑 + tags 存在 + yaml 元数据 + 指纹一致」，任一不满足就
+  `raise ValueError`，被 `server.py`（`except (TypeError, ValueError)`）统一转成 **HTTP 422**。
+  两个叠加因素：① 前端 `ApiError` 只带 `API 422: /api/plans`，后端 `detail` 一个页面都没显示；
+  ② 实现与权威设计不一致 —— `docs/参考资料/plan表设计-初版.md` §4.2 明写「暂时无法解析时步骤进入
+  `waiting`，禁止编造坐标」，而实现是 fail-closed 直接拒绝整个 Plan。
+- **修法（按设计 §4.2，用户选定）**：
+  - `agent/plan.py`：新增 `DEFERRED_NAV_ACTIONS`、`_compile_target_result()`（把"解析失败"从异常变成返回值）、
+    `defer_reason()`；`compile_steps` 对导航动作解析失败时把该步落 `waiting` 并保留**原动作与原参数**
+    （`robot_goto_place` + `{"place": …}`），`map_name`/`target_json`/`tags_fingerprint` 全空
+    （绝不编造坐标），原因写进 `last_error`；参数本身不合法（缺字段、超范围）仍在 `_normalize_action_args`
+    阶段抛错 → 仍是 422，不降级。`create_candidate` 有步骤被推迟时 Plan 初始状态取 `waiting`
+    （与 `_handle_wait` 口径一致）并在 `summary` 里注明"其中 N 步等待目标解析"。
+  - 新增 `plan.resolve_step_target(step)`：调度器侧的重解析入口，复用同一套 `_normalize_action_args` +
+    `_compile_target` 规则（不复制一份判定）；目标仍解析不到返回 `{"ok": False, "error"}`，
+    落库参数已损坏则抛 `ValueError`。
+  - `agent/plan_scheduler.py`：`_deferred_navigation()` 判定 + `_resolve_deferred()`。每个 tick 最多处理一步；
+    **解析成功那一 tick 只把步骤转成 `pending` 并写入固化坐标，派发留到下一 tick**（不与派发同 tick 两次写库）；
+    仍失败时只在"原因字符串变了"时才写 `last_error`，避免每 tick bump `plan.version` 触发前端重载；
+    `_resolve_checked` 按 step id 做节流，间隔取 `conf.PLAN_RESOLVE_RETRY_S`（新增，默认 15.0，环境变量可覆盖）。
+    参数损坏的 waiting 步骤转 `needs_review`（那是数据问题，不是"地图暂时读不到"，不许无限等待）。
+  - 前端：`shared/src/api/client.ts` 新增 `apiErrorMessage()`（优先取 FastAPI 字符串 `detail`，
+    校验数组则拼 `参数不合法：…`，都没有才退回 `API 4xx: /url`）；admin `PlansPage.vue` 与护士台
+    `PlanPanel.vue` 的读取/操作/创建失败全部改用它；步骤行显示 `step.last_error`；新建计划对话框加一句
+    "导航未运行时会先挂起"的提示。
+- 测试：`test_plan.py` +4（waiting 落库、快照缺失/指纹非法也只挂起、参数不合法仍拒绝、混合计划只推迟自己那一步、
+  `resolve_step_target` 复用编译规则）；`test_plan_scheduler.py` +2（解析成功→下一 tick 派发；失败节流且从不派发）；
+  `test_plan_api.py` +1（HTTP 回归：导航读不到地图返回 200 + waiting，参数错误仍 422）。
+  后端全量 688 passed / 1 failed（`test_server_voice_routes.py::test_face_status_route` 的
+  `NameError: face_api` 是本次改动前就存在的独立故障）；`frontend` shared 83 passed；
+  `pnpm -r build` 四端产物已重建（dist 里可搜到新提示文案）。
+- 未验项：真机「导航起不来 → 恢复后自动解析并执行」的端到端只到 fake `CarNav` + fake MCP，未接真 rosbridge；
+  目标**永久**解析不了（例如坐标落在地图外/障碍上）会让步骤一直挂在 waiting，按设计只能由护士取消该 Plan，
+  目前没有"挂太久就提示"的兜底；前端 422 原因是这次才上屏，尚未做浏览器实测。

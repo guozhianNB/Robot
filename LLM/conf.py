@@ -63,6 +63,10 @@ PLAN_STATUS_GRACE_S = _positive_finite_env("PLAN_STATUS_GRACE_S", 15.0)
 PLAN_GOTO_TIMEOUT_S = _positive_finite_env("PLAN_GOTO_TIMEOUT_S", 200)
 PLAN_MOVE_TIMEOUT_S = _positive_finite_env("PLAN_MOVE_TIMEOUT_S", 45)
 PLAN_TURN_TIMEOUT_S = _positive_finite_env("PLAN_TURN_TIMEOUT_S", 45)
+# 创建期解析不了目标的导航步骤会挂 waiting，由调度器按此间隔重试解析
+# （设计 §4.2；间隔太小会让每次 tick 都打一次 SSH/rosbridge 并在失败理由
+# 不变时反复 bump plan.version）。
+PLAN_RESOLVE_RETRY_S = _positive_finite_env("PLAN_RESOLVE_RETRY_S", 15.0)
 
 
 def _bool_env(name: str, default: bool) -> bool:

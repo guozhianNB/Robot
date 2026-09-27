@@ -1394,6 +1394,9 @@ async def plans_create(body: PlanCreateIn, request: Request):
     try:
         result = await asyncio.to_thread(plan_ops.create_candidate, payload, _plan_actor(request))
     except (TypeError, ValueError) as exc:
+        # 只有**请求本身**不合法才 422（字段越权、动作不在白名单、参数缺失/超范围）。
+        # 「导航目标暂时解析不了」（导航没跑、地点没标、指纹变化）不在此列：按设计 §4.2
+        # 该步骤落 waiting 由调度器重解析，创建照样返回 200（2026-09-27 修）。
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return result
 

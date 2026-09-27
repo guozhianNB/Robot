@@ -36,6 +36,9 @@ _thread: threading.Thread | None = None
 _attempt_started: dict[int, float] = {}
 _unavailable_since: dict[int, float] = {}
 _cancel_started: dict[int, float] = {}
+# 上一次重解析「创建期没解析出目标」的导航步骤的时刻（monotonic，按 step id）。
+# 重解析要连地图/rosbridge，不能每个 tick 都打一次。
+_resolve_checked: dict[int, float] = {}
 
 
 @dataclass(frozen=True)
@@ -363,6 +366,62 @@ def _poll_cancel(step: dict, now: float) -> None:
     _cancel_started.pop(step["id"], None)
 
 
+def _deferred_navigation(step: dict) -> bool:
+    """A navigation step whose target creation could not freeze (design §4.2).
+
+    Such a row keeps its original ``robot_goto_place/zone/point`` action and args,
+    has no ``target_json``, and is parked in ``waiting`` until the map is readable.
+    """
+    return (step.get("step_type") == "action"
+            and step.get("status") == "waiting"
+            and not step.get("target_json")
+            and step.get("action") in plan_ops.DEFERRED_NAV_ACTIONS)
+
+
+def _resolve_deferred(step: dict, now: float) -> None:
+    """Re-resolve a parked navigation target; never dispatch in the same tick.
+
+    A deferred step becomes dispatchable only after its coordinates are resolved
+    and frozen, so a plan created while navigation is down waits instead of being
+    rejected — and no coordinate is ever invented to unblock it.
+    """
+    last = _resolve_checked.get(step["id"])
+    if last is not None and now - last < conf.PLAN_RESOLVE_RETRY_S:
+        return
+    _resolve_checked[step["id"]] = now
+    try:
+        outcome = plan_ops.resolve_step_target(step)
+    except (TypeError, ValueError) as exc:
+        # 落库参数本身不合法：这是数据损坏，不是「地图暂时读不到」，不许无限等待。
+        _mark_review(step, f"等待中的导航步骤参数无法重解析: {exc}")
+        return
+    if not outcome.get("ok"):
+        reason = plan_ops.defer_reason(step.get("action"), str(outcome.get("error") or ""))
+        if reason != (step.get("last_error") or ""):
+            updated = db.transition_plan_execution(
+                step["plan_id"], expected_version=step.get("_plan_version"),
+                step_id=step["id"], step_changes={"last_error": reason},
+            )
+            if updated:
+                plan_ops._publish(updated, step=step)
+        return
+    fields = outcome["fields"]
+    updated = db.transition_plan_execution(
+        step["plan_id"], expected_version=step.get("_plan_version"), step_id=step["id"],
+        step_changes={
+            "status": "pending", "action": "robot_goto_point",
+            "args_json": outcome["point"], "last_error": "",
+            "map_name": fields["map_name"], "target_json": fields["target_json"],
+            "tags_fingerprint": fields["tags_fingerprint"],
+        },
+    )
+    if updated:
+        _resolve_checked.pop(step["id"], None)
+        audit.log("plan", action="resolve_target", plan_id=step["plan_id"],
+                  step_id=step["id"], map_name=fields["map_name"])
+        plan_ops._publish(updated, step=step)
+
+
 def _dispatch(step: dict, now: float) -> None:
     if step.get("action") not in _ACTION_NAMES:
         _mark_review(step, f"动作不在自动调度清单: {step.get('action')}")
@@ -532,6 +591,9 @@ def tick_once(now: float | None = None) -> None:
 
         step = _choose_pending(plans)
         if step is None:
+            return
+        if _deferred_navigation(step):
+            _resolve_deferred(step, mono_now)
             return
         if step.get("step_type") == "action" and step.get("status") == "pending":
             _dispatch(step, mono_now)
